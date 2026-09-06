@@ -1,5 +1,5 @@
 {
-  "name": "slopdex",
+  "name": "@ninjaxtools/slopdex",
   "version": "0.1.0",
   "description": "Callable-level semantic indexing, search, and duplicate discovery for TypeScript and JavaScript codebases",
   "license": "MIT",
@@ -32,6 +32,7 @@
     "test:run": "vitest run",
     "smoke": "node scripts/smoke.mjs",
     "install:skill:opencode": "node scripts/install-opencode-skill.mjs",
+    "publish:minor": "npm version minor && npm publish --access public",
     "prepack": "npm run build && npm run smoke",
     "check": "npm run typecheck && npm run test:run && npm run build && npm run smoke"
   },

@@ -135,7 +135,7 @@ import {
   JinaEmbeddingProvider,
   crossSearch,
   openCodeIndex,
-} from "slopdex";
+} from "@ninjaxtools/slopdex";
 
 const index = openCodeIndex({
   rootDir: "/path/to/repository",
