@@ -38,13 +38,15 @@ Use `JINA_API_KEY` for Jina AI or `OPENAI_API_KEY` for OpenAI. The OpenAI defaul
 
 ## CLI
 
-When a command needs an index and none exists, Slopdex prints a notice to stderr and automatically indexes committed `HEAD`. Automatic initialization requires a clean Git worktree, just like `update-git`.
+Before running a command, Slopdex updates the index from committed `HEAD`, then overlays staged, unstaged, and untracked working-tree changes. If the index does not exist, it prints a notice and creates it automatically.
 
-Index an exact committed snapshot and record its commit:
+Index a committed snapshot, record its commit, and overlay current working-tree changes:
 
 ```bash
 slopdex update-git --root /path/to/repository
 ```
+
+The overlay is applied when the target resolves to the checked-out `HEAD`. An explicit historical or other-branch target is indexed as an exact committed snapshot without mixing in files from the current checkout.
 
 Later Git updates read only files changed between the recorded commit and `HEAD`:
 
@@ -52,7 +54,7 @@ Later Git updates read only files changed between the recorded commit and `HEAD`
 slopdex update-git --root /path/to/repository --target HEAD
 ```
 
-Update or delete specific working-tree files without advancing the Git checkpoint:
+After the automatic full refresh, explicitly update or delete specific working-tree files. These explicit operations do not themselves advance the Git checkpoint:
 
 ```bash
 slopdex update-files src/service.ts src/model.ts
@@ -83,6 +85,19 @@ src/users.ts :: Users.authenticate
   0.8475  src/auth.ts :: authenticate
 ```
 
+Group overlapping similarity pairs into connected clusters and list each function once:
+
+```bash
+slopdex cross-search --threshold 0.85 --format clusters
+```
+
+```text
+Cluster 1 (3 functions, similarity 0.8732-0.9410)
+  src/auth.ts:18:0 :: authenticate
+  src/session.ts:42:0 :: validateSession
+  src/users.ts:27:2 :: Users.authenticate
+```
+
 `--format summary` also produces compact file and function names for `search`. JSON remains the default format.
 
 Use `--threshold` to omit weaker matches. The threshold is a raw cosine similarity and is applied before `--limit`:
@@ -98,7 +113,6 @@ Use an inclusive range to omit matches that are either weaker or stronger than t
 slopdex cross-search --format summary --threshold 0.85-0.95 --limit 5
 ```
 
-`--min-similarity` remains available as an equivalent option; do not specify both.
 Source functions with no matches at the selected threshold are omitted.
 For same-index searches, each function pair is shown only in its first direction by default. Use
 `--include-symmetric-duplicates` to include both `A -> B` and `B -> A` results.
@@ -110,10 +124,16 @@ slopdex cross-search --source-path src/services --format summary
 slopdex cross-search --source-path src/service.ts --format summary
 ```
 
-Restrict source functions to functions currently present but absent at a historical commit:
+Restrict source functions to functions added, modified, or moved since a historical commit. This also compares the current working-tree overlay against that commit:
 
 ```bash
-slopdex cross-search --added-since origin/main --limit 5
+slopdex cross-search --changed-since origin/main --limit 5
+```
+
+Restrict source functions to files with uncommitted working-tree content:
+
+```bash
+slopdex cross-search --uncommitted --format clusters --threshold 0.85
 ```
 
 Search one index against another. Both indexes must use exactly the same embedding profile:
@@ -123,6 +143,8 @@ slopdex cross-search \
   --target-root /path/to/other-repository \
   --target-index /path/to/other-repository/.slopdex/index.sqlite
 ```
+
+If the target uses a non-default configuration path, pass it with `--target-config`. The target repository's indexing policy is kept separate from the source policy.
 
 ## Library
 
@@ -147,7 +169,7 @@ const results = await index.similaritySearch({
 
 for await (const result of crossSearch({
   source: index,
-  sourceFilter: { type: "added-since", commit: "origin/main", path: "src/services" },
+  sourceFilter: { type: "changed-since", commit: "origin/main", path: "src/services" },
   limitPerFunction: 5,
 })) {
   console.log(result);
@@ -160,12 +182,13 @@ Standalone functions `updateFiles`, `updateFromGit`, `similaritySearch`, and `cr
 
 ## Semantics
 
-- Git updates read blobs from the target commit, not dirty working-tree contents.
-- Git updates abort when the worktree contains staged, unstaged, or untracked changes; commit or stash them first.
-- The Git checkpoint advances only after every changed file has parsed and embedded successfully.
+- Git updates first reconcile the index to blobs from the target commit. When that target is the checked-out `HEAD`, they then overlay staged, unstaged, and untracked files from the working tree.
+- The Git checkpoint always identifies the committed base. Working-tree files are marked separately and do not advance it.
+- Commit reconciliation and the working-tree overlay are applied in one database transaction after every changed file has parsed and embedded successfully.
 - Explicit updates mark files as working-tree sourced and do not move the checkpoint.
-- The next Git update after those changes are committed reconciles working-tree-sourced files to the commit.
-- `added-since X` means a current function whose logical callable identity was absent at X. It does not rely only on `firstSeenCommit`.
+- Every Git update removes stale working-tree state before re-indexing the current overlay, so deleted transient files cannot remain in the index.
+- `changed-since X` returns current functions that were added, modified, or moved relative to X, including uncommitted overlays. Deleted functions are not returned because they cannot be cross-search sources.
+- `uncommitted` returns functions from files currently marked as working-tree sourced.
 - Search output is ordered by raw cosine similarity descending, then function ID ascending.
 - Threshold ranges are inclusive and are applied before the result limit.
 - Same-index cross-search excludes the source function itself and lists each unordered function pair once by default.

@@ -111,8 +111,9 @@ export class CodeIndex {
     const indexArtifacts = relativeIndexPath && !relativeIndexPath.startsWith("../")
       ? [relativeIndexPath, `${relativeIndexPath}-shm`, `${relativeIndexPath}-wal`, `${relativeIndexPath}-journal`]
       : [];
-    await this.#git.assertCleanWorkingTree(indexArtifacts);
     const target = await this.#git.resolveCommit(options.target ?? "HEAD");
+    const head = await this.#git.resolveCommit("HEAD");
+    const overlayWorkingTree = target === head;
     const checkpoint = this.#database.getCheckpoint();
     let rebuild = checkpoint === null;
     if (checkpoint && !(await this.#git.isAncestor(checkpoint, target))) {
@@ -153,8 +154,6 @@ export class CodeIndex {
       }
     }
 
-    if (!rebuild && checkpoint === target && upserts.size === 0 && deletes.size === 0) return emptyStats(checkpoint);
-
     const prepared: PreparedFile[] = [];
     for (const { entry, previousPath } of upserts.values()) {
       throwIfAborted(options.signal);
@@ -171,11 +170,87 @@ export class CodeIndex {
       }));
     }
     await this.#attachEmbeddings(prepared, options.signal);
+
+    const workingPrepared: PreparedFile[] = [];
+    const workingDeletes = new Set<string>();
+    const skippedWorkingPaths = new Set<string>();
+    const workingChanges = overlayWorkingTree ? await this.#git.workTreeChanges(target, indexArtifacts) : [];
+    for (const change of workingChanges) {
+      throwIfAborted(options.signal);
+      if (change.status === "D") {
+        workingDeletes.add(change.path);
+        continue;
+      }
+
+      let previousPath: string | undefined;
+      let replacePath: string | undefined;
+      if (change.status === "R") {
+        workingDeletes.add(change.oldPath);
+        replacePath = change.oldPath;
+        previousPath = upserts.get(change.oldPath)?.previousPath
+          ?? this.#database.previousPath(change.oldPath)
+          ?? change.oldPath;
+      }
+      const relativePath = change.path;
+      if (!this.#policy.includes(relativePath)) {
+        workingDeletes.add(relativePath);
+        continue;
+      }
+      const absolutePath = path.join(this.rootDir, relativePath);
+      const info = await lstat(absolutePath);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize) {
+        workingDeletes.add(relativePath);
+        skippedWorkingPaths.add(relativePath);
+        continue;
+      }
+      const content = await readFile(absolutePath);
+      workingPrepared.push(this.#prepareFile(relativePath, content, {
+        blobOid: null,
+        sourceMode: "working-tree",
+        indexedCommit: null,
+        ...(previousPath ? { previousPath } : {}),
+        ...(replacePath ? { replacePath } : {}),
+      }));
+    }
+    await this.#attachEmbeddings(workingPrepared, options.signal);
+    if (
+      !rebuild
+      && checkpoint === target
+      && prepared.length === 0
+      && deletes.size === 0
+      && workingPrepared.length === 0
+      && workingDeletes.size === 0
+    ) return emptyStats(checkpoint);
+
     const resolvedAgain = await this.#git.resolveCommit(options.target ?? "HEAD");
     if (resolvedAgain !== target) throw new CodeIndexError("Target Git ref changed while indexing; retry the update.");
+    if (overlayWorkingTree) {
+      const headAgain = await this.#git.resolveCommit("HEAD");
+      const workingChangesAgain = await this.#git.workTreeChanges(target, indexArtifacts);
+      if (headAgain !== head || JSON.stringify(workingChangesAgain) !== JSON.stringify(workingChanges)) {
+        throw new CodeIndexError("Git HEAD or working-tree changes changed while indexing; retry the update.");
+      }
+      for (const file of workingPrepared) {
+        const info = await lstat(path.join(this.rootDir, file.path));
+        const content = await readFile(path.join(this.rootDir, file.path));
+        if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize || sha256(content.toString("utf8")) !== file.contentHash) {
+          throw new CodeIndexError(`Working-tree file changed while indexing: ${file.path}`);
+        }
+      }
+      for (const relativePath of skippedWorkingPaths) {
+        const info = await lstat(path.join(this.rootDir, relativePath));
+        if (info.isFile() && !info.isSymbolicLink() && info.size <= this.#maxFileSize) {
+          throw new CodeIndexError(`Working-tree file changed while indexing: ${relativePath}`);
+        }
+      }
+    }
     return this.#database.applyUpdate({
       files: prepared,
       deletePaths: [...deletes],
+      workingTree: {
+        files: workingPrepared,
+        deletePaths: [...workingDeletes],
+      },
       checkpoint: target,
       expectedCheckpoint: checkpoint,
     });
@@ -292,16 +367,20 @@ export class CodeIndex {
   }
 
   public async sourceFunctions(filter: CrossSearchSourceFilter): Promise<IndexedFunction[]> {
-    const functions = filter.type === "all" ? this.allFunctions() : await this.#functionsAddedSince(filter.commit);
+    const functions = filter.type === "all"
+      ? this.allFunctions()
+      : filter.type === "uncommitted"
+        ? this.allFunctions().filter((callable) => callable.sourceMode === "working-tree")
+        : await this.#functionsChangedSince(filter.commit);
     if (!filter.path) return functions;
     const sourcePath = normalizeRelativePath(this.rootDir, filter.path);
     return functions.filter((callable) => callable.path === sourcePath || callable.path.startsWith(`${sourcePath}/`));
   }
 
-  async #functionsAddedSince(baseRef: string): Promise<IndexedFunction[]> {
+  async #functionsChangedSince(baseRef: string): Promise<IndexedFunction[]> {
     await this.#git.assertRepository();
     const checkpoint = this.#database.getCheckpoint();
-    if (!checkpoint) throw new CodeIndexError("added-since requires an index with a Git checkpoint.");
+    if (!checkpoint) throw new CodeIndexError("changed-since requires an index with a Git checkpoint.");
     const base = await this.#git.resolveCommit(baseRef);
     if (!(await this.#git.isAncestor(base, checkpoint))) {
       throw new GitDivergenceError(base, checkpoint);
@@ -309,22 +388,21 @@ export class CodeIndex {
 
     const changes = await this.#git.diff(base, checkpoint);
     const baseTree = await this.#git.listTree(base);
-    const comparisonPaths = new Map<string, string | null>();
+    const comparisonPaths = new Map<string, { basePath: string | null; pathChanged: boolean }>();
     for (const change of changes) {
       if (change.status === "D") continue;
-      if (change.status === "R") comparisonPaths.set(change.path, change.oldPath);
-      else if (change.status === "A" || change.status === "C") comparisonPaths.set(change.path, null);
-      else comparisonPaths.set(change.path, change.path);
+      if (change.status === "R") comparisonPaths.set(change.path, { basePath: change.oldPath, pathChanged: true });
+      else if (change.status === "A" || change.status === "C") comparisonPaths.set(change.path, { basePath: null, pathChanged: false });
+      else comparisonPaths.set(change.path, { basePath: change.path, pathChanged: false });
     }
     for (const dirtyFile of this.#database.getWorkingTreeFiles()) {
-      if (!comparisonPaths.has(dirtyFile.path)) {
-        comparisonPaths.set(dirtyFile.path, dirtyFile.previousPath ?? dirtyFile.path);
-      }
+      const basePath = dirtyFile.previousPath ?? comparisonPaths.get(dirtyFile.path)?.basePath ?? dirtyFile.path;
+      comparisonPaths.set(dirtyFile.path, { basePath, pathChanged: basePath !== dirtyFile.path });
     }
 
     const current = this.#database.functionsForPaths([...comparisonPaths.keys()]);
     const baseFunctionsByCurrentPath = new Map<string, ReturnType<typeof parseCallables>>();
-    for (const [currentPath, basePath] of comparisonPaths) {
+    for (const [currentPath, { basePath }] of comparisonPaths) {
       if (!basePath) {
         baseFunctionsByCurrentPath.set(currentPath, []);
         continue;
@@ -338,23 +416,30 @@ export class CodeIndex {
       baseFunctionsByCurrentPath.set(currentPath, parseCallables(basePath, content, this.#onWarning));
     }
     const currentByPath = groupBy(current, (callable) => callable.path);
-    const addedIds = new Set<number>();
+    const changedIds = new Set<number>();
     for (const [currentPath, currentFunctions] of currentByPath) {
-      for (const id of addedFunctionIds(currentFunctions, baseFunctionsByCurrentPath.get(currentPath) ?? [])) {
-        addedIds.add(id);
+      const comparison = comparisonPaths.get(currentPath)!;
+      for (const id of changedFunctionIds(
+        currentFunctions,
+        baseFunctionsByCurrentPath.get(currentPath) ?? [],
+        comparison.pathChanged,
+      )) {
+        changedIds.add(id);
       }
     }
-    return current.filter((callable) => addedIds.has(callable.id));
+    return current.filter((callable) => changedIds.has(callable.id));
   }
 }
 
-function addedFunctionIds(
+function changedFunctionIds(
   current: readonly IndexedFunction[],
   base: readonly Pick<IndexedFunction, "qualifiedName" | "kind" | "sourceHash">[],
+  pathChanged: boolean,
 ): number[] {
+  if (pathChanged) return current.map((callable) => callable.id);
   const currentGroups = groupBy(current, (callable) => `${callable.qualifiedName}\0${callable.kind}`);
   const baseGroups = groupBy(base, (callable) => `${callable.qualifiedName}\0${callable.kind}`);
-  const added: number[] = [];
+  const changed: number[] = [];
   for (const [key, currentGroup] of currentGroups) {
     const baseGroup = baseGroups.get(key) ?? [];
     const unmatchedBase = new Set(baseGroup.map((_, index) => index));
@@ -368,13 +453,9 @@ function addedFunctionIds(
         unmatchedCurrent.delete(currentIndex);
       }
     }
-    for (const currentIndex of unmatchedCurrent) {
-      const baseIndex = unmatchedBase.values().next().value as number | undefined;
-      if (baseIndex === undefined) added.push(currentGroup[currentIndex]!.id);
-      else unmatchedBase.delete(baseIndex);
-    }
+    for (const currentIndex of unmatchedCurrent) changed.push(currentGroup[currentIndex]!.id);
   }
-  return added;
+  return changed;
 }
 
 function normalizeProfile(profile: EmbeddingProfile): Required<EmbeddingProfile> {

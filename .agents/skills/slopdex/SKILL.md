@@ -13,10 +13,10 @@ Run the command that satisfies the user's request immediately. Do not begin with
 
 - For semantic search, run `slopdex search "<query>" --format summary --limit 10`.
 - For duplicate candidates, run `slopdex cross-search --format summary --threshold 0.9 --limit 5`.
-- For an explicit request to refresh the committed index, run `slopdex update-git`.
+- For an explicit request to refresh the current index, run `slopdex update-git`.
 - Use `slopdex status` only when the user asks for index metadata or checkpoint information.
 
-Any command that needs a missing index automatically creates and populates it from committed `HEAD`. Let the requested command do this; do not initialize separately. In particular, `slopdex update-git --target HEAD` uses the same initialization path and cannot bypass an automatic-initialization failure.
+Every command refreshes its index from committed `HEAD`, then overlays working-tree changes. A missing index is created automatically; let the requested command perform the refresh rather than initializing separately.
 
 ## Prerequisites
 
@@ -38,15 +38,15 @@ Do not expose API keys in commands, output, configuration files, or commits.
 
 ## Indexing
 
-If a CLI command cannot find its source index, Slopdex prints a notice to stderr and automatically creates and populates it from committed `HEAD`. Missing cross-search target indexes are initialized from the target repository's `HEAD` as well. Automatic initialization requires a clean Git worktree.
+If a CLI command cannot find its source index, Slopdex prints a notice to stderr and automatically creates and populates it from committed `HEAD`, then overlays working-tree changes. Missing cross-search target indexes are initialized from the target repository's `HEAD` and working tree as well.
 
-Index the current committed snapshot:
+Index the current committed snapshot and working-tree overlay:
 
 ```bash
 slopdex update-git
 ```
 
-`update-git` requires a clean Git worktree. It aborts for staged, unstaged, or untracked files. Do not commit or stash user changes without permission. Either ask the user to resolve the changes or explicitly index selected working-tree files:
+`update-git` reconciles the committed snapshot and, when the target is the checked-out `HEAD`, indexes staged, unstaged, and untracked changes. Historical or other-branch targets remain exact committed snapshots. The Git checkpoint remains the committed base hash. After the mandatory automatic refresh, explicitly re-index selected working-tree files with:
 
 ```bash
 slopdex update-files src/service.ts src/model.ts
@@ -71,12 +71,11 @@ Check index metadata and its Git checkpoint:
 slopdex status
 ```
 
-Git updates read committed blobs, not working-tree contents. Explicit file updates do not advance the Git checkpoint.
+Git updates reconcile committed blobs first, then overlay working-tree contents. Explicit file updates do not advance the Git checkpoint.
 
 ## Failure Handling
 
 - Preserve and report the exact failure from the requested command. Do not retry equivalent initialization commands.
-- A dirty-worktree error on first use means automatic Git initialization cannot proceed. Do not commit or stash changes; ask the user to clean the worktree, or use `update-files` only when indexing selected working-tree files actually satisfies the request.
 - Provider authentication and configuration failures are actionable as printed. Never display key values, and do not probe whether keys are set unless the error specifically indicates missing credentials and the user asks for diagnosis.
 - A bare system error such as `Invalid argument` is a Slopdex/runtime failure, not evidence that a different indexing command is needed. Stop retrying, report the command and error, and recommend diagnosing or updating Slopdex.
 - `slopdex --help` is the supported capability reference. There is no `slopdex --version` option; never invoke it.
@@ -98,7 +97,7 @@ slopdex search "validate an authenticated session" \
   --limit 10
 ```
 
-`--threshold` is the minimum raw cosine similarity. `--min-similarity` is an equivalent legacy option; never pass both.
+`--threshold` is the minimum raw cosine similarity. Use a range such as `--threshold 0.85-0.95` to set both bounds.
 
 ## Duplicate Discovery
 
@@ -126,18 +125,30 @@ Same-index search reports each unordered pair once by default. Include both `A -
 slopdex cross-search --include-symmetric-duplicates
 ```
 
+Group overlapping pairs into connected components and list each function once:
+
+```bash
+slopdex cross-search --format clusters --threshold 0.9
+```
+
 Restrict source functions to a file or recursive directory while still matching them against the whole codebase:
 
 ```bash
 slopdex cross-search --source-path src/services --format summary --threshold 0.9
 ```
 
-`--source-path` restricts only source functions. It can be combined with `--added-since`.
+`--source-path` restricts only source functions. It can be combined with `--changed-since` or `--uncommitted`.
 
-Restrict source functions to additions relative to a commit:
+Restrict source functions to additions, modifications, and moves relative to a commit, including current working-tree changes:
 
 ```bash
-slopdex cross-search --added-since origin/main --format summary --threshold 0.9
+slopdex cross-search --changed-since origin/main --format summary --threshold 0.9
+```
+
+Restrict source functions to uncommitted files:
+
+```bash
+slopdex cross-search --uncommitted --format summary --threshold 0.9
 ```
 
 Search against another compatible index:
@@ -151,10 +162,12 @@ slopdex cross-search \
 ```
 
 Cross-index searches require identical provider, model, dimensions, and embedding strategy profiles.
+Use `--target-config <path>` when the target repository does not use `.slopdex/config.json`.
 
 ## Output Formats
 
 - `--format summary` is intended for human review and includes file and qualified function names.
+- `--format clusters` groups overlapping pairs and lists each function once with its source line.
 - The default `search` output is formatted JSON.
 - The default `cross-search` output is JSONL, with one object per source function. Process it as a stream rather than a single JSON array.
 - Functions with no matches after threshold filtering are omitted from cross-search output.
@@ -171,8 +184,9 @@ Prefer JSON or JSONL when another command will consume the results. Prefer summa
 --model <name>                      Embedding model
 --dimensions <number>               Embedding dimensions
 --limit <number>                    Result limit
---threshold <number>                Minimum raw cosine similarity
---format <json|summary>             Output format
+--threshold <number|range>          Similarity threshold or inclusive range
+--format <json|summary|clusters>    Output format
+--target-config <path>             Target repository configuration file
 ```
 
 Run `slopdex --help` for the complete current option list.

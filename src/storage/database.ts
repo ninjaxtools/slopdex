@@ -125,8 +125,16 @@ export class IndexDatabase {
         source_mode TEXT NOT NULL CHECK(source_mode IN ('git', 'working-tree')),
         embedding_id INTEGER NOT NULL REFERENCES embeddings(id)
       );
+      CREATE TABLE IF NOT EXISTS callable_provenance (
+        identity_key TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        first_seen_commit TEXT NOT NULL,
+        PRIMARY KEY(identity_key, source_hash)
+      );
       CREATE INDEX IF NOT EXISTS functions_path ON functions(path);
       CREATE INDEX IF NOT EXISTS functions_embedding ON functions(embedding_id);
+      INSERT OR IGNORE INTO callable_provenance(identity_key, source_hash, first_seen_commit)
+        SELECT identity_key, source_hash, first_seen_commit FROM functions WHERE first_seen_commit IS NOT NULL;
     `);
     const fileColumns = this.#db.prepare("PRAGMA table_info(files)").all() as Array<{ name: string }>;
     if (!fileColumns.some((column) => column.name === "previous_path")) {
@@ -211,6 +219,10 @@ export class IndexDatabase {
   public applyUpdate(options: {
     files: readonly PreparedFile[];
     deletePaths: readonly string[];
+    workingTree?: {
+      files: readonly PreparedFile[];
+      deletePaths: readonly string[];
+    };
     checkpoint?: string;
     expectedCheckpoint?: string | null;
   }): UpdateStats {
@@ -220,7 +232,7 @@ export class IndexDatabase {
       }
 
       const stats: UpdateStats = {
-        filesUpdated: options.files.length,
+        filesUpdated: 0,
         filesDeleted: 0,
         functionsAdded: 0,
         functionsUpdated: 0,
@@ -231,22 +243,28 @@ export class IndexDatabase {
 
       const deleteFile = this.#db.prepare("DELETE FROM files WHERE path = ?");
       const countFunctions = this.#db.prepare("SELECT COUNT(*) AS count FROM functions WHERE path = ?");
-      const uniqueDeletes = new Set(options.deletePaths);
-      for (const file of options.files) {
-        uniqueDeletes.delete(file.path);
-        if (file.previousPath) uniqueDeletes.delete(file.previousPath);
-        if (file.replacePath) uniqueDeletes.delete(file.replacePath);
-      }
-      for (const filePath of uniqueDeletes) {
-        const count = Number((countFunctions.get(filePath) as { count: number }).count);
-        const result = deleteFile.run(filePath);
-        if (result.changes > 0) {
-          stats.filesDeleted += 1;
-          stats.functionsDeleted += count;
+      const applyStage = (files: readonly PreparedFile[], deletePaths: readonly string[]): void => {
+        stats.filesUpdated += files.length;
+        const uniqueDeletes = new Set(deletePaths);
+        for (const file of files) {
+          uniqueDeletes.delete(file.path);
+          if (file.previousPath) uniqueDeletes.delete(file.previousPath);
+          if (file.replacePath) uniqueDeletes.delete(file.replacePath);
         }
-      }
+        for (const filePath of uniqueDeletes) {
+          const count = Number((countFunctions.get(filePath) as { count: number }).count);
+          const result = deleteFile.run(filePath);
+          if (result.changes > 0) {
+            stats.filesDeleted += 1;
+            stats.functionsDeleted += count;
+          }
+        }
 
-      for (const file of options.files) this.#replaceFile(file, stats);
+        for (const file of files) this.#replaceFile(file, stats);
+      };
+
+      applyStage(options.files, options.deletePaths);
+      if (options.workingTree) applyStage(options.workingTree.files, options.workingTree.deletePaths);
 
       this.#db.exec("DELETE FROM embeddings WHERE id NOT IN (SELECT DISTINCT embedding_id FROM functions)");
       const generation = this.getGeneration() + 1;
@@ -299,7 +317,10 @@ export class IndexDatabase {
 
       const old = oldMatches.get(callable);
       if (old) usedIds.add(old.id);
-      const firstSeenCommit = old?.first_seen_commit ?? file.indexedCommit;
+      const remembered = this.#db.prepare(`
+        SELECT first_seen_commit FROM callable_provenance WHERE identity_key = ? AND source_hash = ?
+      `).get(callable.identityKey, callable.sourceHash) as { first_seen_commit: string } | undefined;
+      const firstSeenCommit = old?.first_seen_commit ?? remembered?.first_seen_commit ?? file.indexedCommit;
       this.#db.prepare(`
         INSERT INTO functions(
           id, path, language, kind, name, qualified_name, signature, identity_key,
@@ -329,6 +350,11 @@ export class IndexDatabase {
       );
       if (old) stats.functionsUpdated += 1;
       else stats.functionsAdded += 1;
+      if (firstSeenCommit) {
+        this.#db.prepare(`
+          INSERT OR IGNORE INTO callable_provenance(identity_key, source_hash, first_seen_commit) VALUES (?, ?, ?)
+        `).run(callable.identityKey, callable.sourceHash, firstSeenCommit);
+      }
     }
     stats.functionsDeleted += oldRows.length - usedIds.size;
   }

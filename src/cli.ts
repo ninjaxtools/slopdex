@@ -8,9 +8,18 @@ import { CodeIndex } from "./code-index.js";
 import { JinaEmbeddingProvider } from "./embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError } from "./errors.js";
-import { formatSimilaritySummary } from "./format.js";
+import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
-import type { CodeIndexOptions, EmbeddingProvider, IndexedFunction, SimilarityResult, UpdateStats } from "./types.js";
+import type {
+  CodeIndexOptions,
+  CrossSearchOptions,
+  CrossSearchResult,
+  CrossSearchSourceFilter,
+  EmbeddingProvider,
+  IndexedFunction,
+  SimilarityResult,
+  UpdateStats,
+} from "./types.js";
 
 interface FileConfig {
   provider?: "openai" | "jina";
@@ -23,31 +32,39 @@ interface FileConfig {
   embeddingBatchSize?: number;
 }
 
-const parsed = parseArgs({
-  args: process.argv.slice(2),
-  allowPositionals: true,
-  strict: true,
-  options: {
-    root: { type: "string", default: process.cwd() },
-    config: { type: "string" },
-    index: { type: "string" },
-    provider: { type: "string" },
-    model: { type: "string" },
-    dimensions: { type: "string" },
-    target: { type: "string" },
-    "target-root": { type: "string" },
-    "target-index": { type: "string" },
-    "added-since": { type: "string" },
-    "source-path": { type: "string" },
-    limit: { type: "string" },
-    "min-similarity": { type: "string" },
-    threshold: { type: "string" },
-    format: { type: "string" },
-    "include-symmetric-duplicates": { type: "boolean", default: false },
-    "rebuild-on-divergence": { type: "boolean", default: false },
-    help: { type: "boolean", short: "h", default: false },
-  },
-});
+const parsed = (() => {
+  try {
+    return parseArgs({
+      args: process.argv.slice(2),
+      allowPositionals: true,
+      strict: true,
+      options: {
+        root: { type: "string", default: process.cwd() },
+        config: { type: "string" },
+        index: { type: "string" },
+        provider: { type: "string" },
+        model: { type: "string" },
+        dimensions: { type: "string" },
+        target: { type: "string" },
+        "target-root": { type: "string" },
+        "target-index": { type: "string" },
+        "target-config": { type: "string" },
+        "changed-since": { type: "string" },
+        uncommitted: { type: "boolean", default: false },
+        "source-path": { type: "string" },
+        limit: { type: "string" },
+        threshold: { type: "string" },
+        format: { type: "string" },
+        "include-symmetric-duplicates": { type: "boolean", default: false },
+        "rebuild-on-divergence": { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+    });
+  } catch (error) {
+    process.stderr.write(`slopdex: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(2);
+  }
+})();
 
 const [command, ...positionals] = parsed.positionals;
 
@@ -63,6 +80,7 @@ void main().catch((error: unknown) => {
 });
 
 async function main(): Promise<void> {
+  validateInvocation();
   const rootDir = path.resolve(parsed.values.root!);
   const config = loadConfig(rootDir, parsed.values.config);
   const provider = createProvider(config);
@@ -76,10 +94,12 @@ async function main(): Promise<void> {
     ...(config.maxFileSize ? { maxFileSize: config.maxFileSize } : {}),
     ...(config.embeddingBatchSize ? { embeddingBatchSize: config.embeddingBatchSize } : {}),
   };
-  const initialized = await initializeMissingIndex(
+  const updateTarget = command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD";
+  const updateStats = await ensureIndexUpdated(
     indexOptions,
     "index",
-    command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD",
+    updateTarget,
+    parsed.values["rebuild-on-divergence"],
   );
   const index = new CodeIndex(indexOptions);
   try {
@@ -96,11 +116,7 @@ async function main(): Promise<void> {
         printJson(await index.updateFiles({ delete: positionals }));
         break;
       case "update-git": {
-        const stats = initialized ?? await index.updateFromGit({
-          ...(parsed.values.target ? { target: parsed.values.target } : {}),
-          rebuildOnDivergence: parsed.values["rebuild-on-divergence"],
-        });
-        printJson(stats);
+        printJson(updateStats);
         break;
       }
       case "search": {
@@ -113,7 +129,9 @@ async function main(): Promise<void> {
           minSimilarity: threshold.min,
           ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
         });
-        if (outputFormat() === "summary") process.stdout.write(`${formatSimilaritySummary(results)}\n`);
+        const format = outputFormat();
+        if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+        if (format === "summary") process.stdout.write(`${formatSimilaritySummary(results)}\n`);
         else printJson(results.map(presentMatch));
         break;
       }
@@ -138,37 +156,43 @@ async function runCrossSearch(
   if ((targetRoot && !targetPath) || (!targetRoot && targetPath)) {
     throw new CodeIndexError("Cross-index search requires both --target-root and --target-index.");
   }
-  const targetOptions: CodeIndexOptions | undefined = targetRoot && targetPath
-    ? {
-      ...sourceOptions,
-      rootDir: path.resolve(targetRoot),
-      indexPath: path.resolve(targetPath),
-      provider,
-    }
+  const targetRootDir = targetRoot ? path.resolve(targetRoot) : undefined;
+  const resolvedTargetPath = targetPath ? path.resolve(targetPath) : undefined;
+  const usesSourceAsTarget = targetRootDir === source.rootDir && resolvedTargetPath === source.indexPath;
+  const targetConfig = targetRootDir && !usesSourceAsTarget
+    ? loadConfig(targetRootDir, parsed.values["target-config"])
     : undefined;
-  if (targetOptions) await initializeMissingIndex(targetOptions, "target index", "HEAD");
+  const targetOptions: CodeIndexOptions | undefined = targetRootDir && resolvedTargetPath && !usesSourceAsTarget ? {
+    rootDir: targetRootDir,
+    indexPath: resolvedTargetPath,
+    provider,
+    ...(sourceOptions.onWarning ? { onWarning: sourceOptions.onWarning } : {}),
+    ...(targetConfig?.include ? { include: targetConfig.include } : {}),
+    ...(targetConfig?.exclude ? { exclude: targetConfig.exclude } : {}),
+    ...(targetConfig?.maxFileSize ? { maxFileSize: targetConfig.maxFileSize } : {}),
+    ...(targetConfig?.embeddingBatchSize ? { embeddingBatchSize: targetConfig.embeddingBatchSize } : {}),
+  } : undefined;
+  if (targetOptions) await ensureIndexUpdated(targetOptions, "target index", "HEAD", parsed.values["rebuild-on-divergence"]);
   const target = targetOptions ? new CodeIndex({ ...targetOptions, readOnly: true }) : undefined;
   const format = outputFormat();
   const threshold = similarityThreshold();
+  const searchOptions: CrossSearchOptions = {
+    source,
+    ...(target ? { target } : {}),
+    sourceFilter: crossSearchSourceFilter(),
+    limitPerFunction: numberOption(parsed.values.limit, 5, "limit"),
+    minSimilarity: threshold.min,
+    ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
+    includeSymmetricDuplicates: parsed.values["include-symmetric-duplicates"],
+  };
   try {
-    for await (const result of crossSearch({
-      source,
-      ...(target ? { target } : {}),
-      sourceFilter: parsed.values["added-since"]
-        ? {
-          type: "added-since",
-          commit: parsed.values["added-since"],
-          ...(parsed.values["source-path"] ? { path: parsed.values["source-path"] } : {}),
-        }
-        : {
-          type: "all",
-          ...(parsed.values["source-path"] ? { path: parsed.values["source-path"] } : {}),
-        },
-      limitPerFunction: numberOption(parsed.values.limit, 5, "limit"),
-      minSimilarity: threshold.min,
-      ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
-      includeSymmetricDuplicates: parsed.values["include-symmetric-duplicates"],
-    })) {
+    if (format === "clusters") {
+      const results: CrossSearchResult[] = [];
+      for await (const result of crossSearch(searchOptions)) results.push(result);
+      process.stdout.write(`${formatSimilarityClusters(results, !target)}\n`);
+      return;
+    }
+    for await (const result of crossSearch(searchOptions)) {
       if (format === "summary") {
         process.stdout.write(`${formatSimilaritySummary(result.matches, result.source)}\n`);
       } else {
@@ -183,6 +207,22 @@ async function runCrossSearch(
   }
 }
 
+async function ensureIndexUpdated(
+  options: CodeIndexOptions,
+  label: string,
+  target: string,
+  rebuildOnDivergence: boolean,
+): Promise<UpdateStats> {
+  const initialized = await initializeMissingIndex(options, label, target);
+  if (initialized) return initialized;
+  const index = new CodeIndex(options);
+  try {
+    return await index.updateFromGit({ target, rebuildOnDivergence });
+  } finally {
+    index.close();
+  }
+}
+
 async function initializeMissingIndex(
   options: CodeIndexOptions,
   label: string,
@@ -191,7 +231,7 @@ async function initializeMissingIndex(
   const indexPath = path.resolve(options.indexPath ?? path.join(path.resolve(options.rootDir), ".slopdex", "index.sqlite"));
   if (existsSync(indexPath)) return null;
 
-  process.stderr.write(`slopdex: ${label} not found at ${indexPath}; initializing automatically from committed ${target}.\n`);
+  process.stderr.write(`slopdex: ${label} not found at ${indexPath}; initializing automatically from ${target} and the working tree.\n`);
   const index = new CodeIndex({ ...options, indexPath });
   let initialized = false;
   try {
@@ -252,13 +292,49 @@ function numberOption(value: string | undefined, defaultValue: number, name: str
   return parsedValue;
 }
 
+function validateInvocation(): void {
+  switch (command) {
+    case "status":
+    case "update-git":
+      return;
+    case "update-files":
+      if (positionals.length === 0) throw new CodeIndexError("update-files requires at least one path.");
+      return;
+    case "delete-files":
+      if (positionals.length === 0) throw new CodeIndexError("delete-files requires at least one path.");
+      return;
+    case "search": {
+      if (!positionals.join(" ").trim()) throw new CodeIndexError("search requires a query.");
+      validateLimit(10);
+      similarityThreshold();
+      if (outputFormat() === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      return;
+    }
+    case "cross-search":
+      if (Boolean(parsed.values["target-root"]) !== Boolean(parsed.values["target-index"])) {
+        throw new CodeIndexError("Cross-index search requires both --target-root and --target-index.");
+      }
+      if (parsed.values["target-config"] && !parsed.values["target-root"]) {
+        throw new CodeIndexError("--target-config requires --target-root and --target-index.");
+      }
+      validateLimit(5);
+      similarityThreshold();
+      outputFormat();
+      crossSearchSourceFilter();
+      return;
+    default:
+      throw new CodeIndexError(`Unknown command: ${command}`);
+  }
+}
+
+function validateLimit(defaultValue: number): void {
+  const limit = numberOption(parsed.values.limit, defaultValue, "limit");
+  if (!Number.isInteger(limit) || limit < 1) throw new CodeIndexError("limit must be a positive integer.");
+}
+
 function similarityThreshold(): { min: number; max?: number } {
   const threshold = parsed.values.threshold;
-  const minimum = parsed.values["min-similarity"];
-  if (threshold !== undefined && minimum !== undefined) {
-    throw new CodeIndexError("Use either --threshold or --min-similarity, not both.");
-  }
-  if (threshold === undefined) return { min: numberOption(minimum, -1, "min-similarity") };
+  if (threshold === undefined) return { min: -1 };
 
   const number = "[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:e[+-]?\\d+)?";
   const range = new RegExp(`^\\s*(${number})\\s*-\\s*(${number})\\s*$`, "i").exec(threshold);
@@ -270,10 +346,22 @@ function similarityThreshold(): { min: number; max?: number } {
   return { min, max };
 }
 
-function outputFormat(): "json" | "summary" {
+function outputFormat(): "json" | "summary" | "clusters" {
   const value = parsed.values.format ?? "json";
-  if (value !== "json" && value !== "summary") throw new CodeIndexError("format must be json or summary.");
+  if (value !== "json" && value !== "summary" && value !== "clusters") {
+    throw new CodeIndexError("format must be json, summary, or clusters.");
+  }
   return value;
+}
+
+function crossSearchSourceFilter(): CrossSearchSourceFilter {
+  const changedSince = parsed.values["changed-since"];
+  const uncommitted = parsed.values.uncommitted;
+  if (changedSince && uncommitted) throw new CodeIndexError("Use either --changed-since or --uncommitted, not both.");
+  const pathOption = parsed.values["source-path"] ? { path: parsed.values["source-path"] } : {};
+  if (changedSince) return { type: "changed-since", commit: changedSince, ...pathOption };
+  if (uncommitted) return { type: "uncommitted", ...pathOption };
+  return { type: "all", ...pathOption };
 }
 
 function presentFunction(value: IndexedFunction) {
@@ -296,7 +384,7 @@ Commands:
   status                              Show index metadata
   update-files <path...>              Index specific working-tree files
   delete-files <path...>              Remove specific files from the index
-  update-git                          Index committed changes since the checkpoint
+  update-git                          Index a Git snapshot plus working-tree changes
   search <query>                      Search functions by semantic similarity
   cross-search                        Find nearest functions for each source function
 
@@ -311,13 +399,14 @@ Options:
   --rebuild-on-divergence             Rebuild after a rebase or branch change
   --limit <number>                    Search result limit
   --threshold <number|range>          Show similarities at/above a value or within a range
-  --min-similarity <number>           Minimum raw cosine similarity
-  --format <json|summary>             Similarity output format (default: json)
+  --format <json|summary|clusters>    Similarity output format (default: json)
   --include-symmetric-duplicates      Show both directions of same-index matches
-  --added-since <commit>              Restrict cross-search source functions
+  --changed-since <commit>            Search added, modified, or moved functions
+  --uncommitted                       Search functions from uncommitted files
   --source-path <path>                Restrict cross-search sources to a file or directory
   --target-root <path>                Root of a second indexed codebase
   --target-index <path>               SQLite path of a second index
+  --target-config <path>              Config file for a second indexed codebase
 
 Examples:
   Show metadata for the current index:
@@ -329,7 +418,7 @@ Examples:
   Remove deleted files from the index:
     slopdex delete-files src/removed.ts
 
-  Index the latest committed Git snapshot:
+  Index HEAD and overlay uncommitted working-tree changes:
     slopdex update-git --target HEAD
 
   Find functions matching a semantic query:

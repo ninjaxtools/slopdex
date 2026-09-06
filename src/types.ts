@@ -92,7 +92,8 @@ export interface SimilarityResult {
 
 export type CrossSearchSourceFilter =
   | { type: "all"; path?: string }
-  | { type: "added-since"; commit: string; path?: string };
+  | { type: "changed-since"; commit: string; path?: string }
+  | { type: "uncommitted"; path?: string };
 
 export interface CrossSearchOptions {
   source: import("./code-index.js").CodeIndex;

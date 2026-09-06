@@ -47,20 +47,28 @@ export class GitRepository {
     }
   }
 
-  public async assertCleanWorkingTree(excludePaths: readonly string[] = []): Promise<void> {
+  public async workTreeChanges(base: string, excludePaths: readonly string[] = []): Promise<GitChange[]> {
     const pathspecs = [".", ...excludePaths.map((filePath) => `:(top,literal,exclude)${filePath}`)];
     const result = await this.#run([
-      "status",
-      "--porcelain=v1",
+      "diff",
+      "--name-status",
       "-z",
-      "--untracked-files=all",
-      "--ignore-submodules=none",
+      "--find-renames",
+      base,
       "--",
       ...pathspecs,
     ]);
-    if (result.stdout.length > 0) {
-      throw new CodeIndexError("Cannot update from Git: the working tree has uncommitted changes. Commit or stash them first.");
-    }
+    const changes = parseChanges(splitNull(result.stdout));
+    const untracked = await this.#run([
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...pathspecs,
+    ]);
+    for (const filePath of splitNull(untracked.stdout)) changes.push({ status: "A", path: filePath });
+    return changes;
   }
 
   public async resolveCommit(ref: string): Promise<string> {
@@ -97,25 +105,28 @@ export class GitRepository {
 
   public async diff(base: string, target: string): Promise<GitChange[]> {
     const result = await this.#run(["diff", "--name-status", "-z", "--find-renames", `${base}..${target}`, "--"]);
-    const values = splitNull(result.stdout);
-    const changes: GitChange[] = [];
-    for (let index = 0; index < values.length;) {
-      const rawStatus = values[index++];
-      if (!rawStatus) continue;
-      const status = rawStatus[0];
-      if (status === "R" || status === "C") {
-        const oldPath = values[index++];
-        const filePath = values[index++];
-        if (oldPath && filePath) changes.push({ status, oldPath, path: filePath });
-      } else if (status === "A" || status === "M" || status === "D" || status === "T") {
-        const filePath = values[index++];
-        if (filePath) changes.push({ status, path: filePath });
-      } else {
-        throw new CodeIndexError(`Unsupported Git diff status: ${rawStatus}`);
-      }
-    }
-    return changes;
+    return parseChanges(splitNull(result.stdout));
   }
+}
+
+function parseChanges(values: readonly string[]): GitChange[] {
+  const changes: GitChange[] = [];
+  for (let index = 0; index < values.length;) {
+    const rawStatus = values[index++];
+    if (!rawStatus) continue;
+    const status = rawStatus[0];
+    if (status === "R" || status === "C") {
+      const oldPath = values[index++];
+      const filePath = values[index++];
+      if (oldPath && filePath) changes.push({ status, oldPath, path: filePath });
+    } else if (status === "A" || status === "M" || status === "D" || status === "T") {
+      const filePath = values[index++];
+      if (filePath) changes.push({ status, path: filePath });
+    } else {
+      throw new CodeIndexError(`Unsupported Git diff status: ${rawStatus}`);
+    }
+  }
+  return changes;
 }
 
 function splitNull(buffer: Buffer): string[] {
