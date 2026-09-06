@@ -6,24 +6,20 @@ The index extracts named functions with tree-sitter, stores metadata and float32
 
 ## Requirements
 
-- Node.js 24 or newer
-- Git for Git-tracked updates and `added-since` searches
+- Node.js 24
 - An OpenAI or Jina AI API key
 
 ## Install
 
 ```bash
-npm install
-npm run build
+npm install -g @ninjaxtools/slopdex
 ```
 
-Install the bundled Slopdex skill for OpenCode:
+Install the skill for OpenCode (`~/.config/opencode/skills/slopdex/SKILL.md`):
 
 ```bash
 npm run install:skill:opencode
 ```
-
-This copies the skill to `~/.config/opencode/skills/slopdex/SKILL.md`, creating the destination directories when needed.
 
 ## Configuration
 

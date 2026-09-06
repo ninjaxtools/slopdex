@@ -3,6 +3,10 @@
   "version": "0.3.0",
   "description": "Callable-level semantic indexing, search, and duplicate discovery for TypeScript and JavaScript codebases",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ninjaxtools/slopdex.git"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
