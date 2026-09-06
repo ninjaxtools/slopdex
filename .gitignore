@@ -1,0 +1,7 @@
+node_modules/
+dist/
+coverage/
+.slopdex/
+*.sqlite-shm
+*.sqlite-wal
+similarities.jsonl

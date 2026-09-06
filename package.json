@@ -1,0 +1,52 @@
+{
+  "name": "slopdex",
+  "version": "0.1.0",
+  "description": "Callable-level semantic indexing, search, and duplicate discovery for TypeScript and JavaScript codebases",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "slopdex": "dist/cli.js"
+  },
+  "files": [
+    ".agents/skills/slopdex/SKILL.md",
+    "dist",
+    "README.md",
+    "scripts/install-opencode-skill.mjs"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "smoke": "node scripts/smoke.mjs",
+    "install:skill:opencode": "node scripts/install-opencode-skill.mjs",
+    "prepack": "npm run build && npm run smoke",
+    "check": "npm run typecheck && npm run test:run && npm run build && npm run smoke"
+  },
+  "dependencies": {
+    "install": "^0.13.0",
+    "js-tiktoken": "^1.0.21",
+    "sqlite-vec": "^0.1.9",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-javascript": "^0.23.1",
+    "tree-sitter-typescript": "^0.23.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}
