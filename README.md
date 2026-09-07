@@ -36,7 +36,7 @@ Create `.slopdex/config.json` in the repository being indexed:
 
 Use `JINA_API_KEY` for Jina AI or `OPENAI_API_KEY` for OpenAI. The OpenAI default is `text-embedding-3-large` with 3072 dimensions. Provider, model, dimensions, and embedding strategy form an immutable index profile; changing one requires a new or rebuilt index.
 
-Pass `--force-rebuild` to remove and recreate an existing index automatically when its stored profile or other index metadata is incompatible with the current settings. Slopdex prints a warning whenever it performs this rebuild.
+Pass `--force-reindex` to remove and recreate an existing index automatically when its stored profile or other index metadata is incompatible with the current settings. Slopdex prints a warning whenever it performs this rebuild.
 
 ## CLI
 

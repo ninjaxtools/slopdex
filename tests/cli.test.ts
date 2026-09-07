@@ -255,10 +255,10 @@ describe("CLI index initialization", () => {
     expect(incompatible.status).toBe(2);
     expect(incompatible.stderr).toContain("Embedding provider, model, dimensions, or strategy differs");
 
-    const rebuilt = runCli(root, "status", "--force-rebuild");
+    const rebuilt = runCli(root, "status", "--force-reindex");
     expect(rebuilt.status).toBe(0);
     expect(rebuilt.stderr).toContain("warning: index is incompatible");
-    expect(rebuilt.stderr).toContain("rebuilding automatically because --force-rebuild was specified");
+    expect(rebuilt.stderr).toContain("rebuilding automatically because --force-reindex was specified");
     expect(JSON.parse(rebuilt.stdout)).toMatchObject({
       embeddingProfile: { provider: "openai", model: "text-embedding-3-large", dimensions: 3072 },
     });
@@ -317,7 +317,7 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--changed-since <commit>");
     expect(result.stdout).toContain("--uncommitted");
     expect(result.stdout).toContain("--target-config <path>");
-    expect(result.stdout).toContain("--force-rebuild");
+    expect(result.stdout).toContain("--force-reindex");
     expect(result.stdout).toContain("--no-reindex");
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");

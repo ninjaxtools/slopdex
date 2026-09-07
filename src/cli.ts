@@ -57,7 +57,7 @@ const parsed = (() => {
         format: { type: "string" },
         "include-symmetric-duplicates": { type: "boolean", default: false },
         "rebuild-on-divergence": { type: "boolean", default: false },
-        "force-rebuild": { type: "boolean", default: false },
+        "force-reindex": { type: "boolean", default: false },
         "no-reindex": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
@@ -102,7 +102,7 @@ async function main(): Promise<void> {
     "index",
     updateTarget,
     parsed.values["rebuild-on-divergence"],
-    parsed.values["force-rebuild"],
+    parsed.values["force-reindex"],
     parsed.values["no-reindex"],
   );
   const index = new CodeIndex(indexOptions);
@@ -182,7 +182,7 @@ async function runCrossSearch(
       "target index",
       "HEAD",
       parsed.values["rebuild-on-divergence"],
-      parsed.values["force-rebuild"],
+      parsed.values["force-reindex"],
       parsed.values["no-reindex"],
     );
   }
@@ -240,7 +240,7 @@ async function ensureIndexUpdated(
   } catch (error) {
     if (!forceRebuild || !(error instanceof IncompatibleIndexError)) throw error;
     process.stderr.write(
-      `slopdex: warning: ${label} is incompatible (${error.message}); rebuilding automatically because --force-rebuild was specified.\n`,
+      `slopdex: warning: ${label} is incompatible (${error.message}); rebuilding automatically because --force-reindex was specified.\n`,
     );
     const indexPath = resolveIndexPath(options);
     removeIndexArtifacts(indexPath);
@@ -476,7 +476,7 @@ Options:
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)
   --rebuild-on-divergence             Rebuild after a rebase or branch change
-  --force-rebuild                     Rebuild an incompatible existing index
+  --force-reindex                     Rebuild an incompatible existing index
   --no-reindex                        Skip worktree overlays or reuse a non-Git index
   --limit <number>                    Search result limit
   --threshold <number|range>          Show similarities at/above a value or within a range
