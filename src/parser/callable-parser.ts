@@ -329,6 +329,7 @@ export function parseCallables(
       startColumn: node.startPosition.column + 1,
       endLine: node.endPosition.row + 1,
       endColumn: node.endPosition.column + 1,
+      lineCount: node.endPosition.row - node.startPosition.row + 1,
       source,
       sourceHash: sha256(source),
       embeddingInput,

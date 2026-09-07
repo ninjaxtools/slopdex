@@ -52,6 +52,7 @@ const parsed = (() => {
         "changed-since": { type: "string" },
         uncommitted: { type: "boolean", default: false },
         "source-path": { type: "string" },
+        "min-lines": { type: "string" },
         limit: { type: "string" },
         threshold: { type: "string" },
         format: { type: "string" },
@@ -134,7 +135,7 @@ async function main(): Promise<void> {
           minSimilarity: threshold.min,
           ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
         });
-        const format = outputFormat();
+        const format = outputFormat("json");
         if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
         if (format === "summary") process.stdout.write(`${formatSimilaritySummary(results)}\n`);
         else printJson(results.map(presentMatch));
@@ -188,7 +189,7 @@ async function runCrossSearch(
     );
   }
   const target = targetOptions ? new CodeIndex({ ...targetOptions, readOnly: true }) : undefined;
-  const format = outputFormat();
+  const format = outputFormat("clusters");
   const threshold = similarityThreshold();
   const searchOptions: CrossSearchOptions = {
     source,
@@ -199,6 +200,7 @@ async function runCrossSearch(
     ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
     includeSymmetricDuplicates: parsed.values["include-symmetric-duplicates"],
     crossFileOnly: parsed.values["cross-file-only"],
+    minLines: minimumLines(),
   };
   try {
     if (format === "clusters") {
@@ -388,7 +390,7 @@ function validateInvocation(): void {
       if (!positionals.join(" ").trim()) throw new CodeIndexError("search requires a query.");
       validateLimit(10);
       similarityThreshold();
-      if (outputFormat() === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      if (outputFormat("json") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
     }
     case "cross-search":
@@ -400,7 +402,8 @@ function validateInvocation(): void {
       }
       validateLimit(5);
       similarityThreshold();
-      outputFormat();
+      outputFormat("clusters");
+      minimumLines();
       crossSearchSourceFilter();
       return;
     default:
@@ -427,11 +430,17 @@ function similarityThreshold(): { min: number; max?: number } {
   return { min, max };
 }
 
-function outputFormat(): "json" | "summary" | "clusters" {
-  const value = parsed.values.format ?? "json";
+function outputFormat(defaultValue: "json" | "clusters"): "json" | "summary" | "clusters" {
+  const value = parsed.values.format ?? defaultValue;
   if (value !== "json" && value !== "summary" && value !== "clusters") {
     throw new CodeIndexError("format must be json, summary, or clusters.");
   }
+  return value;
+}
+
+function minimumLines(): number {
+  const value = numberOption(parsed.values["min-lines"], 2, "min-lines");
+  if (!Number.isInteger(value) || value < 1) throw new CodeIndexError("min-lines must be a positive integer.");
   return value;
 }
 
@@ -482,9 +491,10 @@ Options:
   --no-reindex                        Skip worktree overlays or reuse a non-Git index
   --limit <number>                    Search result limit
   --threshold <number|range>          Show similarities at/above a value or within a range
-  --format <json|summary|clusters>    Similarity output format (default: json)
+  --format <json|summary|clusters>    Output format (search: json; cross-search: clusters)
   --include-symmetric-duplicates      Show both directions of same-index matches
-  --cross-file-only                  Exclude matches from the source file
+  --cross-file-only                   Exclude matches from the source file
+  --min-lines <number>               Minimum callable length for cross-search (default: 2)
   --changed-since <commit>            Search added, modified, or moved functions
   --uncommitted                       Search functions from uncommitted files
   --source-path <path>                Restrict cross-search sources to a file or directory

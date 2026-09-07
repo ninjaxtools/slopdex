@@ -131,6 +131,12 @@ src/users.ts :: Users.authenticate
 
 Interpret high similarity as a candidate requiring source review, not proof of duplication. Public facade methods, API wrappers, interface implementations, and test doubles often score highly while serving distinct roles.
 
+Cross-search excludes one-line callables by default. Raise `--min-lines` for more substantial duplicate candidates, or use `--min-lines 1` when short wrappers are relevant:
+
+```bash
+slopdex cross-search --min-lines 4 --threshold 0.9
+```
+
 Use `--threshold <minimum>-<maximum>` for an inclusive similarity range, such as `--threshold 0.85-0.95`. The range is applied before `--limit`.
 
 Same-index search reports each unordered pair once by default. Include both `A -> B` and `B -> A` only when explicitly needed:
@@ -189,7 +195,7 @@ Use `--target-config <path>` when the target repository does not use `.slopdex/c
 - `--format summary` is intended for human review and includes file and qualified function names.
 - `--format clusters` groups overlapping pairs and lists each function once with its source line.
 - The default `search` output is formatted JSON.
-- The default `cross-search` output is JSONL, with one object per source function. Process it as a stream rather than a single JSON array.
+- The default `cross-search` output is connected clusters. Use `--format json` for JSONL with one object per source function.
 - Functions with no matches after threshold filtering are omitted from cross-search output.
 
 Prefer JSON or JSONL when another command will consume the results. Prefer summary output when presenting candidates to a user.
@@ -207,7 +213,8 @@ Prefer JSON or JSONL when another command will consume the results. Prefer summa
 --limit <number>                    Result limit
 --threshold <number|range>          Similarity threshold or inclusive range
 --format <json|summary|clusters>    Output format
---cross-file-only                  Exclude matches from the source file
+--cross-file-only                   Exclude matches from the source file
+--min-lines <number>               Minimum cross-search callable length
 --target-config <path>             Target repository configuration file
 ```
 

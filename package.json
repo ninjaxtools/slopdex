@@ -1,6 +1,6 @@
 {
   "name": "@ninjaxtools/slopdex",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Callable-level semantic indexing, search, and duplicate discovery for TypeScript and JavaScript codebases",
   "license": "MIT",
   "repository": {

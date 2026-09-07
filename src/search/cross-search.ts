@@ -15,7 +15,10 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
 
   const limit = options.limitPerFunction ?? 5;
   assertPositiveInteger(limit, "limitPerFunction");
-  const sourceFunctions = await options.source.sourceFunctions(options.sourceFilter ?? { type: "all" });
+  const minLines = options.minLines ?? 2;
+  assertPositiveInteger(minLines, "minLines");
+  const sourceFunctions = (await options.source.sourceFunctions(options.sourceFilter ?? { type: "all" }))
+    .filter((callable) => callable.lineCount >= minLines);
   const sameIndex = target.indexPath === options.source.indexPath
     || await fileIdentity(target.indexPath) === await fileIdentity(options.source.indexPath);
   const sourceRoot = options.crossFileOnly ? await canonicalRoot(options.source.rootDir) : undefined;
@@ -55,12 +58,14 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         limit,
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+        minLines,
         ...excludePaths,
       })
       : target.searchByVector(vector, {
         limit,
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+        minLines,
         ...excludePaths,
       });
     const matches = sameIndex && !options.includeSymmetricDuplicates

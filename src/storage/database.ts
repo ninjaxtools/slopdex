@@ -14,7 +14,7 @@ import type {
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "1";
+const SCHEMA_VERSION = "2";
 
 export interface PreparedCallable extends ParsedCallable {
   embeddingKey: string;
@@ -55,6 +55,7 @@ interface FunctionRow {
   start_column: number;
   end_line: number;
   end_column: number;
+  line_count: number;
   source: string;
   source_hash: string;
   embedding_input: string;
@@ -130,6 +131,7 @@ export class IndexDatabase {
         start_column INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
         end_column INTEGER NOT NULL,
+        line_count INTEGER NOT NULL,
         source TEXT NOT NULL,
         source_hash TEXT NOT NULL,
         embedding_input TEXT NOT NULL,
@@ -152,6 +154,16 @@ export class IndexDatabase {
     const fileColumns = this.#db.prepare("PRAGMA table_info(files)").all() as Array<{ name: string }>;
     if (!fileColumns.some((column) => column.name === "previous_path")) {
       this.#db.exec("ALTER TABLE files ADD COLUMN previous_path TEXT");
+    }
+    const functionColumns = this.#db.prepare("PRAGMA table_info(functions)").all() as Array<{ name: string }>;
+    const needsLineCount = !functionColumns.some((column) => column.name === "line_count");
+    const schemaVersion = this.#metadata("schema_version");
+    if (needsLineCount || schemaVersion === "1") {
+      this.#transaction(() => {
+        if (needsLineCount) this.#db.exec("ALTER TABLE functions ADD COLUMN line_count INTEGER NOT NULL DEFAULT 1");
+        this.#db.exec("UPDATE functions SET line_count = end_line - start_line + 1");
+        if (schemaVersion === "1") this.#setMetadata("schema_version", SCHEMA_VERSION);
+      });
     }
   }
 
@@ -359,9 +371,9 @@ export class IndexDatabase {
       this.#db.prepare(`
         INSERT INTO functions(
           id, path, language, kind, name, qualified_name, signature, identity_key,
-          start_line, start_column, end_line, end_column, source, source_hash,
+          start_line, start_column, end_line, end_column, line_count, source, source_hash,
           embedding_input, first_seen_commit, last_seen_commit, source_mode, embedding_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         old?.id ?? null,
         file.path,
@@ -375,6 +387,7 @@ export class IndexDatabase {
         callable.startColumn,
         callable.endLine,
         callable.endColumn,
+        callable.lineCount,
         callable.source,
         callable.sourceHash,
         callable.embeddingInput,
@@ -426,6 +439,7 @@ export class IndexDatabase {
     maxSimilarity?: number;
     excludeId?: number;
     excludePaths?: readonly string[];
+    minLines?: number;
   }): Array<{ function: IndexedFunction; similarity: number }> {
     const excludePaths = options.excludePaths ?? [];
     const pathFilter = excludePaths.length > 0
@@ -437,6 +451,7 @@ export class IndexDatabase {
       JOIN embeddings e ON e.id = f.embedding_id
       WHERE (? IS NULL OR f.id != ?)
         ${pathFilter}
+        AND f.line_count >= ?
         AND (1.0 - vec_distance_cosine(e.vector, ?)) >= ?
         AND (? IS NULL OR (1.0 - vec_distance_cosine(e.vector, ?)) <= ?)
       ORDER BY similarity DESC, f.id ASC
@@ -446,6 +461,7 @@ export class IndexDatabase {
       options.excludeId ?? null,
       options.excludeId ?? null,
       ...excludePaths,
+      options.minLines ?? 1,
       vectorBuffer(vector),
       options.minSimilarity,
       options.maxSimilarity ?? null,
@@ -498,6 +514,7 @@ function toIndexedFunction(row: FunctionRow): IndexedFunction {
     startColumn: row.start_column,
     endLine: row.end_line,
     endColumn: row.end_column,
+    lineCount: row.line_count,
     source: row.source,
     sourceHash: row.source_hash,
     embeddingInput: row.embedding_input,

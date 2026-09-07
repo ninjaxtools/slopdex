@@ -16,6 +16,7 @@ export interface ParsedCallable {
   startColumn: number;
   endLine: number;
   endColumn: number;
+  lineCount: number;
   source: string;
   sourceHash: string;
   embeddingInput: string;
@@ -109,6 +110,7 @@ export interface CrossSearchOptions {
   maxSimilarity?: number;
   includeSymmetricDuplicates?: boolean;
   crossFileOnly?: boolean;
+  minLines?: number;
   signal?: AbortSignal;
   onProgress?: (progress: { completed: number; total: number }) => void;
 }

@@ -1,5 +1,6 @@
 import { linkSync, symlinkSync } from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
@@ -28,6 +29,28 @@ export function addNumbers(a: number, b: number) { return a + b; }
 });
 
 describe("cross search", () => {
+  it("backfills callable line counts when migrating a version-1 index", async () => {
+    const root = temporaryRoot();
+    write(root, "function.ts", `export function migrated() {
+  return 1;
+}\n`);
+    const provider = new FakeEmbeddingProvider();
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFiles({ upsert: ["function.ts"] });
+    const indexPath = index.indexPath;
+    index.close();
+    const database = new DatabaseSync(indexPath);
+    database.exec("UPDATE functions SET line_count = 1; UPDATE metadata SET value = '1' WHERE key = 'schema_version';");
+    database.close();
+
+    const migrated = new CodeIndex({ rootDir: root, provider });
+    expect(migrated.allFunctions()[0]!.lineCount).toBe(3);
+    migrated.close();
+    const verified = new DatabaseSync(indexPath, { readOnly: true });
+    expect(verified.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "2" });
+    verified.close();
+  });
+
   it("can include symmetric matches for every source function while excluding itself", async () => {
     const root = temporaryRoot();
     write(root, "functions.ts", `
@@ -43,6 +66,7 @@ export function three(value: number) { return value * 2; }
       source: index,
       limitPerFunction: 2,
       includeSymmetricDuplicates: true,
+      minLines: 1,
     })) results.push(result);
     expect(results).toHaveLength(3);
     expect(results.every((result) => result.matches.every((match) => match.function.id !== result.source.id))).toBe(true);
@@ -60,12 +84,51 @@ export function two(value: string) { return value.trim(); }
     await index.updateFiles({ upsert: ["functions.ts"] });
 
     const results = [];
-    for await (const result of crossSearch({ source: index })) results.push(result);
+    for await (const result of crossSearch({ source: index, minLines: 1 })) results.push(result);
 
     expect(results).toHaveLength(1);
     expect(results[0]!.source.name).toBe("one");
     expect(results[0]!.matches.map((match) => match.function.name)).toEqual(["two"]);
     index.close();
+  });
+
+  it("defaults to callables spanning at least two lines and filters candidates before limiting", async () => {
+    const sourceRoot = temporaryRoot();
+    const targetRoot = temporaryRoot();
+    write(sourceRoot, "source.ts", `
+export function shortSource() { return 1; }
+export function longSource() {
+  return 2;
+}
+`);
+    write(targetRoot, "target.ts", `
+export function shortTarget() { return 1; }
+export function longTarget() {
+  return 2;
+}
+`);
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "test", dimensions: 2, strategyVersion: "callable-v1" },
+      embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    const source = new CodeIndex({ rootDir: sourceRoot, provider });
+    const target = new CodeIndex({ rootDir: targetRoot, provider });
+    await source.updateFiles({ upsert: ["source.ts"] });
+    await target.updateFiles({ upsert: ["target.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({ source, target, limitPerFunction: 1 })) results.push(result);
+
+    expect(source.allFunctions().map((callable) => [callable.name, callable.lineCount])).toEqual([
+      ["shortSource", 1],
+      ["longSource", 3],
+    ]);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.source.name).toBe("longSource");
+    expect(results[0]!.matches.map((match) => match.function.name)).toEqual(["longTarget"]);
+    source.close();
+    target.close();
   });
 
   it("excludes same-file matches before applying the per-function limit", async () => {
@@ -90,6 +153,7 @@ export function two(value: string) { return value.trim(); }
       limitPerFunction: 1,
       includeSymmetricDuplicates: true,
       crossFileOnly: true,
+      minLines: 1,
     })) results.push(result);
 
     expect(results).toHaveLength(2);
@@ -110,7 +174,7 @@ export function two(value: string) { return value.trim(); }
     await target.updateFiles({ upsert: ["same.ts"] });
 
     const results = [];
-    for await (const result of crossSearch({ source, target, crossFileOnly: true })) results.push(result);
+    for await (const result of crossSearch({ source, target, crossFileOnly: true, minLines: 1 })) results.push(result);
 
     expect(results[0]!.matches[0]!.function.path).toBe("same.ts");
     source.close();
@@ -128,7 +192,7 @@ export function two(value: string) { return value.trim(); }
     await target.updateFiles({ upsert: ["nested/same.ts"] });
 
     const results = [];
-    for await (const result of crossSearch({ source, target, crossFileOnly: true })) results.push(result);
+    for await (const result of crossSearch({ source, target, crossFileOnly: true, minLines: 1 })) results.push(result);
 
     expect(results).toEqual([]);
     source.close();
@@ -147,7 +211,7 @@ export function two(value: string) { return value.trim(); }
     await target.updateFiles({ upsert: ["same.ts"] });
 
     const results = [];
-    for await (const result of crossSearch({ source, target, crossFileOnly: true })) results.push(result);
+    for await (const result of crossSearch({ source, target, crossFileOnly: true, minLines: 1 })) results.push(result);
 
     expect(results).toEqual([]);
     source.close();
@@ -166,7 +230,7 @@ export function two(value: string) { return value.trim(); }
     await target.updateFiles({ upsert: ["alias.ts"] });
 
     const results = [];
-    for await (const result of crossSearch({ source, target, crossFileOnly: true })) results.push(result);
+    for await (const result of crossSearch({ source, target, crossFileOnly: true, minLines: 1 })) results.push(result);
 
     expect(results).toEqual([]);
     source.close();
@@ -188,6 +252,7 @@ export function two(value: string) { return value.trim(); }
       sourceFilter: { type: "all", path: "src" },
       limitPerFunction: 10,
       includeSymmetricDuplicates: true,
+      minLines: 1,
     })) directoryResults.push(result);
     expect(directoryResults.map((result) => result.source.path).sort()).toEqual(["src/nested/deep.ts", "src/selected.ts"]);
     expect(directoryResults.every((result) => result.matches.some((match) => match.function.path === "outside.ts"))).toBe(true);
@@ -197,6 +262,7 @@ export function two(value: string) { return value.trim(); }
       source: index,
       sourceFilter: { type: "all", path: "src/selected.ts" },
       includeSymmetricDuplicates: true,
+      minLines: 1,
     })) fileResults.push(result);
     expect(fileResults.map((result) => result.source.path)).toEqual(["src/selected.ts"]);
     index.close();
@@ -216,7 +282,7 @@ export function unrelated(a: number, b: number) { return a + b; }
     await target.updateFiles({ upsert: ["target.ts"] });
 
     const results = [];
-    for await (const result of crossSearch({ source, target, limitPerFunction: 2 })) results.push(result);
+    for await (const result of crossSearch({ source, target, limitPerFunction: 2, minLines: 1 })) results.push(result);
     expect(results).toHaveLength(1);
     expect(results[0]!.matches).toHaveLength(2);
     source.close();
@@ -237,6 +303,7 @@ export function two() { return 2; }
     for await (const result of crossSearch({
       source: index,
       minSimilarity: 2,
+      minLines: 1,
       onProgress: ({ completed }) => progress.push(completed),
     })) results.push(result);
 
@@ -270,6 +337,7 @@ export function two() { return 2; }
       minSimilarity: 0.85,
       maxSimilarity: 0.95,
       limitPerFunction: 1,
+      minLines: 1,
     })) results.push(result);
 
     expect(results).toHaveLength(1);
@@ -301,7 +369,7 @@ export function two() { return 2; }
     await target.updateFiles({ upsert: ["target.ts"] });
 
     const results = [];
-    for await (const result of crossSearch({ source, target })) results.push(result);
+    for await (const result of crossSearch({ source, target, minLines: 1 })) results.push(result);
     expect(results).toHaveLength(1);
     source.close();
     target.close();
@@ -321,7 +389,7 @@ export function two() { return 2; }
 
     const target = new CodeIndex({ rootDir: targetRoot, provider, readOnly: true });
     const results = [];
-    for await (const result of crossSearch({ source, target })) results.push(result);
+    for await (const result of crossSearch({ source, target, minLines: 1 })) results.push(result);
     expect(results[0]!.matches[0]!.function.name).toBe("target");
     source.close();
     target.close();

@@ -71,15 +71,16 @@ Search by meaning:
 slopdex search "validate an authenticated session" --limit 10
 ```
 
-Find the nearest functions for each indexed function that has at least one match. Results are emitted as JSONL:
+Find similar callables grouped into connected clusters. Cross-search excludes one-line callables by default:
 
 ```bash
-slopdex cross-search --limit 5 > similarities.jsonl
+slopdex cross-search --threshold 0.85
 ```
 
-For a human-readable summary with each match indented beneath its source function:
+Use `--format json` for JSONL with one object per source function, or `--format summary` for a compact pair listing:
 
 ```bash
+slopdex cross-search --limit 5 --format json > similarities.jsonl
 slopdex cross-search --limit 5 --format summary
 ```
 
@@ -89,7 +90,7 @@ src/users.ts :: Users.authenticate
   0.8475  src/auth.ts :: authenticate
 ```
 
-Group overlapping similarity pairs into connected clusters and list each function once:
+Clusters list each function once:
 
 ```bash
 slopdex cross-search --threshold 0.85 --format clusters
@@ -102,7 +103,7 @@ Cluster 1 (3 functions, similarity 0.8732-0.9410)
   src/users.ts:27:2 :: Users.authenticate
 ```
 
-`--format summary` also produces compact file and function names for `search`. JSON remains the default format.
+`--format summary` also produces compact file and function names for `search`. JSON is the default for `search`; clusters are the default for `cross-search`.
 
 Use `--threshold` to omit weaker matches. The threshold is a raw cosine similarity and is applied before `--limit`:
 
@@ -120,6 +121,12 @@ slopdex cross-search --format summary --threshold 0.85-0.95 --limit 5
 Source functions with no matches at the selected threshold are omitted.
 For same-index searches, each function pair is shown only in its first direction by default. Use
 `--include-symmetric-duplicates` to include both `A -> B` and `B -> A` results.
+
+Cross-search includes only callables spanning at least two lines by default, for both sources and matches. Use `--min-lines` to change the minimum, including `--min-lines 1` to include one-line closures:
+
+```bash
+slopdex cross-search --min-lines 4 --threshold 0.8
+```
 
 Use `--cross-file-only` to exclude matches from the source function's file. Same relative paths in different repository roots remain eligible:
 
@@ -182,6 +189,7 @@ for await (const result of crossSearch({
   sourceFilter: { type: "changed-since", commit: "origin/main", path: "src/services" },
   limitPerFunction: 5,
   crossFileOnly: true,
+  minLines: 4,
 })) {
   console.log(result);
 }
@@ -206,6 +214,7 @@ Standalone functions `updateFiles`, `updateFromGit`, `updateFromWorkingTree`, `s
 - Threshold ranges are inclusive and are applied before the result limit.
 - Same-index cross-search excludes the source function itself and lists each unordered function pair once by default.
 - Cross-file filtering is applied before the per-function result limit.
+- Cross-search defaults to a minimum callable length of two lines; source and match length filtering is applied before the result limit.
 
 ## Development
 

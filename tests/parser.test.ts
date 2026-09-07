@@ -23,6 +23,13 @@ class Store {
       ["Store.constructor", "constructor"],
       ["Store.find", "method"],
     ]);
+    expect(functions.map((item) => [item.qualifiedName, item.lineCount])).toEqual([
+      ["load", 4],
+      ["load.normalize", 1],
+      ["save", 1],
+      ["Store.constructor", 1],
+      ["Store.find", 1],
+    ]);
   });
 
   it("extracts JavaScript object properties and assignments", () => {

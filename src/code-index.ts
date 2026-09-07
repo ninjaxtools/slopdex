@@ -531,6 +531,7 @@ export class CodeIndex {
     minSimilarity: number;
     maxSimilarity?: number;
     excludePaths?: readonly string[];
+    minLines?: number;
   }): SimilarityResult[] {
     const vector = this.#database.vectorForFunction(functionId);
     return this.#database.searchVector(vector, {
@@ -539,6 +540,7 @@ export class CodeIndex {
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
       excludeId: functionId,
       ...(options.excludePaths !== undefined ? { excludePaths: options.excludePaths } : {}),
+      ...(options.minLines !== undefined ? { minLines: options.minLines } : {}),
     });
   }
 
@@ -551,6 +553,7 @@ export class CodeIndex {
     minSimilarity: number;
     maxSimilarity?: number;
     excludePaths?: readonly string[];
+    minLines?: number;
   }): SimilarityResult[] {
     return this.#database.searchVector(normalizeEmbeddingVector(vector, this.provider.profile.dimensions), options);
   }

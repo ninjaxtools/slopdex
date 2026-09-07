@@ -282,10 +282,16 @@ describe("CLI index initialization", () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "same.ts", `
-export function one(value: string) { return value.trim(); }
-export function two(value: string) { return value.trim(); }
+export function one(value: string) {
+  return value.trim();
+}
+export function two(value: string) {
+  return value.trim();
+}
 `);
-    write(root, "other.ts", `export function external(value: string) { return value.trim(); }\n`);
+    write(root, "other.ts", `export function external(value: string) {
+  return value.trim();
+}\n`);
     commitAll(root, "functions");
     const openAI = new OpenAIEmbeddingProvider({ apiKey: "test" });
     const vector = () => [1, ...Array<number>(openAI.profile.dimensions - 1).fill(0)];
@@ -307,6 +313,8 @@ export function two(value: string) { return value.trim(); }
       "--include-symmetric-duplicates",
       "--limit",
       "1",
+      "--format",
+      "json",
     );
 
     expect(result.status).toBe(0);
@@ -314,6 +322,15 @@ export function two(value: string) { return value.trim(); }
     expect(rows).toHaveLength(3);
     expect(rows.every((row) => row.matches.length === 1)).toBe(true);
     expect(rows.every((row) => row.source.path !== row.matches[0].function.path)).toBe(true);
+    expect(rows.every((row) => row.source.lineCount === 3 && row.matches[0].function.lineCount === 3)).toBe(true);
+
+    const defaultFormat = runCli(root, "cross-search");
+    expect(defaultFormat.status).toBe(0);
+    expect(defaultFormat.stdout).toMatch(/^Cluster 1 /);
+
+    const minimum = runCli(root, "cross-search", "--min-lines", "4");
+    expect(minimum.status).toBe(0);
+    expect(minimum.stdout).toBe("No clusters.\n");
   });
 
   it.each(["--min-similarity", "--added-since"])("rejects removed option %s cleanly", (option) => {
@@ -358,6 +375,7 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--force-reindex");
     expect(result.stdout).toContain("--no-reindex");
     expect(result.stdout).toContain("--cross-file-only");
+    expect(result.stdout).toContain("--min-lines <number>");
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
   });
