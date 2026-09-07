@@ -139,6 +139,12 @@ Same-index search reports each unordered pair once by default. Include both `A -
 slopdex cross-search --include-symmetric-duplicates
 ```
 
+Exclude candidates from the source function's file when looking for duplication across files:
+
+```bash
+slopdex cross-search --cross-file-only --format summary --threshold 0.9
+```
+
 Group overlapping pairs into connected components and list each function once:
 
 ```bash
@@ -201,6 +207,7 @@ Prefer JSON or JSONL when another command will consume the results. Prefer summa
 --limit <number>                    Result limit
 --threshold <number|range>          Similarity threshold or inclusive range
 --format <json|summary|clusters>    Output format
+--cross-file-only                  Exclude matches from the source file
 --target-config <path>             Target repository configuration file
 ```
 

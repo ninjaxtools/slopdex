@@ -108,6 +108,7 @@ export interface CrossSearchOptions {
   minSimilarity?: number;
   maxSimilarity?: number;
   includeSymmetricDuplicates?: boolean;
+  crossFileOnly?: boolean;
   signal?: AbortSignal;
   onProgress?: (progress: { completed: number; total: number }) => void;
 }

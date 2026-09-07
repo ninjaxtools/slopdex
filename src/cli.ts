@@ -56,6 +56,7 @@ const parsed = (() => {
         threshold: { type: "string" },
         format: { type: "string" },
         "include-symmetric-duplicates": { type: "boolean", default: false },
+        "cross-file-only": { type: "boolean", default: false },
         "rebuild-on-divergence": { type: "boolean", default: false },
         "force-reindex": { type: "boolean", default: false },
         "no-reindex": { type: "boolean", default: false },
@@ -197,6 +198,7 @@ async function runCrossSearch(
     minSimilarity: threshold.min,
     ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
     includeSymmetricDuplicates: parsed.values["include-symmetric-duplicates"],
+    crossFileOnly: parsed.values["cross-file-only"],
   };
   try {
     if (format === "clusters") {
@@ -482,6 +484,7 @@ Options:
   --threshold <number|range>          Show similarities at/above a value or within a range
   --format <json|summary|clusters>    Similarity output format (default: json)
   --include-symmetric-duplicates      Show both directions of same-index matches
+  --cross-file-only                  Exclude matches from the source file
   --changed-since <commit>            Search added, modified, or moved functions
   --uncommitted                       Search functions from uncommitted files
   --source-path <path>                Restrict cross-search sources to a file or directory

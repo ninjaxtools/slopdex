@@ -425,12 +425,18 @@ export class IndexDatabase {
     minSimilarity: number;
     maxSimilarity?: number;
     excludeId?: number;
+    excludePaths?: readonly string[];
   }): Array<{ function: IndexedFunction; similarity: number }> {
+    const excludePaths = options.excludePaths ?? [];
+    const pathFilter = excludePaths.length > 0
+      ? `AND f.path NOT IN (${excludePaths.map(() => "?").join(", ")})`
+      : "";
     const rows = this.#db.prepare(`
       SELECT f.*, 1.0 - vec_distance_cosine(e.vector, ?) AS similarity
       FROM functions f
       JOIN embeddings e ON e.id = f.embedding_id
       WHERE (? IS NULL OR f.id != ?)
+        ${pathFilter}
         AND (1.0 - vec_distance_cosine(e.vector, ?)) >= ?
         AND (? IS NULL OR (1.0 - vec_distance_cosine(e.vector, ?)) <= ?)
       ORDER BY similarity DESC, f.id ASC
@@ -439,6 +445,7 @@ export class IndexDatabase {
       vectorBuffer(vector),
       options.excludeId ?? null,
       options.excludeId ?? null,
+      ...excludePaths,
       vectorBuffer(vector),
       options.minSimilarity,
       options.maxSimilarity ?? null,

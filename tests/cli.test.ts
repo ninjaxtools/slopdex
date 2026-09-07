@@ -270,12 +270,50 @@ describe("CLI index initialization", () => {
     write(root, "README.md", "# Initial\n");
     const base = commitAll(root, "initial");
 
-    const clusters = runCli(root, "cross-search", "--format", "clusters", "--changed-since", base);
+    const clusters = runCli(root, "cross-search", "--format", "clusters", "--changed-since", base, "--cross-file-only");
     expect(clusters.status).toBe(0);
     expect(clusters.stdout).toBe("No clusters.\n");
 
     const uncommitted = runCli(root, "cross-search", "--uncommitted");
     expect(uncommitted.status).toBe(0);
+  });
+
+  it("filters same-file cross-search matches with --cross-file-only", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "same.ts", `
+export function one(value: string) { return value.trim(); }
+export function two(value: string) { return value.trim(); }
+`);
+    write(root, "other.ts", `export function external(value: string) { return value.trim(); }\n`);
+    commitAll(root, "functions");
+    const openAI = new OpenAIEmbeddingProvider({ apiKey: "test" });
+    const vector = () => [1, ...Array<number>(openAI.profile.dimensions - 1).fill(0)];
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: {
+        profile: openAI.profile,
+        embedDocuments: async (inputs) => inputs.map(vector),
+        embedQuery: async () => vector(),
+      },
+    });
+    await index.updateFromGit();
+    index.close();
+
+    const result = runCli(
+      root,
+      "cross-search",
+      "--cross-file-only",
+      "--include-symmetric-duplicates",
+      "--limit",
+      "1",
+    );
+
+    expect(result.status).toBe(0);
+    const rows = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    expect(rows).toHaveLength(3);
+    expect(rows.every((row) => row.matches.length === 1)).toBe(true);
+    expect(rows.every((row) => row.source.path !== row.matches[0].function.path)).toBe(true);
   });
 
   it.each(["--min-similarity", "--added-since"])("rejects removed option %s cleanly", (option) => {
@@ -319,6 +357,7 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--target-config <path>");
     expect(result.stdout).toContain("--force-reindex");
     expect(result.stdout).toContain("--no-reindex");
+    expect(result.stdout).toContain("--cross-file-only");
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
   });

@@ -1,3 +1,6 @@
+import { linkSync, symlinkSync } from "node:fs";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
@@ -63,6 +66,111 @@ export function two(value: string) { return value.trim(); }
     expect(results[0]!.source.name).toBe("one");
     expect(results[0]!.matches.map((match) => match.function.name)).toEqual(["two"]);
     index.close();
+  });
+
+  it("excludes same-file matches before applying the per-function limit", async () => {
+    const root = temporaryRoot();
+    write(root, "same.ts", `
+export function one(value: string) { return value.trim(); }
+export function two(value: string) { return value.trim(); }
+`);
+    write(root, "other.ts", `export function external(value: string) { return value.trim(); }\n`);
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "test", dimensions: 2, strategyVersion: "callable-v1" },
+      embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFiles({ upsert: ["same.ts", "other.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({
+      source: index,
+      sourceFilter: { type: "all", path: "same.ts" },
+      limitPerFunction: 1,
+      includeSymmetricDuplicates: true,
+      crossFileOnly: true,
+    })) results.push(result);
+
+    expect(results).toHaveLength(2);
+    expect(results.every((result) => result.matches.length === 1)).toBe(true);
+    expect(results.every((result) => result.matches[0]!.function.path === "other.ts")).toBe(true);
+    index.close();
+  });
+
+  it("allows matching paths when cross-searching different repository roots", async () => {
+    const sourceRoot = temporaryRoot();
+    const targetRoot = temporaryRoot();
+    write(sourceRoot, "same.ts", `export function source(value: string) { return value.trim(); }\n`);
+    write(targetRoot, "same.ts", `export function target(value: string) { return value.trim(); }\n`);
+    const provider = new FakeEmbeddingProvider();
+    const source = new CodeIndex({ rootDir: sourceRoot, provider });
+    const target = new CodeIndex({ rootDir: targetRoot, provider });
+    await source.updateFiles({ upsert: ["same.ts"] });
+    await target.updateFiles({ upsert: ["same.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({ source, target, crossFileOnly: true })) results.push(result);
+
+    expect(results[0]!.matches[0]!.function.path).toBe("same.ts");
+    source.close();
+    target.close();
+  });
+
+  it("excludes the same file exposed through overlapping repository roots", async () => {
+    const targetRoot = temporaryRoot();
+    const sourceRoot = `${targetRoot}/nested`;
+    write(sourceRoot, "same.ts", `export function shared(value: string) { return value.trim(); }\n`);
+    const provider = new FakeEmbeddingProvider();
+    const source = new CodeIndex({ rootDir: sourceRoot, provider });
+    const target = new CodeIndex({ rootDir: targetRoot, provider });
+    await source.updateFiles({ upsert: ["same.ts"] });
+    await target.updateFiles({ upsert: ["nested/same.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({ source, target, crossFileOnly: true })) results.push(result);
+
+    expect(results).toEqual([]);
+    source.close();
+    target.close();
+  });
+
+  it("excludes the same file indexed through a symlinked directory", async () => {
+    const sourceRoot = temporaryRoot();
+    const targetRoot = path.join(sourceRoot, "nested");
+    write(targetRoot, "same.ts", `export function shared(value: string) { return value.trim(); }\n`);
+    symlinkSync("nested", path.join(sourceRoot, "linked"), "dir");
+    const provider = new FakeEmbeddingProvider();
+    const source = new CodeIndex({ rootDir: sourceRoot, provider });
+    const target = new CodeIndex({ rootDir: targetRoot, provider });
+    await source.updateFiles({ upsert: ["linked/same.ts"] });
+    await target.updateFiles({ upsert: ["same.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({ source, target, crossFileOnly: true })) results.push(result);
+
+    expect(results).toEqual([]);
+    source.close();
+    target.close();
+  });
+
+  it("excludes the same file indexed through hard links", async () => {
+    const sourceRoot = temporaryRoot();
+    const targetRoot = temporaryRoot();
+    write(sourceRoot, "same.ts", `export function shared(value: string) { return value.trim(); }\n`);
+    linkSync(path.join(sourceRoot, "same.ts"), path.join(targetRoot, "alias.ts"));
+    const provider = new FakeEmbeddingProvider();
+    const source = new CodeIndex({ rootDir: sourceRoot, provider });
+    const target = new CodeIndex({ rootDir: targetRoot, provider });
+    await source.updateFiles({ upsert: ["same.ts"] });
+    await target.updateFiles({ upsert: ["alias.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({ source, target, crossFileOnly: true })) results.push(result);
+
+    expect(results).toEqual([]);
+    source.close();
+    target.close();
   });
 
   it("restricts source functions to a file or recursive directory without restricting matches", async () => {

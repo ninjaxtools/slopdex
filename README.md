@@ -121,6 +121,12 @@ Source functions with no matches at the selected threshold are omitted.
 For same-index searches, each function pair is shown only in its first direction by default. Use
 `--include-symmetric-duplicates` to include both `A -> B` and `B -> A` results.
 
+Use `--cross-file-only` to exclude matches from the source function's file. Same relative paths in different repository roots remain eligible:
+
+```bash
+slopdex cross-search --cross-file-only --format summary --threshold 0.8
+```
+
 Restrict source functions to a file or every indexed file recursively under a directory. Matches are still selected from the whole target index:
 
 ```bash
@@ -175,6 +181,7 @@ for await (const result of crossSearch({
   source: index,
   sourceFilter: { type: "changed-since", commit: "origin/main", path: "src/services" },
   limitPerFunction: 5,
+  crossFileOnly: true,
 })) {
   console.log(result);
 }
@@ -198,6 +205,7 @@ Standalone functions `updateFiles`, `updateFromGit`, `updateFromWorkingTree`, `s
 - Search output is ordered by raw cosine similarity descending, then function ID ascending.
 - Threshold ranges are inclusive and are applied before the result limit.
 - Same-index cross-search excludes the source function itself and lists each unordered function pair once by default.
+- Cross-file filtering is applied before the per-function result limit.
 
 ## Development
 
