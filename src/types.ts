@@ -111,6 +111,7 @@ export interface CrossSearchOptions {
   includeSymmetricDuplicates?: boolean;
   crossFileOnly?: boolean;
   minLines?: number;
+  nameRegex?: string;
   signal?: AbortSignal;
   onProgress?: (progress: { completed: number; total: number }) => void;
 }

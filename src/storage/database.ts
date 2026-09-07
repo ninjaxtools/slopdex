@@ -80,6 +80,16 @@ export class IndexDatabase {
     try {
       sqliteVec.load(this.#db);
       this.#db.enableLoadExtension(false);
+      const regexes = new Map<string, RegExp>();
+      this.#db.function("slopdex_regexp", { deterministic: true }, (pattern, value) => {
+        if (typeof pattern !== "string" || typeof value !== "string") return 0;
+        let regex = regexes.get(pattern);
+        if (!regex) {
+          regex = new RegExp(pattern);
+          regexes.set(pattern, regex);
+        }
+        return regex.test(value) ? 1 : 0;
+      });
       if (readOnly) {
         this.#db.exec("PRAGMA foreign_keys=ON");
       } else {
@@ -440,6 +450,7 @@ export class IndexDatabase {
     excludeId?: number;
     excludePaths?: readonly string[];
     minLines?: number;
+    nameRegex?: string;
   }): Array<{ function: IndexedFunction; similarity: number }> {
     const excludePaths = options.excludePaths ?? [];
     const pathFilter = excludePaths.length > 0
@@ -452,6 +463,7 @@ export class IndexDatabase {
       WHERE (? IS NULL OR f.id != ?)
         ${pathFilter}
         AND f.line_count >= ?
+        AND (? IS NULL OR slopdex_regexp(?, f.qualified_name))
         AND (1.0 - vec_distance_cosine(e.vector, ?)) >= ?
         AND (? IS NULL OR (1.0 - vec_distance_cosine(e.vector, ?)) <= ?)
       ORDER BY similarity DESC, f.id ASC
@@ -462,6 +474,8 @@ export class IndexDatabase {
       options.excludeId ?? null,
       ...excludePaths,
       options.minLines ?? 1,
+      options.nameRegex ?? null,
+      options.nameRegex ?? null,
       vectorBuffer(vector),
       options.minSimilarity,
       options.maxSimilarity ?? null,

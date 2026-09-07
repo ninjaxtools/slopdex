@@ -128,6 +128,12 @@ Cross-search includes only callables spanning at least two lines by default, for
 slopdex cross-search --min-lines 4 --threshold 0.8
 ```
 
+Use `--regex` to require both source and matching candidates to have qualified names matching a JavaScript regular expression. Name filtering happens before the result limit:
+
+```bash
+slopdex cross-search --regex '^(User|Session)\.' --threshold 0.8
+```
+
 Use `--cross-file-only` to exclude matches from the source function's file. Same relative paths in different repository roots remain eligible:
 
 ```bash
@@ -190,6 +196,7 @@ for await (const result of crossSearch({
   limitPerFunction: 5,
   crossFileOnly: true,
   minLines: 4,
+  nameRegex: "^(User|Session)\\.",
 })) {
   console.log(result);
 }
@@ -215,6 +222,7 @@ Standalone functions `updateFiles`, `updateFromGit`, `updateFromWorkingTree`, `s
 - Same-index cross-search excludes the source function itself and lists each unordered function pair once by default.
 - Cross-file filtering is applied before the per-function result limit.
 - Cross-search defaults to a minimum callable length of two lines; source and match length filtering is applied before the result limit.
+- Cross-search name regexes match qualified callable names and filter both sources and matches before the result limit.
 
 ## Development
 

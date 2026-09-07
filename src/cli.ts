@@ -53,6 +53,7 @@ const parsed = (() => {
         uncommitted: { type: "boolean", default: false },
         "source-path": { type: "string" },
         "min-lines": { type: "string" },
+        regex: { type: "string" },
         limit: { type: "string" },
         threshold: { type: "string" },
         format: { type: "string" },
@@ -201,6 +202,7 @@ async function runCrossSearch(
     includeSymmetricDuplicates: parsed.values["include-symmetric-duplicates"],
     crossFileOnly: parsed.values["cross-file-only"],
     minLines: minimumLines(),
+    ...(parsed.values.regex !== undefined ? { nameRegex: parsed.values.regex } : {}),
   };
   try {
     if (format === "clusters") {
@@ -404,6 +406,7 @@ function validateInvocation(): void {
       similarityThreshold();
       outputFormat("clusters");
       minimumLines();
+      functionNameRegex();
       crossSearchSourceFilter();
       return;
     default:
@@ -442,6 +445,16 @@ function minimumLines(): number {
   const value = numberOption(parsed.values["min-lines"], 2, "min-lines");
   if (!Number.isInteger(value) || value < 1) throw new CodeIndexError("min-lines must be a positive integer.");
   return value;
+}
+
+function functionNameRegex(): RegExp | undefined {
+  const pattern = parsed.values.regex;
+  if (pattern === undefined) return undefined;
+  try {
+    return new RegExp(pattern);
+  } catch (error) {
+    throw new CodeIndexError(`Invalid --regex value: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
 }
 
 function crossSearchSourceFilter(): CrossSearchSourceFilter {
@@ -495,6 +508,7 @@ Options:
   --include-symmetric-duplicates      Show both directions of same-index matches
   --cross-file-only                   Exclude matches from the source file
   --min-lines <number>               Minimum callable length for cross-search (default: 2)
+  --regex <regex>                    Restrict cross-search to matching qualified names
   --changed-since <commit>            Search added, modified, or moved functions
   --uncommitted                       Search functions from uncommitted files
   --source-path <path>                Restrict cross-search sources to a file or directory

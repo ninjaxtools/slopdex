@@ -331,6 +331,22 @@ export function two(value: string) {
     const minimum = runCli(root, "cross-search", "--min-lines", "4");
     expect(minimum.status).toBe(0);
     expect(minimum.stdout).toBe("No clusters.\n");
+
+    const regex = runCli(
+      root,
+      "cross-search",
+      "--regex",
+      "^(one|external)$",
+      "--include-symmetric-duplicates",
+      "--limit",
+      "1",
+      "--format",
+      "json",
+    );
+    expect(regex.status).toBe(0);
+    const regexRows = regex.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    expect(regexRows.map((row) => row.source.qualifiedName).sort()).toEqual(["external", "one"]);
+    expect(regexRows.every((row) => /^(one|external)$/.test(row.matches[0].function.qualifiedName))).toBe(true);
   });
 
   it.each(["--min-similarity", "--added-since"])("rejects removed option %s cleanly", (option) => {
@@ -345,6 +361,11 @@ export function two(value: string) {
     initGit(root);
     write(root, "README.md", "# Initial\n");
     commitAll(root, "initial");
+
+    const invalidRegex = runCli(root, "cross-search", "--regex", "[");
+    expect(invalidRegex.status).toBe(2);
+    expect(invalidRegex.stderr).toContain("Invalid --regex value");
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
     const result = runCli(root, "cross-search", "--changed-since", "HEAD", "--uncommitted");
 
@@ -376,6 +397,7 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--no-reindex");
     expect(result.stdout).toContain("--cross-file-only");
     expect(result.stdout).toContain("--min-lines <number>");
+    expect(result.stdout).toContain("--regex <regex>");
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
   });

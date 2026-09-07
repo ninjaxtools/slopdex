@@ -137,6 +137,12 @@ Cross-search excludes one-line callables by default. Raise `--min-lines` for mor
 slopdex cross-search --min-lines 4 --threshold 0.9
 ```
 
+Filter both source and matching candidates by qualified callable name with a JavaScript regular expression:
+
+```bash
+slopdex cross-search --regex '^(User|Session)\.' --threshold 0.9
+```
+
 Use `--threshold <minimum>-<maximum>` for an inclusive similarity range, such as `--threshold 0.85-0.95`. The range is applied before `--limit`.
 
 Same-index search reports each unordered pair once by default. Include both `A -> B` and `B -> A` only when explicitly needed:
@@ -215,6 +221,7 @@ Prefer JSON or JSONL when another command will consume the results. Prefer summa
 --format <json|summary|clusters>    Output format
 --cross-file-only                   Exclude matches from the source file
 --min-lines <number>               Minimum cross-search callable length
+--regex <regex>                    Match qualified callable names
 --target-config <path>             Target repository configuration file
 ```
 

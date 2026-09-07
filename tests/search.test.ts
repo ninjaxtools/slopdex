@@ -131,6 +131,48 @@ export function longTarget() {
     target.close();
   });
 
+  it("filters source and match qualified names before applying the per-function limit", async () => {
+    const sourceRoot = temporaryRoot();
+    const targetRoot = temporaryRoot();
+    write(sourceRoot, "source.ts", `class Source {
+  keep() {
+    return 1;
+  }
+  ignore() {
+    return 2;
+  }
+}\n`);
+    write(targetRoot, "target.ts", `class Target {
+  ignore() {
+    return 1;
+  }
+  keep() {
+    return 2;
+  }
+}\n`);
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "test", dimensions: 2, strategyVersion: "callable-v1" },
+      embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    const source = new CodeIndex({ rootDir: sourceRoot, provider });
+    const target = new CodeIndex({ rootDir: targetRoot, provider });
+    await source.updateFiles({ upsert: ["source.ts"] });
+    await target.updateFiles({ upsert: ["target.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({ source, target, nameRegex: "\\.keep$", limitPerFunction: 1 })) {
+      results.push(result);
+    }
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.source.qualifiedName).toBe("Source.keep");
+    expect(results[0]!.matches.map((match) => match.function.qualifiedName)).toEqual(["Target.keep"]);
+    await expect(crossSearch({ source, target, nameRegex: "[" }).next()).rejects.toThrow(/Invalid name regex/);
+    source.close();
+    target.close();
+  });
+
   it("excludes same-file matches before applying the per-function limit", async () => {
     const root = temporaryRoot();
     write(root, "same.ts", `

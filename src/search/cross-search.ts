@@ -1,7 +1,7 @@
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
-import { IncompatibleIndexError } from "../errors.js";
+import { CodeIndexError, IncompatibleIndexError } from "../errors.js";
 import type { CrossSearchOptions, CrossSearchResult } from "../types.js";
 import { assertPositiveInteger, throwIfAborted } from "../utils.js";
 
@@ -17,8 +17,9 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
   assertPositiveInteger(limit, "limitPerFunction");
   const minLines = options.minLines ?? 2;
   assertPositiveInteger(minLines, "minLines");
+  const nameRegex = compileNameRegex(options.nameRegex);
   const sourceFunctions = (await options.source.sourceFunctions(options.sourceFilter ?? { type: "all" }))
-    .filter((callable) => callable.lineCount >= minLines);
+    .filter((callable) => callable.lineCount >= minLines && (!nameRegex || nameRegex.test(callable.qualifiedName)));
   const sameIndex = target.indexPath === options.source.indexPath
     || await fileIdentity(target.indexPath) === await fileIdentity(options.source.indexPath);
   const sourceRoot = options.crossFileOnly ? await canonicalRoot(options.source.rootDir) : undefined;
@@ -59,6 +60,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
         minLines,
+        ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
         ...excludePaths,
       })
       : target.searchByVector(vector, {
@@ -66,6 +68,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
         minLines,
+        ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
         ...excludePaths,
       });
     const matches = sameIndex && !options.includeSymmetricDuplicates
@@ -80,6 +83,15 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
       : candidates;
     if (matches.length > 0) yield { source, matches };
     options.onProgress?.({ completed: index + 1, total: sourceFunctions.length });
+  }
+}
+
+function compileNameRegex(pattern: string | undefined): RegExp | undefined {
+  if (pattern === undefined) return undefined;
+  try {
+    return new RegExp(pattern);
+  } catch (error) {
+    throw new CodeIndexError(`Invalid name regex: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
 }
 
