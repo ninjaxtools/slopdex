@@ -64,6 +64,11 @@ export interface UpdateFilesOptions {
 export interface UpdateFromGitOptions {
   target?: string;
   rebuildOnDivergence?: boolean;
+  includeWorkingTree?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface UpdateFromWorkingTreeOptions {
   signal?: AbortSignal;
 }
 

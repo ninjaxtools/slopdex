@@ -12,6 +12,13 @@ export class GitDivergenceError extends CodeIndexError {
   }
 }
 
+export class GitUnavailableError extends CodeIndexError {
+  public constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "GitUnavailableError";
+  }
+}
+
 export class IncompatibleIndexError extends CodeIndexError {
   public constructor(message: string) {
     super(message);

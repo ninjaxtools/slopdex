@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
+import { lstat } from "node:fs/promises";
 import path from "node:path";
 
-import { CodeIndexError } from "../errors.js";
+import { CodeIndexError, GitUnavailableError } from "../errors.js";
 
 export type GitChange =
   | { status: "A" | "M" | "D" | "T"; path: string }
@@ -24,7 +25,13 @@ export class GitRepository {
       const stderr: Buffer[] = [];
       child.stdout.on("data", (value: Buffer) => stdout.push(value));
       child.stderr.on("data", (value: Buffer) => stderr.push(value));
-      child.on("error", reject);
+      child.on("error", (error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          reject(new GitUnavailableError("Git executable is not available.", { cause: error }));
+          return;
+        }
+        reject(error);
+      });
       child.on("close", (code) => {
         const exitCode = code ?? -1;
         if (exitCode === 0 || (allowExitOne && exitCode === 1)) {
@@ -37,9 +44,23 @@ export class GitRepository {
   }
 
   public async assertRepository(): Promise<void> {
-    const result = await this.#run(["rev-parse", "--is-inside-work-tree"]);
+    let result: { stdout: Buffer; code: number };
+    try {
+      result = await this.#run(["rev-parse", "--is-inside-work-tree"]);
+    } catch (error) {
+      if (error instanceof GitUnavailableError) throw error;
+      try {
+        await lstat(path.join(this.rootDir, ".git"));
+      } catch (markerError) {
+        if ((markerError as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new GitUnavailableError(`${this.rootDir} is not a Git worktree.`, { cause: error });
+        }
+        throw markerError;
+      }
+      throw error;
+    }
     if (result.stdout.toString("utf8").trim() !== "true") {
-      throw new CodeIndexError(`${this.rootDir} is not a Git worktree.`);
+      throw new GitUnavailableError(`${this.rootDir} is not a Git worktree.`);
     }
     const topLevel = (await this.#run(["rev-parse", "--show-toplevel"])).stdout.toString("utf8").trim();
     if (path.resolve(topLevel) !== path.resolve(this.rootDir)) {

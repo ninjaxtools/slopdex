@@ -53,7 +53,126 @@ export function multiply(a: number, b: number) { return a * b; }
   });
 });
 
+describe("filesystem indexing", () => {
+  it("re-indexes every source file on every refresh and reuses embeddings", async () => {
+    const root = temporaryRoot();
+    write(root, "src/value.ts", `export function value() { return 1; }\n`);
+    const provider = new CountingEmbeddingProvider();
+    const index = new CodeIndex({ rootDir: root, provider });
+
+    const first = await index.updateFromWorkingTree();
+    const second = await index.updateFromWorkingTree();
+
+    expect(first.filesUpdated).toBe(1);
+    expect(second.filesUpdated).toBe(1);
+    expect(provider.documentCount).toBe(1);
+    expect(index.status().gitCheckpoint).toBeNull();
+    expect(index.allFunctions()[0]!.sourceMode).toBe("working-tree");
+    index.close();
+  });
+
+  it("reconciles added and deleted files without Git", async () => {
+    const root = temporaryRoot();
+    write(root, "old.ts", `export function oldValue() { return 1; }\n`);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromWorkingTree();
+
+    rmSync(`${root}/old.ts`);
+    write(root, "new.ts", `export function newValue() { return 2; }\n`);
+    const stats = await index.updateFromWorkingTree();
+
+    expect(stats).toMatchObject({ filesUpdated: 1, filesDeleted: 1, checkpoint: null });
+    expect(index.allFunctions().map((item) => item.name)).toEqual(["newValue"]);
+    index.close();
+  });
+
+  it("clears a previous Git checkpoint after a filesystem refresh", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "value.ts", `export function value() { return 1; }\n`);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    expect(index.status().gitCheckpoint).not.toBeNull();
+
+    rmSync(`${root}/.git`, { recursive: true });
+    await index.updateFromWorkingTree();
+
+    expect(index.status().gitCheckpoint).toBeNull();
+    index.close();
+  });
+
+  it("aborts if an oversized source file becomes eligible while indexing", async () => {
+    const root = temporaryRoot();
+    write(root, "large.ts", " ".repeat(256));
+    write(root, "trigger.ts", `export function trigger() { return 1; }\n`);
+    class ShrinkingProvider extends FakeEmbeddingProvider {
+      public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+        write(root, "large.ts", `export function appeared() { return 2; }\n`);
+        return await super.embedDocuments(inputs);
+      }
+    }
+    const index = new CodeIndex({ rootDir: root, provider: new ShrinkingProvider(), maxFileSize: 128 });
+
+    await expect(index.updateFromWorkingTree()).rejects.toThrow(/Working-tree file changed while indexing/);
+    expect(index.status().fileCount).toBe(0);
+    index.close();
+  });
+});
+
 describe("Git indexing", () => {
+  it("can update committed files without indexing working-tree changes", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "value.ts", `export function committed() { return 1; }\n`);
+    const base = commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+
+    write(root, "value.ts", `export function dirty() { return 2; }\n`);
+    write(root, "untracked.ts", `export function untracked() { return 3; }\n`);
+    await index.updateFromGit({ includeWorkingTree: false });
+
+    expect(index.status().gitCheckpoint).toBe(base);
+    expect(index.allFunctions().map((item) => [item.name, item.sourceMode])).toEqual([["committed", "git"]]);
+    index.close();
+  });
+
+  it("removes an existing working-tree overlay when it is disabled", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "value.ts", `export function committed() { return 1; }\n`);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    write(root, "value.ts", `export function dirty() { return 2; }\n`);
+    write(root, "untracked.ts", `export function untracked() { return 3; }\n`);
+    await index.updateFromGit();
+
+    await index.updateFromGit({ includeWorkingTree: false });
+
+    expect(index.allFunctions().map((item) => [item.name, item.sourceMode])).toEqual([["committed", "git"]]);
+    index.close();
+  });
+
+  it("preserves identity when a working-tree rename is committed before overlays are disabled", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "old.ts", `export function stable() { return 1; }\n`);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const originalId = index.allFunctions()[0]!.id;
+
+    git(root, "mv", "old.ts", "new.ts");
+    await index.updateFromGit();
+    commitAll(root, "rename");
+    await index.updateFromGit({ includeWorkingTree: false });
+
+    expect(index.allFunctions()[0]).toMatchObject({ id: originalId, path: "new.ts", sourceMode: "git" });
+    index.close();
+  });
+
   it("advances the checkpoint without re-indexing unchanged committed files", async () => {
     const root = temporaryRoot();
     initGit(root);

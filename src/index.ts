@@ -4,7 +4,7 @@ export { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 export type { OpenAIEmbeddingProviderOptions } from "./embeddings/openai.js";
 export { JinaEmbeddingProvider } from "./embeddings/jina.js";
 export type { JinaEmbeddingProviderOptions } from "./embeddings/jina.js";
-export { CodeIndexError, GitDivergenceError, IncompatibleIndexError } from "./errors.js";
+export { CodeIndexError, GitDivergenceError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 export type * from "./types.js";
 
 import { CodeIndex } from "./code-index.js";
@@ -15,6 +15,7 @@ import type {
   SimilaritySearchOptions,
   UpdateFilesOptions,
   UpdateFromGitOptions,
+  UpdateFromWorkingTreeOptions,
 } from "./types.js";
 
 export function openCodeIndex(options: CodeIndexOptions): CodeIndex {
@@ -27,6 +28,10 @@ export function updateFiles(index: CodeIndex, options: UpdateFilesOptions) {
 
 export function updateFromGit(index: CodeIndex, options?: UpdateFromGitOptions) {
   return index.updateFromGit(options);
+}
+
+export function updateFromWorkingTree(index: CodeIndex, options?: UpdateFromWorkingTreeOptions) {
+  return index.updateFromWorkingTree(options);
 }
 
 export function similaritySearch(index: CodeIndex, options: SimilaritySearchOptions) {

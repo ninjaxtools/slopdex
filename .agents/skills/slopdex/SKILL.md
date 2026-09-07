@@ -16,7 +16,7 @@ Run the command that satisfies the user's request immediately. Do not begin with
 - For an explicit request to refresh the current index, run `slopdex update-git`.
 - Use `slopdex status` only when the user asks for index metadata or checkpoint information.
 
-Every command refreshes its index from committed `HEAD`, then overlays working-tree changes. A missing index is created automatically; let the requested command perform the refresh rather than initializing separately.
+Every command refreshes its index from committed `HEAD`, then overlays working-tree changes. A missing index is created automatically; let the requested command perform the refresh rather than initializing separately. Without Git or a Git repository, every command warns on stderr and fully re-indexes the working tree. Use `--no-reindex` only when explicitly asked to skip Git working-tree overlays or reuse an existing non-empty index without Git.
 
 ## Prerequisites
 
@@ -72,6 +72,12 @@ slopdex update-git --force-rebuild
 ```
 
 This removes the incompatible index and prints a warning before rebuilding it.
+
+Skip the otherwise mandatory full working-tree refresh when Git is unavailable and a non-empty index already exists:
+
+```bash
+slopdex search "query" --no-reindex
+```
 
 Check index metadata and its Git checkpoint:
 

@@ -11,10 +11,14 @@ import { commitAll, initGit, temporaryRoot, write } from "./helpers.js";
 const projectRoot = path.resolve(import.meta.dirname, "..");
 
 function runCli(root: string, ...args: string[]) {
+  return runCliWithEnv(root, process.env, ...args);
+}
+
+function runCliWithEnv(root: string, env: NodeJS.ProcessEnv, ...args: string[]) {
   return spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args, "--root", root], {
     cwd: projectRoot,
     encoding: "utf8",
-    env: { ...process.env, OPENAI_API_KEY: "test" },
+    env: { ...env, OPENAI_API_KEY: "test" },
   });
 }
 
@@ -139,6 +143,107 @@ describe("CLI index initialization", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ gitCheckpoint: target });
   });
 
+  it("indexes the full working tree when the root is not a Git repository", () => {
+    const root = temporaryRoot();
+    write(root, "src/types.ts", "export interface First {}\n");
+
+    const first = runCli(root, "status");
+    expect(first.status).toBe(0);
+    expect(first.stderr).toContain("warning: no Git repository is available for index; re-indexing all source files");
+    expect(JSON.parse(first.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: null });
+
+    write(root, "src/more.ts", "export interface Second {}\n");
+    const second = runCli(root, "status");
+    expect(second.status).toBe(0);
+    expect(second.stderr).toContain("re-indexing all source files");
+    expect(JSON.parse(second.stdout)).toMatchObject({ fileCount: 2, gitCheckpoint: null });
+  });
+
+  it("uses a non-empty filesystem index with --no-reindex", () => {
+    const root = temporaryRoot();
+    write(root, "src/types.ts", "export interface First {}\n");
+
+    const initial = runCli(root, "status", "--no-reindex");
+    expect(initial.status).toBe(0);
+    expect(initial.stderr).toContain("re-indexing all source files");
+    expect(JSON.parse(initial.stdout)).toMatchObject({ fileCount: 1 });
+
+    write(root, "src/more.ts", "export interface Second {}\n");
+    const cached = runCli(root, "status", "--no-reindex");
+    expect(cached.status).toBe(0);
+    expect(cached.stderr).toContain("full working-tree re-index skipped because --no-reindex was specified");
+    expect(JSON.parse(cached.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: null });
+  });
+
+  it("populates an empty filesystem index despite --no-reindex", () => {
+    const root = temporaryRoot();
+    expect(runCli(root, "status").status).toBe(0);
+
+    write(root, "src/types.ts", "export interface First {}\n");
+    const result = runCli(root, "status", "--no-reindex");
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("re-indexing all source files");
+    expect(JSON.parse(result.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: null });
+  });
+
+  it("uses only committed files with --no-reindex in a Git repository", () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "tracked.ts", "export interface Tracked {}\n");
+    const head = commitAll(root, "base");
+    write(root, "untracked.ts", "export interface Untracked {}\n");
+
+    const committedOnly = runCli(root, "status", "--no-reindex");
+    expect(committedOnly.status).toBe(0);
+    expect(committedOnly.stderr).not.toContain("no Git repository");
+    expect(JSON.parse(committedOnly.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: head });
+
+    expect(runCli(root, "status").status).toBe(0);
+    const restored = runCli(root, "status", "--no-reindex");
+    expect(restored.status).toBe(0);
+    expect(JSON.parse(restored.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: head });
+  });
+
+  it("falls back when the Git executable is unavailable", () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "src/types.ts", "export interface Value {}\n");
+    commitAll(root, "base");
+
+    const result = runCliWithEnv(root, { ...process.env, PATH: "" }, "status");
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("warning: no Git repository is available for index; re-indexing all source files");
+    expect(JSON.parse(result.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: null });
+  });
+
+  it("does not treat an invalid Git target as an unavailable repository", () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "src/types.ts", "export interface Value {}\n");
+    commitAll(root, "base");
+
+    const result = runCli(root, "update-git", "--target", "missing-ref");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("Git command failed");
+    expect(result.stderr).not.toContain("no Git repository is available");
+  });
+
+  it("does not hide Git configuration failures behind filesystem fallback", () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "src/types.ts", "export interface Value {}\n");
+    commitAll(root, "base");
+
+    const result = runCliWithEnv(root, { ...process.env, GIT_DIR: path.join(root, "missing-git-dir") }, "status");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("Git command failed");
+    expect(result.stderr).not.toContain("no Git repository is available");
+  });
+
   it("force rebuilds an incompatible index and prints a warning", () => {
     const root = temporaryRoot();
     initGit(root);
@@ -213,6 +318,7 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--uncommitted");
     expect(result.stdout).toContain("--target-config <path>");
     expect(result.stdout).toContain("--force-rebuild");
+    expect(result.stdout).toContain("--no-reindex");
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
   });

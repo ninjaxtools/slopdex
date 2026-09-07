@@ -7,7 +7,7 @@ import { parseArgs } from "node:util";
 import { CodeIndex } from "./code-index.js";
 import { JinaEmbeddingProvider } from "./embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
-import { CodeIndexError, IncompatibleIndexError } from "./errors.js";
+import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
 import type {
@@ -58,6 +58,7 @@ const parsed = (() => {
         "include-symmetric-duplicates": { type: "boolean", default: false },
         "rebuild-on-divergence": { type: "boolean", default: false },
         "force-rebuild": { type: "boolean", default: false },
+        "no-reindex": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
     });
@@ -102,6 +103,7 @@ async function main(): Promise<void> {
     updateTarget,
     parsed.values["rebuild-on-divergence"],
     parsed.values["force-rebuild"],
+    parsed.values["no-reindex"],
   );
   const index = new CodeIndex(indexOptions);
   try {
@@ -181,6 +183,7 @@ async function runCrossSearch(
       "HEAD",
       parsed.values["rebuild-on-divergence"],
       parsed.values["force-rebuild"],
+      parsed.values["no-reindex"],
     );
   }
   const target = targetOptions ? new CodeIndex({ ...targetOptions, readOnly: true }) : undefined;
@@ -223,13 +226,14 @@ async function ensureIndexUpdated(
   target: string,
   rebuildOnDivergence: boolean,
   forceRebuild: boolean,
+  noReindex: boolean,
 ): Promise<UpdateStats> {
-  const initialized = await initializeMissingIndex(options, label, target);
+  const initialized = await initializeMissingIndex(options, label, target, noReindex);
   if (initialized) return initialized;
   try {
     const index = new CodeIndex(options);
     try {
-      return await index.updateFromGit({ target, rebuildOnDivergence });
+      return await refreshIndex(index, label, target, rebuildOnDivergence, noReindex);
     } finally {
       index.close();
     }
@@ -240,7 +244,7 @@ async function ensureIndexUpdated(
     );
     const indexPath = resolveIndexPath(options);
     removeIndexArtifacts(indexPath);
-    return initializeIndex(options, indexPath, target);
+    return initializeIndex(options, indexPath, label, target, noReindex);
   }
 }
 
@@ -248,23 +252,28 @@ async function initializeMissingIndex(
   options: CodeIndexOptions,
   label: string,
   target: string,
+  noReindex: boolean,
 ): Promise<UpdateStats | null> {
   const indexPath = resolveIndexPath(options);
   if (existsSync(indexPath)) return null;
 
-  process.stderr.write(`slopdex: ${label} not found at ${indexPath}; initializing automatically from ${target} and the working tree.\n`);
-  return initializeIndex(options, indexPath, target);
+  process.stderr.write(
+    `slopdex: ${label} not found at ${indexPath}; initializing automatically from ${target}${noReindex ? "" : " and the working tree"}.\n`,
+  );
+  return initializeIndex(options, indexPath, label, target, noReindex);
 }
 
 async function initializeIndex(
   options: CodeIndexOptions,
   indexPath: string,
+  label: string,
   target: string,
+  noReindex: boolean,
 ): Promise<UpdateStats> {
   const index = new CodeIndex({ ...options, indexPath });
   let initialized = false;
   try {
-    const stats = await index.updateFromGit({ target });
+    const stats = await refreshIndex(index, label, target, false, noReindex);
     initialized = true;
     return stats;
   } finally {
@@ -272,6 +281,39 @@ async function initializeIndex(
     if (!initialized) {
       removeIndexArtifacts(indexPath);
     }
+  }
+}
+
+async function refreshIndex(
+  index: CodeIndex,
+  label: string,
+  target: string,
+  rebuildOnDivergence: boolean,
+  noReindex: boolean,
+): Promise<UpdateStats> {
+  try {
+    return await index.updateFromGit({ target, rebuildOnDivergence, includeWorkingTree: !noReindex });
+  } catch (error) {
+    if (!(error instanceof GitUnavailableError)) throw error;
+    const status = index.status();
+    if (noReindex && status.fileCount > 0) {
+      process.stderr.write(
+        `slopdex: warning: no Git repository is available for ${label}; full working-tree re-index skipped because --no-reindex was specified.\n`,
+      );
+      return {
+        filesUpdated: 0,
+        filesDeleted: 0,
+        functionsAdded: 0,
+        functionsUpdated: 0,
+        functionsDeleted: 0,
+        embeddingsCreated: 0,
+        checkpoint: status.gitCheckpoint,
+      };
+    }
+    process.stderr.write(
+      `slopdex: warning: no Git repository is available for ${label}; re-indexing all source files from the working tree.\n`,
+    );
+    return await index.updateFromWorkingTree();
   }
 }
 
@@ -435,6 +477,7 @@ Options:
   --target <ref>                      Target ref for update-git (default: HEAD)
   --rebuild-on-divergence             Rebuild after a rebase or branch change
   --force-rebuild                     Rebuild an incompatible existing index
+  --no-reindex                        Skip worktree overlays or reuse a non-Git index
   --limit <number>                    Search result limit
   --threshold <number|range>          Show similarities at/above a value or within a range
   --format <json|summary|clusters>    Similarity output format (default: json)

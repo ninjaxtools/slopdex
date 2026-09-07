@@ -42,6 +42,8 @@ Pass `--force-rebuild` to remove and recreate an existing index automatically wh
 
 Before running a command, Slopdex updates the index from committed `HEAD`, then overlays staged, unstaged, and untracked working-tree changes. If the index does not exist, it prints a notice and creates it automatically.
 
+If Git is unavailable or the root is not a Git repository, Slopdex prints a warning to stderr and re-indexes every supported working-tree file on every command. Pass `--no-reindex` to reuse an existing non-empty index instead; missing or empty indexes are still populated. In a Git repository, `--no-reindex` still updates committed files but skips staged, unstaged, and untracked overlays.
+
 Index a committed snapshot, record its commit, and overlay current working-tree changes:
 
 ```bash
@@ -180,7 +182,7 @@ for await (const result of crossSearch({
 index.close();
 ```
 
-Standalone functions `updateFiles`, `updateFromGit`, `similaritySearch`, and `crossSearchFunctions` are also exported.
+Standalone functions `updateFiles`, `updateFromGit`, `updateFromWorkingTree`, `similaritySearch`, and `crossSearchFunctions` are also exported.
 
 ## Semantics
 

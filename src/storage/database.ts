@@ -167,6 +167,10 @@ export class IndexDatabase {
     `).run(key, value);
   }
 
+  #deleteMetadata(key: string): void {
+    this.#db.prepare("DELETE FROM metadata WHERE key = ?").run(key);
+  }
+
   #validateMetadata(readOnly: boolean): void {
     const schemaVersion = this.#metadata("schema_version");
     if (readOnly && !schemaVersion) throw new IncompatibleIndexError("Target file is not a slopdex index.");
@@ -244,7 +248,7 @@ export class IndexDatabase {
       files: readonly PreparedFile[];
       deletePaths: readonly string[];
     };
-    checkpoint?: string;
+    checkpoint?: string | null;
     expectedCheckpoint?: string | null;
     expectedGeneration?: number;
   }): UpdateStats {
@@ -263,7 +267,7 @@ export class IndexDatabase {
         functionsUpdated: 0,
         functionsDeleted: 0,
         embeddingsCreated: 0,
-        checkpoint: options.checkpoint ?? this.getCheckpoint(),
+        checkpoint: options.checkpoint !== undefined ? options.checkpoint : this.getCheckpoint(),
       };
 
       const deleteFile = this.#db.prepare("DELETE FROM files WHERE path = ?");
@@ -293,7 +297,8 @@ export class IndexDatabase {
 
       const generation = this.getGeneration() + 1;
       this.#setMetadata("generation", String(generation));
-      if (options.checkpoint) this.#setMetadata("git_checkpoint", options.checkpoint);
+      if (options.checkpoint === null) this.#deleteMetadata("git_checkpoint");
+      else if (options.checkpoint !== undefined) this.#setMetadata("git_checkpoint", options.checkpoint);
       return stats;
     });
   }

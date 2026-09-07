@@ -1,4 +1,4 @@
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { CodeIndexError, GitDivergenceError } from "./errors.js";
@@ -16,6 +16,7 @@ import type {
   SimilaritySearchOptions,
   UpdateFilesOptions,
   UpdateFromGitOptions,
+  UpdateFromWorkingTreeOptions,
   UpdateStats,
 } from "./types.js";
 import { assertPositiveInteger, chunk, normalizeEmbeddingVector, normalizeRelativePath, sha256, throwIfAborted } from "./utils.js";
@@ -104,6 +105,61 @@ export class CodeIndex {
     });
   }
 
+  public async updateFromWorkingTree(options: UpdateFromWorkingTreeOptions = {}): Promise<UpdateStats> {
+    throwIfAborted(options.signal);
+    const generation = this.#database.getGeneration();
+    const indexedFiles = this.#database.getFileStates();
+    const sourcePaths = await this.#workingTreeSourcePaths(options.signal);
+    const prepared: PreparedFile[] = [];
+    const skippedPaths = new Set<string>();
+    for (const relativePath of sourcePaths) {
+      throwIfAborted(options.signal);
+      const absolutePath = path.join(this.rootDir, relativePath);
+      const info = await lstat(absolutePath);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize) {
+        skippedPaths.add(relativePath);
+        continue;
+      }
+      const content = await readFile(absolutePath);
+      prepared.push(this.#prepareFile(relativePath, content, {
+        blobOid: null,
+        sourceMode: "working-tree",
+        indexedCommit: null,
+      }));
+    }
+    await this.#attachEmbeddings(prepared, options.signal);
+
+    const pathsAgain = await this.#workingTreeSourcePaths(options.signal);
+    if (JSON.stringify(pathsAgain) !== JSON.stringify(sourcePaths)) {
+      throw new CodeIndexError("Working-tree files changed while indexing; retry the update.");
+    }
+    for (const file of prepared) {
+      try {
+        const info = await lstat(path.join(this.rootDir, file.path));
+        const content = await readFile(path.join(this.rootDir, file.path));
+        if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize || sha256(content.toString("utf8")) !== file.contentHash) {
+          throw new CodeIndexError(`Working-tree file changed while indexing: ${file.path}`);
+        }
+      } catch (error) {
+        if (error instanceof CodeIndexError) throw error;
+        throw new CodeIndexError(`Working-tree file changed while indexing: ${file.path}`, { cause: error });
+      }
+    }
+    for (const relativePath of skippedPaths) {
+      const info = await lstat(path.join(this.rootDir, relativePath));
+      if (info.isFile() && !info.isSymbolicLink() && info.size <= this.#maxFileSize) {
+        throw new CodeIndexError(`Working-tree file changed while indexing: ${relativePath}`);
+      }
+    }
+
+    return this.#database.applyUpdate({
+      files: prepared,
+      deletePaths: indexedFiles.map((file) => file.path),
+      checkpoint: null,
+      expectedGeneration: generation,
+    });
+  }
+
   public async updateFromGit(options: UpdateFromGitOptions = {}): Promise<UpdateStats> {
     throwIfAborted(options.signal);
     await this.#git.assertRepository();
@@ -113,7 +169,7 @@ export class CodeIndex {
       : [];
     const target = await this.#git.resolveCommit(options.target ?? "HEAD");
     const head = await this.#git.resolveCommit("HEAD");
-    const overlayWorkingTree = target === head;
+    const overlayWorkingTree = target === head && options.includeWorkingTree !== false;
     const checkpoint = this.#database.getCheckpoint();
     const generation = this.#database.getGeneration();
     let reconcileAll = checkpoint === null;
@@ -190,7 +246,12 @@ export class CodeIndex {
         continue;
       }
       if (entry && this.#policy.includes(dirtyFile.path) && entry.size <= this.#maxFileSize) {
-        if (!upserts.has(dirtyFile.path)) upserts.set(dirtyFile.path, { entry });
+        const planned = upserts.get(dirtyFile.path);
+        if (planned?.previousPath && !indexedByPath.has(planned.previousPath)) {
+          upserts.set(dirtyFile.path, { entry, previousPath: dirtyFile.path });
+        } else if (!planned) {
+          upserts.set(dirtyFile.path, { entry });
+        }
         continue;
       }
       if (previousEntry && this.#policy.includes(previousEntry.path) && previousEntry.size <= this.#maxFileSize) {
@@ -377,6 +438,33 @@ export class CodeIndex {
       if (entry && this.#policy.includes(change.path) && entry.size <= this.#maxFileSize) upserts.set(change.path, { entry });
       else deletes.add(change.path);
     }
+  }
+
+  async #workingTreeSourcePaths(signal?: AbortSignal): Promise<string[]> {
+    const relativeIndexPath = path.relative(this.rootDir, this.indexPath).replaceAll(path.sep, "/");
+    const indexArtifacts = new Set(relativeIndexPath && !relativeIndexPath.startsWith("../")
+      ? [relativeIndexPath, `${relativeIndexPath}-shm`, `${relativeIndexPath}-wal`, `${relativeIndexPath}-journal`]
+      : []);
+    const directories = [""];
+    const sourcePaths: string[] = [];
+    while (directories.length > 0) {
+      throwIfAborted(signal);
+      const relativeDirectory = directories.shift()!;
+      const entries = await readdir(path.join(this.rootDir, relativeDirectory), { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        const relativePath = relativeDirectory
+          ? `${relativeDirectory.replaceAll(path.sep, "/")}/${entry.name}`
+          : entry.name;
+        if (entry.isDirectory()) {
+          if (this.#policy.traversesDirectory(relativePath)) directories.push(relativePath);
+        } else if (entry.isFile() && !indexArtifacts.has(relativePath) && this.#policy.includes(relativePath)) {
+          sourcePaths.push(relativePath);
+        }
+      }
+    }
+    sourcePaths.sort();
+    return sourcePaths;
   }
 
   #prepareFile(
