@@ -115,43 +115,177 @@ export class CodeIndex {
     const head = await this.#git.resolveCommit("HEAD");
     const overlayWorkingTree = target === head;
     const checkpoint = this.#database.getCheckpoint();
-    let rebuild = checkpoint === null;
+    const generation = this.#database.getGeneration();
+    let reconcileAll = checkpoint === null;
     if (checkpoint && !(await this.#git.isAncestor(checkpoint, target))) {
       if (!options.rebuildOnDivergence) throw new GitDivergenceError(checkpoint, target);
-      rebuild = true;
+      reconcileAll = true;
     }
 
     const tree = await this.#git.listTree(target);
-    const workingFiles = this.#database.getWorkingTreeFiles();
-    const changes = rebuild || !checkpoint ? [] : await this.#git.diff(checkpoint, target);
+    const indexedFiles = this.#database.getFileStates();
+    const indexedByPath = new Map(indexedFiles.map((file) => [file.path, file]));
+    const workingFiles = indexedFiles.filter((file) => file.sourceMode === "working-tree");
+    const workingChanges = overlayWorkingTree ? await this.#git.workTreeChanges(target, indexArtifacts) : [];
+    const visibleWorkingPaths = new Set(
+      workingChanges.filter((change) => change.status !== "D").map((change) => change.path),
+    );
+    const changes = reconcileAll || !checkpoint ? [] : await this.#git.diff(checkpoint, target);
     const upserts = new Map<string, { entry: GitTreeEntry; previousPath?: string }>();
     const deletes = new Set<string>();
-    if (rebuild) {
-      for (const existing of this.#database.allFilePaths()) deletes.add(existing);
-      for (const entry of tree.values()) {
-        if (this.#policy.includes(entry.path) && entry.size <= this.#maxFileSize) upserts.set(entry.path, { entry });
+    const eligibleEntries = [...tree.values()]
+      .filter((entry) => this.#policy.includes(entry.path) && entry.size <= this.#maxFileSize);
+    const eligibleTargetPaths = new Set(eligibleEntries.map((entry) => entry.path));
+    if (reconcileAll) {
+      const renameCandidates = indexedFiles.filter((file) => (
+        file.sourceMode === "git" && file.blobOid && !eligibleTargetPaths.has(file.path)
+      ));
+      const claimedRenameSources = new Set<string>();
+      for (const entry of eligibleEntries) {
+        const indexed = indexedByPath.get(entry.path);
+        if (indexed?.sourceMode === "git" && indexed.blobOid === entry.oid) continue;
+        const matches = renameCandidates.filter((candidate) => (
+          candidate.blobOid === entry.oid && !claimedRenameSources.has(candidate.path)
+        ));
+        const previousPath = matches.length === 1 ? matches[0]!.path : undefined;
+        if (previousPath) claimedRenameSources.add(previousPath);
+        upserts.set(entry.path, { entry, ...(previousPath ? { previousPath } : {}) });
+      }
+      for (const indexed of indexedFiles) {
+        if (!eligibleTargetPaths.has(indexed.path)) deletes.add(indexed.path);
       }
     } else {
       this.#classifyGitChanges(changes, tree, upserts, deletes);
-      for (const { path: dirtyPath } of workingFiles) {
-        const entry = tree.get(dirtyPath);
-        if (entry && this.#policy.includes(dirtyPath) && entry.size <= this.#maxFileSize) upserts.set(dirtyPath, { entry });
-        else deletes.add(dirtyPath);
-      }
-      const eligibleTargetPaths = new Set(
-        [...tree.values()]
-          .filter((entry) => this.#policy.includes(entry.path) && entry.size <= this.#maxFileSize)
-          .map((entry) => entry.path),
-      );
-      const indexedPaths = new Set(this.#database.allFilePaths());
+      const indexedPaths = new Set(indexedByPath.keys());
       for (const targetPath of eligibleTargetPaths) {
-        if (!indexedPaths.has(targetPath) && !upserts.has(targetPath)) {
-          upserts.set(targetPath, { entry: tree.get(targetPath)! });
+        const indexed = indexedByPath.get(targetPath);
+        const entry = tree.get(targetPath)!;
+        if (
+          (!indexed || (indexed.sourceMode === "git" && indexed.blobOid !== entry.oid))
+          && !upserts.has(targetPath)
+        ) {
+          upserts.set(targetPath, { entry });
         }
       }
       for (const indexedPath of indexedPaths) {
         if (!eligibleTargetPaths.has(indexedPath)) deletes.add(indexedPath);
       }
+    }
+    for (const dirtyFile of workingFiles) {
+      const entry = tree.get(dirtyFile.path);
+      const previousEntry = dirtyFile.previousPath ? tree.get(dirtyFile.previousPath) : undefined;
+      if (
+        previousEntry
+        && this.#policy.includes(previousEntry.path)
+        && previousEntry.size <= this.#maxFileSize
+        && (entry !== undefined || !visibleWorkingPaths.has(dirtyFile.path))
+      ) {
+        const currentPlan = entry ? upserts.get(dirtyFile.path) : undefined;
+        upserts.delete(dirtyFile.path);
+        upserts.delete(previousEntry.path);
+        upserts.set(previousEntry.path, { entry: previousEntry, previousPath: dirtyFile.path });
+        if (entry && this.#policy.includes(entry.path) && entry.size <= this.#maxFileSize) {
+          upserts.set(dirtyFile.path, currentPlan ?? { entry });
+        }
+        continue;
+      }
+      if (entry && this.#policy.includes(dirtyFile.path) && entry.size <= this.#maxFileSize) {
+        if (!upserts.has(dirtyFile.path)) upserts.set(dirtyFile.path, { entry });
+        continue;
+      }
+      if (previousEntry && this.#policy.includes(previousEntry.path) && previousEntry.size <= this.#maxFileSize) {
+        upserts.set(previousEntry.path, { entry: previousEntry, previousPath: dirtyFile.path });
+      } else {
+        deletes.add(dirtyFile.path);
+      }
+    }
+    for (const [filePath, { entry, previousPath }] of upserts) {
+      const indexed = indexedByPath.get(filePath);
+      if (!previousPath && indexed?.sourceMode === "git" && indexed.blobOid === entry.oid) upserts.delete(filePath);
+    }
+
+    const workingPrepared: PreparedFile[] = [];
+    const workingDeletes = new Set<string>();
+    const skippedWorkingPaths = new Set<string>();
+    for (const change of workingChanges) {
+      throwIfAborted(options.signal);
+      if (change.status === "D") {
+        upserts.delete(change.path);
+        workingDeletes.add(change.path);
+        continue;
+      }
+
+      let previousPath: string | undefined;
+      let replacePath: string | undefined;
+      if (change.status === "R") {
+        const plannedBase = upserts.get(change.oldPath);
+        const existingAtTarget = indexedByPath.get(change.oldPath);
+        const existingAtFinal = indexedByPath.get(change.path);
+        const continuingRename = existingAtFinal?.sourceMode === "working-tree"
+          && existingAtFinal.previousPath === change.oldPath;
+        replacePath = continuingRename
+          ? change.path
+          : existingAtTarget
+            ? change.oldPath
+            : existingAtFinal
+              ? change.path
+              : plannedBase?.previousPath && indexedByPath.has(plannedBase.previousPath)
+                ? plannedBase.previousPath
+                : undefined;
+        previousPath = existingAtFinal?.previousPath ?? change.oldPath;
+        upserts.delete(change.oldPath);
+        upserts.delete(change.path);
+        if (replacePath) deletes.delete(replacePath);
+        workingDeletes.add(change.oldPath);
+      } else {
+        const planned = upserts.get(change.path);
+        const existing = indexedByPath.get(change.path);
+        replacePath = existing
+          ? change.path
+          : planned?.previousPath && indexedByPath.has(planned.previousPath)
+            ? planned.previousPath
+            : undefined;
+        previousPath = existing?.previousPath ?? planned?.previousPath;
+        upserts.delete(change.path);
+        if (replacePath) deletes.delete(replacePath);
+      }
+      const relativePath = change.path;
+      if (!this.#policy.includes(relativePath)) {
+        if (replacePath) workingDeletes.add(replacePath);
+        workingDeletes.add(relativePath);
+        continue;
+      }
+      const absolutePath = path.join(this.rootDir, relativePath);
+      const info = await lstat(absolutePath);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize) {
+        if (replacePath) workingDeletes.add(replacePath);
+        workingDeletes.add(relativePath);
+        skippedWorkingPaths.add(relativePath);
+        continue;
+      }
+      const content = await readFile(absolutePath);
+      if (!replacePath && change.status === "A") {
+        const contentHash = sha256(content.toString("utf8"));
+        const renameCandidates = workingFiles.filter((file) => (
+          file.path !== relativePath
+          && !visibleWorkingPaths.has(file.path)
+          && deletes.has(file.path)
+          && file.contentHash === contentHash
+        ));
+        const renamed = renameCandidates.length === 1 ? renameCandidates[0] : undefined;
+        if (renamed) {
+          replacePath = renamed.path;
+          previousPath = renamed.previousPath ?? renamed.path;
+          deletes.delete(renamed.path);
+        }
+      }
+      workingPrepared.push(this.#prepareFile(relativePath, content, {
+        blobOid: null,
+        sourceMode: "working-tree",
+        indexedCommit: null,
+        ...(previousPath ? { previousPath } : {}),
+        ...(replacePath ? { replacePath } : {}),
+      }));
     }
 
     const prepared: PreparedFile[] = [];
@@ -169,58 +303,15 @@ export class CodeIndex {
         ...(previousPath ? { replacePath: previousPath } : {}),
       }));
     }
-    await this.#attachEmbeddings(prepared, options.signal);
-
-    const workingPrepared: PreparedFile[] = [];
-    const workingDeletes = new Set<string>();
-    const skippedWorkingPaths = new Set<string>();
-    const workingChanges = overlayWorkingTree ? await this.#git.workTreeChanges(target, indexArtifacts) : [];
-    for (const change of workingChanges) {
-      throwIfAborted(options.signal);
-      if (change.status === "D") {
-        workingDeletes.add(change.path);
-        continue;
-      }
-
-      let previousPath: string | undefined;
-      let replacePath: string | undefined;
-      if (change.status === "R") {
-        workingDeletes.add(change.oldPath);
-        replacePath = change.oldPath;
-        previousPath = upserts.get(change.oldPath)?.previousPath
-          ?? this.#database.previousPath(change.oldPath)
-          ?? change.oldPath;
-      }
-      const relativePath = change.path;
-      if (!this.#policy.includes(relativePath)) {
-        workingDeletes.add(relativePath);
-        continue;
-      }
-      const absolutePath = path.join(this.rootDir, relativePath);
-      const info = await lstat(absolutePath);
-      if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize) {
-        workingDeletes.add(relativePath);
-        skippedWorkingPaths.add(relativePath);
-        continue;
-      }
-      const content = await readFile(absolutePath);
-      workingPrepared.push(this.#prepareFile(relativePath, content, {
-        blobOid: null,
-        sourceMode: "working-tree",
-        indexedCommit: null,
-        ...(previousPath ? { previousPath } : {}),
-        ...(replacePath ? { replacePath } : {}),
-      }));
-    }
-    await this.#attachEmbeddings(workingPrepared, options.signal);
-    if (
-      !rebuild
+    await this.#attachEmbeddings([...prepared, ...workingPrepared], options.signal);
+    const noChanges = (
+      !reconcileAll
       && checkpoint === target
       && prepared.length === 0
       && deletes.size === 0
       && workingPrepared.length === 0
       && workingDeletes.size === 0
-    ) return emptyStats(checkpoint);
+    );
 
     const resolvedAgain = await this.#git.resolveCommit(options.target ?? "HEAD");
     if (resolvedAgain !== target) throw new CodeIndexError("Target Git ref changed while indexing; retry the update.");
@@ -244,6 +335,12 @@ export class CodeIndex {
         }
       }
     }
+    if (noChanges) {
+      if (this.#database.getCheckpoint() !== checkpoint || this.#database.getGeneration() !== generation) {
+        throw new CodeIndexError("Index changed while the update was being prepared; retry the update.");
+      }
+      return emptyStats(checkpoint);
+    }
     return this.#database.applyUpdate({
       files: prepared,
       deletePaths: [...deletes],
@@ -253,6 +350,7 @@ export class CodeIndex {
       },
       checkpoint: target,
       expectedCheckpoint: checkpoint,
+      expectedGeneration: generation,
     });
   }
 

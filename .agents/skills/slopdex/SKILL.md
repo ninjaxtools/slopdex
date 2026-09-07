@@ -65,6 +65,14 @@ slopdex update-git --target HEAD
 slopdex update-git --target HEAD --rebuild-on-divergence
 ```
 
+Rebuild automatically when an existing index is incompatible with the current provider, model, dimensions, strategy, schema, or repository:
+
+```bash
+slopdex update-git --force-rebuild
+```
+
+This removes the incompatible index and prints a warning before rebuilding it.
+
 Check index metadata and its Git checkpoint:
 
 ```bash
@@ -183,6 +191,7 @@ Prefer JSON or JSONL when another command will consume the results. Prefer summa
 --provider <openai|jina>            Embedding provider
 --model <name>                      Embedding model
 --dimensions <number>               Embedding dimensions
+--force-rebuild                     Rebuild an incompatible existing index
 --limit <number>                    Result limit
 --threshold <number|range>          Similarity threshold or inclusive range
 --format <json|summary|clusters>    Output format

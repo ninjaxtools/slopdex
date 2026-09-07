@@ -28,8 +28,8 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   public constructor(options: OpenAIEmbeddingProviderOptions = {}) {
     this.#apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? "";
     if (!this.#apiKey) throw new Error("OPENAI_API_KEY is required.");
-    const model = options.model ?? "text-embedding-3-small";
-    const dimensions = options.dimensions ?? 1536;
+    const model = options.model ?? "text-embedding-3-large";
+    const dimensions = options.dimensions ?? 3072;
     if (!Number.isInteger(dimensions) || dimensions < 1) throw new Error("dimensions must be a positive integer.");
     this.profile = { provider: "openai", model, dimensions, strategyVersion: "callable-v1" } as const;
     this.#url = `${(options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "")}/embeddings`;

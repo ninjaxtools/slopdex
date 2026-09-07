@@ -16,6 +16,12 @@ afterEach(async () => {
 });
 
 describe("embedding providers", () => {
+  it("uses the large OpenAI embedding model by default", () => {
+    const provider = new OpenAIEmbeddingProvider({ apiKey: "test" });
+
+    expect(provider.profile).toMatchObject({ model: "text-embedding-3-large", dimensions: 3072 });
+  });
+
   it("sends OpenAI batches and restores response index order", async () => {
     const requests: unknown[] = [];
     const url = await startServer(requests, {

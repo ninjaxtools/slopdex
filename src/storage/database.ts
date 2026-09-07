@@ -34,6 +34,14 @@ export interface PreparedFile {
   callables: PreparedCallable[];
 }
 
+export interface IndexedFileState {
+  path: string;
+  contentHash: string;
+  blobOid: string | null;
+  sourceMode: SourceMode;
+  previousPath: string | null;
+}
+
 interface FunctionRow {
   id: number;
   path: string;
@@ -68,15 +76,20 @@ export class IndexDatabase {
     this.#rootDir = rootDir;
     this.#profile = profile;
     this.#db = new DatabaseSync(indexPath, { allowExtension: true, readOnly });
-    sqliteVec.load(this.#db);
-    this.#db.enableLoadExtension(false);
-    if (readOnly) {
-      this.#db.exec("PRAGMA foreign_keys=ON");
-    } else {
-      this.#db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;");
-      this.#migrate();
+    try {
+      sqliteVec.load(this.#db);
+      this.#db.enableLoadExtension(false);
+      if (readOnly) {
+        this.#db.exec("PRAGMA foreign_keys=ON");
+      } else {
+        this.#db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;");
+        this.#migrate();
+      }
+      this.#validateMetadata(readOnly);
+    } catch (error) {
+      this.#db.close();
+      throw error;
     }
-    this.#validateMetadata(readOnly);
   }
 
   public close(): void {
@@ -207,6 +220,14 @@ export class IndexDatabase {
     `).all() as Array<{ path: string; previousPath: string | null }>;
   }
 
+  public getFileStates(): IndexedFileState[] {
+    return this.#db.prepare(`
+      SELECT path, content_hash AS contentHash, blob_oid AS blobOid,
+        source_mode AS sourceMode, previous_path AS previousPath
+      FROM files ORDER BY path
+    `).all() as unknown as IndexedFileState[];
+  }
+
   public getEmbeddingKeys(keys: readonly string[]): Set<string> {
     const found = new Set<string>();
     const statement = this.#db.prepare("SELECT 1 FROM embeddings WHERE embedding_key = ?");
@@ -225,10 +246,14 @@ export class IndexDatabase {
     };
     checkpoint?: string;
     expectedCheckpoint?: string | null;
+    expectedGeneration?: number;
   }): UpdateStats {
     return this.#transaction(() => {
       if (options.expectedCheckpoint !== undefined && this.getCheckpoint() !== options.expectedCheckpoint) {
         throw new CodeIndexError("Git checkpoint changed while the update was being prepared.");
+      }
+      if (options.expectedGeneration !== undefined && this.getGeneration() !== options.expectedGeneration) {
+        throw new CodeIndexError("Index changed while the update was being prepared; retry the update.");
       }
 
       const stats: UpdateStats = {
@@ -266,7 +291,6 @@ export class IndexDatabase {
       applyStage(options.files, options.deletePaths);
       if (options.workingTree) applyStage(options.workingTree.files, options.workingTree.deletePaths);
 
-      this.#db.exec("DELETE FROM embeddings WHERE id NOT IN (SELECT DISTINCT embedding_id FROM functions)");
       const generation = this.getGeneration() + 1;
       this.#setMetadata("generation", String(generation));
       if (options.checkpoint) this.#setMetadata("git_checkpoint", options.checkpoint);
@@ -283,6 +307,12 @@ export class IndexDatabase {
     const oldMatches = reconcileFunctions(file.callables, oldRows);
 
     if (sourcePath !== file.path) {
+      const displacedRows = this.#rowsForPath(file.path);
+      const displaced = this.#db.prepare("DELETE FROM files WHERE path = ?").run(file.path);
+      if (displaced.changes > 0) {
+        stats.filesDeleted += 1;
+        stats.functionsDeleted += displacedRows.length;
+      }
       this.#db.prepare("DELETE FROM files WHERE path = ?").run(sourcePath);
     } else {
       this.#db.prepare("DELETE FROM files WHERE path = ?").run(file.path);

@@ -34,7 +34,9 @@ Create `.slopdex/config.json` in the repository being indexed:
 }
 ```
 
-Use `JINA_API_KEY` for Jina AI or `OPENAI_API_KEY` for OpenAI. The OpenAI default is `text-embedding-3-small` with 1536 dimensions. Provider, model, dimensions, and embedding strategy form an immutable index profile; changing one requires a new or rebuilt index.
+Use `JINA_API_KEY` for Jina AI or `OPENAI_API_KEY` for OpenAI. The OpenAI default is `text-embedding-3-large` with 3072 dimensions. Provider, model, dimensions, and embedding strategy form an immutable index profile; changing one requires a new or rebuilt index.
+
+Pass `--force-rebuild` to remove and recreate an existing index automatically when its stored profile or other index metadata is incompatible with the current settings. Slopdex prints a warning whenever it performs this rebuild.
 
 ## CLI
 
@@ -184,6 +186,8 @@ Standalone functions `updateFiles`, `updateFromGit`, `similaritySearch`, and `cr
 
 - Git updates first reconcile the index to blobs from the target commit. When that target is the checked-out `HEAD`, they then overlay staged, unstaged, and untracked files from the working tree.
 - The Git checkpoint always identifies the committed base. Working-tree files are marked separately and do not advance it.
+- Committed files are re-indexed only when their Git blob changes or their stored row is missing or inconsistent. Working-tree files are read and re-indexed on every refresh.
+- Function embeddings are cached by their hashed embedding input, including versions that are not currently referenced, so reverting or recommitting known code does not call the embedding provider again.
 - Commit reconciliation and the working-tree overlay are applied in one database transaction after every changed file has parsed and embedded successfully.
 - Explicit updates mark files as working-tree sourced and do not move the checkpoint.
 - Every Git update removes stale working-tree state before re-indexing the current overlay, so deleted transient files cannot remain in the index.

@@ -1,9 +1,18 @@
-import { rmSync } from "node:fs";
+import { chmodSync, renameSync, rmSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
 import { FakeEmbeddingProvider, commitAll, git, initGit, temporaryRoot, write } from "./helpers.js";
+
+class CountingEmbeddingProvider extends FakeEmbeddingProvider {
+  public documentCount = 0;
+
+  public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+    this.documentCount += inputs.length;
+    return await super.embedDocuments(inputs);
+  }
+}
 
 describe("explicit indexing", () => {
   it("updates, reconciles, and deletes specific files", async () => {
@@ -45,6 +54,302 @@ export function multiply(a: number, b: number) { return a * b; }
 });
 
 describe("Git indexing", () => {
+  it("advances the checkpoint without re-indexing unchanged committed files", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "stable.ts", `export function stable() { return 1; }\n`);
+    const base = commitAll(root, "base");
+    const provider = new CountingEmbeddingProvider();
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFromGit();
+    const stable = index.allFunctions()[0]!;
+
+    write(root, "README.md", "# Documentation only\n");
+    const target = commitAll(root, "documentation");
+    const stats = await index.updateFromGit();
+
+    expect(stats).toMatchObject({ filesUpdated: 0, filesDeleted: 0, checkpoint: target });
+    expect(provider.documentCount).toBe(1);
+    expect(index.allFunctions()[0]).toMatchObject({ id: stable.id, lastSeenCommit: base, sourceMode: "git" });
+    index.close();
+  });
+
+  it("does not re-index a committed file when only its executable bit changes", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "script.ts", `export function run() { return 1; }\n`);
+    commitAll(root, "base");
+    const provider = new CountingEmbeddingProvider();
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFromGit();
+
+    chmodSync(`${root}/script.ts`, 0o755);
+    const target = commitAll(root, "make executable");
+    const stats = await index.updateFromGit();
+
+    expect(stats).toMatchObject({ filesUpdated: 0, checkpoint: target });
+    expect(provider.documentCount).toBe(1);
+    index.close();
+  });
+
+  it("re-indexes dirty files on every refresh while reusing function embeddings", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    const committedSource = `export function value() { return 1; }\n`;
+    write(root, "value.ts", committedSource);
+    commitAll(root, "base");
+    const provider = new CountingEmbeddingProvider();
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFromGit();
+
+    write(root, "value.ts", `export function value() { return 2; }\n`);
+    const firstDirty = await index.updateFromGit();
+    const secondDirty = await index.updateFromGit();
+    expect(firstDirty.filesUpdated).toBe(1);
+    expect(secondDirty.filesUpdated).toBe(1);
+    expect(index.allFunctions()[0]!.sourceMode).toBe("working-tree");
+    expect(provider.documentCount).toBe(2);
+
+    write(root, "value.ts", committedSource);
+    const restored = await index.updateFromGit();
+    expect(restored.filesUpdated).toBe(1);
+    expect(index.allFunctions()[0]!.sourceMode).toBe("git");
+    expect(provider.documentCount).toBe(2);
+    index.close();
+  });
+
+  it("preserves function identity when refreshing an uncommitted rename repeatedly", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "old.ts", `export function stable() { return 1; }\n`);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const originalId = index.allFunctions()[0]!.id;
+
+    git(root, "mv", "old.ts", "new.ts");
+    await index.updateFromGit();
+    const firstRefreshId = index.allFunctions()[0]!.id;
+    await index.updateFromGit();
+
+    expect(firstRefreshId).toBe(originalId);
+    expect(index.allFunctions()[0]).toMatchObject({ id: originalId, path: "new.ts", sourceMode: "working-tree" });
+    index.close();
+  });
+
+  it("preserves function identity when an uncommitted rename is undone", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "old.ts", `export function stable() { return 1; }\n`);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const originalId = index.allFunctions()[0]!.id;
+
+    git(root, "mv", "old.ts", "new.ts");
+    await index.updateFromGit();
+    git(root, "mv", "new.ts", "old.ts");
+    await index.updateFromGit();
+
+    expect(index.allFunctions()[0]).toMatchObject({ id: originalId, path: "old.ts", sourceMode: "git" });
+    index.close();
+  });
+
+  it("preserves the source identity when a tracked rename replaces an indexed untracked file", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "old.ts", `export function tracked() { return 1; }\n`);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const trackedId = index.allFunctions()[0]!.id;
+
+    write(root, "new.ts", `export function transient() { return 2; }\n`);
+    await index.updateFromGit();
+    rmSync(`${root}/new.ts`);
+    git(root, "mv", "old.ts", "new.ts");
+    await index.updateFromGit();
+
+    expect(index.allFunctions()).toHaveLength(1);
+    expect(index.allFunctions()[0]).toMatchObject({ id: trackedId, name: "tracked", path: "new.ts" });
+    index.close();
+  });
+
+  it("preserves the source identity when a committed rename replaces an indexed untracked file", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "old.ts", `export function tracked() { return 1; }\n`);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const trackedId = index.allFunctions()[0]!.id;
+
+    write(root, "new.ts", `export function transient() { return 2; }\n`);
+    await index.updateFromGit();
+    rmSync(`${root}/new.ts`);
+    git(root, "mv", "old.ts", "new.ts");
+    commitAll(root, "rename");
+    const stats = await index.updateFromGit();
+
+    expect(stats.filesDeleted).toBe(1);
+    expect(index.allFunctions()).toHaveLength(1);
+    expect(index.allFunctions()[0]).toMatchObject({ id: trackedId, name: "tracked", path: "new.ts", sourceMode: "git" });
+    index.close();
+  });
+
+  it("restores rename identity when both the old and dirty destination paths are committed", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    const originalSource = `export function original() { return 1; }\n`;
+    write(root, "old.ts", originalSource);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const originalId = index.allFunctions()[0]!.id;
+
+    git(root, "mv", "old.ts", "new.ts");
+    await index.updateFromGit();
+    write(root, "old.ts", originalSource);
+    write(root, "new.ts", `export function independent() { return 2; }\n`);
+    commitAll(root, "restore old and add new");
+    await index.updateFromGit();
+
+    expect(index.allFunctions().find((item) => item.name === "original")).toMatchObject({
+      id: originalId,
+      path: "old.ts",
+      sourceMode: "git",
+    });
+    expect(index.allFunctions().find((item) => item.name === "independent")!.id).not.toBe(originalId);
+    index.close();
+  });
+
+  it("restores rename identity before overlaying a dirty independent destination", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    const originalSource = `export function original() { return 1; }\n`;
+    write(root, "old.ts", originalSource);
+    commitAll(root, "base");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const originalId = index.allFunctions()[0]!.id;
+
+    git(root, "mv", "old.ts", "new.ts");
+    await index.updateFromGit();
+    write(root, "old.ts", originalSource);
+    write(root, "new.ts", `export function independent() { return 2; }\n`);
+    commitAll(root, "restore old and add new");
+    write(root, "new.ts", `export function dirtyIndependent() { return 3; }\n`);
+    await index.updateFromGit();
+
+    expect(index.allFunctions().find((item) => item.name === "original")).toMatchObject({
+      id: originalId,
+      path: "old.ts",
+      sourceMode: "git",
+    });
+    expect(index.allFunctions().find((item) => item.name === "dirtyIndependent")).toMatchObject({
+      path: "new.ts",
+      sourceMode: "working-tree",
+    });
+    index.close();
+  });
+
+  it("preserves function identity for an untracked file rename", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "tracked.ts", `export function tracked() { return 1; }\n`);
+    commitAll(root, "base");
+    write(root, "a-untracked.ts", `export function moving() { return 2; }\n`);
+    write(root, "z-untracked.ts", `export function staying() { return 3; }\n`);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const movingId = index.allFunctions().find((item) => item.name === "moving")!.id;
+
+    renameSync(`${root}/a-untracked.ts`, `${root}/b-untracked.ts`);
+    await index.updateFromGit();
+
+    expect(index.allFunctions().find((item) => item.name === "moving")).toMatchObject({
+      id: movingId,
+      path: "b-untracked.ts",
+      sourceMode: "working-tree",
+    });
+    index.close();
+  });
+
+  it("does not guess identity for an ambiguous untracked rename", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "tracked.ts", `export function tracked() { return 1; }\n`);
+    commitAll(root, "base");
+    const duplicateSource = `export function duplicate() { return 2; }\n`;
+    write(root, "a.ts", duplicateSource);
+    write(root, "b.ts", duplicateSource);
+    write(root, "z.ts", `export function staying() { return 3; }\n`);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromGit();
+    const duplicateIds = index.allFunctions()
+      .filter((item) => item.name === "duplicate")
+      .map((item) => item.id);
+
+    rmSync(`${root}/a.ts`);
+    renameSync(`${root}/b.ts`, `${root}/c.ts`);
+    await index.updateFromGit();
+
+    const renamedId = index.allFunctions().find((item) => item.path === "c.ts")!.id;
+    expect(duplicateIds).not.toContain(renamedId);
+    index.close();
+  });
+
+  it("reconciles divergent branches without re-indexing shared blobs", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "stable.ts", `export function stable() { return 1; }\n`);
+    const base = commitAll(root, "base");
+    write(root, "main.md", "main\n");
+    commitAll(root, "main");
+    const provider = new CountingEmbeddingProvider();
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFromGit();
+
+    git(root, "checkout", "-q", "-b", "other", base);
+    write(root, "other.md", "other\n");
+    const target = commitAll(root, "other");
+    const stats = await index.updateFromGit({ rebuildOnDivergence: true });
+
+    expect(stats).toMatchObject({ filesUpdated: 0, checkpoint: target });
+    expect(provider.documentCount).toBe(1);
+    index.close();
+  });
+
+  it("rejects a prepared update if another writer changes the index", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "value.ts", `export function committed() { return 1; }\n`);
+    write(root, "other.ts", `export function other() { return 2; }\n`);
+    const base = commitAll(root, "base");
+    const initial = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await initial.updateFromGit();
+    initial.close();
+
+    write(root, "value.ts", `export function dirty() { return 3; }\n`);
+    class ConcurrentProvider extends FakeEmbeddingProvider {
+      public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+        const concurrent = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+        await concurrent.updateFiles({ upsert: ["other.ts"] });
+        concurrent.close();
+        return await super.embedDocuments(inputs);
+      }
+    }
+    const index = new CodeIndex({ rootDir: root, provider: new ConcurrentProvider() });
+
+    await expect(index.updateFromGit()).rejects.toThrow(/Index changed while the update was being prepared/);
+    expect(index.status().gitCheckpoint).toBe(base);
+    expect(index.allFunctions().map((item) => [item.name, item.sourceMode])).toEqual([
+      ["other", "working-tree"],
+      ["committed", "git"],
+    ]);
+    index.close();
+  });
+
   it.each(["unstaged", "staged", "untracked"] as const)("overlays %s changes without advancing past HEAD", async (change) => {
     const root = temporaryRoot();
     initGit(root);

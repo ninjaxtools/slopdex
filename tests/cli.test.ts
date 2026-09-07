@@ -139,6 +139,26 @@ describe("CLI index initialization", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ gitCheckpoint: target });
   });
 
+  it("force rebuilds an incompatible index and prints a warning", () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "README.md", "# Example\n");
+    commitAll(root, "initial");
+    expect(runCli(root, "status", "--model", "text-embedding-3-small").status).toBe(0);
+
+    const incompatible = runCli(root, "status");
+    expect(incompatible.status).toBe(2);
+    expect(incompatible.stderr).toContain("Embedding provider, model, dimensions, or strategy differs");
+
+    const rebuilt = runCli(root, "status", "--force-rebuild");
+    expect(rebuilt.status).toBe(0);
+    expect(rebuilt.stderr).toContain("warning: index is incompatible");
+    expect(rebuilt.stderr).toContain("rebuilding automatically because --force-rebuild was specified");
+    expect(JSON.parse(rebuilt.stdout)).toMatchObject({
+      embeddingProfile: { provider: "openai", model: "text-embedding-3-large", dimensions: 3072 },
+    });
+  });
+
   it("supports clusters, changed-since, and uncommitted filters", () => {
     const root = temporaryRoot();
     initGit(root);
@@ -192,6 +212,7 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--changed-since <commit>");
     expect(result.stdout).toContain("--uncommitted");
     expect(result.stdout).toContain("--target-config <path>");
+    expect(result.stdout).toContain("--force-rebuild");
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
   });

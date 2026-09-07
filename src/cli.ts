@@ -7,7 +7,7 @@ import { parseArgs } from "node:util";
 import { CodeIndex } from "./code-index.js";
 import { JinaEmbeddingProvider } from "./embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
-import { CodeIndexError } from "./errors.js";
+import { CodeIndexError, IncompatibleIndexError } from "./errors.js";
 import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
 import type {
@@ -57,6 +57,7 @@ const parsed = (() => {
         format: { type: "string" },
         "include-symmetric-duplicates": { type: "boolean", default: false },
         "rebuild-on-divergence": { type: "boolean", default: false },
+        "force-rebuild": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
     });
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
     "index",
     updateTarget,
     parsed.values["rebuild-on-divergence"],
+    parsed.values["force-rebuild"],
   );
   const index = new CodeIndex(indexOptions);
   try {
@@ -172,7 +174,15 @@ async function runCrossSearch(
     ...(targetConfig?.maxFileSize ? { maxFileSize: targetConfig.maxFileSize } : {}),
     ...(targetConfig?.embeddingBatchSize ? { embeddingBatchSize: targetConfig.embeddingBatchSize } : {}),
   } : undefined;
-  if (targetOptions) await ensureIndexUpdated(targetOptions, "target index", "HEAD", parsed.values["rebuild-on-divergence"]);
+  if (targetOptions) {
+    await ensureIndexUpdated(
+      targetOptions,
+      "target index",
+      "HEAD",
+      parsed.values["rebuild-on-divergence"],
+      parsed.values["force-rebuild"],
+    );
+  }
   const target = targetOptions ? new CodeIndex({ ...targetOptions, readOnly: true }) : undefined;
   const format = outputFormat();
   const threshold = similarityThreshold();
@@ -212,14 +222,25 @@ async function ensureIndexUpdated(
   label: string,
   target: string,
   rebuildOnDivergence: boolean,
+  forceRebuild: boolean,
 ): Promise<UpdateStats> {
   const initialized = await initializeMissingIndex(options, label, target);
   if (initialized) return initialized;
-  const index = new CodeIndex(options);
   try {
-    return await index.updateFromGit({ target, rebuildOnDivergence });
-  } finally {
-    index.close();
+    const index = new CodeIndex(options);
+    try {
+      return await index.updateFromGit({ target, rebuildOnDivergence });
+    } finally {
+      index.close();
+    }
+  } catch (error) {
+    if (!forceRebuild || !(error instanceof IncompatibleIndexError)) throw error;
+    process.stderr.write(
+      `slopdex: warning: ${label} is incompatible (${error.message}); rebuilding automatically because --force-rebuild was specified.\n`,
+    );
+    const indexPath = resolveIndexPath(options);
+    removeIndexArtifacts(indexPath);
+    return initializeIndex(options, indexPath, target);
   }
 }
 
@@ -228,10 +249,18 @@ async function initializeMissingIndex(
   label: string,
   target: string,
 ): Promise<UpdateStats | null> {
-  const indexPath = path.resolve(options.indexPath ?? path.join(path.resolve(options.rootDir), ".slopdex", "index.sqlite"));
+  const indexPath = resolveIndexPath(options);
   if (existsSync(indexPath)) return null;
 
   process.stderr.write(`slopdex: ${label} not found at ${indexPath}; initializing automatically from ${target} and the working tree.\n`);
+  return initializeIndex(options, indexPath, target);
+}
+
+async function initializeIndex(
+  options: CodeIndexOptions,
+  indexPath: string,
+  target: string,
+): Promise<UpdateStats> {
   const index = new CodeIndex({ ...options, indexPath });
   let initialized = false;
   try {
@@ -241,9 +270,17 @@ async function initializeMissingIndex(
   } finally {
     index.close();
     if (!initialized) {
-      for (const suffix of ["", "-shm", "-wal", "-journal"]) rmSync(`${indexPath}${suffix}`, { force: true });
+      removeIndexArtifacts(indexPath);
     }
   }
+}
+
+function resolveIndexPath(options: CodeIndexOptions): string {
+  return path.resolve(options.indexPath ?? path.join(path.resolve(options.rootDir), ".slopdex", "index.sqlite"));
+}
+
+function removeIndexArtifacts(indexPath: string): void {
+  for (const suffix of ["", "-shm", "-wal", "-journal"]) rmSync(`${indexPath}${suffix}`, { force: true });
 }
 
 function loadConfig(rootDir: string, configuredPath?: string): FileConfig {
@@ -397,6 +434,7 @@ Options:
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)
   --rebuild-on-divergence             Rebuild after a rebase or branch change
+  --force-rebuild                     Rebuild an incompatible existing index
   --limit <number>                    Search result limit
   --threshold <number|range>          Show similarities at/above a value or within a range
   --format <json|summary|clusters>    Similarity output format (default: json)
