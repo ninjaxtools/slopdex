@@ -1,4 +1,5 @@
 export { CodeIndex } from "./code-index.js";
+export { analyzeCohesion, cohesionLocation } from "./analysis/cohesion.js";
 export { crossSearch } from "./search/cross-search.js";
 export { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 export type { OpenAIEmbeddingProviderOptions } from "./embeddings/openai.js";
@@ -8,9 +9,11 @@ export { CodeIndexError, GitDivergenceError, GitUnavailableError, IncompatibleIn
 export type * from "./types.js";
 
 import { CodeIndex } from "./code-index.js";
+import { analyzeCohesion } from "./analysis/cohesion.js";
 import { crossSearch } from "./search/cross-search.js";
 import type {
   CodeIndexOptions,
+  CohesionAnalysisOptions,
   CrossSearchOptions,
   SimilaritySearchOptions,
   UpdateFilesOptions,
@@ -40,4 +43,8 @@ export function similaritySearch(index: CodeIndex, options: SimilaritySearchOpti
 
 export function crossSearchFunctions(options: CrossSearchOptions) {
   return crossSearch(options);
+}
+
+export function analyzeCodeCohesion(options: CohesionAnalysisOptions) {
+  return analyzeCohesion(options);
 }

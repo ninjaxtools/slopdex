@@ -1,4 +1,4 @@
-import type { CrossSearchResult, IndexedFunction, SimilarityResult } from "./types.js";
+import type { CohesionReport, CrossSearchResult, IndexedFunction, SimilarityResult } from "./types.js";
 
 function functionName(value: Pick<IndexedFunction, "path" | "qualifiedName">): string {
   return `${value.path} :: ${value.qualifiedName}`;
@@ -75,10 +75,33 @@ export function formatSimilarityClusters(results: readonly CrossSearchResult[], 
   }).join("\n\n");
 }
 
+export function formatCohesionSummary(report: CohesionReport): string {
+  const { summary } = report;
+  const edgeLabel = summary.semanticEdges === 1 ? "edge" : "edges";
+  const lines = [
+    `Cohesion: ${summary.functionsAnalyzed} functions analyzed, ${summary.semanticEdges} semantic ${edgeLabel}`,
+    `  same file ${(summary.sameFileRatio * 100).toFixed(1)}%  same folder ${(summary.sameFolderRatio * 100).toFixed(1)}%  remote ${(summary.remoteRatio * 100).toFixed(1)}%  mean distance ${summary.weightedMeanDistance.toFixed(2)}`,
+  ];
+  if (report.pairs.length === 0) return [...lines, "No cohesion gaps."].join("\n");
+  lines.push("");
+  for (const pair of report.pairs) {
+    lines.push(
+      `${pair.rank}. gap ${pair.cohesionGap.toFixed(4)}  similarity ${pair.similarity.toFixed(4)}  distance ${pair.location.physicalDistance}${pair.reciprocal ? "  reciprocal" : ""}`,
+      `   ${functionLocation(pair.left)}`,
+      `   ${functionLocation(pair.right)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
 function clusterFunctionName(
   member: { function: IndexedFunction; role: "source" | "target" },
   sameIndex: boolean,
 ): string {
   const role = sameIndex ? "" : `[${member.role}] `;
   return `${role}${member.function.path}:${member.function.startLine}:${member.function.startColumn} :: ${member.function.qualifiedName}`;
+}
+
+function functionLocation(value: IndexedFunction): string {
+  return `${value.path}:${value.startLine}:${value.startColumn} :: ${value.qualifiedName}`;
 }

@@ -349,6 +349,46 @@ export function two(value: string) {
     expect(regexRows.every((row) => /^(one|external)$/.test(row.matches[0].function.qualifiedName))).toBe(true);
   });
 
+  it("reports cohesion as compact JSON or a summary", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "src/one.ts", `export function one() {
+  return 1;
+}\n`);
+    write(root, "packages/feature/two.ts", `export function two() {
+  return 2;
+}\n`);
+    commitAll(root, "functions");
+    const openAI = new OpenAIEmbeddingProvider({ apiKey: "test" });
+    const vector = () => [1, ...Array<number>(openAI.profile.dimensions - 1).fill(0)];
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: {
+        profile: openAI.profile,
+        embedDocuments: async (inputs) => inputs.map(vector),
+        embedQuery: async () => vector(),
+      },
+    });
+    await index.updateFromGit();
+    index.close();
+
+    const json = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1");
+    expect(json.status).toBe(0);
+    const report = JSON.parse(json.stdout);
+    expect(report.summary).toMatchObject({ functionsAnalyzed: 2, semanticEdges: 1, remoteRatio: 1 });
+    expect(report.pairs).toHaveLength(1);
+    expect(report.pairs[0].left).not.toHaveProperty("source");
+    expect(report.groups[0].members[0]).not.toHaveProperty("source");
+
+    const included = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--include-source");
+    expect(JSON.parse(included.stdout).pairs[0].left).toHaveProperty("source");
+
+    const summary = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--format", "summary");
+    expect(summary.status).toBe(0);
+    expect(summary.stdout).toContain("Cohesion: 2 functions analyzed, 1 semantic edge");
+    expect(summary.stdout).toContain("distance 4");
+  });
+
   it.each(["--min-similarity", "--added-since"])("rejects removed option %s cleanly", (option) => {
     const result = runCli("/", "cross-search", option, "0.8");
     expect(result.status).toBe(2);
@@ -377,6 +417,16 @@ export function two(value: string) {
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("either --changed-since or --uncommitted");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
+    const invalidNeighbors = runCli(root, "cohesion", "--neighbors", "0");
+    expect(invalidNeighbors.status).toBe(2);
+    expect(invalidNeighbors.stderr).toContain("neighbors must be a positive integer");
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
+    const invalidCohesionThreshold = runCli(root, "cohesion", "--threshold", "1");
+    expect(invalidCohesionThreshold.status).toBe(2);
+    expect(invalidCohesionThreshold.stderr).toContain("cohesion threshold must be at least -1 and less than 1");
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
   });
 });
 
@@ -392,6 +442,7 @@ describe("CLI help", () => {
       "slopdex update-git",
       "slopdex search",
       "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5",
+      "slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary",
     ]) expect(result.stdout).toContain(example);
     expect(result.stdout).toContain("--source-path <path>");
     expect(result.stdout).toContain("--format <json|summary|clusters>");
@@ -403,6 +454,8 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--cross-file-only");
     expect(result.stdout).toContain("--min-lines <number>");
     expect(result.stdout).toContain("--regex <regex>");
+    expect(result.stdout).toContain("--neighbors <number>");
+    expect(result.stdout).toContain("--include-source");
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
   });

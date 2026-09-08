@@ -1,11 +1,11 @@
 ---
 name: slopdex
-description: Use when indexing TypeScript or JavaScript code, running semantic function search, or finding duplicate function candidates with the slopdex command-line tool.
+description: Use when indexing TypeScript or JavaScript code, running semantic function search, finding duplicate function candidates, or analyzing physical code cohesion with the slopdex command-line tool.
 ---
 
 # Slopdex CLI
 
-Use `slopdex` to index named JavaScript and TypeScript callables, search them by meaning, and identify similar or duplicated functions.
+Use `slopdex` to index named JavaScript and TypeScript callables, search them by meaning, identify similar or duplicated functions, and find related functions scattered across a repository.
 
 ## Default Workflow
 
@@ -13,6 +13,7 @@ Run the command that satisfies the user's request immediately. Do not begin with
 
 - For semantic search, run `slopdex search "<query>" --format summary --limit 10`.
 - For duplicate-code clusters, run `slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5`.
+- For related functions that are physically separated, run `slopdex cohesion --format summary --threshold 0.8 --neighbors 20 --limit 50`.
 - For an explicit request to refresh the current index, run `slopdex update-git`.
 - Use `slopdex status` only when the user asks for index metadata or checkpoint information.
 
@@ -212,12 +213,31 @@ slopdex cross-search \
 Cross-index searches require identical provider, model, dimensions, and embedding strategy profiles.
 Use `--target-config <path>` when the target repository does not use `.slopdex/config.json`.
 
+## Cohesion Analysis
+
+Rank semantically related functions by how far apart they are in the repository:
+
+```bash
+slopdex cohesion --format summary --threshold 0.8 --neighbors 20 --limit 50
+```
+
+Use JSON when passing the report to another tool or an LLM:
+
+```bash
+slopdex cohesion --format json --threshold 0.8 --neighbors 20 --limit 50
+```
+
+The report includes raw similarity, physical path distance, a combined cohesion-gap score, reciprocal-neighbor status, repository metrics, file-level external affinity, and connected groups for navigation. Reciprocity is `null` when the other endpoint was not searched because a source filter is active. Source code is omitted from JSON by default; add `--include-source` only when the consumer needs complete callable bodies.
+
+Treat findings as review candidates. Tests, facades, adapters, and intentionally layered implementations can be semantically related while correctly living in separate locations.
+
 ## Output Formats
 
 - `--format summary` is intended for human review and includes file and qualified function names.
 - `--format clusters` groups overlapping pairs and lists each function once with its source line.
 - The default `search` output is formatted JSON.
 - The default `cross-search` output is connected clusters. Use `--format json` for JSONL with one object per source function.
+- The default `cohesion` output is one compact JSON report. Use `--format summary` for ranked pairs.
 - Functions with no matches after threshold filtering are omitted from cross-search output.
 
 Prefer JSON or JSONL when another command will consume the results. Prefer summary output when presenting candidates to a user.
@@ -233,8 +253,10 @@ Prefer JSON or JSONL when another command will consume the results. Prefer summa
 --dimensions <number>               Embedding dimensions
 --force-rebuild                     Rebuild an incompatible existing index
 --limit <number>                    Result limit
+--neighbors <number>                Semantic neighbors per function for cohesion
 --threshold <number|range>          Similarity threshold or half-open range
 --format <json|summary|clusters>    Output format
+--include-source                    Include callable source in cohesion JSON
 --cross-file-only                   Exclude matches from the source file
 --min-lines <number>               Minimum cross-search callable length
 --regex <regex>                    Match qualified callable names

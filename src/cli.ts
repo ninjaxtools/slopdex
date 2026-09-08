@@ -5,13 +5,17 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 
 import { CodeIndex } from "./code-index.js";
+import { analyzeCohesion } from "./analysis/cohesion.js";
 import { JinaEmbeddingProvider } from "./embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
-import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
+import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
 import type {
   CodeIndexOptions,
+  CohesionFunctionReference,
+  CohesionJsonReport,
+  CohesionReport,
   CrossSearchOptions,
   CrossSearchResult,
   CrossSearchSourceFilter,
@@ -55,8 +59,10 @@ const parsed = (() => {
         "min-lines": { type: "string" },
         regex: { type: "string" },
         limit: { type: "string" },
+        neighbors: { type: "string" },
         threshold: { type: "string" },
         format: { type: "string" },
+        "include-source": { type: "boolean", default: false },
         "include-symmetric-duplicates": { type: "boolean", default: false },
         "cross-file-only": { type: "boolean", default: false },
         "rebuild-on-divergence": { type: "boolean", default: false },
@@ -145,6 +151,24 @@ async function main(): Promise<void> {
       case "cross-search":
         await runCrossSearch(index, indexOptions, provider);
         break;
+      case "cohesion": {
+        const threshold = cohesionThreshold();
+        const report = await analyzeCohesion({
+          source: index,
+          sourceFilter: crossSearchSourceFilter(),
+          neighbors: positiveIntegerOption(parsed.values.neighbors, 20, "neighbors"),
+          limit: positiveIntegerOption(parsed.values.limit, 50, "limit"),
+          minSimilarity: threshold.min,
+          ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
+          minLines: minimumLines(),
+          ...(parsed.values.regex !== undefined ? { nameRegex: parsed.values.regex } : {}),
+        });
+        const format = outputFormat("json");
+        if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+        if (format === "summary") process.stdout.write(`${formatCohesionSummary(report)}\n`);
+        else printJson(presentCohesionReport(report, parsed.values["include-source"]));
+        break;
+      }
       default:
         throw new CodeIndexError(`Unknown command: ${command}`);
     }
@@ -409,19 +433,33 @@ function validateInvocation(): void {
       functionNameRegex();
       crossSearchSourceFilter();
       return;
+    case "cohesion":
+      positiveIntegerOption(parsed.values.limit, 50, "limit");
+      positiveIntegerOption(parsed.values.neighbors, 20, "neighbors");
+      cohesionThreshold();
+      if (outputFormat("json") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      minimumLines();
+      functionNameRegex();
+      crossSearchSourceFilter();
+      return;
     default:
       throw new CodeIndexError(`Unknown command: ${command}`);
   }
 }
 
 function validateLimit(defaultValue: number): void {
-  const limit = numberOption(parsed.values.limit, defaultValue, "limit");
-  if (!Number.isInteger(limit) || limit < 1) throw new CodeIndexError("limit must be a positive integer.");
+  positiveIntegerOption(parsed.values.limit, defaultValue, "limit");
 }
 
-function similarityThreshold(): { min: number; max?: number } {
+function positiveIntegerOption(value: string | undefined, defaultValue: number, name: string): number {
+  const parsedValue = numberOption(value, defaultValue, name);
+  if (!Number.isInteger(parsedValue) || parsedValue < 1) throw new CodeIndexError(`${name} must be a positive integer.`);
+  return parsedValue;
+}
+
+function similarityThreshold(defaultMin = -1): { min: number; max?: number } {
   const threshold = parsed.values.threshold;
-  if (threshold === undefined) return { min: -1 };
+  if (threshold === undefined) return { min: defaultMin };
 
   const number = "[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:e[+-]?\\d+)?";
   const range = new RegExp(`^\\s*(${number})\\s*-\\s*(${number})\\s*$`, "i").exec(threshold);
@@ -431,6 +469,14 @@ function similarityThreshold(): { min: number; max?: number } {
   if (!Number.isFinite(min) || !Number.isFinite(max)) throw new CodeIndexError("threshold range bounds must be numbers.");
   if (min >= max) throw new CodeIndexError("threshold range minimum must be less than its maximum.");
   return { min, max };
+}
+
+function cohesionThreshold(): { min: number; max?: number } {
+  const threshold = similarityThreshold(0.8);
+  if (threshold.min < -1 || threshold.min >= 1) {
+    throw new CodeIndexError("cohesion threshold must be at least -1 and less than 1.");
+  }
+  return threshold;
 }
 
 function outputFormat(defaultValue: "json" | "clusters"): "json" | "summary" | "clusters" {
@@ -476,6 +522,42 @@ function presentMatch(value: SimilarityResult) {
   return { similarity: value.similarity, function: presentFunction(value.function) };
 }
 
+function presentCohesionReport(report: CohesionReport, includeSource: boolean): CohesionJsonReport {
+  const presentCohesionFunction = (value: IndexedFunction): CohesionFunctionReference => ({
+    path: value.path,
+    qualifiedName: value.qualifiedName,
+    kind: value.kind,
+    signature: value.signature,
+    startLine: value.startLine,
+    startColumn: value.startColumn,
+    endLine: value.endLine,
+    endColumn: value.endColumn,
+    lineCount: value.lineCount,
+    ...(includeSource ? { source: value.source } : {}),
+  });
+  return {
+    ...report,
+    pairs: report.pairs.map((pair) => ({
+      ...pair,
+      left: presentCohesionFunction(pair.left),
+      right: presentCohesionFunction(pair.right),
+    })),
+    files: report.files.map((file) => ({
+      ...file,
+      ...(file.strongestExternalMatch ? {
+        strongestExternalMatch: {
+          ...file.strongestExternalMatch,
+          function: presentCohesionFunction(file.strongestExternalMatch.function),
+        },
+      } : {}),
+    })),
+    groups: report.groups.map((group) => ({
+      ...group,
+      members: group.members.map(presentCohesionFunction),
+    })),
+  };
+}
+
 function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
@@ -490,6 +572,7 @@ Commands:
   update-git                          Index a Git snapshot plus working-tree changes
   search <query>                      Search functions by semantic similarity
   cross-search                        Find nearest functions for each source function
+  cohesion                            Rank related functions separated across the repository
 
 Options:
   --root <path>                       Repository root (default: current directory)
@@ -503,8 +586,10 @@ Options:
   --force-reindex                     Rebuild an incompatible existing index
   --no-reindex                        Skip worktree overlays or reuse a non-Git index
   --limit <number>                    Search result limit
+  --neighbors <number>                Semantic neighbors per function for cohesion (default: 20)
   --threshold <number|range>          Show similarities at/above a value or within a range
   --format <json|summary|clusters>    Output format (search: json; cross-search: clusters)
+  --include-source                    Include function source in cohesion JSON
   --include-symmetric-duplicates      Show both directions of same-index matches
   --cross-file-only                   Exclude matches from the source file
   --min-lines <number>               Minimum callable length for cross-search (default: 2)
@@ -537,5 +622,8 @@ Examples:
 
   Review functions under a path against the whole codebase:
     slopdex cross-search --source-path src/services --format summary
+
+  Rank semantically related functions that are physically separated:
+    slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
 `);
 }

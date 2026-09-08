@@ -121,6 +121,114 @@ export interface CrossSearchResult {
   matches: SimilarityResult[];
 }
 
+export type CohesionLocationCategory = "same-file" | "same-folder" | "different-folder";
+
+export interface CohesionLocation {
+  category: CohesionLocationCategory;
+  physicalDistance: number;
+  folderHops: number;
+  commonAncestor: string | null;
+  sourceTestPair: boolean;
+}
+
+export interface CohesionFunctionReference {
+  path: string;
+  qualifiedName: string;
+  kind: CallableKind;
+  signature: string | null;
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+  lineCount: number;
+  source?: string;
+}
+
+export interface CohesionPair<FunctionValue = IndexedFunction> {
+  rank: number;
+  left: FunctionValue;
+  right: FunctionValue;
+  similarity: number;
+  reciprocal: boolean | null;
+  semanticWeight: number;
+  separationWeight: number;
+  cohesionGap: number;
+  location: CohesionLocation;
+}
+
+export interface CohesionFileReport<FunctionValue = IndexedFunction> {
+  path: string;
+  functionCount: number;
+  internalAffinity: number;
+  sameFolderAffinity: number;
+  externalAffinity: number;
+  externalAffinityRatio: number;
+  strongestExternalMatch?: {
+    function: FunctionValue;
+    similarity: number;
+    cohesionGap: number;
+  };
+}
+
+export interface CohesionGroup<FunctionValue = IndexedFunction> {
+  rank: number;
+  memberCount: number;
+  fileCount: number;
+  minimumEdgeSimilarity: number;
+  maximumEdgeSimilarity: number;
+  maximumPhysicalDistance: number;
+  maximumCohesionGap: number;
+  members: FunctionValue[];
+}
+
+export interface CohesionSummary {
+  scope: "repository" | "selected-sources";
+  functionsAnalyzed: number;
+  candidateFunctions: number;
+  semanticEdges: number;
+  sameFileRatio: number;
+  sameFolderRatio: number;
+  remoteRatio: number;
+  weightedMeanDistance: number;
+}
+
+export interface CohesionAnalysisOptions {
+  source: import("./code-index.js").CodeIndex;
+  sourceFilter?: CrossSearchSourceFilter;
+  neighbors?: number;
+  limit?: number;
+  minSimilarity?: number;
+  maxSimilarity?: number;
+  minLines?: number;
+  nameRegex?: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: { completed: number; total: number }) => void;
+}
+
+export interface CohesionReport<FunctionValue = IndexedFunction> {
+  schemaVersion: 1;
+  repository: {
+    generation: number;
+    gitCheckpoint: string | null;
+    embeddingProfile: Required<EmbeddingProfile>;
+  };
+  parameters: {
+    neighbors: number;
+    limit: number;
+    minSimilarity: number;
+    maxSimilarity?: number;
+    minLines: number;
+    nameRegex?: string;
+    sourceFilter: CrossSearchSourceFilter;
+  };
+  summary: CohesionSummary;
+  pairs: CohesionPair<FunctionValue>[];
+  files: CohesionFileReport<FunctionValue>[];
+  groups: CohesionGroup<FunctionValue>[];
+}
+
+export type CohesionJsonReport = CohesionReport<CohesionFunctionReference>;
+
 export interface IndexStatus {
   rootDir: string;
   indexPath: string;

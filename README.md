@@ -1,6 +1,6 @@
 # slopdex
 
-Callable-level embedding index, semantic search, and duplicate discovery for TypeScript and JavaScript repositories.
+Callable-level embedding index, semantic search, duplicate discovery, and physical cohesion analysis for TypeScript and JavaScript repositories.
 
 The index extracts named functions with tree-sitter, stores metadata and float32 embeddings in SQLite, and uses `sqlite-vec` for exact cosine search. It supports explicit working-tree updates, transactional Git-delta updates, and function-to-function cross-search within one codebase or between compatible indexes.
 
@@ -185,10 +185,45 @@ slopdex cross-search \
 
 If the target uses a non-default configuration path, pass it with `--target-config`. The target repository's indexing policy is kept separate from the source policy.
 
+## Cohesion Analysis
+
+Rank semantically related functions that are separated across files and directory subtrees:
+
+```bash
+slopdex cohesion \
+  --threshold 0.8 \
+  --neighbors 20 \
+  --limit 50 \
+  --format summary
+```
+
+Cohesion analysis builds a same-index semantic neighbor graph and combines each edge's cosine similarity with its repository path distance. The default JSON report is designed for downstream analysis and contains repository-wide metrics, ranked pairs, file-level external-affinity metrics, and connected groups for navigation. Function source is omitted by default; use `--include-source` when a downstream consumer needs it.
+
+Path distance is zero within a file. Crossing to another file costs one unit, plus one unit for each directory-tree hop after the paths' common ancestor. Every pair also reports `same-file`, `same-folder`, or `different-folder`, the common ancestor, and whether it crosses between source and test paths.
+
+The ranking score is a review heuristic, not an instruction to move code:
+
+```text
+semanticWeight = clamp((similarity - threshold) / (1 - threshold), 0, 1)
+separationWeight = 1 - exp(-physicalDistance / 2)
+cohesionGap = semanticWeight * separationWeight
+```
+
+Raw similarity, path distance, both weights, and reciprocal-neighbor status remain in the output so an LLM or reviewer can assess the result. Reciprocity is `null` when a source filter means the other endpoint's neighborhood was not searched. Facades, adapters, source/test mirrors, and intentionally layered implementations may be correctly separated.
+
+Restrict analysis sources while continuing to compare them with the whole index:
+
+```bash
+slopdex cohesion --source-path src/services --format summary
+slopdex cohesion --changed-since origin/main --format json
+slopdex cohesion --uncommitted --format json
+```
+
 ## Library
 
 ```ts
 import {
+  analyzeCohesion,
   JinaEmbeddingProvider,
   crossSearch,
   openCodeIndex,
@@ -206,6 +241,13 @@ const results = await index.similaritySearch({
   limit: 10,
 });
 
+const cohesion = await analyzeCohesion({
+  source: index,
+  minSimilarity: 0.8,
+  neighbors: 20,
+  limit: 50,
+});
+
 for await (const result of crossSearch({
   source: index,
   sourceFilter: { type: "changed-since", commit: "origin/main", path: "src/services" },
@@ -220,7 +262,7 @@ for await (const result of crossSearch({
 index.close();
 ```
 
-Standalone functions `updateFiles`, `updateFromGit`, `updateFromWorkingTree`, `similaritySearch`, and `crossSearchFunctions` are also exported.
+Standalone functions `updateFiles`, `updateFromGit`, `updateFromWorkingTree`, `similaritySearch`, `crossSearchFunctions`, and `analyzeCodeCohesion` are also exported.
 
 ## Semantics
 
@@ -239,6 +281,11 @@ Standalone functions `updateFiles`, `updateFromGit`, `updateFromWorkingTree`, `s
 - Cross-file filtering is applied before the per-function result limit.
 - Cross-search defaults to a minimum callable length of two lines; source and match length filtering is applied before the result limit.
 - Cross-search name regexes match qualified callable names and filter both sources and matches before the result limit.
+- Cohesion analyzes the strongest `--neighbors` semantic matches per source, ranks unique pairs globally, and applies `--limit` after scoring.
+- Cohesion summary metrics use every discovered semantic edge. Pair, file, and group output is bounded by `--limit`.
+- Cohesion's location ratios are exclusive: same file, different files in the same folder, and edges crossing a directory boundary.
+- With `--source-path`, `--changed-since`, or `--uncommitted`, summary and file metrics are scoped to the selected source functions rather than presented as repository-wide measurements.
+- Cohesion runs one exact vector-neighbor query per selected source function. Whole-repository analysis therefore has quadratic compute cost with the current exact search backend; use source filters on very large indexes.
 
 ## Development
 
