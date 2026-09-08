@@ -574,6 +574,38 @@ Commands:
   cross-search                        Find nearest functions for each source function
   cohesion                            Rank related functions separated across the repository
 
+Analysis Examples:
+  Duplicate Analysis:
+    slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
+
+    Cluster 1 (3 functions, similarity 0.9124-0.9568)
+      src/auth/session.ts:18:1 :: validateSession
+      src/http/middleware.ts:42:1 :: authenticate
+      src/users/user-service.ts:27:3 :: UserService.authenticate
+
+    This found three substantial authentication functions in separate files with very
+    high similarity. Review them for repeated validation or session logic that could be shared.
+    Middleware and service locations may be intentional architectural layers, so this is
+    evidence to inspect rather than proof they should merge. Connected components may use
+    transitive links, so every function need not directly match every other function.
+
+  Cohesion Analysis:
+    slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
+
+    Cohesion: 184 functions analyzed, 37 semantic edges
+      same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84
+
+    1. gap 0.6053  similarity 0.9400  distance 4  reciprocal
+       src/auth/session.ts:18:1 :: validateSession
+       packages/http/middleware.ts:42:1 :: authenticate
+
+    There is no universal pass/fail cutoff, but this warrants review: 35.2% of weighted
+    semantic affinity crosses folders, mean distance 1.84 exceeds the same-folder distance
+    of one, and the top pair is 0.94 similar but four units apart. A more cohesive result
+    would concentrate affinity in the same file or folder and have few high-gap remote
+    pairs. Compare modules or history rather than treating one percentage as a fixed
+    threshold, and allow for intentionally separate architectural responsibilities.
+
 Options:
   --root <path>                       Repository root (default: current directory)
   --config <path>                     Config file (default: .slopdex/config.json)
@@ -601,7 +633,7 @@ Options:
   --target-index <path>               SQLite path of a second index
   --target-config <path>              Config file for a second indexed codebase
 
-Examples:
+Other Examples:
   Show metadata for the current index:
     slopdex status
 
@@ -617,13 +649,7 @@ Examples:
   Find functions matching a semantic query:
     slopdex search "validate an authenticated session" --limit 10
 
-  Review similar functions as duplicate-code candidates:
-    slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
-
   Review functions under a path against the whole codebase:
     slopdex cross-search --source-path src/services --format summary
-
-  Rank semantically related functions that are physically separated:
-    slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
 `);
 }

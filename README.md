@@ -65,13 +65,11 @@ slopdex update-files src/service.ts src/model.ts
 slopdex delete-files src/removed.ts
 ```
 
-Search by meaning:
+## Analysis Examples
 
-```bash
-slopdex search "validate an authenticated session" --limit 10
-```
+### Duplicate Analysis
 
-For a strong duplicate-code detection default, compare substantial callables across files at a high similarity threshold. Cross-search groups the resulting pairs into connected clusters by default:
+Compare substantial callables across files at a high similarity threshold:
 
 ```bash
 slopdex cross-search \
@@ -80,6 +78,50 @@ slopdex cross-search \
   --threshold 0.9 \
   --limit 5
 ```
+
+```text
+Cluster 1 (3 functions, similarity 0.9124-0.9568)
+  src/auth/session.ts:18:1 :: validateSession
+  src/http/middleware.ts:42:1 :: authenticate
+  src/users/user-service.ts:27:3 :: UserService.authenticate
+```
+
+This result found three substantial authentication functions in three files with very high similarity. They are a strong candidate for reviewing repeated validation or session-handling logic and possibly extracting one shared implementation. The middleware and service locations may instead represent intentional architectural layers, so the cluster is evidence to inspect rather than proof that the functions should be merged. The similarity range covers observed links in the connected component; transitive clustering means every function is not necessarily directly similar to every other function.
+
+### Cohesion Analysis
+
+Rank semantically related functions that are separated across files and directory subtrees:
+
+```bash
+slopdex cohesion \
+  --threshold 0.8 \
+  --neighbors 20 \
+  --limit 50 \
+  --format summary
+```
+
+```text
+Cohesion: 184 functions analyzed, 37 semantic edges
+  same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84
+
+1. gap 0.6053  similarity 0.9400  distance 4  reciprocal
+   src/auth/session.ts:18:1 :: validateSession
+   packages/http/middleware.ts:42:1 :: authenticate
+```
+
+There is no universal pass/fail cutoff for cohesion, but this example has several warning signs. More than a third of weighted semantic affinity crosses folder boundaries, and the mean distance of 1.84 is above the same-folder distance of one. The top pair is also strongly related at 0.94 similarity yet four distance units apart, producing a relatively high gap of 0.6053; the reciprocal match strengthens that signal. A more cohesive result under the same settings would concentrate affinity in the same-file and same-folder percentages, have a lower mean distance, and contain few high-gap remote pairs. An LLM or reviewer should inspect whether the shared authentication behavior belongs in one module, while accounting for the possibility that session and middleware responsibilities are intentionally separated. Compare these metrics between modules or over time rather than treating any single percentage as a fixed quality threshold.
+
+## Command Details
+
+### Semantic Search
+
+Search by meaning:
+
+```bash
+slopdex search "validate an authenticated session" --limit 10
+```
+
+### Duplicate Discovery
 
 Treat these clusters as review candidates rather than proof of duplication. Lower `--threshold` to broaden discovery, or lower `--min-lines` when short wrappers are relevant.
 
@@ -94,19 +136,6 @@ slopdex cross-search --limit 5 --format summary
 src/users.ts :: Users.authenticate
   0.9321  src/session.ts :: validateSession
   0.8475  src/auth.ts :: authenticate
-```
-
-Clusters list each function once:
-
-```bash
-slopdex cross-search --threshold 0.85 --format clusters
-```
-
-```text
-Cluster 1 (3 functions, similarity 0.8732-0.9410)
-  src/auth.ts:18:0 :: authenticate
-  src/session.ts:42:0 :: validateSession
-  src/users.ts:27:2 :: Users.authenticate
 ```
 
 `--format summary` also produces compact file and function names for `search`. JSON is the default for `search`; clusters are the default for `cross-search`.
@@ -185,17 +214,7 @@ slopdex cross-search \
 
 If the target uses a non-default configuration path, pass it with `--target-config`. The target repository's indexing policy is kept separate from the source policy.
 
-## Cohesion Analysis
-
-Rank semantically related functions that are separated across files and directory subtrees:
-
-```bash
-slopdex cohesion \
-  --threshold 0.8 \
-  --neighbors 20 \
-  --limit 50 \
-  --format summary
-```
+### Cohesion Analysis
 
 Cohesion analysis builds a same-index semantic neighbor graph and combines each edge's cosine similarity with its repository path distance. The default JSON report is designed for downstream analysis and contains repository-wide metrics, ranked pairs, file-level external-affinity metrics, and connected groups for navigation. Function source is omitted by default; use `--include-source` when a downstream consumer needs it.
 

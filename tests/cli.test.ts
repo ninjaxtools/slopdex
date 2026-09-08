@@ -456,6 +456,17 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--regex <regex>");
     expect(result.stdout).toContain("--neighbors <number>");
     expect(result.stdout).toContain("--include-source");
+    expect(result.stdout).toContain("Cluster 1 (3 functions, similarity 0.9124-0.9568)");
+    expect(result.stdout).toContain("Review them for repeated validation or session logic that could be shared");
+    expect(result.stdout).toContain("transitive links, so every function need not directly match every other function");
+    expect(result.stdout).toContain("Cohesion: 184 functions analyzed, 37 semantic edges");
+    expect(result.stdout).toContain("same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84");
+    expect(result.stdout).toContain("There is no universal pass/fail cutoff, but this warrants review");
+    expect(result.stdout).toContain("top pair is 0.94 similar but four units apart");
+    expect(result.stdout).toContain("Compare modules or history rather than treating one percentage as a fixed");
+    expect(result.stdout.indexOf("Commands:")).toBeLessThan(result.stdout.indexOf("Analysis Examples:"));
+    expect(result.stdout.indexOf("Analysis Examples:")).toBeLessThan(result.stdout.indexOf("Options:"));
+    expect(result.stdout.indexOf("Options:")).toBeLessThan(result.stdout.indexOf("Other Examples:"));
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
   });

@@ -95,6 +95,44 @@ Git updates reconcile committed blobs first, then overlay working-tree contents.
 - A bare system error such as `Invalid argument` is a Slopdex/runtime failure, not evidence that a different indexing command is needed. Stop retrying, report the command and error, and recommend diagnosing or updating Slopdex.
 - `slopdex --help` is the supported capability reference. There is no `slopdex --version` option; never invoke it.
 
+## Analysis Examples
+
+### Duplicate Analysis
+
+```bash
+slopdex cross-search \
+  --cross-file-only \
+  --min-lines 4 \
+  --threshold 0.9 \
+  --limit 5
+```
+
+```text
+Cluster 1 (3 functions, similarity 0.9124-0.9568)
+  src/auth/session.ts:18:1 :: validateSession
+  src/http/middleware.ts:42:1 :: authenticate
+  src/users/user-service.ts:27:3 :: UserService.authenticate
+```
+
+This result found three substantial authentication functions in three files with very high similarity. Review them for repeated validation or session-handling logic that could move into one shared implementation. The middleware and service locations may represent intentional architectural layers, so treat the result as evidence to inspect rather than proof that the functions should be merged. The range describes observed links in a connected component; transitive clustering means every function is not necessarily directly similar to every other function.
+
+### Cohesion Analysis
+
+```bash
+slopdex cohesion --format summary --threshold 0.8 --neighbors 20 --limit 50
+```
+
+```text
+Cohesion: 184 functions analyzed, 37 semantic edges
+  same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84
+
+1. gap 0.6053  similarity 0.9400  distance 4  reciprocal
+   src/auth/session.ts:18:1 :: validateSession
+   packages/http/middleware.ts:42:1 :: authenticate
+```
+
+There is no universal pass/fail cutoff for cohesion, but this example has several warning signs. More than a third of weighted semantic affinity crosses folder boundaries, and the mean distance of 1.84 is above the same-folder distance of one. The top pair is strongly related at 0.94 similarity yet four distance units apart, producing a relatively high gap of 0.6053; the reciprocal match strengthens that signal. A more cohesive result under the same settings would concentrate affinity in the same-file and same-folder percentages, have a lower mean distance, and contain few high-gap remote pairs. Inspect whether shared authentication behavior belongs in one module, while accounting for the possibility that session and middleware responsibilities are intentionally separated. Compare modules or repository history rather than treating one percentage as a fixed quality threshold.
+
 ## Semantic Search
 
 Search indexed functions by intent:
@@ -115,16 +153,6 @@ slopdex search "validate an authenticated session" \
 `--threshold` is the minimum raw cosine similarity. Use a half-open range such as `--threshold 0.85-0.95` to include the left bound and exclude the right bound.
 
 ## Duplicate Discovery
-
-Start with this high-signal duplicate-code detection recipe:
-
-```bash
-slopdex cross-search \
-  --cross-file-only \
-  --min-lines 4 \
-  --threshold 0.9 \
-  --limit 5
-```
 
 Cross-search defaults to connected clusters. Treat each cluster as a source-review candidate rather than proof of duplication. Lower `--threshold` to broaden discovery, or lower `--min-lines` when short wrappers are relevant.
 
@@ -214,12 +242,6 @@ Cross-index searches require identical provider, model, dimensions, and embeddin
 Use `--target-config <path>` when the target repository does not use `.slopdex/config.json`.
 
 ## Cohesion Analysis
-
-Rank semantically related functions by how far apart they are in the repository:
-
-```bash
-slopdex cohesion --format summary --threshold 0.8 --neighbors 20 --limit 50
-```
 
 Use JSON when passing the report to another tool or an LLM:
 
