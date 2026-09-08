@@ -354,7 +354,7 @@ export function two() { return 2; }
     index.close();
   });
 
-  it("applies an inclusive similarity range before limiting matches", async () => {
+  it("applies a half-open similarity range before limiting matches", async () => {
     const root = temporaryRoot();
     write(root, "source.ts", `export function sourceMarker() { return 1; }\n`);
     write(root, "close.ts", `export function closeMarker() { return 1; }\n`);
@@ -377,7 +377,7 @@ export function two() { return 2; }
       source: index,
       sourceFilter: { type: "all", path: "source.ts" },
       minSimilarity: 0.85,
-      maxSimilarity: 0.95,
+      maxSimilarity: 1,
       limitPerFunction: 1,
       minLines: 1,
     })) results.push(result);
@@ -385,7 +385,7 @@ export function two() { return 2; }
     expect(results).toHaveLength(1);
     expect(results[0]!.matches.map((match) => match.function.name)).toEqual(["rangeMarker"]);
     expect(results[0]!.matches[0]!.similarity).toBeGreaterThanOrEqual(0.85);
-    expect(results[0]!.matches[0]!.similarity).toBeLessThanOrEqual(0.95);
+    expect(results[0]!.matches[0]!.similarity).toBeLessThan(1);
     index.close();
   });
 

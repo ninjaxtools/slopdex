@@ -367,6 +367,11 @@ export function two(value: string) {
     expect(invalidRegex.stderr).toContain("Invalid --regex value");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
+    const emptyRange = runCli(root, "cross-search", "--threshold", "0.9-0.9");
+    expect(emptyRange.status).toBe(2);
+    expect(emptyRange.stderr).toContain("minimum must be less than its maximum");
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
     const result = runCli(root, "cross-search", "--changed-since", "HEAD", "--uncommitted");
 
     expect(result.status).toBe(2);
@@ -386,7 +391,7 @@ describe("CLI help", () => {
       "slopdex delete-files",
       "slopdex update-git",
       "slopdex search",
-      "slopdex cross-search --format summary --threshold 0.8",
+      "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5",
     ]) expect(result.stdout).toContain(example);
     expect(result.stdout).toContain("--source-path <path>");
     expect(result.stdout).toContain("--format <json|summary|clusters>");

@@ -465,7 +465,7 @@ export class IndexDatabase {
         AND f.line_count >= ?
         AND (? IS NULL OR slopdex_regexp(?, f.qualified_name))
         AND (1.0 - vec_distance_cosine(e.vector, ?)) >= ?
-        AND (? IS NULL OR (1.0 - vec_distance_cosine(e.vector, ?)) <= ?)
+        AND (? IS NULL OR (1.0 - vec_distance_cosine(e.vector, ?)) < ?)
       ORDER BY similarity DESC, f.id ASC
       LIMIT ?
     `).all(

@@ -71,11 +71,17 @@ Search by meaning:
 slopdex search "validate an authenticated session" --limit 10
 ```
 
-Find similar callables grouped into connected clusters. Cross-search excludes one-line callables by default:
+For a strong duplicate-code detection default, compare substantial callables across files at a high similarity threshold. Cross-search groups the resulting pairs into connected clusters by default:
 
 ```bash
-slopdex cross-search --threshold 0.85
+slopdex cross-search \
+  --cross-file-only \
+  --min-lines 4 \
+  --threshold 0.9 \
+  --limit 5
 ```
+
+Treat these clusters as review candidates rather than proof of duplication. Lower `--threshold` to broaden discovery, or lower `--min-lines` when short wrappers are relevant.
 
 Use `--format json` for JSONL with one object per source function, or `--format summary` for a compact pair listing:
 
@@ -112,11 +118,21 @@ slopdex cross-search --format summary --threshold 0.8 --limit 5
 slopdex search "validate session" --format summary --threshold 0.8
 ```
 
-Use an inclusive range to omit matches that are either weaker or stronger than the desired band:
+Use a half-open range to select a similarity band. The left bound is inclusive and the right bound is exclusive, so `0.85-0.9` means `0.85 <= similarity < 0.9`:
 
 ```bash
 slopdex cross-search --format summary --threshold 0.85-0.95 --limit 5
 ```
+
+For iterative duplicate review, start with the strongest matches and then inspect progressively weaker bands. This keeps each pass focused while avoiding one large, noisy result set:
+
+```bash
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.8-0.85 --limit 5
+```
+
+Because range upper bounds are exclusive, these adjacent passes do not repeat boundary matches.
 
 Source functions with no matches at the selected threshold are omitted.
 For same-index searches, each function pair is shown only in its first direction by default. Use
@@ -218,7 +234,7 @@ Standalone functions `updateFiles`, `updateFromGit`, `updateFromWorkingTree`, `s
 - `changed-since X` returns current functions that were added, modified, or moved relative to X, including uncommitted overlays. Deleted functions are not returned because they cannot be cross-search sources.
 - `uncommitted` returns functions from files currently marked as working-tree sourced.
 - Search output is ordered by raw cosine similarity descending, then function ID ascending.
-- Threshold ranges are inclusive and are applied before the result limit.
+- Threshold ranges include the left bound, exclude the right bound, and are applied before the result limit.
 - Same-index cross-search excludes the source function itself and lists each unordered function pair once by default.
 - Cross-file filtering is applied before the per-function result limit.
 - Cross-search defaults to a minimum callable length of two lines; source and match length filtering is applied before the result limit.

@@ -12,7 +12,7 @@ Use `slopdex` to index named JavaScript and TypeScript callables, search them by
 Run the command that satisfies the user's request immediately. Do not begin with `slopdex status`, `slopdex --help`, executable lookup, API-key probes, or version probes. Slopdex performs its own validation and reports missing credentials or incompatible state.
 
 - For semantic search, run `slopdex search "<query>" --format summary --limit 10`.
-- For duplicate candidates, run `slopdex cross-search --format summary --threshold 0.9 --limit 5`.
+- For duplicate-code clusters, run `slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5`.
 - For an explicit request to refresh the current index, run `slopdex update-git`.
 - Use `slopdex status` only when the user asks for index metadata or checkpoint information.
 
@@ -111,17 +111,23 @@ slopdex search "validate an authenticated session" \
   --limit 10
 ```
 
-`--threshold` is the minimum raw cosine similarity. Use a range such as `--threshold 0.85-0.95` to set both bounds.
+`--threshold` is the minimum raw cosine similarity. Use a half-open range such as `--threshold 0.85-0.95` to include the left bound and exclude the right bound.
 
 ## Duplicate Discovery
 
-Find similar functions within the current index:
+Start with this high-signal duplicate-code detection recipe:
 
 ```bash
-slopdex cross-search --format summary --threshold 0.9 --limit 5
+slopdex cross-search \
+  --cross-file-only \
+  --min-lines 4 \
+  --threshold 0.9 \
+  --limit 5
 ```
 
-Summary output groups matches beneath each source:
+Cross-search defaults to connected clusters. Treat each cluster as a source-review candidate rather than proof of duplication. Lower `--threshold` to broaden discovery, or lower `--min-lines` when short wrappers are relevant.
+
+Summary output can instead group matches beneath each source:
 
 ```text
 src/users.ts :: Users.authenticate
@@ -143,7 +149,17 @@ Filter both source and matching candidates by qualified callable name with a Jav
 slopdex cross-search --regex '^(User|Session)\.' --threshold 0.9
 ```
 
-Use `--threshold <minimum>-<maximum>` for an inclusive similarity range, such as `--threshold 0.85-0.95`. The range is applied before `--limit`.
+Use `--threshold <minimum>-<maximum>` for a half-open similarity range, such as `--threshold 0.85-0.95`. It includes the minimum, excludes the maximum, and is applied before `--limit`.
+
+Review duplicate candidates iteratively from high confidence to lower-confidence bands instead of requesting one broad result set:
+
+```bash
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.8-0.85 --limit 5
+```
+
+Because range upper bounds are exclusive, adjacent passes do not repeat boundary candidates.
 
 Same-index search reports each unordered pair once by default. Include both `A -> B` and `B -> A` only when explicitly needed:
 
@@ -217,7 +233,7 @@ Prefer JSON or JSONL when another command will consume the results. Prefer summa
 --dimensions <number>               Embedding dimensions
 --force-rebuild                     Rebuild an incompatible existing index
 --limit <number>                    Result limit
---threshold <number|range>          Similarity threshold or inclusive range
+--threshold <number|range>          Similarity threshold or half-open range
 --format <json|summary|clusters>    Output format
 --cross-file-only                   Exclude matches from the source file
 --min-lines <number>               Minimum cross-search callable length

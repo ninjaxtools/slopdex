@@ -429,7 +429,7 @@ function similarityThreshold(): { min: number; max?: number } {
   const min = Number(range[1]);
   const max = Number(range[2]);
   if (!Number.isFinite(min) || !Number.isFinite(max)) throw new CodeIndexError("threshold range bounds must be numbers.");
-  if (min > max) throw new CodeIndexError("threshold range minimum must not exceed its maximum.");
+  if (min >= max) throw new CodeIndexError("threshold range minimum must be less than its maximum.");
   return { min, max };
 }
 
@@ -533,7 +533,7 @@ Examples:
     slopdex search "validate an authenticated session" --limit 10
 
   Review similar functions as duplicate-code candidates:
-    slopdex cross-search --format summary --threshold 0.8 --limit 5
+    slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
 
   Review functions under a path against the whole codebase:
     slopdex cross-search --source-path src/services --format summary
