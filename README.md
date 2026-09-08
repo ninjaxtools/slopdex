@@ -111,6 +111,45 @@ Cohesion: 184 functions analyzed, 37 semantic edges
 
 There is no universal pass/fail cutoff for cohesion, but this example has several warning signs. More than a third of weighted semantic affinity crosses folder boundaries, and the mean distance of 1.84 is above the same-folder distance of one. The top pair is also strongly related at 0.94 similarity yet four distance units apart, producing a relatively high gap of 0.6053; the reciprocal match strengthens that signal. A more cohesive result under the same settings would concentrate affinity in the same-file and same-folder percentages, have a lower mean distance, and contain few high-gap remote pairs. An LLM or reviewer should inspect whether the shared authentication behavior belongs in one module, while accounting for the possibility that session and middleware responsibilities are intentionally separated. Compare these metrics between modules or over time rather than treating any single percentage as a fixed quality threshold.
 
+## Reading Analysis Output
+
+Interpret values only within the same embedding profile and similar command settings. Changing the model, threshold, neighbor count, source scope, or minimum line count changes the candidate graph and makes direct comparisons unreliable.
+
+### Duplicate Clusters
+
+For `Cluster 1 (3 functions, similarity 0.9124-0.9568)`:
+
+- `Cluster 1` is the display identifier. Clusters are ordered by function count and then name, not by duplication severity, so a lower cluster number is not inherently worse.
+- `3 functions` is the number of unique callables connected by observed similarity edges. A higher count can indicate a larger duplicate family, but can also result from generic helpers or transitive links. A two-function cluster is simply one candidate pair.
+- `similarity 0.9124-0.9568` is the minimum and maximum raw cosine similarity among observed edges in the cluster. Higher values mean the implementations are more semantically alike according to the configured model. A high minimum means even the weakest observed link is strong; a wide range can indicate that one weaker edge joined otherwise tighter matches.
+- Each following line identifies one callable as `path:line:column :: qualifiedFunctionName`. Location has no higher-or-lower meaning, but separation across files or architectural layers helps determine whether similarity is duplication or intentional delegation.
+
+### Cohesion Summary
+
+For `Cohesion: 184 functions analyzed, 37 semantic edges`:
+
+- `184 functions analyzed` is the source population after filters. Higher or lower is coverage, not quality; compare cohesion metrics only across similarly scoped populations.
+- `37 semantic edges` counts unique top-neighbor pairs that meet the threshold before the output limit. More edges can mean more repeated or overlapping responsibilities, but the value also rises when `--neighbors` increases or `--threshold` decreases, so it is not a standalone cohesion score.
+
+For `same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84`:
+
+- `same file` is the share of semantic affinity between functions in one file. Higher generally means related implementation is co-located; extremely high values can also indicate oversized files.
+- `same folder` is the share between different files in one folder. Higher means related code is split into nearby modules while remaining locally grouped.
+- `remote` is the share crossing a folder boundary. Higher indicates weaker physical cohesion and deserves review; lower means semantic relationships stay within files or their immediate folder.
+- `mean distance` is semantic-weighted physical distance. Zero means all discovered affinity is within files, one means it crosses only between files in the same folder, and larger values indicate increasingly dispersed related code. Lower is generally more cohesive.
+
+### Cohesion Findings
+
+For `1. gap 0.6053  similarity 0.9400  distance 4  reciprocal`:
+
+- `1.` is the review rank. Lower rank numbers are more important because pairs are ordered primarily by cohesion gap, then similarity and reciprocal confidence.
+- `gap` is the 0-to-1 combination of semantic weight and separation weight. Higher means a pair is both strongly related and physically far apart; lower means it is weaker, closer together, or both. A same-file pair has a gap of zero.
+- `similarity` is raw cosine similarity. Higher means stronger semantic resemblance, but values are model-specific and do not prove duplication.
+- `distance` is zero in the same file, one in different files in the same folder, and increases by directory-tree hops. Higher means the functions are physically farther apart.
+- `reciprocal` means both functions place each other in their top neighbor results, strengthening confidence. Its absence means the relationship is one-directional or could not be evaluated because only selected sources were searched.
+
+The JSON report also exposes `semanticWeight`, `separationWeight`, `sourceTestPair`, and each file's `externalAffinityRatio`. Higher semantic weight means similarity is farther above the configured threshold. Higher separation weight means greater path distance, with distant paths gradually saturating near one. `sourceTestPair: true` identifies a source/test relationship that may be intentionally separated. A higher external-affinity ratio means more of a file's observed related-function affinity lies outside its folder; lower means its relationships are predominantly internal or local.
+
 ## Command Details
 
 ### Semantic Search

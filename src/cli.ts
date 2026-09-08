@@ -606,6 +606,43 @@ Analysis Examples:
     pairs. Compare modules or history rather than treating one percentage as a fixed
     threshold, and allow for intentionally separate architectural responsibilities.
 
+Reading Analysis Output:
+  Compare values only with the same embedding profile and similar threshold, neighbor,
+  source-filter, and minimum-line settings.
+
+  Duplicate cluster line:
+    Cluster N           Display order by function count, then name; not severity
+    functions           Unique connected callables; higher may mean a larger duplicate family
+    similarity range    Raw cosine edge range; higher means stronger model-assessed resemblance
+                       A high minimum means all observed links are strong; a wide range may
+                       indicate that a weaker transitive edge joined tighter matches
+    callable location   path:line:column :: qualifiedFunctionName; inspect architectural roles
+
+  Cohesion headline:
+    functions analyzed  Filtered source coverage; higher or lower does not mean better or worse
+    semantic edges      Unique qualifying neighbor pairs before --limit; not a quality score
+                       More neighbors or a lower threshold generally increases this count
+
+  Cohesion distribution:
+    same file           Higher generally means related implementation is co-located
+    same folder         Higher means related modules remain locally grouped
+    remote              Higher means more affinity crosses folders and weaker physical cohesion
+    mean distance       Lower is generally more cohesive (same file 0, same folder 1)
+
+  Ranked cohesion finding:
+    rank                Lower number means higher review priority
+    gap                 0-to-1 combined signal; higher means strongly related and farther apart
+    similarity          Higher means greater resemblance; values are model-specific
+    distance            Higher means more file and directory-tree separation
+    reciprocal          Mutual top-neighbor relationship; strengthens confidence when present
+
+  JSON diagnostics:
+    semanticWeight      Higher means similarity is farther above --threshold
+    separationWeight    Higher means greater path distance, saturating near one
+    sourceTestPair      True flags a possibly intentional source/test relationship
+    externalAffinityRatio
+                       Higher means more of a file's related affinity lies outside its folder
+
 Options:
   --root <path>                       Repository root (default: current directory)
   --config <path>                     Config file (default: .slopdex/config.json)

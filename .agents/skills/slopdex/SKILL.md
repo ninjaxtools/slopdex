@@ -133,6 +133,45 @@ Cohesion: 184 functions analyzed, 37 semantic edges
 
 There is no universal pass/fail cutoff for cohesion, but this example has several warning signs. More than a third of weighted semantic affinity crosses folder boundaries, and the mean distance of 1.84 is above the same-folder distance of one. The top pair is strongly related at 0.94 similarity yet four distance units apart, producing a relatively high gap of 0.6053; the reciprocal match strengthens that signal. A more cohesive result under the same settings would concentrate affinity in the same-file and same-folder percentages, have a lower mean distance, and contain few high-gap remote pairs. Inspect whether shared authentication behavior belongs in one module, while accounting for the possibility that session and middleware responsibilities are intentionally separated. Compare modules or repository history rather than treating one percentage as a fixed quality threshold.
 
+## Reading Analysis Output
+
+Interpret values only within the same embedding profile and similar command settings. Changing the model, threshold, neighbor count, source scope, or minimum line count changes the candidate graph and makes direct comparisons unreliable.
+
+### Duplicate Clusters
+
+For `Cluster 1 (3 functions, similarity 0.9124-0.9568)`:
+
+- `Cluster 1` is the display identifier. Clusters are ordered by function count and then name, not severity, so a lower number is not inherently worse.
+- `3 functions` counts unique callables connected by observed edges. Higher can indicate a larger duplicate family, but may also result from generic helpers or transitive links.
+- `similarity 0.9124-0.9568` is the weakest-to-strongest raw cosine similarity among observed edges. Higher means greater semantic resemblance according to the configured model. A high minimum means every observed link is strong; a wide range can identify a weaker bridge.
+- Callable lines use `path:line:column :: qualifiedFunctionName`. Location is contextual rather than scored; inspect architectural roles before consolidating code.
+
+### Cohesion Summary
+
+For `Cohesion: 184 functions analyzed, 37 semantic edges`:
+
+- `functions analyzed` is coverage after filters, not a quality value.
+- `semantic edges` counts unique top-neighbor pairs meeting the threshold before output limiting. Higher can reflect more overlapping responsibilities, but also increases with more neighbors or a lower threshold.
+
+For `same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84`:
+
+- Higher `same file` generally means stronger co-location, though very high values can indicate oversized files.
+- Higher `same folder` means related code is split into nearby modules but remains locally grouped.
+- Higher `remote` means more semantic affinity crosses folder boundaries and indicates weaker physical cohesion.
+- Lower `mean distance` generally means stronger physical cohesion. Zero is entirely within files, one reaches only other files in the same folder, and larger values indicate greater dispersion.
+
+### Cohesion Findings
+
+For `1. gap 0.6053  similarity 0.9400  distance 4  reciprocal`:
+
+- A lower rank number is a higher review priority.
+- Higher `gap` means stronger semantic affinity combined with greater physical separation; same-file pairs have zero gap.
+- Higher `similarity` means stronger model-assessed resemblance, but does not prove duplication and is not comparable across embedding profiles.
+- Higher `distance` means more file and directory-tree separation: zero is the same file and one is different files in the same folder.
+- `reciprocal` strengthens confidence because both functions rank each other as neighbors. Its absence means one-directional or unevaluated under a source filter.
+
+In JSON, higher `semanticWeight` means similarity lies farther above the threshold, and higher `separationWeight` means greater path distance. `sourceTestPair: true` flags an often-intentional source/test relationship. Higher file `externalAffinityRatio` means more observed related-function affinity lies outside that file's folder; lower means relationships are primarily internal or local.
+
 ## Semantic Search
 
 Search indexed functions by intent:

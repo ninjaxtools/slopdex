@@ -464,8 +464,13 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("There is no universal pass/fail cutoff, but this warrants review");
     expect(result.stdout).toContain("top pair is 0.94 similar but four units apart");
     expect(result.stdout).toContain("Compare modules or history rather than treating one percentage as a fixed");
+    expect(result.stdout).toContain("Reading Analysis Output:");
+    expect(result.stdout).toContain("remote              Higher means more affinity crosses folders and weaker physical cohesion");
+    expect(result.stdout).toContain("gap                 0-to-1 combined signal; higher means strongly related and farther apart");
+    expect(result.stdout).toContain("externalAffinityRatio");
     expect(result.stdout.indexOf("Commands:")).toBeLessThan(result.stdout.indexOf("Analysis Examples:"));
-    expect(result.stdout.indexOf("Analysis Examples:")).toBeLessThan(result.stdout.indexOf("Options:"));
+    expect(result.stdout.indexOf("Analysis Examples:")).toBeLessThan(result.stdout.indexOf("Reading Analysis Output:"));
+    expect(result.stdout.indexOf("Reading Analysis Output:")).toBeLessThan(result.stdout.indexOf("Options:"));
     expect(result.stdout.indexOf("Options:")).toBeLessThan(result.stdout.indexOf("Other Examples:"));
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
