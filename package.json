@@ -1,6 +1,6 @@
 {
   "name": "@ninjaxtools/slopdex",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Tree-sitter callable-level semantic indexing, search, and duplicate discovery for Python, JavaScript, TypeScript, Rust, Go, Java, and C",
   "license": "MIT",
   "repository": {
