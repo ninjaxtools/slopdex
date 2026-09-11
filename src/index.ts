@@ -2,6 +2,8 @@ export { CodeIndex } from "./code-index.js";
 export { analyzeCohesion, cohesionLocation } from "./analysis/cohesion.js";
 export { crossSearch } from "./search/cross-search.js";
 export { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
+export { OpenAISummaryProvider } from "./summaries/openai.js";
+export type { OpenAISummaryProviderOptions } from "./summaries/openai.js";
 export type { OpenAIEmbeddingProviderOptions } from "./embeddings/openai.js";
 export { JinaEmbeddingProvider } from "./embeddings/jina.js";
 export type { JinaEmbeddingProviderOptions } from "./embeddings/jina.js";
@@ -39,6 +41,14 @@ export function updateFromWorkingTree(index: CodeIndex, options?: UpdateFromWork
 
 export function similaritySearch(index: CodeIndex, options: SimilaritySearchOptions) {
   return index.similaritySearch(options);
+}
+
+export function useSummaries(index: CodeIndex, options?: { signal?: AbortSignal }) {
+  return index.useSummaries(options);
+}
+
+export function searchSummary(index: CodeIndex, options: SimilaritySearchOptions) {
+  return index.searchSummary(options);
 }
 
 export function crossSearchFunctions(options: CrossSearchOptions) {

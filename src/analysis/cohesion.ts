@@ -1,6 +1,7 @@
 import path from "node:path";
 
 import { CodeIndexError } from "../errors.js";
+import { analysisSimilarity } from "../search/similarity.js";
 import type {
   CohesionAnalysisOptions,
   CohesionFileReport,
@@ -10,16 +11,18 @@ import type {
   CohesionReport,
   IndexedFunction,
   SimilarityResult,
+  SimilarityScores,
 } from "../types.js";
 import { assertPositiveInteger, throwIfAborted } from "../utils.js";
 
-interface CandidateEdge {
+interface CandidateEdge extends SimilarityScores {
   left: IndexedFunction;
   right: IndexedFunction;
-  similarity: number;
 }
 
 export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise<CohesionReport> {
+  const status = options.source.status();
+  const scoring = analysisSimilarity(status);
   const neighbors = options.neighbors ?? 20;
   const limit = options.limit ?? 50;
   const minSimilarity = options.minSimilarity ?? 0.8;
@@ -46,6 +49,7 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
   const neighborsFor = (callable: IndexedFunction): SimilarityResult[] => {
     throwIfAborted(options.signal);
     const matches = options.source.similarToFunction(callable.id, {
+      includeSummaries: scoring.similarityMode === "code-summary-average",
       limit: neighbors,
       minSimilarity,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -64,7 +68,8 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
       const key = pairKey(left.id, right.id);
       const existing = edges.get(key);
       if (!existing || match.similarity > existing.similarity) {
-        edges.set(key, { left, right, similarity: match.similarity });
+        const { function: _function, ...scores } = match;
+        edges.set(key, { left, right, ...scores });
       }
     }
     options.onProgress?.({ completed: index + 1, total: sourceFunctions.length });
@@ -94,15 +99,16 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
     .filter((file) => file.internalAffinity + file.sameFolderAffinity + file.externalAffinity > 0)
     .slice(0, limit);
   const groups = buildGroups(reportedPairs);
-  const status = options.source.status();
   return {
     schemaVersion: 1,
     repository: {
       generation: status.generation,
       gitCheckpoint: status.gitCheckpoint,
       embeddingProfile: status.embeddingProfile,
+      summaryProfile: status.summaryProfile,
     },
     parameters: {
+      ...scoring,
       neighbors,
       limit,
       minSimilarity,
@@ -153,6 +159,8 @@ function scorePair(edge: CandidateEdge, reciprocal: boolean | null, minSimilarit
     left: edge.left,
     right: edge.right,
     similarity: edge.similarity,
+    ...(edge.codeSimilarity !== undefined ? { codeSimilarity: edge.codeSimilarity } : {}),
+    ...(edge.summarySimilarity !== undefined ? { summarySimilarity: edge.summarySimilarity } : {}),
     reciprocal,
     semanticWeight,
     separationWeight,
@@ -246,6 +254,8 @@ function updateStrongestExternal(
     report.strongestExternalMatch = {
       function: callable,
       similarity: pair.similarity,
+      ...(pair.codeSimilarity !== undefined ? { codeSimilarity: pair.codeSimilarity } : {}),
+      ...(pair.summarySimilarity !== undefined ? { summarySimilarity: pair.summarySimilarity } : {}),
       cohesionGap: pair.cohesionGap,
     };
   }

@@ -4,14 +4,23 @@ import path from "node:path";
 import { CodeIndexError, IncompatibleIndexError } from "../errors.js";
 import type { CrossSearchOptions, CrossSearchResult } from "../types.js";
 import { assertPositiveInteger, throwIfAborted } from "../utils.js";
+import { analysisSimilarity } from "./similarity.js";
 
 export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<CrossSearchResult> {
   const target = options.target ?? options.source;
-  const sourceProfile = JSON.stringify(options.source.status().embeddingProfile);
-  const targetProfile = JSON.stringify(target.status().embeddingProfile);
+  const sourceStatus = options.source.status();
+  const targetStatus = target.status();
+  const sourceProfile = JSON.stringify(sourceStatus.embeddingProfile);
+  const targetProfile = JSON.stringify(targetStatus.embeddingProfile);
   if (sourceProfile !== targetProfile) {
     throw new IncompatibleIndexError("Cross-search requires identical embedding profiles.");
   }
+  const scoring = {
+    ...analysisSimilarity(sourceStatus, targetStatus),
+    sourceSummaryProfile: sourceStatus.summaryProfile,
+    targetSummaryProfile: targetStatus.summaryProfile,
+  };
+  const includeSummaries = scoring.similarityMode === "code-summary-average";
 
   const limit = options.limitPerFunction ?? 5;
   assertPositiveInteger(limit, "limitPerFunction");
@@ -56,6 +65,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
     const excludePaths = excludedTargetPaths ? { excludePaths: excludedTargetPaths } : {};
     const candidates = sameIndex
       ? options.source.similarToFunction(source.id, {
+        includeSummaries,
         limit,
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -64,6 +74,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         ...excludePaths,
       })
       : target.searchByVector(vector, {
+        ...(includeSummaries ? { summaryVector: options.source.vectorForFunction(source.id, "summary") } : {}),
         limit,
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -81,7 +92,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         return true;
       })
       : candidates;
-    if (matches.length > 0) yield { source, matches };
+    if (matches.length > 0) yield { source, matches, scoring };
     options.onProgress?.({ completed: index + 1, total: sourceFunctions.length });
   }
 }

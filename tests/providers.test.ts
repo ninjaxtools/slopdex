@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { JinaEmbeddingProvider } from "../src/embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "../src/embeddings/openai.js";
+import { OpenAISummaryProvider } from "../src/summaries/openai.js";
+import { parseCallables } from "../src/parser/callable-parser.js";
 
 const servers: Server[] = [];
 
@@ -13,6 +15,34 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   })));
+});
+
+describe("OpenAI summary provider", () => {
+  const fileSource = "export function deliver() { send(); }";
+  const input = { repository: "example", callable: parseCallables("client.ts", fileSource)[0]!, fileSource };
+
+  it("uses gpt-5.6-sol and sends purpose-oriented context to the Responses API", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, {
+      status: "completed",
+      output: [{ type: "reasoning" }, { type: "message", content: [{ type: "output_text", text: "Delivers application messages." }] }],
+    });
+    const provider = new OpenAISummaryProvider({ apiKey: "test", baseUrl: url });
+    await expect(provider.summarize(input)).resolves.toBe("Delivers application messages.");
+    expect(requests[0]).toMatchObject({ model: "gpt-5.6-sol", store: false });
+    expect(requests[0]!.instructions).toContain("purpose of the specified callable within its codebase");
+    expect(JSON.parse(requests[0]!.input as string)).toMatchObject({ repository: "example", path: "client.ts", fileContext: fileSource });
+  });
+
+  it.each([
+    { status: "incomplete", output: [] },
+    { status: "completed", output: [] },
+    { status: "completed", output: [{ type: "message", content: [{ type: "refusal", refusal: "no" }] }] },
+  ])("rejects unusable summaries: %j", async (response) => {
+    const url = await startServer([], response);
+    const provider = new OpenAISummaryProvider({ apiKey: "test", baseUrl: url });
+    await expect(provider.summarize(input)).rejects.toThrow(/incomplete|empty/);
+  });
 });
 
 describe("embedding providers", () => {

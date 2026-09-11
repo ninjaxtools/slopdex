@@ -2,13 +2,6 @@
 
 Slopdex indexes named functions in TypeScript and JavaScript repositories. It uses embeddings to search code by meaning, find similar implementations, and measure whether related functions are stored near each other.
 
-Supported file types are `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, and `.cjs`.
-
-## Requirements
-
-- Node.js 24 or later
-- An OpenAI or Jina AI API key
-
 ## Install
 
 ```bash
@@ -30,6 +23,45 @@ slopdex search "validate an authenticated session" --format summary --limit 10
 ```
 
 ## Analysis Examples
+
+### Search By Function Purpose
+
+Enable optional purpose summaries for every indexed callable:
+
+```bash
+slopdex use-summaries
+slopdex search-summary "keep the repository index synchronized" --limit 10 --format summary
+```
+
+Summaries describe a function's responsibility and role in its codebase, using its repository name, path, source, and surrounding file context. Generation uses the OpenAI Responses API with **`gpt-5.6-sol`** by default and requires `OPENAI_API_KEY`, including when Jina supplies the embeddings.
+
+`use-summaries` stores each summary and its embedding in SQLite and enables a persistent repository-index setting. Subsequent indexing operations automatically generate summaries for new and changed files, including changes to surrounding context and file paths. Unchanged inputs reuse cached summaries and vectors; deleted functions disappear from summary search. Running `use-summaries` again is a no-op when summaries are already complete. Summary generation and embeddings are saved atomically, so a failed request does not leave partially updated callables.
+
+`search-summary` uses a separate summary embedding store with the configured embedding provider and supports the same query, limit, threshold, and output options as `search`. JSON results include the summary; `--format summary` prints it alongside each match. `status` reports `summariesEnabled`, `summaryCount`, and `summaryProfile`.
+
+To choose a different summary model, run `slopdex use-summaries --summary-model <model-id>` or set `summaryModel` in `.slopdex/config.json`. The chosen model is persisted for future updates. Existing indexes migrate automatically; summaries remain disabled until enabled explicitly.
+
+### Combined Code And Purpose Analysis
+
+Once summaries are enabled and every indexed callable has a summary embedding, `cross-search` and `cohesion` automatically combine implementation and purpose similarity:
+
+```text
+similarity = 0.5 * codeSimilarity + 0.5 * summarySimilarity
+```
+
+```bash
+slopdex use-summaries
+slopdex cross-search --threshold 0.8 --format json
+slopdex cohesion --threshold 0.8 --format summary
+```
+
+Both cosine scores and their average are calculated in one SQLite query. Thresholds (including half-open ranges), ranking, and neighbor/result limits apply to the combined score. Cohesion uses these combined neighbors for reciprocity, gap scores, file affinities, and groups.
+
+For cross-repository search, both indexes must have complete, enabled summaries. If either index lacks them, the entire analysis uses code-only similarity. Cohesion likewise uses code-only scoring if its summary index is incomplete or disabled. The existing embedding profiles must match across repositories; summary-generator models may differ.
+
+Combined JSON matches and cohesion pairs expose `codeSimilarity` and `summarySimilarity` alongside `similarity`. Cross-search rows include a `scoring` object with `similarityMode`, `similarityWeights`, and both summary-generator profiles. Cohesion records the mode and weights in `parameters` and the summary-generator profile in `repository.summaryProfile`. The mode is `"code-summary-average"` with weights `{ "code": 0.5, "summary": 0.5 }`, or `"code"` with weights `{ "code": 1, "summary": 0 }`. Text output labels combined scores.
+
+Compare analysis results only when the similarity mode and weights match, as well as the embedding profile, summary-generator profiles, thresholds, and analysis scope. Enabling summaries can change rankings and cohesion metrics. `search` continues to use only code vectors, and `search-summary` uses only summary vectors.
 
 ### Duplicate Analysis
 
@@ -77,7 +109,7 @@ Cohesion: 184 functions analyzed, 37 semantic edges
 
 The summary divides semantic relationships into the same file, the same folder, and different folders. Mean distance increases when related functions are stored farther apart. The gap score combines semantic similarity with path distance and ranks pairs for review. `reciprocal` means both functions are among each other's nearest semantic matches.
 
-Cohesion does not have a universal pass threshold. Compare results only when the embedding profile, threshold, neighbor count, and source scope are the same.
+Cohesion does not have a universal pass threshold. Compare results only when the similarity mode and weights, embedding and summary-generator profiles, threshold, neighbor count, and source scope are the same.
 
 ## Limit Analysis Scope
 
@@ -155,6 +187,8 @@ index.close();
 ```
 
 Exports also include `crossSearch`, `analyzeCohesion`, `JinaEmbeddingProvider`, and standalone functions for index updates and searches.
+
+For summary search, call `await index.useSummaries()` after updating the index, then `await index.searchSummary({ query: "maintain the repository index" })`. Optionally pass `summaryProvider: new OpenAISummaryProvider({ model: "gpt-5.6-sol" })` when opening an index. Custom providers implement the exported `SummaryProvider` interface. The package also exports standalone `useSummaries` and `searchSummary` helpers.
 
 ## Development
 

@@ -28,6 +28,8 @@ export interface IndexedFunction extends ParsedCallable {
   lastSeenCommit: string | null;
   sourceMode: SourceMode;
   embeddingId: number;
+  summary: string | null;
+  summaryEmbeddingId: number | null;
 }
 
 export interface EmbeddingProfile {
@@ -43,10 +45,33 @@ export interface EmbeddingProvider {
   embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]>;
 }
 
+export interface SummaryProfile {
+  provider: string;
+  model: string;
+  strategyVersion: string;
+}
+
+export interface SummaryInput {
+  repository: string;
+  callable: ParsedCallable;
+  fileSource: string;
+}
+
+export interface SummaryProvider {
+  readonly profile: SummaryProfile;
+  summarize(input: SummaryInput, options?: { signal?: AbortSignal }): Promise<string>;
+}
+
+export interface SummaryStats {
+  summariesCreated: number;
+  summariesEnabled: boolean;
+}
+
 export interface CodeIndexOptions {
   rootDir: string;
   indexPath?: string;
   provider: EmbeddingProvider;
+  summaryProvider?: SummaryProvider;
   onWarning?: (message: string) => void;
   include?: readonly string[];
   exclude?: readonly string[];
@@ -91,9 +116,19 @@ export interface SimilaritySearchOptions {
   signal?: AbortSignal;
 }
 
-export interface SimilarityResult {
-  function: IndexedFunction;
+export interface SimilarityScores {
   similarity: number;
+  codeSimilarity?: number;
+  summarySimilarity?: number;
+}
+
+export interface AnalysisSimilarity {
+  similarityMode: "code" | "code-summary-average";
+  similarityWeights: { code: number; summary: number };
+}
+
+export interface SimilarityResult extends SimilarityScores {
+  function: IndexedFunction;
 }
 
 export type CrossSearchSourceFilter =
@@ -119,6 +154,10 @@ export interface CrossSearchOptions {
 export interface CrossSearchResult {
   source: IndexedFunction;
   matches: SimilarityResult[];
+  scoring?: AnalysisSimilarity & {
+    sourceSummaryProfile: SummaryProfile | null;
+    targetSummaryProfile: SummaryProfile | null;
+  };
 }
 
 export type CohesionLocationCategory = "same-file" | "same-folder" | "different-folder";
@@ -144,11 +183,10 @@ export interface CohesionFunctionReference {
   source?: string;
 }
 
-export interface CohesionPair<FunctionValue = IndexedFunction> {
+export interface CohesionPair<FunctionValue = IndexedFunction> extends SimilarityScores {
   rank: number;
   left: FunctionValue;
   right: FunctionValue;
-  similarity: number;
   reciprocal: boolean | null;
   semanticWeight: number;
   separationWeight: number;
@@ -163,9 +201,8 @@ export interface CohesionFileReport<FunctionValue = IndexedFunction> {
   sameFolderAffinity: number;
   externalAffinity: number;
   externalAffinityRatio: number;
-  strongestExternalMatch?: {
+  strongestExternalMatch?: SimilarityScores & {
     function: FunctionValue;
-    similarity: number;
     cohesionGap: number;
   };
 }
@@ -211,8 +248,9 @@ export interface CohesionReport<FunctionValue = IndexedFunction> {
     generation: number;
     gitCheckpoint: string | null;
     embeddingProfile: Required<EmbeddingProfile>;
+    summaryProfile: SummaryProfile | null;
   };
-  parameters: {
+  parameters: AnalysisSimilarity & {
     neighbors: number;
     limit: number;
     minSimilarity: number;
@@ -237,4 +275,7 @@ export interface IndexStatus {
   generation: number;
   gitCheckpoint: string | null;
   embeddingProfile: Required<EmbeddingProfile>;
+  summariesEnabled: boolean;
+  summaryCount: number;
+  summaryProfile: SummaryProfile | null;
 }

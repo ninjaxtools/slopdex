@@ -2,6 +2,7 @@
 
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
 
 import { CodeIndex } from "./code-index.js";
@@ -11,6 +12,7 @@ import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
+import { OpenAISummaryProvider } from "./summaries/openai.js";
 import type {
   CodeIndexOptions,
   CohesionFunctionReference,
@@ -22,6 +24,7 @@ import type {
   EmbeddingProvider,
   IndexedFunction,
   SimilarityResult,
+  SummaryProfile,
   UpdateStats,
 } from "./types.js";
 
@@ -34,6 +37,7 @@ interface FileConfig {
   exclude?: string[];
   maxFileSize?: number;
   embeddingBatchSize?: number;
+  summaryModel?: string;
 }
 
 const parsed = (() => {
@@ -48,6 +52,7 @@ const parsed = (() => {
         index: { type: "string" },
         provider: { type: "string" },
         model: { type: "string" },
+        "summary-model": { type: "string" },
         dimensions: { type: "string" },
         target: { type: "string" },
         "target-root": { type: "string" },
@@ -98,6 +103,7 @@ async function main(): Promise<void> {
   const indexOptions: CodeIndexOptions = {
     rootDir,
     provider,
+    ...(config.summaryModel ? { summaryProvider: new OpenAISummaryProvider({ model: config.summaryModel }) } : {}),
     onWarning: (message) => process.stderr.write(`slopdex: warning: ${message}\n`),
     ...(parsed.values.index || config.indexPath ? { indexPath: parsed.values.index ?? config.indexPath } : {}),
     ...(config.include ? { include: config.include } : {}),
@@ -106,8 +112,9 @@ async function main(): Promise<void> {
     ...(config.embeddingBatchSize ? { embeddingBatchSize: config.embeddingBatchSize } : {}),
   };
   const updateTarget = command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD";
+  const { summaryProvider: _summaryProvider, ...refreshOptions } = indexOptions;
   const updateStats = await ensureIndexUpdated(
-    indexOptions,
+    command === "use-summaries" ? refreshOptions : indexOptions,
     "index",
     updateTarget,
     parsed.values["rebuild-on-divergence"],
@@ -132,11 +139,15 @@ async function main(): Promise<void> {
         printJson(updateStats);
         break;
       }
-      case "search": {
+      case "use-summaries":
+        printJson(await index.useSummaries());
+        break;
+      case "search":
+      case "search-summary": {
         const query = positionals.join(" ").trim();
-        if (!query) throw new CodeIndexError("search requires a query.");
+        if (!query) throw new CodeIndexError(`${command} requires a query.`);
         const threshold = similarityThreshold();
-        const results = await index.similaritySearch({
+        const results = await (command === "search-summary" ? index.searchSummary.bind(index) : index.similaritySearch.bind(index))({
           query,
           limit: numberOption(parsed.values.limit, 10, "limit"),
           minSimilarity: threshold.min,
@@ -144,8 +155,11 @@ async function main(): Promise<void> {
         });
         const format = outputFormat("json");
         if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
-        if (format === "summary") process.stdout.write(`${formatSimilaritySummary(results)}\n`);
-        else printJson(results.map(presentMatch));
+        if (format === "summary") {
+          process.stdout.write(`${command === "search-summary"
+            ? results.map((match) => `${formatSimilaritySummary([match])}\n  ${match.function.summary}`).join("\n")
+            : formatSimilaritySummary(results)}\n`);
+        } else printJson(results.map(presentMatch));
         break;
       }
       case "cross-search":
@@ -202,6 +216,7 @@ async function runCrossSearch(
     ...(targetConfig?.exclude ? { exclude: targetConfig.exclude } : {}),
     ...(targetConfig?.maxFileSize ? { maxFileSize: targetConfig.maxFileSize } : {}),
     ...(targetConfig?.embeddingBatchSize ? { embeddingBatchSize: targetConfig.embeddingBatchSize } : {}),
+    ...(targetConfig?.summaryModel ? { summaryProvider: new OpenAISummaryProvider({ model: targetConfig.summaryModel }) } : {}),
   } : undefined;
   if (targetOptions) {
     await ensureIndexUpdated(
@@ -242,6 +257,7 @@ async function runCrossSearch(
         process.stdout.write(`${JSON.stringify({
           source: presentFunction(result.source),
           matches: result.matches.map(presentMatch),
+          scoring: result.scoring,
         })}\n`);
       }
     }
@@ -273,8 +289,9 @@ async function ensureIndexUpdated(
       `slopdex: warning: ${label} is incompatible (${error.message}); rebuilding automatically because --force-reindex was specified.\n`,
     );
     const indexPath = resolveIndexPath(options);
+    const summaryProfile = summaryProfileForRebuild(indexPath, options.rootDir);
     removeIndexArtifacts(indexPath);
-    return initializeIndex(options, indexPath, label, target, noReindex);
+    return initializeIndex(options, indexPath, label, target, noReindex, summaryProfile);
   }
 }
 
@@ -299,10 +316,16 @@ async function initializeIndex(
   label: string,
   target: string,
   noReindex: boolean,
+  summaryProfile: SummaryProfile | null = null,
 ): Promise<UpdateStats> {
-  const index = new CodeIndex({ ...options, indexPath });
+  const index = new CodeIndex({
+    ...options, indexPath,
+    ...(summaryProfile && !options.summaryProvider
+      ? { summaryProvider: new OpenAISummaryProvider({ model: summaryProfile.model }) } : {}),
+  });
   let initialized = false;
   try {
+    if (summaryProfile) await index.useSummaries();
     const stats = await refreshIndex(index, label, target, false, noReindex);
     initialized = true;
     return stats;
@@ -311,6 +334,20 @@ async function initializeIndex(
     if (!initialized) {
       removeIndexArtifacts(indexPath);
     }
+  }
+}
+
+function summaryProfileForRebuild(indexPath: string, rootDir: string): SummaryProfile | null {
+  const db = new DatabaseSync(indexPath, { readOnly: true });
+  try {
+    const metadata = new Map((db.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>)
+      .map((row) => [row.key, row.value]));
+    if (metadata.get("root_dir") !== path.resolve(rootDir) || metadata.get("summaries_enabled") !== "true") return null;
+    const profile = JSON.parse(metadata.get("summary_profile")!) as SummaryProfile;
+    if (profile.provider !== "openai") throw new CodeIndexError("Rebuilding this summary index requires its custom summary provider through the library API.");
+    return profile;
+  } finally {
+    db.close();
   }
 }
 
@@ -377,6 +414,7 @@ function commandLineConfig(config: FileConfig): FileConfig {
     ...config,
     ...(provider ? { provider } : {}),
     ...(parsed.values.model ? { model: parsed.values.model } : {}),
+    ...(parsed.values["summary-model"] ? { summaryModel: parsed.values["summary-model"] } : {}),
     ...(dimensions ? { dimensions } : {}),
   };
 }
@@ -405,6 +443,7 @@ function validateInvocation(): void {
   switch (command) {
     case "status":
     case "update-git":
+    case "use-summaries":
       return;
     case "update-files":
       if (positionals.length === 0) throw new CodeIndexError("update-files requires at least one path.");
@@ -412,8 +451,9 @@ function validateInvocation(): void {
     case "delete-files":
       if (positionals.length === 0) throw new CodeIndexError("delete-files requires at least one path.");
       return;
-    case "search": {
-      if (!positionals.join(" ").trim()) throw new CodeIndexError("search requires a query.");
+    case "search":
+    case "search-summary": {
+      if (!positionals.join(" ").trim()) throw new CodeIndexError(`${command} requires a query.`);
       validateLimit(10);
       similarityThreshold();
       if (outputFormat("json") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
@@ -514,12 +554,13 @@ function crossSearchSourceFilter(): CrossSearchSourceFilter {
 }
 
 function presentFunction(value: IndexedFunction) {
-  const { embeddingInput: _embeddingInput, embeddingId: _embeddingId, ...result } = value;
+  const { embeddingInput: _embeddingInput, embeddingId: _embeddingId, summaryEmbeddingId: _summaryEmbeddingId, ...result } = value;
   return result;
 }
 
 function presentMatch(value: SimilarityResult) {
-  return { similarity: value.similarity, function: presentFunction(value.function) };
+  const { function: callable, ...scores } = value;
+  return { ...scores, function: presentFunction(callable) };
 }
 
 function presentCohesionReport(report: CohesionReport, includeSource: boolean): CohesionJsonReport {
@@ -571,6 +612,8 @@ Commands:
   delete-files <path...>              Remove specific files from the index
   update-git                          Index a Git snapshot plus working-tree changes
   search <query>                      Search functions by semantic similarity
+  use-summaries                       Generate purpose summaries and enable automatic updates
+  search-summary <query>              Search functions using summary embeddings
   cross-search                        Find nearest functions for each source function
   cohesion                            Rank related functions separated across the repository
 
@@ -607,6 +650,11 @@ Analysis Examples:
     threshold, and allow for intentionally separate architectural responsibilities.
 
 Reading Analysis Output:
+  With complete summary indexes, cross-search and cohesion use combined 50% code + 50%
+  summary similarity. Cross-repository search requires complete summaries on both sides;
+  otherwise the analysis uses code-only similarity. Thresholds and limits apply after fusion.
+  JSON includes component scores and summary-generator profiles for reproducibility.
+  Compare results only when similarity mode and weights match.
   Compare values only with the same embedding profile and similar threshold, neighbor,
   source-filter, and minimum-line settings.
 
@@ -649,6 +697,7 @@ Options:
   --index <path>                      SQLite index path
   --provider <openai|jina>            Embedding provider
   --model <name>                      Embedding model
+  --summary-model <name>              OpenAI summary model (default: gpt-5.6-sol)
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)
   --rebuild-on-divergence             Rebuild after a rebase or branch change
@@ -685,6 +734,10 @@ Other Examples:
 
   Find functions matching a semantic query:
     slopdex search "validate an authenticated session" --limit 10
+
+  Enable purpose summaries, then search by their meaning:
+    slopdex use-summaries
+    slopdex search-summary "maintain the repository index" --format summary
 
   Review functions under a path against the whole codebase:
     slopdex cross-search --source-path src/services --format summary

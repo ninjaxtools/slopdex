@@ -5,7 +5,8 @@ import { CodeIndexError, GitDivergenceError } from "./errors.js";
 import { GitRepository, type GitChange, type GitTreeEntry } from "./git/repository.js";
 import { parseCallables } from "./parser/callable-parser.js";
 import { SourcePolicy } from "./source-policy.js";
-import { IndexDatabase, type PreparedCallable, type PreparedFile } from "./storage/database.js";
+import { IndexDatabase, type PreparedCallable, type PreparedFile, type PreparedSummary } from "./storage/database.js";
+import { OpenAISummaryProvider } from "./summaries/openai.js";
 import type {
   CodeIndexOptions,
   CrossSearchSourceFilter,
@@ -14,6 +15,8 @@ import type {
   IndexedFunction,
   SimilarityResult,
   SimilaritySearchOptions,
+  SummaryProvider,
+  SummaryStats,
   UpdateFilesOptions,
   UpdateFromGitOptions,
   UpdateFromWorkingTreeOptions,
@@ -28,6 +31,7 @@ export class CodeIndex {
   public readonly rootDir: string;
   public readonly indexPath: string;
   public readonly provider;
+  public readonly summaryProvider: SummaryProvider;
   readonly #database: IndexDatabase;
   readonly #policy: SourcePolicy;
   readonly #maxFileSize: number;
@@ -42,6 +46,9 @@ export class CodeIndex {
     const profile = normalizeProfile(options.provider.profile);
     assertPositiveInteger(profile.dimensions, "embedding dimensions");
     this.#database = new IndexDatabase(this.indexPath, this.rootDir, profile, options.readOnly ?? false);
+    this.summaryProvider = options.summaryProvider ?? new OpenAISummaryProvider({
+      ...(this.#database.summaryProfile()?.provider === "openai" ? { model: this.#database.summaryProfile()!.model } : {}),
+    });
     this.#policy = new SourcePolicy(options.include, options.exclude);
     this.#maxFileSize = options.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     this.#embeddingBatchSize = options.embeddingBatchSize ?? DEFAULT_BATCH_SIZE;
@@ -64,6 +71,8 @@ export class CodeIndex {
   }
 
   public async updateFiles(options: UpdateFilesOptions): Promise<UpdateStats> {
+    throwIfAborted(options.signal);
+    const generation = this.#database.getGeneration();
     const normalizedRenames = (options.renames ?? []).map(({ from, to }) => ({
       from: normalizeRelativePath(this.rootDir, from),
       to: normalizeRelativePath(this.rootDir, to),
@@ -102,6 +111,7 @@ export class CodeIndex {
     return this.#database.applyUpdate({
       files: prepared,
       deletePaths: [...deletePaths, ...renameMap.values()],
+      expectedGeneration: generation,
     });
   }
 
@@ -483,6 +493,7 @@ export class CodeIndex {
       indexedCommit: provenance.indexedCommit,
       language,
       byteSize: buffer.byteLength,
+      source: content,
       ...(provenance.previousPath ? { previousPath: provenance.previousPath } : {}),
       ...(provenance.replacePath ? { replacePath: provenance.replacePath } : {}),
       callables,
@@ -490,6 +501,12 @@ export class CodeIndex {
   }
 
   async #attachEmbeddings(files: PreparedFile[], signal?: AbortSignal): Promise<void> {
+    if (this.#database.summariesEnabled()) {
+      if (JSON.stringify(this.#database.summaryProfile()) !== JSON.stringify(this.summaryProvider.profile)) {
+        throw new CodeIndexError("Summary provider or model differs from this index; run use-summaries (useSummaries() in the library) with the new provider first.");
+      }
+      await this.#attachSummaries(files, signal);
+    }
     const profile = JSON.stringify(normalizeProfile(this.provider.profile));
     const unique = new Map<string, PreparedCallable[]>();
     for (const file of files) {
@@ -511,6 +528,92 @@ export class CodeIndex {
         for (const callable of batch[index]![1]) callable.vector = converted;
       });
     }
+    throwIfAborted(signal);
+  }
+
+  async #attachSummaries(files: PreparedFile[], signal?: AbortSignal): Promise<number> {
+    const profile = JSON.stringify(this.summaryProvider.profile);
+    const embeddingProfile = JSON.stringify(normalizeProfile(this.provider.profile));
+    const prepared = new Map<string, PreparedSummary>();
+    for (const file of files) {
+      for (const callable of file.callables) {
+        throwIfAborted(signal);
+        const key = sha256(`${profile}\0${embeddingProfile}\0${file.path}\0${file.contentHash}\0${callable.identityKey}\0${callable.sourceHash}`);
+        let purpose = prepared.get(key) ?? this.#database.cachedSummary(key);
+        if (!purpose) {
+          const summary = await this.summaryProvider.summarize({
+            repository: path.basename(this.rootDir),
+            callable,
+            fileSource: file.source,
+          }, signal ? { signal } : undefined);
+          if (typeof summary !== "string" || !summary.trim()) throw new CodeIndexError("Summary provider returned an empty summary.");
+          purpose = { key, summary: summary.trim() };
+          prepared.set(key, purpose);
+        }
+        callable.purpose = purpose;
+      }
+    }
+    for (const batch of chunk([...prepared.values()], this.#embeddingBatchSize)) {
+      throwIfAborted(signal);
+      const vectors = await this.provider.embedDocuments(batch.map((value) => value.summary), signal ? { signal } : undefined);
+      if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of summary vectors.");
+      vectors.forEach((vector, index) => {
+        batch[index]!.vector = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
+      });
+    }
+    throwIfAborted(signal);
+    return prepared.size;
+  }
+
+  public async useSummaries(options: { signal?: AbortSignal } = {}): Promise<SummaryStats> {
+    throwIfAborted(options.signal);
+    const generation = this.#database.getGeneration();
+    const functions = this.allFunctions();
+    if (this.#database.summariesEnabled()
+      && JSON.stringify(this.#database.summaryProfile()) === JSON.stringify(this.summaryProvider.profile)
+      && functions.every((callable) => callable.summaryEmbeddingId !== null)) {
+      return { summariesCreated: 0, summariesEnabled: true };
+    }
+    const byPath = groupBy(functions, (callable) => callable.path);
+    const files: PreparedFile[] = [];
+    for (const file of this.#database.getFileStates()) {
+      const callables = byPath.get(file.path);
+      if (!callables?.length) continue;
+      throwIfAborted(options.signal);
+      const buffer = file.sourceMode === "git" && file.blobOid
+        ? await this.#git.readBlob(file.blobOid)
+        : await readFile(path.join(this.rootDir, file.path));
+      const source = buffer.toString("utf8");
+      if (sha256(source) !== file.contentHash) {
+        throw new CodeIndexError(`Source changed since indexing: ${file.path}; update the index before enabling summaries.`);
+      }
+      files.push({
+        path: file.path, contentHash: file.contentHash, blobOid: file.blobOid,
+        sourceMode: file.sourceMode, indexedCommit: null, language: callables[0]!.language,
+        byteSize: buffer.byteLength, source,
+        callables: callables.map((callable) => ({ ...callable, embeddingKey: "" })),
+      });
+    }
+    const summariesCreated = await this.#attachSummaries(files, options.signal);
+    const ids = new Map(functions.map((callable) => [callable.identityKey, callable.id]));
+    this.#database.enableSummaries(files.flatMap((file) => file.callables.map((callable) => ({
+      id: ids.get(callable.identityKey)!, purpose: callable.purpose!,
+    }))), this.summaryProvider.profile, generation);
+    return { summariesCreated, summariesEnabled: true };
+  }
+
+  public async searchSummary(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
+    if (!this.#database.summariesEnabled()) throw new CodeIndexError("Summaries are not enabled; run use-summaries first.");
+    if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
+    const limit = options.limit ?? 10;
+    assertPositiveInteger(limit, "limit");
+    throwIfAborted(options.signal);
+    const vector = await this.provider.embedQuery(options.query, options.signal ? { signal: options.signal } : undefined);
+    throwIfAborted(options.signal);
+    return this.#database.searchVector(normalizeEmbeddingVector(vector, this.provider.profile.dimensions), {
+      summaries: true, limit, minSimilarity: options.minSimilarity ?? -1,
+      ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+    });
   }
 
   public async similaritySearch(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
@@ -527,6 +630,7 @@ export class CodeIndex {
   }
 
   public similarToFunction(functionId: number, options: {
+    includeSummaries?: boolean;
     limit: number;
     minSimilarity: number;
     maxSimilarity?: number;
@@ -536,6 +640,7 @@ export class CodeIndex {
   }): SimilarityResult[] {
     const vector = this.#database.vectorForFunction(functionId);
     return this.#database.searchVector(vector, {
+      ...(options.includeSummaries ? { summaryVector: this.#database.vectorForFunction(functionId, "summary") } : {}),
       limit: options.limit,
       minSimilarity: options.minSimilarity,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -546,11 +651,12 @@ export class CodeIndex {
     });
   }
 
-  public vectorForFunction(functionId: number): number[] {
-    return this.#database.vectorForFunction(functionId);
+  public vectorForFunction(functionId: number, kind: "code" | "summary" = "code"): number[] {
+    return this.#database.vectorForFunction(functionId, kind);
   }
 
   public searchByVector(vector: readonly number[], options: {
+    summaryVector?: readonly number[];
     limit: number;
     minSimilarity: number;
     maxSimilarity?: number;
@@ -558,7 +664,11 @@ export class CodeIndex {
     minLines?: number;
     nameRegex?: string;
   }): SimilarityResult[] {
-    return this.#database.searchVector(normalizeEmbeddingVector(vector, this.provider.profile.dimensions), options);
+    return this.#database.searchVector(normalizeEmbeddingVector(vector, this.provider.profile.dimensions), {
+      ...options,
+      ...(options.summaryVector !== undefined
+        ? { summaryVector: normalizeEmbeddingVector(options.summaryVector, this.provider.profile.dimensions) } : {}),
+    });
   }
 
   public async sourceFunctions(filter: CrossSearchSourceFilter): Promise<IndexedFunction[]> {

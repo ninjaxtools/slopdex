@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
@@ -441,6 +442,8 @@ describe("CLI help", () => {
       "slopdex delete-files",
       "slopdex update-git",
       "slopdex search",
+      "slopdex use-summaries",
+      "slopdex search-summary",
       "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5",
       "slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary",
     ]) expect(result.stdout).toContain(example);
@@ -474,5 +477,84 @@ describe("CLI help", () => {
     expect(result.stdout.indexOf("Options:")).toBeLessThan(result.stdout.indexOf("Other Examples:"));
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
+  });
+});
+
+describe("CLI summaries", () => {
+  it("initializes, searches, updates, changes models, and preserves summary mode through a rebuild", () => {
+    const root = temporaryRoot();
+    write(root, "src/a.ts", "export function one() { return 1; }\n");
+    write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2 }));
+    write(root, ".slopdex/mock-api.mjs", `
+globalThis.fetch = async (url, options) => {
+  const body = JSON.parse(options.body);
+  if (url === 'https://api.openai.com/v1/responses') {
+    const input = JSON.parse(body.input);
+    return Response.json({status: 'completed', output: [{type: 'message', content: [{
+      type: 'output_text', text: 'Purpose of ' + input.qualifiedName + ' using ' + body.model
+    }]}]});
+  }
+  if (url === 'https://api.openai.com/v1/embeddings') {
+    return Response.json({data: body.input.map((input, index) => ({index, embedding: [1, 0]}))});
+  }
+  throw new Error('Unexpected API URL: ' + url);
+};
+`);
+    const env = { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}` };
+    const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
+    const initialized = run("use-summaries");
+    expect(initialized.status, initialized.stderr).toBe(0);
+    expect(JSON.parse(initialized.stdout)).toEqual({ summariesCreated: 1, summariesEnabled: true });
+    expect(JSON.parse(run("use-summaries").stdout).summariesCreated).toBe(0);
+
+    const search = run("search-summary", "workflow", "--threshold", "0.9", "--limit", "1");
+    expect(search.status, search.stderr).toBe(0);
+    expect(JSON.parse(search.stdout)[0].function.summary).toBe("Purpose of one using gpt-5.6-sol");
+    expect(JSON.parse(search.stdout)[0].function).not.toHaveProperty("summaryEmbeddingId");
+    const text = run("search-summary", "workflow", "--format", "summary");
+    expect(text.stdout).toContain("Purpose of one using gpt-5.6-sol");
+
+    write(root, "src/b.ts", "export function two() { return 2; }\n");
+    const updated = run("status");
+    expect(updated.status, updated.stderr).toBe(0);
+    expect(JSON.parse(updated.stdout)).toMatchObject({ functionCount: 2, summaryCount: 2, summariesEnabled: true });
+    const changedModel = run("use-summaries", "--summary-model", "custom-summary-model");
+    expect(changedModel.status, changedModel.stderr).toBe(0);
+    expect(JSON.parse(changedModel.stdout).summariesCreated).toBe(2);
+    expect(JSON.parse(run("status").stdout).summaryProfile.model).toBe("custom-summary-model");
+
+    const cross = run("cross-search", "--min-lines", "1", "--format", "json");
+    expect(cross.status, cross.stderr).toBe(0);
+    const crossRow = JSON.parse(cross.stdout.trim());
+    expect(crossRow.matches[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, summarySimilarity: 1 });
+    expect(crossRow.scoring).toMatchObject({
+      similarityMode: "code-summary-average", similarityWeights: { code: 0.5, summary: 0.5 },
+      sourceSummaryProfile: { model: "custom-summary-model" }, targetSummaryProfile: { model: "custom-summary-model" },
+    });
+    expect(run("cross-search", "--min-lines", "1").stdout).toContain("combined 50% code + 50% summary");
+    const cohesion = run("cohesion", "--min-lines", "1");
+    expect(cohesion.status, cohesion.stderr).toBe(0);
+    const report = JSON.parse(cohesion.stdout);
+    expect(report.pairs[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, summarySimilarity: 1 });
+    expect(report.parameters).toMatchObject({ similarityMode: "code-summary-average", similarityWeights: { code: 0.5, summary: 0.5 } });
+    expect(report.repository.summaryProfile.model).toBe("custom-summary-model");
+
+    const rebuilt = run("status", "--model", "text-embedding-3-small", "--force-reindex");
+    expect(rebuilt.status, rebuilt.stderr).toBe(0);
+    expect(JSON.parse(rebuilt.stdout)).toMatchObject({
+      functionCount: 2, summaryCount: 2, summariesEnabled: true,
+      summaryProfile: { model: "custom-summary-model" },
+    });
+  });
+
+  it("validates summary search arguments and explains how to enable summaries", () => {
+    const root = temporaryRoot();
+    const missingQuery = runCli(root, "search-summary");
+    expect(missingQuery.status).toBe(2);
+    expect(missingQuery.stderr).toContain("search-summary requires a query");
+    expect(existsSync(path.join(root, ".slopdex/index.sqlite"))).toBe(false);
+    const disabled = runCli(root, "search-summary", "workflow");
+    expect(disabled.status).toBe(2);
+    expect(disabled.stderr).toContain("run use-summaries first");
   });
 });

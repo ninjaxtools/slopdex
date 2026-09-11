@@ -11,14 +11,23 @@ import type {
   IndexedFunction,
   ParsedCallable,
   SourceMode,
+  SimilarityResult,
+  SummaryProfile,
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "2";
+const SCHEMA_VERSION = "3";
+
+export interface PreparedSummary {
+  key: string;
+  summary: string;
+  vector?: readonly number[];
+}
 
 export interface PreparedCallable extends ParsedCallable {
   embeddingKey: string;
   vector?: readonly number[];
+  purpose?: PreparedSummary;
 }
 
 export interface PreparedFile {
@@ -29,6 +38,7 @@ export interface PreparedFile {
   indexedCommit: string | null;
   language: string;
   byteSize: number;
+  source: string;
   previousPath?: string;
   replacePath?: string;
   callables: PreparedCallable[];
@@ -63,6 +73,8 @@ interface FunctionRow {
   last_seen_commit: string | null;
   source_mode: SourceMode;
   embedding_id: number;
+  summary: string | null;
+  summary_embedding_id: number | null;
 }
 
 export class IndexDatabase {
@@ -150,6 +162,12 @@ export class IndexDatabase {
         source_mode TEXT NOT NULL CHECK(source_mode IN ('git', 'working-tree')),
         embedding_id INTEGER NOT NULL REFERENCES embeddings(id)
       );
+      CREATE TABLE IF NOT EXISTS summary_embeddings (
+        id INTEGER PRIMARY KEY,
+        embedding_key TEXT NOT NULL UNIQUE,
+        summary TEXT NOT NULL,
+        vector BLOB NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS callable_provenance (
         identity_key TEXT NOT NULL,
         source_hash TEXT NOT NULL,
@@ -172,9 +190,16 @@ export class IndexDatabase {
       this.#transaction(() => {
         if (needsLineCount) this.#db.exec("ALTER TABLE functions ADD COLUMN line_count INTEGER NOT NULL DEFAULT 1");
         this.#db.exec("UPDATE functions SET line_count = end_line - start_line + 1");
-        if (schemaVersion === "1") this.#setMetadata("schema_version", SCHEMA_VERSION);
       });
     }
+    this.#transaction(() => {
+      if (!functionColumns.some((column) => column.name === "summary")) {
+        this.#db.exec("ALTER TABLE functions ADD COLUMN summary TEXT");
+        this.#db.exec("ALTER TABLE functions ADD COLUMN summary_embedding_id INTEGER REFERENCES summary_embeddings(id)");
+      }
+      this.#db.exec("CREATE INDEX IF NOT EXISTS functions_summary_embedding ON functions(summary_embedding_id)");
+      if (schemaVersion === "1" || schemaVersion === "2") this.#setMetadata("schema_version", SCHEMA_VERSION);
+    });
   }
 
   #metadata(key: string): string | null {
@@ -237,6 +262,45 @@ export class IndexDatabase {
 
   public getGeneration(): number {
     return Number(this.#metadata("generation") ?? 0);
+  }
+
+  public summariesEnabled(): boolean {
+    return this.#metadata("summaries_enabled") === "true";
+  }
+
+  public summaryProfile(): SummaryProfile | null {
+    const value = this.#metadata("summary_profile");
+    return value ? JSON.parse(value) as SummaryProfile : null;
+  }
+
+  public cachedSummary(key: string): PreparedSummary | undefined {
+    const row = this.#db.prepare("SELECT summary FROM summary_embeddings WHERE embedding_key = ?").get(key) as
+      { summary: string } | undefined;
+    return row ? { key, summary: row.summary } : undefined;
+  }
+
+  #storeSummary(purpose: PreparedSummary): number {
+    if (purpose.vector) {
+      this.#db.prepare("INSERT OR IGNORE INTO summary_embeddings(embedding_key, summary, vector) VALUES (?, ?, ?)")
+        .run(purpose.key, purpose.summary, vectorBuffer(purpose.vector));
+    }
+    const row = this.#db.prepare("SELECT id FROM summary_embeddings WHERE embedding_key = ?").get(purpose.key) as
+      { id: number } | undefined;
+    if (!row) throw new CodeIndexError("Missing summary embedding.");
+    return row.id;
+  }
+
+  public enableSummaries(values: readonly { id: number; purpose: PreparedSummary }[], profile: SummaryProfile, expectedGeneration: number): void {
+    this.#transaction(() => {
+      if (this.getGeneration() !== expectedGeneration) throw new CodeIndexError("Index changed while summaries were being prepared; retry the update.");
+      for (const { id, purpose } of values) {
+        this.#db.prepare("UPDATE functions SET summary = ?, summary_embedding_id = ? WHERE id = ?")
+          .run(purpose.summary, this.#storeSummary(purpose), id);
+      }
+      this.#setMetadata("summaries_enabled", "true");
+      this.#setMetadata("summary_profile", JSON.stringify(profile));
+      this.#setMetadata("generation", String(expectedGeneration + 1));
+    });
   }
 
   public getWorkingTreeFiles(): Array<{ path: string; previousPath: string | null }> {
@@ -373,6 +437,8 @@ export class IndexDatabase {
       if (!embedding) throw new CodeIndexError(`Missing embedding for ${callable.qualifiedName}.`);
 
       const old = oldMatches.get(callable);
+      if (this.summariesEnabled() && !callable.purpose) throw new CodeIndexError(`Missing summary for ${callable.qualifiedName}.`);
+      const summaryId = callable.purpose ? this.#storeSummary(callable.purpose) : null;
       if (old) usedIds.add(old.id);
       const remembered = this.#db.prepare(`
         SELECT first_seen_commit FROM callable_provenance WHERE identity_key = ? AND source_hash = ?
@@ -382,8 +448,8 @@ export class IndexDatabase {
         INSERT INTO functions(
           id, path, language, kind, name, qualified_name, signature, identity_key,
           start_line, start_column, end_line, end_column, line_count, source, source_hash,
-          embedding_input, first_seen_commit, last_seen_commit, source_mode, embedding_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          embedding_input, first_seen_commit, last_seen_commit, source_mode, embedding_id, summary, summary_embedding_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         old?.id ?? null,
         file.path,
@@ -405,6 +471,8 @@ export class IndexDatabase {
         file.indexedCommit,
         file.sourceMode,
         embedding.id,
+        callable.purpose?.summary ?? null,
+        summaryId,
       );
       if (old) stats.functionsUpdated += 1;
       else stats.functionsAdded += 1;
@@ -444,6 +512,8 @@ export class IndexDatabase {
   }
 
   public searchVector(vector: readonly number[], options: {
+    summaries?: boolean;
+    summaryVector?: readonly number[];
     limit: number;
     minSimilarity: number;
     maxSimilarity?: number;
@@ -451,46 +521,60 @@ export class IndexDatabase {
     excludePaths?: readonly string[];
     minLines?: number;
     nameRegex?: string;
-  }): Array<{ function: IndexedFunction; similarity: number }> {
+  }): SimilarityResult[] {
+    const fused = options.summaryVector !== undefined;
+    if (fused && options.summaries) throw new CodeIndexError("Summary-only search cannot also use score fusion.");
     const excludePaths = options.excludePaths ?? [];
     const pathFilter = excludePaths.length > 0
       ? `AND f.path NOT IN (${excludePaths.map(() => "?").join(", ")})`
       : "";
     const rows = this.#db.prepare(`
-      SELECT f.*, 1.0 - vec_distance_cosine(e.vector, ?) AS similarity
-      FROM functions f
-      JOIN embeddings e ON e.id = f.embedding_id
-      WHERE (? IS NULL OR f.id != ?)
-        ${pathFilter}
-        AND f.line_count >= ?
-        AND (? IS NULL OR slopdex_regexp(?, f.qualified_name))
-        AND (1.0 - vec_distance_cosine(e.vector, ?)) >= ?
-        AND (? IS NULL OR (1.0 - vec_distance_cosine(e.vector, ?)) < ?)
-      ORDER BY similarity DESC, f.id ASC
+      WITH scores AS (
+        SELECT f.*, 1.0 - vec_distance_cosine(e.vector, ?) AS base_similarity
+          ${fused ? ", 1.0 - vec_distance_cosine(s.vector, ?) AS summary_similarity" : ""}
+        FROM functions f
+        JOIN ${options.summaries ? "summary_embeddings" : "embeddings"} e ON e.id = f.${options.summaries ? "summary_embedding_id" : "embedding_id"}
+        ${fused ? "JOIN summary_embeddings s ON s.id = f.summary_embedding_id" : ""}
+        WHERE (? IS NULL OR f.id != ?)
+          ${pathFilter}
+          AND f.line_count >= ?
+          AND (? IS NULL OR slopdex_regexp(?, f.qualified_name))
+      ), ranked AS (
+        SELECT *, ${fused ? "0.5 * base_similarity + 0.5 * summary_similarity" : "base_similarity"} AS similarity
+        FROM scores
+      )
+      SELECT * FROM ranked
+      WHERE similarity >= ? AND (? IS NULL OR similarity < ?)
+      ORDER BY similarity DESC, id ASC
       LIMIT ?
     `).all(
       vectorBuffer(vector),
+      ...(options.summaryVector ? [vectorBuffer(options.summaryVector)] : []),
       options.excludeId ?? null,
       options.excludeId ?? null,
       ...excludePaths,
       options.minLines ?? 1,
       options.nameRegex ?? null,
       options.nameRegex ?? null,
-      vectorBuffer(vector),
       options.minSimilarity,
       options.maxSimilarity ?? null,
-      vectorBuffer(vector),
       options.maxSimilarity ?? null,
       options.limit,
-    ) as unknown as Array<FunctionRow & { similarity: number }>;
-    return rows.map((row) => ({ function: toIndexedFunction(row), similarity: row.similarity }));
+    ) as unknown as Array<FunctionRow & { similarity: number; base_similarity: number; summary_similarity: number }>;
+    return rows.map((row) => ({
+      function: toIndexedFunction(row),
+      similarity: row.similarity,
+      ...(fused ? { codeSimilarity: row.base_similarity, summarySimilarity: row.summary_similarity } : {}),
+    }));
   }
 
-  public vectorForFunction(id: number): number[] {
+  public vectorForFunction(id: number, kind: "code" | "summary" = "code"): number[] {
     const row = this.#db.prepare(`
-      SELECT e.vector FROM functions f JOIN embeddings e ON e.id = f.embedding_id WHERE f.id = ?
+      SELECT e.vector FROM functions f
+      JOIN ${kind === "summary" ? "summary_embeddings" : "embeddings"} e
+        ON e.id = f.${kind === "summary" ? "summary_embedding_id" : "embedding_id"} WHERE f.id = ?
     `).get(id) as { vector: Uint8Array } | undefined;
-    if (!row) throw new CodeIndexError(`Function ${id} does not exist.`);
+    if (!row) throw new CodeIndexError(`Function ${id} does not exist or has no ${kind} embedding.`);
     return Array.from(new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4));
   }
 
@@ -505,6 +589,9 @@ export class IndexDatabase {
       generation: this.getGeneration(),
       gitCheckpoint: this.getCheckpoint(),
       embeddingProfile: this.#profile,
+      summariesEnabled: this.summariesEnabled(),
+      summaryCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM functions WHERE summary_embedding_id IS NOT NULL").get() as { count: number }).count),
+      summaryProfile: this.summaryProfile(),
     };
   }
 }
@@ -536,6 +623,8 @@ function toIndexedFunction(row: FunctionRow): IndexedFunction {
     lastSeenCommit: row.last_seen_commit,
     sourceMode: row.source_mode,
     embeddingId: row.embedding_id,
+    summary: row.summary,
+    summaryEmbeddingId: row.summary_embedding_id,
   };
 }
 
