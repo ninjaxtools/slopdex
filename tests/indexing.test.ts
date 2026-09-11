@@ -1,6 +1,7 @@
 import { chmodSync, renameSync, rmSync } from "node:fs";
 
-import { describe, expect, it } from "vitest";
+import Parser from "tree-sitter";
+import { describe, expect, it, vi } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
 import { FakeEmbeddingProvider, commitAll, git, initGit, temporaryRoot, write } from "./helpers.js";
@@ -50,6 +51,39 @@ export function multiply(a: number, b: number) { return a * b; }
     expect(stats).toMatchObject({ functionsAdded: 2, embeddingsCreated: 1 });
     expect(index.status().functionCount).toBe(2);
     index.close();
+  });
+
+  it("durably caches parsing and each completed embedding before a failed initial update", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    class FailingProvider extends FakeEmbeddingProvider {
+      public inputs: string[] = [];
+      public fail = true;
+
+      public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+        this.inputs.push(...inputs);
+        if (this.fail && inputs.some((input) => input.includes("symbol: two"))) throw new Error("embedding failed");
+        return await super.embedDocuments(inputs);
+      }
+    }
+    const provider = new FailingProvider();
+    const first = new CodeIndex({ rootDir: root, provider, embeddingBatchSize: 1 });
+    await expect(first.updateFiles({ upsert: ["functions.ts"] })).rejects.toThrow(/embedding failed/);
+    expect(first.status()).toMatchObject({ fileCount: 0, functionCount: 0, generation: 0 });
+    first.close();
+
+    provider.fail = false;
+    const parse = vi.spyOn(Parser.prototype, "parse").mockImplementation(() => { throw new Error("parse should be cached"); });
+    const resumed = new CodeIndex({ rootDir: root, provider, embeddingBatchSize: 1 });
+    await expect(resumed.updateFiles({ upsert: ["functions.ts"] })).resolves.toMatchObject({
+      functionsAdded: 2,
+      embeddingsCreated: 1,
+    });
+    expect(provider.inputs.filter((input) => input.includes("symbol: one"))).toHaveLength(1);
+    expect(provider.inputs.filter((input) => input.includes("symbol: two"))).toHaveLength(2);
+    expect(parse).not.toHaveBeenCalled();
+    parse.mockRestore();
+    resumed.close();
   });
 });
 

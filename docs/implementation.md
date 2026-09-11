@@ -12,7 +12,7 @@ For installation, command examples, configuration, and result interpretation, se
 | `src/source-policy.ts`, `src/gitignore.ts` | Supported paths, built-in/config exclusions, nested ignore rules. |
 | `src/git/repository.ts` | Git commits, trees, blobs, diffs, ancestry, and working-tree changes. |
 | `src/embeddings/`, `src/summaries/` | Provider requests and provider profiles. |
-| `src/storage/database.ts` | SQLite schema, migrations, transactions, metadata, and vector queries. |
+| `src/storage/database.ts` | SQLite schema, durable artifact caches, transactions, metadata, and vector queries. |
 | `src/search/` | Analysis scoring selection and cross-index neighbor discovery. |
 | `src/analysis/cohesion.ts` | Physical distance, gap scores, aggregate affinity, and groups. |
 | `src/format.ts` | Human-readable search, cluster, and cohesion output. |
@@ -44,18 +44,20 @@ The CLI reconciles an index before most commands. Library callers choose when to
 
 Git updates resolve the target commit, validate ancestry against the checkpoint, reconcile committed blobs, and optionally overlay current working-tree files when the target equals HEAD. Overlays account for staged, unstaged, untracked, renamed, and deleted paths. The saved checkpoint remains the committed base. Historical/other-branch targets are committed-only. Explicit `updateFiles` operations do not advance the checkpoint.
 
-File preparation and provider calls precede database updates. Generation checks detect concurrent index changes; working-tree updates also verify source and ignore-rule stability. SQLite transactions apply related file, function, vector, summary, diagnostic, and checkpoint changes together. Failed initialization removes its incomplete index artifacts.
+Tree-sitter results and each valid provider result are committed to content-addressed cache tables immediately. Generation checks detect concurrent logical index changes; working-tree updates also verify source and ignore-rule stability. A separate SQLite transaction atomically applies related file, function, diagnostic, summary-reference, and checkpoint changes. Failed or aborted initialization retains the valid database and its cache rows so the next invocation resumes without repeating completed work.
 
-Storage uses Node's `node:sqlite` and `sqlite-vec`. Writable connections enable WAL, foreign keys, and normal synchronization. The schema contains:
+Storage uses Node's `node:sqlite` and `sqlite-vec`. Writable connections enable WAL, foreign keys, and full synchronization. The schema contains:
 
 - `metadata`: repository root, embedding and summary profiles, generation, checkpoint, schema version, and feature/scan state.
 - `files`: paths, content hashes, blob IDs, source mode, previous paths, language, and size.
 - `functions`: identity, names, signatures, locations, source, provenance, and embedding/summary references.
-- `embeddings` and `summary_embeddings`: cached vectors, with summary text in the latter.
+- `embeddings`: code, summary, and query vectors keyed by embedding profile, operation, and exact input.
+- `summary_cache`: generated summary text keyed independently by summary profile and complete source context.
+- `parse_cache`: successful Tree-sitter extraction results keyed by parser strategy, path, and file-content hash.
 - `callable_provenance`: first-seen committed source identity.
 - `indexing_errors`: diagnostics associated with files.
 
-Current schema version is `4`. Supported older versions migrate automatically; the diagnostics migration marks a full rescan pending. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. CLI `--force-reindex` recreates incompatible indexes, preserving enabled OpenAI summary settings for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`.
+Current schema version is `5`. Earlier schemas are intentionally incompatible and require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. For a schema-5 index, `--force-reindex` clears logical index state while retaining content-addressed caches; incompatible older databases are recreated. Enabled OpenAI summary settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`.
 
 ### Diagnostics
 
@@ -74,7 +76,7 @@ Embedding inputs identify language, callable kind, qualified symbol, signature, 
 
 Purpose generation uses OpenAI's Responses API with `gpt-5.6-sol` and strategy `callable-purpose-v1`. The prompt asks for one to three sentences describing responsibility and visible relationships, using repository name, path, callable source, and full file context. Requests use `store: false`. Generated text is embedded with the configured embedding provider.
 
-Summary inputs include contextual and profile information so file-context, path, or model changes invalidate relevant cached results. Unchanged inputs reuse summaries and vectors. `useSummaries` persists the profile and enabled state; `disableSummaries` turns automatic updates and summary search/scoring off without deleting cached summaries. Summary generation and embedding preparation finish before the corresponding database transaction, preventing partially updated callable records on provider failure. Deleting a function removes it from summary search.
+Summary inputs include contextual and profile information so file-context, path, or model changes invalidate relevant cached results. Summary text identity is independent of the embedding profile, allowing an embedding-model change to reuse generation output while producing the required new vector. Every validated summary and vector is cached before indexing continues. `useSummaries` persists the profile and enabled state; `disableSummaries` turns automatic updates and summary search/scoring off without deleting cached artifacts. Function references are attached only by the final logical transaction, so provider failure cannot expose partially updated callable records. Deleting a function removes it from summary search but retains reusable cache rows.
 
 ## Similarity and analysis
 

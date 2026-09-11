@@ -55,6 +55,41 @@ describe("CLI index initialization", () => {
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(true);
   });
 
+  it("retains a partial initialization cache and resumes without repeating completed API calls", () => {
+    const root = temporaryRoot();
+    const statePath = path.join(root, ".slopdex", "api-state.json");
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2, embeddingBatchSize: 1 }));
+    write(root, ".slopdex/mock-api.mjs", `
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+globalThis.fetch = async (_url, options) => {
+  const body = JSON.parse(options.body);
+  const statePath = process.env.SLOPDEX_STATE_PATH;
+  const calls = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : [];
+  calls.push(body.input[0]);
+  writeFileSync(statePath, JSON.stringify(calls));
+  if (calls.length === 2) return new Response('intentional failure', {status: 400});
+  return Response.json({data: [{index: 0, embedding: [1, 0]}]});
+};
+`);
+    const env = {
+      ...process.env,
+      NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}`,
+      SLOPDEX_STATE_PATH: statePath,
+    };
+
+    const failed = runCliWithEnv(root, env, "status");
+    expect(failed.status).not.toBe(0);
+    expect(failed.stderr).toContain("intentional failure");
+    expect(existsSync(path.join(root, ".slopdex/index.sqlite"))).toBe(true);
+
+    const resumed = runCliWithEnv(root, env, "status");
+    expect(resumed.status, resumed.stderr).toBe(0);
+    const calls = JSON.parse(readFileSync(statePath, "utf8")) as string[];
+    expect(calls.filter((input) => input.includes("symbol: one"))).toHaveLength(1);
+    expect(calls.filter((input) => input.includes("symbol: two"))).toHaveLength(2);
+  });
+
   it("initializes a missing cross-search target index", () => {
     const sourceRoot = temporaryRoot();
     const targetRoot = temporaryRoot();

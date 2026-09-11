@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
 import { OpenAISummaryProvider } from "../src/summaries/openai.js";
+import { resetIndexState } from "../src/storage/database.js";
 import type { EmbeddingProvider, SummaryInput, SummaryProvider } from "../src/types.js";
 import { FakeEmbeddingProvider, commitAll, git, initGit, temporaryRoot, write } from "./helpers.js";
 
@@ -144,6 +145,92 @@ export class Client { constructor() {} send() { deliver(); } }
     index.close();
   });
 
+  it("persists each generated summary before a later summary request fails", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    class FailingSummaryProvider extends FakeSummaryProvider {
+      public shouldFail = true;
+
+      public override async summarize(input: SummaryInput): Promise<string> {
+        if (this.shouldFail && input.callable.name === "two") {
+          this.inputs.push(input);
+          throw new Error("summary failed");
+        }
+        return await super.summarize(input);
+      }
+    }
+    const summaries = new FailingSummaryProvider();
+    const provider = new FakeEmbeddingProvider();
+    const first = new CodeIndex({ rootDir: root, provider, summaryProvider: summaries, embeddingBatchSize: 1 });
+    await first.updateFiles({ upsert: ["functions.ts"] });
+    await expect(first.useSummaries()).rejects.toThrow(/summary failed/);
+    expect(first.status()).toMatchObject({ summariesEnabled: false, summaryCount: 0 });
+    first.close();
+
+    summaries.shouldFail = false;
+    const resumed = new CodeIndex({ rootDir: root, provider, summaryProvider: summaries, embeddingBatchSize: 1 });
+    await expect(resumed.useSummaries()).resolves.toEqual({ summariesCreated: 1, summariesEnabled: true });
+    expect(summaries.inputs.filter((input) => input.callable.name === "one")).toHaveLength(1);
+    expect(summaries.inputs.filter((input) => input.callable.name === "two")).toHaveLength(2);
+    resumed.close();
+  });
+
+  it("persists each completed summary vector before a later vector request fails", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    class FailingEmbeddingProvider extends FakeEmbeddingProvider {
+      public summaryInputs: string[] = [];
+      public shouldFail = true;
+
+      public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+        if (inputs.every((input) => input.startsWith("Purpose of"))) {
+          this.summaryInputs.push(...inputs);
+          if (this.shouldFail && this.summaryInputs.length === 2) throw new Error("summary embedding failed");
+        }
+        return await super.embedDocuments(inputs);
+      }
+    }
+    const provider = new FailingEmbeddingProvider();
+    const summaries = new FakeSummaryProvider();
+    const first = new CodeIndex({ rootDir: root, provider, summaryProvider: summaries, embeddingBatchSize: 1 });
+    await first.updateFiles({ upsert: ["functions.ts"] });
+    await expect(first.useSummaries()).rejects.toThrow(/summary embedding failed/);
+    first.close();
+
+    provider.shouldFail = false;
+    const resumed = new CodeIndex({ rootDir: root, provider, summaryProvider: summaries, embeddingBatchSize: 1 });
+    await expect(resumed.useSummaries()).resolves.toEqual({ summariesCreated: 0, summariesEnabled: true });
+    expect(summaries.inputs).toHaveLength(2);
+    expect(provider.summaryInputs.filter((input) => input.includes("one"))).toHaveLength(1);
+    expect(provider.summaryInputs.filter((input) => input.includes("two"))).toHaveLength(2);
+    resumed.close();
+  });
+
+  it("retains summary text across a logical rebuild with a new embedding profile", async () => {
+    const root = temporaryRoot();
+    write(root, "function.ts", "export function one() { return 1; }\n");
+    const provider = new FakeEmbeddingProvider();
+    const summaries = new FakeSummaryProvider();
+    const first = new CodeIndex({ rootDir: root, provider, summaryProvider: summaries });
+    await first.updateFiles({ upsert: ["function.ts"] });
+    await first.useSummaries();
+    const indexPath = first.indexPath;
+    first.close();
+
+    const replacement: EmbeddingProvider = {
+      profile: { ...provider.profile, model: "replacement" },
+      embedDocuments: provider.embedDocuments.bind(provider),
+      embedQuery: provider.embedQuery.bind(provider),
+    };
+    resetIndexState(indexPath, root, replacement.profile);
+    const rebuilt = new CodeIndex({ rootDir: root, provider: replacement, summaryProvider: summaries });
+    await rebuilt.useSummaries();
+    await rebuilt.updateFiles({ upsert: ["function.ts"] });
+    expect(summaries.inputs).toHaveLength(1);
+    expect(rebuilt.status()).toMatchObject({ functionCount: 1, summaryCount: 1, summariesEnabled: true });
+    rebuilt.close();
+  });
+
   it("rejects concurrent changes and aborted initialization without enabling summaries", async () => {
     const root = temporaryRoot();
     write(root, "a.ts", "export function one() { return 1; }\n");
@@ -163,27 +250,17 @@ export class Client { constructor() {} send() { deliver(); } }
     index.close();
   });
 
-  it("migrates version-2 indexes without changing code vectors", async () => {
+  it("rejects indexes from before the cache schema cutover", async () => {
     const root = temporaryRoot();
     write(root, "a.ts", "export function one() { return 1; }\n");
     const provider = new FakeEmbeddingProvider();
     const index = new CodeIndex({ rootDir: root, provider });
     await index.updateFiles({ upsert: ["a.ts"] });
-    const original = index.allFunctions()[0]!;
-    const vector = index.vectorForFunction(original.id);
     index.close();
     const db = new DatabaseSync(path.join(root, ".slopdex/index.sqlite"));
-    db.exec(`DROP INDEX functions_summary_embedding;
-      ALTER TABLE functions DROP COLUMN summary_embedding_id;
-      ALTER TABLE functions DROP COLUMN summary;
-      DROP TABLE summary_embeddings;
-      UPDATE metadata SET value = '2' WHERE key = 'schema_version';`);
+    db.exec("UPDATE metadata SET value = '4' WHERE key = 'schema_version';");
     db.close();
-    const migrated = new CodeIndex({ rootDir: root, provider });
-    expect(migrated.allFunctions()[0]).toEqual(original);
-    expect(migrated.vectorForFunction(original.id)).toEqual(vector);
-    expect(migrated.status()).toMatchObject({ summariesEnabled: false, summaryCount: 0 });
-    migrated.close();
+    expect(() => new CodeIndex({ rootDir: root, provider })).toThrow(/Unsupported index schema version 4/);
   });
 
   it("persists the OpenAI model choice and enables summaries on empty indexes", async () => {

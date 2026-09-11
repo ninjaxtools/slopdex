@@ -18,7 +18,7 @@ import type {
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "4";
+const SCHEMA_VERSION = "5";
 
 export interface PreparedSummary {
   key: string;
@@ -46,6 +46,11 @@ export interface PreparedFile {
   callables: PreparedCallable[];
   errors: IndexingIssue[];
   unavailable?: boolean;
+}
+
+export interface CachedParse {
+  callables: ParsedCallable[];
+  errors: IndexingIssue[];
 }
 
 export interface IndexedFileState {
@@ -86,12 +91,14 @@ export class IndexDatabase {
   readonly #rootDir: string;
   readonly #indexPath: string;
   readonly #profile: Required<EmbeddingProfile>;
+  readonly #readOnly: boolean;
 
   public constructor(indexPath: string, rootDir: string, profile: Required<EmbeddingProfile>, readOnly = false) {
     if (!readOnly) mkdirSync(path.dirname(indexPath), { recursive: true });
     this.#indexPath = indexPath;
     this.#rootDir = rootDir;
     this.#profile = profile;
+    this.#readOnly = readOnly;
     this.#db = new DatabaseSync(indexPath, { allowExtension: true, readOnly });
     try {
       sqliteVec.load(this.#db);
@@ -109,8 +116,8 @@ export class IndexDatabase {
       if (readOnly) {
         this.#db.exec("PRAGMA foreign_keys=ON");
       } else {
-        this.#db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;");
-        this.#migrate();
+        this.#db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+        this.#initializeSchema();
       }
       this.#validateMetadata(readOnly);
     } catch (error) {
@@ -123,7 +130,11 @@ export class IndexDatabase {
     this.#db.close();
   }
 
-  #migrate(): void {
+  #initializeSchema(): void {
+    const existingVersion = this.#metadataTableExists() ? this.#metadata("schema_version") : null;
+    if (existingVersion && existingVersion !== SCHEMA_VERSION) {
+      throw new IncompatibleIndexError(`Unsupported index schema version ${existingVersion}.`);
+    }
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY,
@@ -143,6 +154,14 @@ export class IndexDatabase {
         id INTEGER PRIMARY KEY,
         embedding_key TEXT NOT NULL UNIQUE,
         vector BLOB NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS summary_cache (
+        summary_key TEXT PRIMARY KEY,
+        summary TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS parse_cache (
+        parse_key TEXT PRIMARY KEY,
+        result TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS functions (
         id INTEGER PRIMARY KEY,
@@ -164,13 +183,9 @@ export class IndexDatabase {
         first_seen_commit TEXT,
         last_seen_commit TEXT,
         source_mode TEXT NOT NULL CHECK(source_mode IN ('git', 'working-tree')),
-        embedding_id INTEGER NOT NULL REFERENCES embeddings(id)
-      );
-      CREATE TABLE IF NOT EXISTS summary_embeddings (
-        id INTEGER PRIMARY KEY,
-        embedding_key TEXT NOT NULL UNIQUE,
-        summary TEXT NOT NULL,
-        vector BLOB NOT NULL
+        embedding_id INTEGER NOT NULL REFERENCES embeddings(id),
+        summary TEXT,
+        summary_embedding_id INTEGER REFERENCES embeddings(id)
       );
       CREATE TABLE IF NOT EXISTS callable_provenance (
         identity_key TEXT NOT NULL,
@@ -180,6 +195,7 @@ export class IndexDatabase {
       );
       CREATE INDEX IF NOT EXISTS functions_path ON functions(path);
       CREATE INDEX IF NOT EXISTS functions_embedding ON functions(embedding_id);
+      CREATE INDEX IF NOT EXISTS functions_summary_embedding ON functions(summary_embedding_id);
       CREATE TABLE IF NOT EXISTS indexing_errors (
         id INTEGER PRIMARY KEY,
         path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE ON UPDATE CASCADE,
@@ -189,33 +205,14 @@ export class IndexDatabase {
       INSERT OR IGNORE INTO callable_provenance(identity_key, source_hash, first_seen_commit)
         SELECT identity_key, source_hash, first_seen_commit FROM functions WHERE first_seen_commit IS NOT NULL;
     `);
-    const fileColumns = this.#db.prepare("PRAGMA table_info(files)").all() as Array<{ name: string }>;
-    if (!fileColumns.some((column) => column.name === "previous_path")) {
-      this.#db.exec("ALTER TABLE files ADD COLUMN previous_path TEXT");
-    }
-    const functionColumns = this.#db.prepare("PRAGMA table_info(functions)").all() as Array<{ name: string }>;
-    const needsLineCount = !functionColumns.some((column) => column.name === "line_count");
-    const schemaVersion = this.#metadata("schema_version");
-    if (needsLineCount || schemaVersion === "1") {
-      this.#transaction(() => {
-        if (needsLineCount) this.#db.exec("ALTER TABLE functions ADD COLUMN line_count INTEGER NOT NULL DEFAULT 1");
-        this.#db.exec("UPDATE functions SET line_count = end_line - start_line + 1");
-      });
-    }
-    this.#transaction(() => {
-      if (!functionColumns.some((column) => column.name === "summary")) {
-        this.#db.exec("ALTER TABLE functions ADD COLUMN summary TEXT");
-        this.#db.exec("ALTER TABLE functions ADD COLUMN summary_embedding_id INTEGER REFERENCES summary_embeddings(id)");
-      }
-      this.#db.exec("CREATE INDEX IF NOT EXISTS functions_summary_embedding ON functions(summary_embedding_id)");
-      if (schemaVersion === "1" || schemaVersion === "2" || schemaVersion === "3") {
-        this.#setMetadata("schema_version", SCHEMA_VERSION);
-        this.#setMetadata("diagnostics_scan_pending", "true");
-      }
-    });
+  }
+
+  #metadataTableExists(): boolean {
+    return Boolean(this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'").get());
   }
 
   #metadata(key: string): string | null {
+    if (!this.#metadataTableExists()) return null;
     const row = this.#db.prepare("SELECT value FROM metadata WHERE key = ?").get(key) as { value: string } | undefined;
     return row?.value ?? null;
   }
@@ -286,20 +283,46 @@ export class IndexDatabase {
     return value ? JSON.parse(value) as SummaryProfile : null;
   }
 
-  public cachedSummary(key: string): PreparedSummary | undefined {
-    const row = this.#db.prepare("SELECT summary FROM summary_embeddings WHERE embedding_key = ?").get(key) as
-      { summary: string } | undefined;
-    return row ? { key, summary: row.summary } : undefined;
+  public cachedEmbedding(key: string): number[] | undefined {
+    const row = this.#db.prepare("SELECT vector FROM embeddings WHERE embedding_key = ?").get(key) as
+      { vector: Uint8Array } | undefined;
+    return row ? bufferVector(row.vector) : undefined;
   }
 
-  #storeSummary(purpose: PreparedSummary): number {
-    if (purpose.vector) {
-      this.#db.prepare("INSERT OR IGNORE INTO summary_embeddings(embedding_key, summary, vector) VALUES (?, ?, ?)")
-        .run(purpose.key, purpose.summary, vectorBuffer(purpose.vector));
-    }
-    const row = this.#db.prepare("SELECT id FROM summary_embeddings WHERE embedding_key = ?").get(purpose.key) as
+  public storeEmbedding(key: string, vector: readonly number[]): void {
+    if (this.#readOnly) return;
+    this.#db.prepare("INSERT OR IGNORE INTO embeddings(embedding_key, vector) VALUES (?, ?)")
+      .run(key, vectorBuffer(vector));
+  }
+
+  public cachedSummary(key: string): string | undefined {
+    const row = this.#db.prepare("SELECT summary FROM summary_cache WHERE summary_key = ?").get(key) as
+      { summary: string } | undefined;
+    return row?.summary;
+  }
+
+  public storeSummary(key: string, summary: string): string {
+    if (this.#readOnly) return summary;
+    this.#db.prepare("INSERT OR IGNORE INTO summary_cache(summary_key, summary) VALUES (?, ?)").run(key, summary);
+    return (this.#db.prepare("SELECT summary FROM summary_cache WHERE summary_key = ?").get(key) as { summary: string }).summary;
+  }
+
+  public cachedParse(key: string): CachedParse | undefined {
+    const row = this.#db.prepare("SELECT result FROM parse_cache WHERE parse_key = ?").get(key) as
+      { result: string } | undefined;
+    return row ? JSON.parse(row.result) as CachedParse : undefined;
+  }
+
+  public storeParse(key: string, result: CachedParse): void {
+    if (this.#readOnly) return;
+    this.#db.prepare("INSERT OR IGNORE INTO parse_cache(parse_key, result) VALUES (?, ?)").run(key, JSON.stringify(result));
+  }
+
+  #embeddingId(key: string, vector?: readonly number[]): number {
+    if (vector) this.storeEmbedding(key, vector);
+    const row = this.#db.prepare("SELECT id FROM embeddings WHERE embedding_key = ?").get(key) as
       { id: number } | undefined;
-    if (!row) throw new CodeIndexError("Missing summary embedding.");
+    if (!row) throw new CodeIndexError("Missing cached embedding.");
     return row.id;
   }
 
@@ -308,7 +331,7 @@ export class IndexDatabase {
       if (this.getGeneration() !== expectedGeneration) throw new CodeIndexError("Index changed while summaries were being prepared; retry the update.");
       for (const { id, purpose } of values) {
         this.#db.prepare("UPDATE functions SET summary = ?, summary_embedding_id = ? WHERE id = ?")
-          .run(purpose.summary, this.#storeSummary(purpose), id);
+          .run(purpose.summary, this.#embeddingId(purpose.key, purpose.vector), id);
       }
       this.#setMetadata("summaries_enabled", "true");
       this.#setMetadata("summary_profile", JSON.stringify(profile));
@@ -339,15 +362,6 @@ export class IndexDatabase {
     `).all() as unknown as IndexedFileState[];
   }
 
-  public getEmbeddingKeys(keys: readonly string[]): Set<string> {
-    const found = new Set<string>();
-    const statement = this.#db.prepare("SELECT 1 FROM embeddings WHERE embedding_key = ?");
-    for (const key of keys) {
-      if (statement.get(key)) found.add(key);
-    }
-    return found;
-  }
-
   public applyUpdate(options: {
     files: readonly PreparedFile[];
     deletePaths: readonly string[];
@@ -359,6 +373,7 @@ export class IndexDatabase {
     expectedCheckpoint?: string | null;
     expectedGeneration?: number;
     completeDiagnosticsScan?: boolean;
+    embeddingsCreated?: number;
   }): UpdateStats {
     return this.#transaction(() => {
       if (options.expectedCheckpoint !== undefined && this.getCheckpoint() !== options.expectedCheckpoint) {
@@ -374,7 +389,7 @@ export class IndexDatabase {
         functionsAdded: 0,
         functionsUpdated: 0,
         functionsDeleted: 0,
-        embeddingsCreated: 0,
+        embeddingsCreated: options.embeddingsCreated ?? 0,
         checkpoint: options.checkpoint !== undefined ? options.checkpoint : this.getCheckpoint(),
       };
 
@@ -454,16 +469,14 @@ export class IndexDatabase {
     ];
     for (const callable of orderedCallables) {
       if (callable.vector) {
-        const result = this.#db.prepare("INSERT OR IGNORE INTO embeddings(embedding_key, vector) VALUES (?, ?)")
-          .run(callable.embeddingKey, vectorBuffer(callable.vector));
-        stats.embeddingsCreated += Number(result.changes);
+        this.storeEmbedding(callable.embeddingKey, callable.vector);
       }
       const embedding = this.#db.prepare("SELECT id FROM embeddings WHERE embedding_key = ?").get(callable.embeddingKey) as { id: number } | undefined;
       if (!embedding) throw new CodeIndexError(`Missing embedding for ${callable.qualifiedName}.`);
 
       const old = oldMatches.get(callable);
       if (this.summariesEnabled() && !callable.purpose) throw new CodeIndexError(`Missing summary for ${callable.qualifiedName}.`);
-      const summaryId = callable.purpose ? this.#storeSummary(callable.purpose) : null;
+      const summaryId = callable.purpose ? this.#embeddingId(callable.purpose.key, callable.purpose.vector) : null;
       if (old) usedIds.add(old.id);
       const remembered = this.#db.prepare(`
         SELECT first_seen_commit FROM callable_provenance WHERE identity_key = ? AND source_hash = ?
@@ -558,8 +571,8 @@ export class IndexDatabase {
         SELECT f.*, 1.0 - vec_distance_cosine(e.vector, ?) AS base_similarity
           ${fused ? ", 1.0 - vec_distance_cosine(s.vector, ?) AS summary_similarity" : ""}
         FROM functions f
-        JOIN ${options.summaries ? "summary_embeddings" : "embeddings"} e ON e.id = f.${options.summaries ? "summary_embedding_id" : "embedding_id"}
-        ${fused ? "JOIN summary_embeddings s ON s.id = f.summary_embedding_id" : ""}
+        JOIN embeddings e ON e.id = f.${options.summaries ? "summary_embedding_id" : "embedding_id"}
+        ${fused ? "JOIN embeddings s ON s.id = f.summary_embedding_id" : ""}
         WHERE (? IS NULL OR f.id != ?)
           ${pathFilter}
           AND f.line_count >= ?
@@ -596,11 +609,10 @@ export class IndexDatabase {
   public vectorForFunction(id: number, kind: "code" | "summary" = "code"): number[] {
     const row = this.#db.prepare(`
       SELECT e.vector FROM functions f
-      JOIN ${kind === "summary" ? "summary_embeddings" : "embeddings"} e
-        ON e.id = f.${kind === "summary" ? "summary_embedding_id" : "embedding_id"} WHERE f.id = ?
+      JOIN embeddings e ON e.id = f.${kind === "summary" ? "summary_embedding_id" : "embedding_id"} WHERE f.id = ?
     `).get(id) as { vector: Uint8Array } | undefined;
     if (!row) throw new CodeIndexError(`Function ${id} does not exist or has no ${kind} embedding.`);
-    return Array.from(new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4));
+    return bufferVector(row.vector);
   }
 
   public status(): IndexStatus {
@@ -645,6 +657,45 @@ export function readIndexErrors(indexPath: string): IndexingError[] {
   }
 }
 
+export function resetIndexState(
+  indexPath: string,
+  rootDir: string,
+  profile: EmbeddingProfile,
+): void {
+  const database = new DatabaseSync(indexPath);
+  try {
+    database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+    const metadata = new Map((database.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>)
+      .map((row) => [row.key, row.value]));
+    if (metadata.get("schema_version") !== SCHEMA_VERSION) {
+      throw new IncompatibleIndexError(`Unsupported index schema version ${metadata.get("schema_version") ?? "unknown"}.`);
+    }
+    if (path.resolve(metadata.get("root_dir") ?? "") !== path.resolve(rootDir)) {
+      throw new IncompatibleIndexError("Index belongs to a different repository.");
+    }
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec("DELETE FROM files; DELETE FROM callable_provenance; DELETE FROM metadata;");
+      const setMetadata = database.prepare("INSERT INTO metadata(key, value) VALUES (?, ?)");
+      setMetadata.run("schema_version", SCHEMA_VERSION);
+      setMetadata.run("root_dir", path.resolve(rootDir));
+      setMetadata.run("embedding_profile", JSON.stringify({
+        provider: profile.provider,
+        model: profile.model,
+        dimensions: profile.dimensions,
+        strategyVersion: profile.strategyVersion ?? "callable-v2",
+      }));
+      setMetadata.run("generation", "0");
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    database.close();
+  }
+}
+
 export function readIndexErrorCounts(indexPath: string): { errors: number; files: number } {
   const database = new DatabaseSync(indexPath, { readOnly: true });
   try {
@@ -673,6 +724,10 @@ function errorsFromDatabase(database: DatabaseSync): IndexingError[] {
 function vectorBuffer(vector: readonly number[]): Uint8Array {
   const values = Float32Array.from(vector);
   return new Uint8Array(values.buffer);
+}
+
+function bufferVector(vector: Uint8Array): number[] {
+  return Array.from(new Float32Array(vector.buffer, vector.byteOffset, vector.byteLength / 4));
 }
 
 function toIndexedFunction(row: FunctionRow): IndexedFunction {

@@ -26,10 +26,34 @@ export function addNumbers(a: number, b: number) { return a + b; }
     expect(results[1]!.similarity).toBeGreaterThanOrEqual(results[2]!.similarity);
     index.close();
   });
+
+  it("persists query embeddings by profile, operation, and input", async () => {
+    const root = temporaryRoot();
+    write(root, "function.ts", "export function one() { return 1; }\n");
+    class QueryCountingProvider extends FakeEmbeddingProvider {
+      public queries: string[] = [];
+
+      public override async embedQuery(input: string): Promise<number[]> {
+        this.queries.push(input);
+        return await super.embedQuery(input);
+      }
+    }
+    const provider = new QueryCountingProvider();
+    const first = new CodeIndex({ rootDir: root, provider });
+    await first.updateFiles({ upsert: ["function.ts"] });
+    await first.similaritySearch({ query: "same query" });
+    await first.similaritySearch({ query: "same query" });
+    first.close();
+
+    const reopened = new CodeIndex({ rootDir: root, provider });
+    await reopened.similaritySearch({ query: "same query" });
+    expect(provider.queries).toEqual(["same query"]);
+    reopened.close();
+  });
 });
 
 describe("cross search", () => {
-  it("backfills callable line counts when migrating a version-1 index", async () => {
+  it("rejects indexes from before the cache schema cutover", async () => {
     const root = temporaryRoot();
     write(root, "function.ts", `export function migrated() {
   return 1;
@@ -40,15 +64,10 @@ describe("cross search", () => {
     const indexPath = index.indexPath;
     index.close();
     const database = new DatabaseSync(indexPath);
-    database.exec("UPDATE functions SET line_count = 1; UPDATE metadata SET value = '1' WHERE key = 'schema_version';");
+    database.exec("UPDATE metadata SET value = '4' WHERE key = 'schema_version';");
     database.close();
 
-    const migrated = new CodeIndex({ rootDir: root, provider });
-    expect(migrated.allFunctions()[0]!.lineCount).toBe(3);
-    migrated.close();
-    const verified = new DatabaseSync(indexPath, { readOnly: true });
-    expect(verified.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "4" });
-    verified.close();
+    expect(() => new CodeIndex({ rootDir: root, provider })).toThrow(/Unsupported index schema version 4/);
   });
 
   it("can include symmetric matches for every source function while excluding itself", async () => {

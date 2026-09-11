@@ -166,23 +166,18 @@ describe("persistent indexing diagnostics", () => {
     expect(index.allFunctions()).toHaveLength(2);
   });
 
-  it("migrates version-3 indexes and scans unchanged files once to discover old omissions", async () => {
+  it("rejects indexes from before the cache schema cutover", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "store.ts", brokenClass);
     commitAll(root, "broken source");
     const original = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider(), onWarning: () => {} });
     await original.updateFromGit();
-    const id = original.allFunctions()[0]!.id;
     const indexPath = original.indexPath;
     original.close();
     const db = new DatabaseSync(indexPath);
-    db.exec("DROP TABLE indexing_errors; UPDATE metadata SET value = '3' WHERE key = 'schema_version';");
+    db.exec("UPDATE metadata SET value = '4' WHERE key = 'schema_version';");
     db.close();
-    expect(readIndexErrors(indexPath)).toEqual([]);
-    const migrated = openIndex(root);
-    expect((await migrated.updateFromGit()).filesUpdated).toBe(1);
-    expect(migrated.allFunctions()[0]!.id).toBe(id);
-    expect(migrated.indexErrors()).toHaveLength(1);
+    expect(() => openIndex(root)).toThrow(/Unsupported index schema version 4/);
   });
 });

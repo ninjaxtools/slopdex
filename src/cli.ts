@@ -13,7 +13,7 @@ import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./e
 import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
 import { OpenAISummaryProvider } from "./summaries/openai.js";
-import { readIndexErrorCounts, readIndexErrors } from "./storage/database.js";
+import { readIndexErrorCounts, readIndexErrors, resetIndexState } from "./storage/database.js";
 import { compileNameRegex } from "./utils.js";
 import type {
   CodeIndexOptions,
@@ -347,7 +347,12 @@ async function ensureIndexUpdated(
     );
     const indexPath = resolveIndexPath(options);
     const summaryProfile = summaryProfileForRebuild(indexPath, options.rootDir);
-    removeIndexArtifacts(indexPath);
+    try {
+      resetIndexState(indexPath, options.rootDir, options.provider.profile);
+    } catch (resetError) {
+      if (!(resetError instanceof IncompatibleIndexError)) throw resetError;
+      removeIndexArtifacts(indexPath);
+    }
     return initializeIndex(options, indexPath, label, target, noReindex, summaryProfile);
   }
 }
@@ -380,17 +385,11 @@ async function initializeIndex(
     ...(summaryProfile && !options.summaryProvider
       ? { summaryProvider: new OpenAISummaryProvider({ model: summaryProfile.model }) } : {}),
   });
-  let initialized = false;
   try {
     if (summaryProfile) await index.useSummaries();
-    const stats = await refreshIndex(index, label, target, false, noReindex);
-    initialized = true;
-    return stats;
+    return await refreshIndex(index, label, target, false, noReindex);
   } finally {
     index.close();
-    if (!initialized) {
-      removeIndexArtifacts(indexPath);
-    }
   }
 }
 

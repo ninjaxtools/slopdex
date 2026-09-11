@@ -210,6 +210,8 @@ For automation, pass `--format json`: query searches and diagnostics return JSON
 
 Summaries are optional and disabled initially. `summaries enable` persists the selected summary model and keeps summaries current on later updates, including file-context and path changes. Use `slopdex summaries enable --summary-model <model-id>` to change it, or `slopdex summaries disable` to stop automatic updates and summary-based searching/scoring while retaining cached summaries. `status` exposes `summariesEnabled`, `summaryCount`, and `summaryProfile`.
 
+Tree-sitter extraction, generated summaries, and document/query vectors are content-addressed in the same SQLite database. Each validated result is committed immediately, independently of the final logical index update. If indexing is interrupted or a later provider call fails, rerunning reuses every completed result whose profile, operation, input, and source context hash still match.
+
 `search` always searches code; `search-summary` always searches purpose summaries. When all callables have enabled summaries, cross-search and cohesion automatically use **50% code similarity + 50% summary similarity**. Cross-repository analysis needs complete summaries on both sides; otherwise the entire analysis uses code-only scores. Thresholds and neighbor limits apply to the selected score.
 
 Text output labels combined scores. JSON exposes `codeSimilarity`, `summarySimilarity`, and scoring mode/weights (`scoring` for cross-search, `parameters` for cohesion). Compare runs only with matching scoring mode, weights, embedding and summary-generator profiles, threshold, neighbor count, and source/candidate filters.
@@ -226,7 +228,7 @@ Parse, extraction, read, and file-size failures are saved while healthy callable
 
 Saved failures trigger stderr warnings, including on cached runs, help, and cross-search targets. `--ignore-errors` silences warnings without clearing records. Updates retry failed files; successful indexing, deletion, or exclusion clears their diagnostics. Version output bypasses diagnostics.
 
-Use the recovery flag named in the error: `--rebuild-on-divergence` for Git history changes, `--force-reindex` for incompatible indexes. For provider/authentication failures, fix the reported configuration. For source-change-during-indexing errors, rerun after edits settle. Exit status is `0` on success, `2` for argument/domain errors, and `1` for other failures (or invocation without a command).
+Use the recovery flag named in the error: `--rebuild-on-divergence` for Git history changes, `--force-reindex` for incompatible indexes. Schema versions before 5 require `--force-reindex`; schema-5 rebuilds preserve reusable artifact caches. For provider/authentication failures, fix the reported configuration and rerun. For source-change-during-indexing errors, rerun after edits settle. Exit status is `0` on success, `2` for argument/domain errors, and `1` for other failures (or invocation without a command).
 
 ## Configuration
 

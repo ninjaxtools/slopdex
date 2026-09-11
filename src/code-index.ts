@@ -4,7 +4,7 @@ import path from "node:path";
 import { CodeIndexError, GitDivergenceError } from "./errors.js";
 import { GitRepository, type GitChange, type GitTreeEntry } from "./git/repository.js";
 import { GitignoreRules } from "./gitignore.js";
-import { languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
+import { CALLABLE_PARSER_CACHE_VERSION, languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
 import { SourcePolicy } from "./source-policy.js";
 import { IndexDatabase, type PreparedCallable, type PreparedFile, type PreparedSummary } from "./storage/database.js";
 import { OpenAISummaryProvider } from "./summaries/openai.js";
@@ -111,12 +111,13 @@ export class CodeIndex {
       }, true);
       if (file) prepared.push(file);
     }
-    await this.#attachEmbeddings(prepared, options.signal);
+    const embeddingsCreated = await this.#attachEmbeddings(prepared, options.signal);
     await gitignore.assertUnchanged(options.signal);
     return this.#database.applyUpdate({
       files: prepared,
       deletePaths: [...deletePaths, ...renameMap.values()],
       expectedGeneration: generation,
+      embeddingsCreated,
     });
   }
 
@@ -138,7 +139,7 @@ export class CodeIndex {
       if (!file || file.errors.some((error) => error.code === "file-too-large")) skippedPaths.add(relativePath);
       if (file) prepared.push(file);
     }
-    await this.#attachEmbeddings(prepared, options.signal);
+    const embeddingsCreated = await this.#attachEmbeddings(prepared, options.signal);
 
     await gitignore.assertUnchanged(options.signal);
     const pathsAgain = await this.#workingTreeSourcePaths(gitignore, options.signal);
@@ -172,6 +173,7 @@ export class CodeIndex {
       checkpoint: null,
       expectedGeneration: generation,
       completeDiagnosticsScan: true,
+      embeddingsCreated,
     });
   }
 
@@ -396,7 +398,7 @@ export class CodeIndex {
         prepared.push(this.#failedFile(entry.path, "read-error", error instanceof Error ? error.message : String(error), provenance, entry.size));
       }
     }
-    await this.#attachEmbeddings([...prepared, ...workingPrepared], options.signal);
+    const embeddingsCreated = await this.#attachEmbeddings([...prepared, ...workingPrepared], options.signal);
     const noChanges = (
       !reconcileAll
       && !diagnosticsScan
@@ -448,6 +450,7 @@ export class CodeIndex {
       expectedCheckpoint: checkpoint,
       expectedGeneration: generation,
       completeDiagnosticsScan: true,
+      embeddingsCreated,
     });
   }
 
@@ -510,11 +513,21 @@ export class CodeIndex {
     provenance: Pick<PreparedFile, "blobOid" | "sourceMode" | "indexedCommit" | "previousPath" | "replacePath">,
   ): PreparedFile {
     const content = buffer.toString("utf8");
-    const { callables, errors } = parseFileCallables(relativePath, content, this.#onWarning);
+    const contentHash = sha256(content);
+    const parseKey = sha256(`${CALLABLE_PARSER_CACHE_VERSION}\0${relativePath}\0${contentHash}`);
+    let parsed = this.#database.cachedParse(parseKey);
+    if (!parsed) {
+      parsed = parseFileCallables(relativePath, content, this.#onWarning);
+      if (!parsed.errors.some((error) => error.code === "parse-failed" || error.code === "extraction-error")) {
+        this.#database.storeParse(parseKey, parsed);
+      }
+    } else if (parsed.errors.length > 0) {
+      this.#onWarning(`Cannot fully parse ${relativePath}: tree-sitter reported syntax errors; indexing recoverable callables only.`);
+    }
     const language = languageForPath(relativePath) ?? path.extname(relativePath).slice(1);
     return {
       path: relativePath,
-      contentHash: sha256(content),
+      contentHash,
       blobOid: provenance.blobOid,
       sourceMode: provenance.sourceMode,
       indexedCommit: provenance.indexedCommit,
@@ -523,8 +536,8 @@ export class CodeIndex {
       source: content,
       ...(provenance.previousPath ? { previousPath: provenance.previousPath } : {}),
       ...(provenance.replacePath ? { replacePath: provenance.replacePath } : {}),
-      callables: callables as PreparedCallable[],
-      errors,
+      callables: parsed.callables as PreparedCallable[],
+      errors: parsed.errors,
     };
   }
 
@@ -568,9 +581,9 @@ export class CodeIndex {
     };
   }
 
-  async #attachEmbeddings(files: PreparedFile[], signal?: AbortSignal): Promise<void> {
+  async #attachEmbeddings(files: PreparedFile[], signal?: AbortSignal): Promise<number> {
     if (this.#database.summariesEnabled()) {
-      if (JSON.stringify(this.#database.summaryProfile()) !== JSON.stringify(this.summaryProvider.profile)) {
+      if (summaryProfileJson(this.#database.summaryProfile()!) !== summaryProfileJson(this.summaryProvider.profile)) {
         throw new CodeIndexError("Summary provider or model differs from this index; run summaries enable (useSummaries() in the library) with the new provider first.");
       }
       await this.#attachSummaries(files, signal);
@@ -579,58 +592,79 @@ export class CodeIndex {
     const unique = new Map<string, PreparedCallable[]>();
     for (const file of files) {
       for (const callable of file.callables) {
-        callable.embeddingKey = sha256(`${profile}\0${callable.embeddingInput}`);
+        callable.embeddingKey = embeddingKey(profile, "document", callable.embeddingInput);
         const values = unique.get(callable.embeddingKey) ?? [];
         values.push(callable);
         unique.set(callable.embeddingKey, values);
       }
     }
-    const existing = this.#database.getEmbeddingKeys([...unique.keys()]);
-    const missing = [...unique.entries()].filter(([key]) => !existing.has(key));
+    const missing: Array<[string, PreparedCallable[]]> = [];
+    for (const [key, callables] of unique) {
+      const vector = this.#database.cachedEmbedding(key);
+      if (vector) {
+        for (const callable of callables) callable.vector = vector;
+      } else {
+        missing.push([key, callables]);
+      }
+    }
     for (const batch of chunk(missing, this.#embeddingBatchSize)) {
       throwIfAborted(signal);
       const vectors = await this.provider.embedDocuments(batch.map(([, callables]) => callables[0]!.embeddingInput), signal ? { signal } : undefined);
       if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of vectors.");
       vectors.forEach((vector, index) => {
         const converted = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
+        this.#database.storeEmbedding(batch[index]![0], converted);
         for (const callable of batch[index]![1]) callable.vector = converted;
       });
     }
     throwIfAborted(signal);
+    return missing.length;
   }
 
   async #attachSummaries(files: PreparedFile[], signal?: AbortSignal): Promise<number> {
-    const profile = JSON.stringify(this.summaryProvider.profile);
+    const profile = summaryProfileJson(this.summaryProvider.profile);
     const embeddingProfile = JSON.stringify(normalizeProfile(this.provider.profile));
     const prepared = new Map<string, PreparedSummary>();
+    let summariesCreated = 0;
     for (const file of files) {
       for (const callable of file.callables) {
         throwIfAborted(signal);
-        const key = sha256(`${profile}\0${embeddingProfile}\0${file.path}\0${file.contentHash}\0${callable.identityKey}\0${callable.sourceHash}`);
-        let purpose = prepared.get(key) ?? this.#database.cachedSummary(key);
-        if (!purpose) {
-          const summary = await this.summaryProvider.summarize({
+        const summaryKey = sha256(`${profile}\0${path.basename(this.rootDir)}\0${file.path}\0${file.contentHash}\0${callable.identityKey}\0${callable.sourceHash}`);
+        let summary = this.#database.cachedSummary(summaryKey);
+        if (!summary) {
+          const generated = await this.summaryProvider.summarize({
             repository: path.basename(this.rootDir),
             callable,
             fileSource: file.source,
           }, signal ? { signal } : undefined);
-          if (typeof summary !== "string" || !summary.trim()) throw new CodeIndexError("Summary provider returned an empty summary.");
-          purpose = { key, summary: summary.trim() };
+          if (typeof generated !== "string" || !generated.trim()) throw new CodeIndexError("Summary provider returned an empty summary.");
+          summary = this.#database.storeSummary(summaryKey, generated.trim());
+          summariesCreated += 1;
+        }
+        const key = embeddingKey(embeddingProfile, "document", summary);
+        let purpose = prepared.get(key);
+        if (!purpose) {
+          purpose = { key, summary };
+          const vector = this.#database.cachedEmbedding(key);
+          if (vector) purpose.vector = vector;
           prepared.set(key, purpose);
         }
         callable.purpose = purpose;
       }
     }
-    for (const batch of chunk([...prepared.values()], this.#embeddingBatchSize)) {
+    const missing = [...prepared.values()].filter((purpose) => !purpose.vector);
+    for (const batch of chunk(missing, this.#embeddingBatchSize)) {
       throwIfAborted(signal);
       const vectors = await this.provider.embedDocuments(batch.map((value) => value.summary), signal ? { signal } : undefined);
       if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of summary vectors.");
       vectors.forEach((vector, index) => {
-        batch[index]!.vector = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
+        const converted = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
+        this.#database.storeEmbedding(batch[index]!.key, converted);
+        batch[index]!.vector = converted;
       });
     }
     throwIfAborted(signal);
-    return prepared.size;
+    return summariesCreated;
   }
 
   public async useSummaries(options: { signal?: AbortSignal } = {}): Promise<SummaryStats> {
@@ -638,7 +672,7 @@ export class CodeIndex {
     const generation = this.#database.getGeneration();
     const functions = this.allFunctions();
     if (this.#database.summariesEnabled()
-      && JSON.stringify(this.#database.summaryProfile()) === JSON.stringify(this.summaryProvider.profile)
+      && summaryProfileJson(this.#database.summaryProfile()!) === summaryProfileJson(this.summaryProvider.profile)
       && functions.every((callable) => callable.summaryEmbeddingId !== null)) {
       return { summariesCreated: 0, summariesEnabled: true };
     }
@@ -683,9 +717,9 @@ export class CodeIndex {
     assertPositiveInteger(limit, "limit");
     compileNameRegex(options.nameRegex);
     throwIfAborted(options.signal);
-    const vector = await this.provider.embedQuery(options.query, options.signal ? { signal: options.signal } : undefined);
+    const vector = await this.#queryEmbedding(options.query, options.signal);
     throwIfAborted(options.signal);
-    return this.#database.searchVector(normalizeEmbeddingVector(vector, this.provider.profile.dimensions), {
+    return this.#database.searchVector(vector, {
       summaries: true, limit, minSimilarity: options.minSimilarity ?? -1,
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -698,13 +732,26 @@ export class CodeIndex {
     assertPositiveInteger(limit, "limit");
     compileNameRegex(options.nameRegex);
     throwIfAborted(options.signal);
-    const vector = await this.provider.embedQuery(options.query, options.signal ? { signal: options.signal } : undefined);
+    const vector = await this.#queryEmbedding(options.query, options.signal);
     return this.searchByVector(vector, {
       limit,
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       minSimilarity: options.minSimilarity ?? -1,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
+  }
+
+  async #queryEmbedding(query: string, signal?: AbortSignal): Promise<number[]> {
+    const profile = JSON.stringify(normalizeProfile(this.provider.profile));
+    const key = embeddingKey(profile, "query", query);
+    const cached = this.#database.cachedEmbedding(key);
+    if (cached) return cached;
+    const vector = normalizeEmbeddingVector(
+      await this.provider.embedQuery(query, signal ? { signal } : undefined),
+      this.provider.profile.dimensions,
+    );
+    this.#database.storeEmbedding(key, vector);
+    return vector;
   }
 
   public similarToFunction(functionId: number, options: {
@@ -850,6 +897,18 @@ function normalizeProfile(profile: EmbeddingProfile): Required<EmbeddingProfile>
     dimensions: profile.dimensions,
     strategyVersion: profile.strategyVersion ?? "callable-v2",
   };
+}
+
+function summaryProfileJson(profile: SummaryProvider["profile"]): string {
+  return JSON.stringify({
+    provider: profile.provider,
+    model: profile.model,
+    strategyVersion: profile.strategyVersion,
+  });
+}
+
+function embeddingKey(profile: string, operation: "document" | "query", input: string): string {
+  return sha256(`${profile}\0${operation}\0${input}`);
 }
 
 function emptyStats(checkpoint: string | null): UpdateStats {

@@ -17,6 +17,7 @@ import { collectNativeCallables } from "./native-callables.js";
 import { parseDiagnostics } from "./diagnostics.js";
 
 const parsers = new Map<SupportedLanguage, Parser>();
+export const CALLABLE_PARSER_CACHE_VERSION = "callable-parser-v1";
 
 export function languageForPath(filePath: string): SupportedLanguage | null {
   switch (path.extname(filePath).toLowerCase()) {
