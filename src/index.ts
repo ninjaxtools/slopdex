@@ -3,8 +3,8 @@ export { readIndexErrors } from "./storage/database.js";
 export { analyzeCohesion, cohesionLocation } from "./analysis/cohesion.js";
 export { crossSearch } from "./search/cross-search.js";
 export { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
-export { OpenAISummaryProvider } from "./summaries/openai.js";
-export type { OpenAISummaryProviderOptions } from "./summaries/openai.js";
+export { OpenAIDescriptionProvider } from "./descriptions/openai.js";
+export type { OpenAIDescriptionProviderOptions } from "./descriptions/openai.js";
 export type { OpenAIEmbeddingProviderOptions } from "./embeddings/openai.js";
 export { JinaEmbeddingProvider } from "./embeddings/jina.js";
 export type { JinaEmbeddingProviderOptions } from "./embeddings/jina.js";
@@ -44,16 +44,16 @@ export function similaritySearch(index: CodeIndex, options: SimilaritySearchOpti
   return index.similaritySearch(options);
 }
 
-export function useSummaries(index: CodeIndex, options?: { signal?: AbortSignal }) {
-  return index.useSummaries(options);
+export function useDescriptions(index: CodeIndex, options?: { signal?: AbortSignal }) {
+  return index.useDescriptions(options);
 }
 
-export function disableSummaries(index: CodeIndex) {
-  return index.disableSummaries();
+export function disableDescriptions(index: CodeIndex) {
+  return index.disableDescriptions();
 }
 
-export function searchSummary(index: CodeIndex, options: SimilaritySearchOptions) {
-  return index.searchSummary(options);
+export function searchDescription(index: CodeIndex, options: SimilaritySearchOptions) {
+  return index.searchDescription(options);
 }
 
 export function crossSearchFunctions(options: CrossSearchOptions) {

@@ -12,7 +12,7 @@ import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
-import { OpenAISummaryProvider } from "./summaries/openai.js";
+import { OpenAIDescriptionProvider } from "./descriptions/openai.js";
 import { readIndexErrorCounts, readIndexErrors, resetIndexState } from "./storage/database.js";
 import { compileNameRegex } from "./utils.js";
 import type {
@@ -26,7 +26,7 @@ import type {
   EmbeddingProvider,
   IndexedFunction,
   SimilarityResult,
-  SummaryProfile,
+  DescriptionProfile,
   UpdateStats,
 } from "./types.js";
 
@@ -41,7 +41,7 @@ interface FileConfig {
   exclude?: string[];
   maxFileSize?: number;
   embeddingBatchSize?: number;
-  summaryModel?: string;
+  descriptionModel?: string;
 }
 
 const parsed = (() => {
@@ -56,7 +56,7 @@ const parsed = (() => {
         index: { type: "string" },
         provider: { type: "string" },
         model: { type: "string" },
-        "summary-model": { type: "string" },
+        "description-model": { type: "string" },
         dimensions: { type: "string" },
         target: { type: "string" },
         "target-root": { type: "string" },
@@ -90,7 +90,7 @@ const parsed = (() => {
 })();
 
 const [command, ...positionals] = parsed.positionals;
-const summariesAction = command === "summaries" ? positionals[0] : undefined;
+const descriptionsAction = command === "descriptions" ? positionals[0] : undefined;
 
 if (parsed.values.version) {
   const version = typeof __SLOPDEX_VERSION__ === "string"
@@ -154,7 +154,7 @@ async function main(): Promise<void> {
   const indexOptions: CodeIndexOptions = {
     rootDir,
     provider,
-    ...(config.summaryModel ? { summaryProvider: new OpenAISummaryProvider({ model: config.summaryModel }) } : {}),
+    ...(config.descriptionModel ? { descriptionProvider: new OpenAIDescriptionProvider({ model: config.descriptionModel }) } : {}),
     onWarning: () => {}, // Persisted diagnostics are reported once per index at exit.
     ...(parsed.values.index || config.indexPath ? { indexPath: parsed.values.index ?? config.indexPath } : {}),
     ...(config.include ? { include: config.include } : {}),
@@ -163,16 +163,16 @@ async function main(): Promise<void> {
     ...(config.embeddingBatchSize ? { embeddingBatchSize: config.embeddingBatchSize } : {}),
   };
   const updateTarget = command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD";
-  const { summaryProvider: _summaryProvider, ...refreshOptions } = indexOptions;
+  const { descriptionProvider: _descriptionProvider, ...refreshOptions } = indexOptions;
   const updateStats = await ensureIndexUpdated(
-    command === "summaries" && summariesAction === "enable" ? refreshOptions : indexOptions,
+    command === "descriptions" && descriptionsAction === "enable" ? refreshOptions : indexOptions,
     "index",
     updateTarget,
     parsed.values["rebuild-on-divergence"],
     parsed.values["force-reindex"],
     parsed.values["no-reindex"],
-    command === "summaries" && summariesAction === "disable"
-      ? (refreshIndex) => { refreshIndex.disableSummaries(); }
+    command === "descriptions" && descriptionsAction === "disable"
+      ? (refreshIndex) => { refreshIndex.disableDescriptions(); }
       : undefined,
   );
   const index = new CodeIndex(indexOptions);
@@ -193,16 +193,16 @@ async function main(): Promise<void> {
         printJson(updateStats);
         break;
       }
-      case "summaries":
-        printJson(summariesAction === "enable" ? await index.useSummaries() : index.disableSummaries());
+      case "descriptions":
+        printJson(descriptionsAction === "enable" ? await index.useDescriptions() : index.disableDescriptions());
         break;
       case "search":
-      case "search-summary": {
+      case "search-description": {
         const query = positionals.join(" ").trim();
         if (!query) throw new CodeIndexError(`${command} requires a query.`);
         const threshold = similarityThreshold();
         const nameRegex = qualifiedNameRegex();
-        const results = await (command === "search-summary" ? index.searchSummary.bind(index) : index.similaritySearch.bind(index))({
+        const results = await (command === "search-description" ? index.searchDescription.bind(index) : index.similaritySearch.bind(index))({
           query,
           ...(nameRegex !== undefined ? { nameRegex } : {}),
           limit: numberOption(parsed.values.limit, 10, "limit"),
@@ -212,8 +212,8 @@ async function main(): Promise<void> {
         const format = outputFormat("summary");
         if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
         if (format === "summary") {
-          process.stdout.write(`${command === "search-summary"
-            ? results.map((match) => `${formatSimilaritySummary([match])}\n  ${match.function.summary}`).join("\n")
+          process.stdout.write(`${command === "search-description"
+            ? results.map((match) => `${formatSimilaritySummary([match])}\n  ${match.function.description}`).join("\n")
             : formatSimilaritySummary(results)}\n`);
         } else printJson(results.map(presentMatch));
         break;
@@ -271,7 +271,7 @@ async function runCrossSearch(
     ...(targetConfig?.exclude ? { exclude: targetConfig.exclude } : {}),
     ...(targetConfig?.maxFileSize ? { maxFileSize: targetConfig.maxFileSize } : {}),
     ...(targetConfig?.embeddingBatchSize ? { embeddingBatchSize: targetConfig.embeddingBatchSize } : {}),
-    ...(targetConfig?.summaryModel ? { summaryProvider: new OpenAISummaryProvider({ model: targetConfig.summaryModel }) } : {}),
+    ...(targetConfig?.descriptionModel ? { descriptionProvider: new OpenAIDescriptionProvider({ model: targetConfig.descriptionModel }) } : {}),
   } : undefined;
   if (targetOptions) {
     await ensureIndexUpdated(
@@ -346,14 +346,14 @@ async function ensureIndexUpdated(
       `slopdex: warning: ${label} is incompatible (${error.message}); rebuilding automatically because --force-reindex was specified.\n`,
     );
     const indexPath = resolveIndexPath(options);
-    const summaryProfile = summaryProfileForRebuild(indexPath, options.rootDir);
+    const descriptionProfile = descriptionProfileForRebuild(indexPath, options.rootDir);
     try {
       resetIndexState(indexPath, options.rootDir, options.provider.profile);
     } catch (resetError) {
       if (!(resetError instanceof IncompatibleIndexError)) throw resetError;
       removeIndexArtifacts(indexPath);
     }
-    return initializeIndex(options, indexPath, label, target, noReindex, summaryProfile);
+    return initializeIndex(options, indexPath, label, target, noReindex, descriptionProfile);
   }
 }
 
@@ -378,29 +378,29 @@ async function initializeIndex(
   label: string,
   target: string,
   noReindex: boolean,
-  summaryProfile: SummaryProfile | null = null,
+  descriptionProfile: DescriptionProfile | null = null,
 ): Promise<UpdateStats> {
   const index = new CodeIndex({
     ...options, indexPath,
-    ...(summaryProfile && !options.summaryProvider
-      ? { summaryProvider: new OpenAISummaryProvider({ model: summaryProfile.model }) } : {}),
+    ...(descriptionProfile && !options.descriptionProvider
+      ? { descriptionProvider: new OpenAIDescriptionProvider({ model: descriptionProfile.model }) } : {}),
   });
   try {
-    if (summaryProfile) await index.useSummaries();
+    if (descriptionProfile) await index.useDescriptions();
     return await refreshIndex(index, label, target, false, noReindex);
   } finally {
     index.close();
   }
 }
 
-function summaryProfileForRebuild(indexPath: string, rootDir: string): SummaryProfile | null {
+function descriptionProfileForRebuild(indexPath: string, rootDir: string): DescriptionProfile | null {
   const db = new DatabaseSync(indexPath, { readOnly: true });
   try {
     const metadata = new Map((db.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>)
       .map((row) => [row.key, row.value]));
-    if (metadata.get("root_dir") !== path.resolve(rootDir) || metadata.get("summaries_enabled") !== "true") return null;
-    const profile = JSON.parse(metadata.get("summary_profile")!) as SummaryProfile;
-    if (profile.provider !== "openai") throw new CodeIndexError("Rebuilding this summary index requires its custom summary provider through the library API.");
+    if (metadata.get("root_dir") !== path.resolve(rootDir) || metadata.get("descriptions_enabled") !== "true") return null;
+    const profile = JSON.parse(metadata.get("description_profile")!) as DescriptionProfile;
+    if (profile.provider !== "openai") throw new CodeIndexError("Rebuilding this description index requires its custom description provider through the library API.");
     return profile;
   } finally {
     db.close();
@@ -470,7 +470,7 @@ function commandLineConfig(config: FileConfig): FileConfig {
     ...config,
     ...(provider ? { provider } : {}),
     ...(parsed.values.model ? { model: parsed.values.model } : {}),
-    ...(parsed.values["summary-model"] ? { summaryModel: parsed.values["summary-model"] } : {}),
+    ...(parsed.values["description-model"] ? { descriptionModel: parsed.values["description-model"] } : {}),
     ...(dimensions ? { dimensions } : {}),
   };
 }
@@ -498,8 +498,8 @@ function numberOption(value: string | undefined, defaultValue: number, name: str
 function validateInvocation(): void {
   const nameRegex = qualifiedNameRegex();
   if (nameRegex !== undefined) {
-    if (!["search", "search-summary", "cross-search", "cohesion"].includes(command!)) {
-      throw new CodeIndexError("-e/--regexp/--regex is only available for search, search-summary, cross-search, and cohesion.");
+    if (!["search", "search-description", "cross-search", "cohesion"].includes(command!)) {
+      throw new CodeIndexError("-e/--regexp/--regex is only available for search, search-description, cross-search, and cohesion.");
     }
     compileNameRegex(nameRegex, parsed.values.regex !== undefined ? "--regex value" : "-e/--regexp value");
   }
@@ -510,9 +510,9 @@ function validateInvocation(): void {
     case "status":
     case "update-git":
       return;
-    case "summaries":
-      if (positionals.length !== 1 || (summariesAction !== "enable" && summariesAction !== "disable")) {
-        throw new CodeIndexError("summaries requires enable or disable.");
+    case "descriptions":
+      if (positionals.length !== 1 || (descriptionsAction !== "enable" && descriptionsAction !== "disable")) {
+        throw new CodeIndexError("descriptions requires enable or disable.");
       }
       return;
     case "update-files":
@@ -522,7 +522,7 @@ function validateInvocation(): void {
       if (positionals.length === 0) throw new CodeIndexError("delete-files requires at least one path.");
       return;
     case "search":
-    case "search-summary": {
+    case "search-description": {
       if (!positionals.join(" ").trim()) throw new CodeIndexError(`${command} requires a query.`);
       validateLimit(10);
       similarityThreshold();
@@ -622,7 +622,7 @@ function crossSearchSourceFilter(): CrossSearchSourceFilter {
 }
 
 function presentFunction(value: IndexedFunction) {
-  const { embeddingInput: _embeddingInput, embeddingId: _embeddingId, summaryEmbeddingId: _summaryEmbeddingId, ...result } = value;
+  const { embeddingInput: _embeddingInput, embeddingId: _embeddingId, descriptionEmbeddingId: _descriptionEmbeddingId, ...result } = value;
   return result;
 }
 
@@ -681,8 +681,8 @@ Commands:
   delete-files <path...>              Remove specific files from the index
   update-git                          Index a Git snapshot plus working-tree changes
   search <query>                      Search functions by semantic similarity
-  summaries <enable|disable>          Enable or disable automatic purpose summaries
-  search-summary <query>              Search functions using summary embeddings
+  descriptions <enable|disable>       Enable or disable automatic purpose descriptions
+  search-description <query>          Search functions using description embeddings
   cross-search                        Find nearest functions for each source function
   cohesion                            Rank related functions separated across the repository
 
@@ -727,10 +727,10 @@ Analysis Examples:
     threshold, and allow for intentionally separate architectural responsibilities.
 
 Reading Analysis Output:
-  With complete summary indexes, cross-search and cohesion use combined 50% code + 50%
-  summary similarity. Cross-repository search requires complete summaries on both sides;
+  With complete description indexes, cross-search and cohesion use combined 50% code + 50%
+  description similarity. Cross-repository search requires complete descriptions on both sides;
   otherwise the analysis uses code-only similarity. Thresholds and limits apply after fusion.
-  JSON includes component scores and summary-generator profiles for reproducibility.
+  JSON includes component scores and description-generator profiles for reproducibility.
   Compare results only when similarity mode and weights match.
   Compare values only with the same embedding profile and similar threshold, neighbor,
   source-filter, and minimum-line settings.
@@ -775,7 +775,7 @@ Options:
   --index <path>                      SQLite index path
   --provider <openai|jina>            Embedding provider
   --model <name>                      Embedding model
-  --summary-model <name>              OpenAI summary model (default: gpt-5.6-sol)
+  --description-model <name>          OpenAI description model (default: gpt-5.6-sol)
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)
   --rebuild-on-divergence             Rebuild after a rebase or branch change
@@ -818,9 +818,9 @@ Other Examples:
   Find functions matching a semantic query:
     slopdex search "validate an authenticated session" --limit 10
 
-  Enable purpose summaries, then search by their meaning:
-    slopdex summaries enable
-    slopdex search-summary "maintain the repository index" --format summary
+  Enable purpose descriptions, then search by their meaning:
+    slopdex descriptions enable
+    slopdex search-description "maintain the repository index" --format summary
 
   Review functions under a path against the whole codebase:
     slopdex cross-search --source-path src/services --format summary

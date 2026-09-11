@@ -6,8 +6,8 @@ import { GitRepository, type GitChange, type GitTreeEntry } from "./git/reposito
 import { GitignoreRules } from "./gitignore.js";
 import { CALLABLE_PARSER_CACHE_VERSION, languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
 import { SourcePolicy } from "./source-policy.js";
-import { IndexDatabase, type PreparedCallable, type PreparedFile, type PreparedSummary } from "./storage/database.js";
-import { OpenAISummaryProvider } from "./summaries/openai.js";
+import { IndexDatabase, type PreparedCallable, type PreparedDescription, type PreparedFile } from "./storage/database.js";
+import { OpenAIDescriptionProvider } from "./descriptions/openai.js";
 import type {
   CodeIndexOptions,
   CrossSearchSourceFilter,
@@ -17,8 +17,8 @@ import type {
   IndexingError,
   SimilarityResult,
   SimilaritySearchOptions,
-  SummaryProvider,
-  SummaryStats,
+  DescriptionProvider,
+  DescriptionStats,
   UpdateFilesOptions,
   UpdateFromGitOptions,
   UpdateFromWorkingTreeOptions,
@@ -33,7 +33,7 @@ export class CodeIndex {
   public readonly rootDir: string;
   public readonly indexPath: string;
   public readonly provider;
-  public readonly summaryProvider: SummaryProvider;
+  public readonly descriptionProvider: DescriptionProvider;
   readonly #database: IndexDatabase;
   readonly #policy: SourcePolicy;
   readonly #maxFileSize: number;
@@ -48,8 +48,8 @@ export class CodeIndex {
     const profile = normalizeProfile(options.provider.profile);
     assertPositiveInteger(profile.dimensions, "embedding dimensions");
     this.#database = new IndexDatabase(this.indexPath, this.rootDir, profile, options.readOnly ?? false);
-    this.summaryProvider = options.summaryProvider ?? new OpenAISummaryProvider({
-      ...(this.#database.summaryProfile()?.provider === "openai" ? { model: this.#database.summaryProfile()!.model } : {}),
+    this.descriptionProvider = options.descriptionProvider ?? new OpenAIDescriptionProvider({
+      ...(this.#database.descriptionProfile()?.provider === "openai" ? { model: this.#database.descriptionProfile()!.model } : {}),
     });
     this.#policy = new SourcePolicy(options.include, options.exclude);
     this.#maxFileSize = options.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
@@ -126,44 +126,39 @@ export class CodeIndex {
     const generation = this.#database.getGeneration();
     const indexedFiles = this.#database.getFileStates();
     const gitignore = GitignoreRules.workingTree(this.rootDir);
-    const sourcePaths = await this.#workingTreeSourcePaths(gitignore, options.signal);
-    const prepared: PreparedFile[] = [];
-    const skippedPaths = new Set<string>();
-    for (const relativePath of sourcePaths) {
-      throwIfAborted(options.signal);
-      const file = await this.#prepareWorkingFile(relativePath, {
-        blobOid: null,
-        sourceMode: "working-tree",
-        indexedCommit: null,
-      });
-      if (!file || file.errors.some((error) => error.code === "file-too-large")) skippedPaths.add(relativePath);
-      if (file) prepared.push(file);
-    }
-    const embeddingsCreated = await this.#attachEmbeddings(prepared, options.signal);
+    let sourcePaths = await this.#workingTreeSourcePaths(gitignore, options.signal);
+    let prepared = await this.#prepareWorkingPaths(sourcePaths, options.signal);
+    let embeddingsCreated = await this.#attachEmbeddings(prepared, options.signal);
 
-    await gitignore.assertUnchanged(options.signal);
-    const pathsAgain = await this.#workingTreeSourcePaths(gitignore, options.signal);
-    if (JSON.stringify(pathsAgain) !== JSON.stringify(sourcePaths)) {
-      throw new CodeIndexError("Working-tree files changed while indexing; retry the update.");
-    }
-    for (const file of prepared) {
-      if (file.unavailable) continue;
-      try {
-        const info = await lstat(path.join(this.rootDir, file.path));
-        const content = await readFile(path.join(this.rootDir, file.path));
-        if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize || sha256(content.toString("utf8")) !== file.contentHash) {
-          throw new CodeIndexError(`Working-tree file changed while indexing: ${file.path}`);
+    while (true) {
+      await gitignore.assertUnchanged(options.signal);
+      const pathsAgain = await this.#workingTreeSourcePaths(gitignore, options.signal);
+      if (JSON.stringify(pathsAgain) !== JSON.stringify(sourcePaths)) {
+        sourcePaths = pathsAgain;
+        prepared = await this.#prepareWorkingPaths(sourcePaths, options.signal);
+        embeddingsCreated += await this.#attachEmbeddings(prepared, options.signal);
+        continue;
+      }
+      const changed: PreparedFile[] = [];
+      for (let index = 0; index < prepared.length; index += 1) {
+        const file = prepared[index]!;
+        if (!await this.#workingFileChanged(file)) continue;
+        const refreshed = await this.#prepareWorkingFile(file.path, {
+          blobOid: null,
+          sourceMode: "working-tree",
+          indexedCommit: null,
+        });
+        if (!refreshed) {
+          sourcePaths = await this.#workingTreeSourcePaths(gitignore, options.signal);
+          prepared = await this.#prepareWorkingPaths(sourcePaths, options.signal);
+          changed.push(...prepared);
+          break;
         }
-      } catch (error) {
-        if (error instanceof CodeIndexError) throw error;
-        throw new CodeIndexError(`Working-tree file changed while indexing: ${file.path}`, { cause: error });
+        prepared[index] = refreshed;
+        changed.push(refreshed);
       }
-    }
-    for (const relativePath of skippedPaths) {
-      const info = await lstat(path.join(this.rootDir, relativePath));
-      if (info.isFile() && !info.isSymbolicLink() && info.size <= this.#maxFileSize) {
-        throw new CodeIndexError(`Working-tree file changed while indexing: ${relativePath}`);
-      }
+      if (changed.length === 0) break;
+      embeddingsCreated += await this.#attachEmbeddings(changed, options.signal);
     }
 
     await gitignore.assertUnchanged(options.signal);
@@ -355,7 +350,6 @@ export class CodeIndex {
         skippedWorkingPaths.add(relativePath);
         continue;
       }
-      if (file.errors.some((error) => error.code === "file-too-large")) skippedWorkingPaths.add(relativePath);
       if (!file.unavailable && !replacePath && change.status === "A") {
         const contentHash = file.contentHash;
         const renameCandidates = workingFiles.filter((file) => (
@@ -398,7 +392,7 @@ export class CodeIndex {
         prepared.push(this.#failedFile(entry.path, "read-error", error instanceof Error ? error.message : String(error), provenance, entry.size));
       }
     }
-    const embeddingsCreated = await this.#attachEmbeddings([...prepared, ...workingPrepared], options.signal);
+    let embeddingsCreated = await this.#attachEmbeddings([...prepared, ...workingPrepared], options.signal);
     const noChanges = (
       !reconcileAll
       && !diagnosticsScan
@@ -409,29 +403,43 @@ export class CodeIndex {
       && workingDeletes.size === 0
     );
 
-    const resolvedAgain = await this.#git.resolveCommit(options.target ?? "HEAD");
-    if (resolvedAgain !== target) throw new CodeIndexError("Target Git ref changed while indexing; retry the update.");
-    if (overlayWorkingTree) {
+    while (true) {
+      const resolvedAgain = await this.#git.resolveCommit(options.target ?? "HEAD");
+      if (resolvedAgain !== target) throw new CodeIndexError("Target Git ref changed while indexing; retry the update.");
+      if (!overlayWorkingTree) break;
       const headAgain = await this.#git.resolveCommit("HEAD");
       const workingChangesAgain = await this.#git.workTreeChanges(target, indexArtifacts);
-      if (headAgain !== head || JSON.stringify(workingChangesAgain) !== JSON.stringify(workingChanges)) {
-        throw new CodeIndexError("Git HEAD or working-tree changes changed while indexing; retry the update.");
-      }
-      for (const file of workingPrepared) {
-        if (file.unavailable) continue;
-        const info = await lstat(path.join(this.rootDir, file.path));
-        const content = await readFile(path.join(this.rootDir, file.path));
-        if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize || sha256(content.toString("utf8")) !== file.contentHash) {
-          throw new CodeIndexError(`Working-tree file changed while indexing: ${file.path}`);
-        }
+      if (headAgain !== head) throw new CodeIndexError("Git HEAD changed while indexing; retry the update.");
+      if (JSON.stringify(workingChangesAgain) !== JSON.stringify(workingChanges)) return await this.updateFromGit(options);
+      const changed: PreparedFile[] = [];
+      for (let index = 0; index < workingPrepared.length; index += 1) {
+        const file = workingPrepared[index]!;
+        if (!await this.#workingFileChanged(file)) continue;
+        const refreshed = await this.#prepareWorkingFile(file.path, {
+          blobOid: null,
+          sourceMode: "working-tree",
+          indexedCommit: null,
+          ...(file.previousPath ? { previousPath: file.previousPath } : {}),
+          ...(file.replacePath ? { replacePath: file.replacePath } : {}),
+        });
+        if (!refreshed) return await this.updateFromGit(options);
+        workingPrepared[index] = refreshed;
+        changed.push(refreshed);
       }
       for (const relativePath of skippedWorkingPaths) {
-        const info = await lstat(path.join(this.rootDir, relativePath));
-        if (info.isFile() && !info.isSymbolicLink() && info.size <= this.#maxFileSize) {
-          throw new CodeIndexError(`Working-tree file changed while indexing: ${relativePath}`);
-        }
+        const refreshed = await this.#prepareWorkingFile(relativePath, {
+          blobOid: null,
+          sourceMode: "working-tree",
+          indexedCommit: null,
+        });
+        if (refreshed && !refreshed.unavailable) return await this.updateFromGit(options);
+      }
+      if (changed.length > 0) {
+        embeddingsCreated += await this.#attachEmbeddings(changed, options.signal);
+        continue;
       }
       await gitignore.assertUnchanged(options.signal);
+      break;
     }
     if (noChanges) {
       if (this.#database.getCheckpoint() !== checkpoint || this.#database.getGeneration() !== generation) {
@@ -505,6 +513,32 @@ export class CodeIndex {
     }
     sourcePaths.sort();
     return sourcePaths;
+  }
+
+  async #prepareWorkingPaths(relativePaths: readonly string[], signal?: AbortSignal): Promise<PreparedFile[]> {
+    const prepared: PreparedFile[] = [];
+    for (const relativePath of relativePaths) {
+      throwIfAborted(signal);
+      const file = await this.#prepareWorkingFile(relativePath, {
+        blobOid: null,
+        sourceMode: "working-tree",
+        indexedCommit: null,
+      });
+      if (file) prepared.push(file);
+    }
+    return prepared;
+  }
+
+  async #workingFileChanged(file: PreparedFile): Promise<boolean> {
+    try {
+      const info = await lstat(path.join(this.rootDir, file.path));
+      if (!info.isFile() || info.isSymbolicLink() || info.size !== file.byteSize) return true;
+      if (info.size > this.#maxFileSize) return !file.errors.some((error) => error.code === "file-too-large");
+      const content = await readFile(path.join(this.rootDir, file.path));
+      return file.unavailable === true || sha256(content.toString("utf8")) !== file.contentHash;
+    } catch {
+      return file.unavailable !== true;
+    }
   }
 
   #prepareFile(
@@ -582,11 +616,11 @@ export class CodeIndex {
   }
 
   async #attachEmbeddings(files: PreparedFile[], signal?: AbortSignal): Promise<number> {
-    if (this.#database.summariesEnabled()) {
-      if (summaryProfileJson(this.#database.summaryProfile()!) !== summaryProfileJson(this.summaryProvider.profile)) {
-        throw new CodeIndexError("Summary provider or model differs from this index; run summaries enable (useSummaries() in the library) with the new provider first.");
+    if (this.#database.descriptionsEnabled()) {
+      if (descriptionProfileJson(this.#database.descriptionProfile()!) !== descriptionProfileJson(this.descriptionProvider.profile)) {
+        throw new CodeIndexError("Description provider or model differs from this index; run descriptions enable (useDescriptions() in the library) with the new provider first.");
       }
-      await this.#attachSummaries(files, signal);
+      await this.#attachDescriptions(files, signal);
     }
     const profile = JSON.stringify(normalizeProfile(this.provider.profile));
     const unique = new Map<string, PreparedCallable[]>();
@@ -621,42 +655,42 @@ export class CodeIndex {
     return missing.length;
   }
 
-  async #attachSummaries(files: PreparedFile[], signal?: AbortSignal): Promise<number> {
-    const profile = summaryProfileJson(this.summaryProvider.profile);
+  async #attachDescriptions(files: PreparedFile[], signal?: AbortSignal): Promise<number> {
+    const profile = descriptionProfileJson(this.descriptionProvider.profile);
     const embeddingProfile = JSON.stringify(normalizeProfile(this.provider.profile));
-    const prepared = new Map<string, PreparedSummary>();
-    let summariesCreated = 0;
+    const prepared = new Map<string, PreparedDescription>();
+    let descriptionsCreated = 0;
     for (const file of files) {
       for (const callable of file.callables) {
         throwIfAborted(signal);
-        const summaryKey = sha256(`${profile}\0${path.basename(this.rootDir)}\0${file.path}\0${file.contentHash}\0${callable.identityKey}\0${callable.sourceHash}`);
-        let summary = this.#database.cachedSummary(summaryKey);
-        if (!summary) {
-          const generated = await this.summaryProvider.summarize({
+        const descriptionKey = sha256(`${profile}\0${path.basename(this.rootDir)}\0${file.path}\0${file.contentHash}\0${callable.identityKey}\0${callable.sourceHash}`);
+        let description = this.#database.cachedDescription(descriptionKey);
+        if (!description) {
+          const generated = await this.descriptionProvider.describe({
             repository: path.basename(this.rootDir),
             callable,
             fileSource: file.source,
           }, signal ? { signal } : undefined);
-          if (typeof generated !== "string" || !generated.trim()) throw new CodeIndexError("Summary provider returned an empty summary.");
-          summary = this.#database.storeSummary(summaryKey, generated.trim());
-          summariesCreated += 1;
+          if (typeof generated !== "string" || !generated.trim()) throw new CodeIndexError("Description provider returned an empty description.");
+          description = this.#database.storeDescription(descriptionKey, generated.trim());
+          descriptionsCreated += 1;
         }
-        const key = embeddingKey(embeddingProfile, "document", summary);
-        let purpose = prepared.get(key);
-        if (!purpose) {
-          purpose = { key, summary };
+        const key = embeddingKey(embeddingProfile, "document", description);
+        let preparedDescription = prepared.get(key);
+        if (!preparedDescription) {
+          preparedDescription = { key, description };
           const vector = this.#database.cachedEmbedding(key);
-          if (vector) purpose.vector = vector;
-          prepared.set(key, purpose);
+          if (vector) preparedDescription.vector = vector;
+          prepared.set(key, preparedDescription);
         }
-        callable.purpose = purpose;
+        callable.description = preparedDescription;
       }
     }
-    const missing = [...prepared.values()].filter((purpose) => !purpose.vector);
+    const missing = [...prepared.values()].filter((description) => !description.vector);
     for (const batch of chunk(missing, this.#embeddingBatchSize)) {
       throwIfAborted(signal);
-      const vectors = await this.provider.embedDocuments(batch.map((value) => value.summary), signal ? { signal } : undefined);
-      if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of summary vectors.");
+      const vectors = await this.provider.embedDocuments(batch.map((value) => value.description), signal ? { signal } : undefined);
+      if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of description vectors.");
       vectors.forEach((vector, index) => {
         const converted = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
         this.#database.storeEmbedding(batch[index]!.key, converted);
@@ -664,17 +698,17 @@ export class CodeIndex {
       });
     }
     throwIfAborted(signal);
-    return summariesCreated;
+    return descriptionsCreated;
   }
 
-  public async useSummaries(options: { signal?: AbortSignal } = {}): Promise<SummaryStats> {
+  public async useDescriptions(options: { signal?: AbortSignal } = {}): Promise<DescriptionStats> {
     throwIfAborted(options.signal);
     const generation = this.#database.getGeneration();
     const functions = this.allFunctions();
-    if (this.#database.summariesEnabled()
-      && summaryProfileJson(this.#database.summaryProfile()!) === summaryProfileJson(this.summaryProvider.profile)
-      && functions.every((callable) => callable.summaryEmbeddingId !== null)) {
-      return { summariesCreated: 0, summariesEnabled: true };
+    if (this.#database.descriptionsEnabled()
+      && descriptionProfileJson(this.#database.descriptionProfile()!) === descriptionProfileJson(this.descriptionProvider.profile)
+      && functions.every((callable) => callable.descriptionEmbeddingId !== null)) {
+      return { descriptionsCreated: 0, descriptionsEnabled: true };
     }
     const byPath = groupBy(functions, (callable) => callable.path);
     const files: PreparedFile[] = [];
@@ -687,31 +721,34 @@ export class CodeIndex {
         : await readFile(path.join(this.rootDir, file.path));
       const source = buffer.toString("utf8");
       if (sha256(source) !== file.contentHash) {
-        throw new CodeIndexError(`Source changed since indexing: ${file.path}; update the index before enabling summaries.`);
+        throw new CodeIndexError(`Source changed since indexing: ${file.path}; update the index before enabling descriptions.`);
       }
       files.push({
         path: file.path, contentHash: file.contentHash, blobOid: file.blobOid,
         sourceMode: file.sourceMode, indexedCommit: null, language: callables[0]!.language,
         byteSize: buffer.byteLength, source,
         errors: [],
-        callables: callables.map((callable) => ({ ...callable, embeddingKey: "" })),
+        callables: callables.map(({ description: _description, descriptionEmbeddingId: _descriptionEmbeddingId, ...callable }) => ({
+          ...callable,
+          embeddingKey: "",
+        })),
       });
     }
-    const summariesCreated = await this.#attachSummaries(files, options.signal);
+    const descriptionsCreated = await this.#attachDescriptions(files, options.signal);
     const ids = new Map(functions.map((callable) => [callable.identityKey, callable.id]));
-    this.#database.enableSummaries(files.flatMap((file) => file.callables.map((callable) => ({
-      id: ids.get(callable.identityKey)!, purpose: callable.purpose!,
-    }))), this.summaryProvider.profile, generation);
-    return { summariesCreated, summariesEnabled: true };
+    this.#database.enableDescriptions(files.flatMap((file) => file.callables.map((callable) => ({
+      id: ids.get(callable.identityKey)!, description: callable.description!,
+    }))), this.descriptionProvider.profile, generation);
+    return { descriptionsCreated, descriptionsEnabled: true };
   }
 
-  public disableSummaries(): SummaryStats {
-    this.#database.disableSummaries();
-    return { summariesCreated: 0, summariesEnabled: false };
+  public disableDescriptions(): DescriptionStats {
+    this.#database.disableDescriptions();
+    return { descriptionsCreated: 0, descriptionsEnabled: false };
   }
 
-  public async searchSummary(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
-    if (!this.#database.summariesEnabled()) throw new CodeIndexError("Summaries are not enabled; run summaries enable first.");
+  public async searchDescription(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
+    if (!this.#database.descriptionsEnabled()) throw new CodeIndexError("Descriptions are not enabled; run descriptions enable first.");
     if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
     const limit = options.limit ?? 10;
     assertPositiveInteger(limit, "limit");
@@ -720,7 +757,7 @@ export class CodeIndex {
     const vector = await this.#queryEmbedding(options.query, options.signal);
     throwIfAborted(options.signal);
     return this.#database.searchVector(vector, {
-      summaries: true, limit, minSimilarity: options.minSimilarity ?? -1,
+      descriptions: true, limit, minSimilarity: options.minSimilarity ?? -1,
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
@@ -755,7 +792,7 @@ export class CodeIndex {
   }
 
   public similarToFunction(functionId: number, options: {
-    includeSummaries?: boolean;
+    includeDescriptions?: boolean;
     limit: number;
     minSimilarity: number;
     maxSimilarity?: number;
@@ -765,7 +802,7 @@ export class CodeIndex {
   }): SimilarityResult[] {
     const vector = this.#database.vectorForFunction(functionId);
     return this.#database.searchVector(vector, {
-      ...(options.includeSummaries ? { summaryVector: this.#database.vectorForFunction(functionId, "summary") } : {}),
+      ...(options.includeDescriptions ? { descriptionVector: this.#database.vectorForFunction(functionId, "description") } : {}),
       limit: options.limit,
       minSimilarity: options.minSimilarity,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -776,12 +813,12 @@ export class CodeIndex {
     });
   }
 
-  public vectorForFunction(functionId: number, kind: "code" | "summary" = "code"): number[] {
+  public vectorForFunction(functionId: number, kind: "code" | "description" = "code"): number[] {
     return this.#database.vectorForFunction(functionId, kind);
   }
 
   public searchByVector(vector: readonly number[], options: {
-    summaryVector?: readonly number[];
+    descriptionVector?: readonly number[];
     limit: number;
     minSimilarity: number;
     maxSimilarity?: number;
@@ -791,8 +828,8 @@ export class CodeIndex {
   }): SimilarityResult[] {
     return this.#database.searchVector(normalizeEmbeddingVector(vector, this.provider.profile.dimensions), {
       ...options,
-      ...(options.summaryVector !== undefined
-        ? { summaryVector: normalizeEmbeddingVector(options.summaryVector, this.provider.profile.dimensions) } : {}),
+      ...(options.descriptionVector !== undefined
+        ? { descriptionVector: normalizeEmbeddingVector(options.descriptionVector, this.provider.profile.dimensions) } : {}),
     });
   }
 
@@ -899,7 +936,7 @@ function normalizeProfile(profile: EmbeddingProfile): Required<EmbeddingProfile>
   };
 }
 
-function summaryProfileJson(profile: SummaryProvider["profile"]): string {
+function descriptionProfileJson(profile: DescriptionProvider["profile"]): string {
   return JSON.stringify({
     provider: profile.provider,
     model: profile.model,

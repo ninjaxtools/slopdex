@@ -18,16 +18,16 @@ Describe behavior rather than guessing a symbol name. `-e` is a regex that restr
 
 ### Search function purpose
 
-Code purpose-summary generation needs to be enabled once:
+Code purpose-description generation needs to be enabled once:
 
 ```bash
-slopdex summaries enable # only needed once
+slopdex descriptions enable # only needed once
 ```
 
-Then purpose-summaries can be searched:
+Then purpose descriptions can be searched:
 
 ```bash
-slopdex search-summary "keep the repository index synchronized" --format summary --limit 10
+slopdex search-description "keep the repository index synchronized" --format summary --limit 10
 ```
 
 Enabling needs `OPENAI_API_KEY` in the environment.
@@ -35,7 +35,7 @@ Enabling needs `OPENAI_API_KEY` in the environment.
 To select another model:
 
 ```bash
-slopdex summaries enable --summary-model <model-id>
+slopdex descriptions enable --description-model <model-id>
 ```
 
 ### Find duplicate candidates
@@ -91,7 +91,7 @@ slopdex cross-search \
   --threshold 0.9 --format summary
 ```
 
-Both target options are required. Both indexes refresh and must have identical embedding profiles. The target refresh uses the source command's embedding provider and the target's file-selection/summary configuration. Use `--target-config <path>` for a custom target config.
+Both target options are required. Both indexes refresh and must have identical embedding profiles. The target refresh uses the source command's embedding provider and the target's file-selection/description configuration. Use `--target-config <path>` for a custom target config.
 
 ### Inspect or maintain the index
 
@@ -125,7 +125,7 @@ Usage: `slopdex <command> [arguments] [options]`. Quote queries and regexes. Boo
 | `--provider <openai\|jina>` | Embedding provider; `openai`. |
 | `--model <name>` | Embedding model; OpenAI `text-embedding-3-large`, Jina `jina-embeddings-v4`. |
 | `--dimensions <number>` | Positive dimensions supported by the model; OpenAI `3072`, Jina `1024`. |
-| `--summary-model <name>` | OpenAI summary model; initially `gpt-5.6-sol`, then the persisted selection. |
+| `--description-model <name>` | OpenAI description model; initially `gpt-5.6-sol`, then the persisted selection. |
 | `--ignore-errors` | Silence saved-diagnostic warnings without deleting records. |
 | `-h`, `--help` | Usage; no refresh. |
 | `--version` | Package version; exits without refresh or saved-diagnostic warnings. |
@@ -136,7 +136,7 @@ Explicit relative config/index paths resolve from the current directory. Source 
 
 | Argument | Applies to / behavior |
 | --- | --- |
-| `--limit <number>` | Positive integer. `search`/`search-summary`: matches, default `10`. Cross-search: neighbors per source, default `5`. Cohesion: reported pairs and file rows, default `50`. |
+| `--limit <number>` | Positive integer. `search`/`search-description`: matches, default `10`. Cross-search: neighbors per source, default `5`. Cohesion: reported pairs and file rows, default `50`. |
 | `--threshold <number\|min-max>` | Both query searches and analyses. Inclusive minimum or half-open range. Default `-1` for query/cross-search; `0.8` for cohesion. Cohesion minimum must be in `[-1, 1)`. |
 | `--format <json\|summary\|clusters>` | Both query searches, cross-search, cohesion, index-errors. `clusters` only supports cross-search; output defaults below. |
 | `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Equivalent case-sensitive JavaScript regex options on qualified names. Query searches filter results before limiting; cross-search/cohesion filter sources only. |
@@ -169,11 +169,11 @@ Use `--no-reindex` when the task calls for committed-only results or reuse of an
 
 | Command | Default | Alternatives |
 | --- | --- | --- |
-| `search`, `search-summary` | `summary` | JSON array; purpose search includes generated summary text |
+| `search`, `search-description` | `summary` | JSON array; purpose search includes generated description text |
 | `cross-search` | `clusters` | `summary`, or `json` for JSONL with one row per matched source |
 | `cohesion` | `summary` | One JSON report |
 | `index-errors` | `summary` | JSON array |
-| `status`, update commands, `summaries` | JSON object | — |
+| `status`, update commands, `descriptions` | JSON object | — |
 
 Prefer summary output for compact source review, clusters for duplicate families, and JSON/JSONL for structured processing. Stdout carries results; stderr carries notices and warnings. Cross-search omits sources without emitted matches. Empty output means no findings under the chosen coverage/filters, not proof that no similar code exists.
 
@@ -195,9 +195,9 @@ When reporting candidates, identify paths/symbols, summarize the shared behavior
 
 ### Purpose-aware scoring
 
-`search` uses code only; `search-summary` uses purpose summaries only. Cross-search and cohesion automatically use **50% code + 50% summary similarity** when summaries are enabled and complete. Cross-repository analysis needs completeness on both sides; otherwise all scores are code-only. Summary-generator models may differ even though embedding profiles must match.
+`search` uses code only; `search-description` uses purpose descriptions only. Cross-search and cohesion automatically use **50% code + 50% description similarity** when descriptions are enabled and complete. Cross-repository analysis needs completeness on both sides; otherwise all scores are code-only. Description-generator models may differ even though embedding profiles must match.
 
-Thresholds and limits apply to the selected score. Text labels combined scoring; JSON includes component scores and mode/weights (`scoring` in cross-search, `parameters` in cohesion). Compare runs only with matching scoring mode, weights, embedding and summary-generator profiles, threshold, neighbor count, and source/candidate filters.
+Thresholds and limits apply to the selected score. Text labels combined scoring; JSON includes component scores and mode/weights (`scoring` in cross-search, `parameters` in cohesion). Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, neighbor count, and source/candidate filters.
 
 ### Cohesion
 
@@ -217,4 +217,4 @@ Cohesion: 184 functions analyzed, 37 semantic edges
 - **Reciprocal:** both functions selected each other as neighbors. JSON `null` means an endpoint was not evaluated because of source filtering.
 - **JSON details:** `semanticWeight` reflects similarity above threshold; `separationWeight` reflects distance; `sourceTestPair` flags a path-inferred source/test relationship; file `externalAffinityRatio` measures affinity outside that file's folder.
 
-The example merits reviewing separated authentication responsibilities, while accounting for intentional layering. There is no universal pass/fail threshold. Use comparable runs to evaluate changes. Filtered reports describe selected sources, not the full repository. Summary metrics use all qualifying edges; pairs/files are limited, and groups use reported pairs.
+The example merits reviewing separated authentication responsibilities, while accounting for intentional layering. There is no universal pass/fail threshold. Use comparable runs to evaluate changes. Filtered reports describe selected sources, not the full repository. Cohesion metrics use all qualifying edges; pairs/files are limited, and groups use reported pairs.

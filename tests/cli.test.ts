@@ -435,7 +435,7 @@ export function two(value: string) {
     const json = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--format", "json");
     expect(json.status).toBe(0);
     const report = JSON.parse(json.stdout);
-    expect(report.summary).toMatchObject({ functionsAnalyzed: 2, semanticEdges: 1, remoteRatio: 1 });
+    expect(report.metrics).toMatchObject({ functionsAnalyzed: 2, semanticEdges: 1, remoteRatio: 1 });
     expect(report.pairs).toHaveLength(1);
     expect(report.pairs[0].left).not.toHaveProperty("source");
     expect(report.groups[0].members[0]).not.toHaveProperty("source");
@@ -443,7 +443,7 @@ export function two(value: string) {
     const included = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--include-source", "--regexp", "^one$", "--format", "json");
     expect(JSON.parse(included.stdout).pairs[0].left).toHaveProperty("source");
     expect(JSON.parse(included.stdout).parameters.sourceFilter).toEqual({ type: "all", nameRegex: "^one$" });
-    expect(JSON.parse(included.stdout).summary).toMatchObject({ scope: "selected-sources", functionsAnalyzed: 1, candidateFunctions: 2 });
+    expect(JSON.parse(included.stdout).metrics).toMatchObject({ scope: "selected-sources", functionsAnalyzed: 1, candidateFunctions: 2 });
 
   });
 
@@ -475,7 +475,7 @@ export function two(value: string) {
     expect(emptyRange.stderr).toContain("minimum must be less than its maximum");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    for (const command of ["cross-search", "cohesion", "search", "search-summary"]) {
+    for (const command of ["cross-search", "cohesion", "search", "search-description"]) {
       for (const option of ["-e", "--regex"]) {
         const invalidSourceRegex = runCli(root, command, ...(command.startsWith("search") ? ["query"] : []), option, "[");
         expect(invalidSourceRegex.status).toBe(2);
@@ -516,8 +516,8 @@ describe("CLI help", () => {
       "slopdex delete-files",
       "slopdex update-git",
       "slopdex search",
-      "slopdex summaries enable",
-      "slopdex search-summary",
+      "slopdex descriptions enable",
+      "slopdex search-description",
       "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5",
       "slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary",
     ]) expect(result.stdout).toContain(example);
@@ -556,8 +556,8 @@ describe("CLI help", () => {
   });
 });
 
-describe("CLI summaries", () => {
-  it("initializes, searches, updates, changes models, and preserves summary mode through a rebuild", () => {
+describe("CLI descriptions", () => {
+  it("initializes, searches, updates, changes models, and preserves description mode through a rebuild", () => {
     const root = temporaryRoot();
     write(root, "src/a.ts", "export function one() { return 1; }\n");
     write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2 }));
@@ -578,77 +578,77 @@ globalThis.fetch = async (url, options) => {
 `);
     const env = { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}` };
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
-    const initialized = run("summaries", "enable");
+    const initialized = run("descriptions", "enable");
     expect(initialized.status, initialized.stderr).toBe(0);
-    expect(JSON.parse(initialized.stdout)).toEqual({ summariesCreated: 1, summariesEnabled: true });
-    expect(JSON.parse(run("summaries", "enable").stdout).summariesCreated).toBe(0);
+    expect(JSON.parse(initialized.stdout)).toEqual({ descriptionsCreated: 1, descriptionsEnabled: true });
+    expect(JSON.parse(run("descriptions", "enable").stdout).descriptionsCreated).toBe(0);
 
-    const disabled = run("summaries", "disable");
+    const disabled = run("descriptions", "disable");
     expect(disabled.status, disabled.stderr).toBe(0);
-    expect(JSON.parse(disabled.stdout)).toEqual({ summariesCreated: 0, summariesEnabled: false });
-    expect(JSON.parse(run("status").stdout)).toMatchObject({ summaryCount: 0, summariesEnabled: false });
-    expect(run("search-summary", "workflow").stderr).toContain("run summaries enable first");
-    expect(JSON.parse(run("summaries", "enable").stdout)).toEqual({ summariesCreated: 0, summariesEnabled: true });
+    expect(JSON.parse(disabled.stdout)).toEqual({ descriptionsCreated: 0, descriptionsEnabled: false });
+    expect(JSON.parse(run("status").stdout)).toMatchObject({ descriptionCount: 0, descriptionsEnabled: false });
+    expect(run("search-description", "workflow").stderr).toContain("run descriptions enable first");
+    expect(JSON.parse(run("descriptions", "enable").stdout)).toEqual({ descriptionsCreated: 0, descriptionsEnabled: true });
 
-    const search = run("search-summary", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
+    const search = run("search-description", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
     expect(search.status, search.stderr).toBe(0);
-    expect(JSON.parse(search.stdout)[0].function.summary).toBe("Purpose of one using gpt-5.6-sol");
-    expect(JSON.parse(search.stdout)[0].function).not.toHaveProperty("summaryEmbeddingId");
-    const text = run("search-summary", "workflow");
+    expect(JSON.parse(search.stdout)[0].function.description).toBe("Purpose of one using gpt-5.6-sol");
+    expect(JSON.parse(search.stdout)[0].function).not.toHaveProperty("descriptionEmbeddingId");
+    const text = run("search-description", "workflow");
     expect(text.stdout).toContain("Purpose of one using gpt-5.6-sol");
 
     write(root, "src/b.ts", "export function two() { return 2; }\n");
     const updated = run("status");
     expect(updated.status, updated.stderr).toBe(0);
-    expect(JSON.parse(updated.stdout)).toMatchObject({ functionCount: 2, summaryCount: 2, summariesEnabled: true });
-    for (const command of ["search", "search-summary"]) {
+    expect(JSON.parse(updated.stdout)).toMatchObject({ functionCount: 2, descriptionCount: 2, descriptionsEnabled: true });
+    for (const command of ["search", "search-description"]) {
       const filtered = run(command, "workflow", "-e", "^two$", "--limit", "1", "--format", "json");
       expect(filtered.status, filtered.stderr).toBe(0);
       expect(JSON.parse(filtered.stdout).map((match: { function: { name: string } }) => match.function.name)).toEqual(["two"]);
     }
-    const changedModel = run("summaries", "enable", "--summary-model", "custom-summary-model");
+    const changedModel = run("descriptions", "enable", "--description-model", "custom-description-model");
     expect(changedModel.status, changedModel.stderr).toBe(0);
-    expect(JSON.parse(changedModel.stdout).summariesCreated).toBe(2);
-    expect(JSON.parse(run("status").stdout).summaryProfile.model).toBe("custom-summary-model");
+    expect(JSON.parse(changedModel.stdout).descriptionsCreated).toBe(2);
+    expect(JSON.parse(run("status").stdout).descriptionProfile.model).toBe("custom-description-model");
 
     const cross = run("cross-search", "--min-lines", "1", "--format", "json");
     expect(cross.status, cross.stderr).toBe(0);
     const crossRow = JSON.parse(cross.stdout.trim());
-    expect(crossRow.matches[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, summarySimilarity: 1 });
+    expect(crossRow.matches[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, descriptionSimilarity: 1 });
     expect(crossRow.scoring).toMatchObject({
-      similarityMode: "code-summary-average", similarityWeights: { code: 0.5, summary: 0.5 },
-      sourceSummaryProfile: { model: "custom-summary-model" }, targetSummaryProfile: { model: "custom-summary-model" },
+      similarityMode: "code-description-average", similarityWeights: { code: 0.5, description: 0.5 },
+      sourceDescriptionProfile: { model: "custom-description-model" }, targetDescriptionProfile: { model: "custom-description-model" },
     });
-    expect(run("cross-search", "--min-lines", "1").stdout).toContain("combined 50% code + 50% summary");
+    expect(run("cross-search", "--min-lines", "1").stdout).toContain("combined 50% code + 50% description");
     const cohesion = run("cohesion", "--min-lines", "1", "--format", "json");
     expect(cohesion.status, cohesion.stderr).toBe(0);
     const report = JSON.parse(cohesion.stdout);
-    expect(report.pairs[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, summarySimilarity: 1 });
-    expect(report.parameters).toMatchObject({ similarityMode: "code-summary-average", similarityWeights: { code: 0.5, summary: 0.5 } });
-    expect(report.repository.summaryProfile.model).toBe("custom-summary-model");
+    expect(report.pairs[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, descriptionSimilarity: 1 });
+    expect(report.parameters).toMatchObject({ similarityMode: "code-description-average", similarityWeights: { code: 0.5, description: 0.5 } });
+    expect(report.repository.descriptionProfile.model).toBe("custom-description-model");
 
     const rebuilt = run("status", "--model", "text-embedding-3-small", "--force-reindex");
     expect(rebuilt.status, rebuilt.stderr).toBe(0);
     expect(JSON.parse(rebuilt.stdout)).toMatchObject({
-      functionCount: 2, summaryCount: 2, summariesEnabled: true,
-      summaryProfile: { model: "custom-summary-model" },
+      functionCount: 2, descriptionCount: 2, descriptionsEnabled: true,
+      descriptionProfile: { model: "custom-description-model" },
     });
   });
 
-  it("validates summary search arguments and explains how to enable summaries", () => {
+  it("validates description search arguments and explains how to enable descriptions", () => {
     const root = temporaryRoot();
-    const missingQuery = runCli(root, "search-summary");
+    const missingQuery = runCli(root, "search-description");
     expect(missingQuery.status).toBe(2);
-    expect(missingQuery.stderr).toContain("search-summary requires a query");
+    expect(missingQuery.stderr).toContain("search-description requires a query");
     expect(existsSync(path.join(root, ".slopdex/index.sqlite"))).toBe(false);
-    const disabled = runCli(root, "search-summary", "workflow");
+    const disabled = runCli(root, "search-description", "workflow");
     expect(disabled.status).toBe(2);
-    expect(disabled.stderr).toContain("run summaries enable first");
+    expect(disabled.stderr).toContain("run descriptions enable first");
 
-    for (const args of [["summaries"], ["summaries", "maybe"], ["summaries", "enable", "extra"]]) {
+    for (const args of [["descriptions"], ["descriptions", "maybe"], ["descriptions", "enable", "extra"]]) {
       const invalid = runCli(root, ...args);
       expect(invalid.status).toBe(2);
-      expect(invalid.stderr).toContain("summaries requires enable or disable");
+      expect(invalid.stderr).toContain("descriptions requires enable or disable");
     }
   });
 });

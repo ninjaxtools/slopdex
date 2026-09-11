@@ -73,15 +73,15 @@ export function beta() { return 2; }
       minLines: 1,
     });
 
-    expect(report.schemaVersion).toBe(1);
-    expect(report.summary).toMatchObject({
+    expect(report.schemaVersion).toBe(2);
+    expect(report.metrics).toMatchObject({
       functionsAnalyzed: 4,
       candidateFunctions: 4,
       semanticEdges: 6,
     });
-    expect(report.summary.sameFileRatio).toBeCloseTo(1 / 6);
-    expect(report.summary.sameFolderRatio).toBeCloseTo(2 / 6);
-    expect(report.summary.remoteRatio).toBeCloseTo(3 / 6);
+    expect(report.metrics.sameFileRatio).toBeCloseTo(1 / 6);
+    expect(report.metrics.sameFolderRatio).toBeCloseTo(2 / 6);
+    expect(report.metrics.remoteRatio).toBeCloseTo(3 / 6);
     expect(report.pairs).toHaveLength(2);
     expect(report.pairs.every((pair) => pair.reciprocal)).toBe(true);
     expect(report.pairs.every((pair) => pair.location.physicalDistance === 4)).toBe(true);
@@ -112,8 +112,8 @@ export function beta() { return 2; }
       minLines: 1,
     });
 
-    expect(report.summary).toMatchObject({ functionsAnalyzed: 1, candidateFunctions: 3, semanticEdges: 2 });
-    expect(report.summary.scope).toBe("selected-sources");
+    expect(report.metrics).toMatchObject({ functionsAnalyzed: 1, candidateFunctions: 3, semanticEdges: 2 });
+    expect(report.metrics.scope).toBe("selected-sources");
     expect(report.files.map((file) => file.path)).toEqual(["selected.ts"]);
     expect(report.pairs.every((pair) => pair.left.path === "selected.ts" || pair.right.path === "selected.ts")).toBe(true);
     expect(report.pairs.every((pair) => pair.reciprocal === null)).toBe(true);

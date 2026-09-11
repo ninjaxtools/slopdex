@@ -27,13 +27,13 @@ slopdex search "keep the repository index synchronized" --format summary --limit
 To search generated descriptions of each function's role instead:
 
 ```bash
-slopdex summaries enable
-slopdex search-summary "keep the repository index synchronized" --format summary --limit 10
+slopdex descriptions enable
+slopdex search-description "keep the repository index synchronized" --format summary --limit 10
 ```
 
-This requires `OPENAI_API_KEY` even when Jina supplies embeddings, and adds generation costs. See [summaries and scoring](#summaries-and-scoring).
+This requires `OPENAI_API_KEY` even when Jina supplies embeddings, and adds generation costs. See [descriptions and scoring](#descriptions-and-scoring).
 
-`summaries disable` turns off summary generation while retaining cached data.
+`descriptions disable` turns off description generation while retaining cached data.
 
 ### Find duplicate-code candidates
 
@@ -70,7 +70,7 @@ slopdex cross-search \
   --threshold 0.9 --format summary
 ```
 
-Both indexes refresh automatically and must use identical embedding profiles. The target is refreshed with the source command's embedding provider; target configuration supplies file-selection and summary settings. Use `--target-config` for a non-default target config.
+Both indexes refresh automatically and must use identical embedding profiles. The target is refreshed with the source command's embedding provider; target configuration supplies file-selection and description settings. Use `--target-config` for a non-default target config.
 
 ### Inspect index health
 
@@ -89,8 +89,8 @@ Usage: `slopdex <command> [arguments] [options]`.
 | Command | Purpose | Output |
 | --- | --- | --- |
 | `search <query>` | Search function code by meaning. Quote multiword queries. | Summary; optional JSON array |
-| `summaries <enable\|disable>` | Enable or disable automatic purpose summaries. Re-enabling with unchanged inputs reuses cached summaries. | JSON statistics |
-| `search-summary <query>` | Search purpose summaries after enabling them. | Summary including summary text; optional JSON array |
+| `descriptions <enable\|disable>` | Enable or disable automatic purpose descriptions. Re-enabling with unchanged inputs reuses cached descriptions. | JSON statistics |
+| `search-description <query>` | Search purpose descriptions after enabling them. | Summary including description text; optional JSON array |
 | `cross-search` | Find neighbors for each selected function in this or another index. | `clusters` by default; optional `summary` or JSONL |
 | `cohesion` | Analyze semantic relationships versus file/folder separation. | Summary; optional JSON report |
 | `status` | Refresh and show index metadata, counts, and profiles. | JSON object |
@@ -119,7 +119,7 @@ slopdex update-git --force-reindex
 | `--provider <openai\|jina>` | Embedding provider; `openai` by default. |
 | `--model <name>` | Embedding model; `text-embedding-3-large` for OpenAI, `jina-embeddings-v4` for Jina. |
 | `--dimensions <number>` | Positive embedding dimension count; OpenAI `3072`, Jina `1024`. Must be supported by the model. |
-| `--summary-model <name>` | OpenAI summary model; `gpt-5.6-sol` initially, then the persisted model unless overridden. |
+| `--description-model <name>` | OpenAI description model; `gpt-5.6-sol` initially, then the persisted model unless overridden. |
 | `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
 | `-h`, `--help` | Show CLI usage without refreshing. |
 | `--version` | Print the package version and exit. |
@@ -200,21 +200,21 @@ Cohesion: 184 functions analyzed, 37 semantic edges
 | `sourceTestPair` | A source/test relationship inferred from paths; separation may be intentional. |
 | `externalAffinityRatio` | In JSON file reports, the share of observed affinity outside that file's folder. |
 
-The example suggests reviewing separated authentication responsibilities. It does not establish that they belong in one module. There is no universal cohesion pass threshold. Filtered reports describe selected sources, not the entire repository. Summary metrics cover all qualifying edges; reported pairs/files are limited, and groups are built from reported pairs.
+The example suggests reviewing separated authentication responsibilities. It does not establish that they belong in one module. There is no universal cohesion pass threshold. Filtered reports describe selected sources, not the entire repository. Cohesion metrics cover all qualifying edges; reported pairs/files are limited, and groups are built from reported pairs.
 
-For automation, pass `--format json`: query searches and diagnostics return JSON arrays; cross-search returns **JSONL**, one row per matched source; cohesion returns one JSON object containing `repository`, `parameters`, `summary`, `pairs`, `files`, and `groups`. Results go to stdout; notices and warnings go to stderr.
+For automation, pass `--format json`: query searches and diagnostics return JSON arrays; cross-search returns **JSONL**, one row per matched source; cohesion returns one JSON object containing `repository`, `parameters`, `metrics`, `pairs`, `files`, and `groups`. Results go to stdout; notices and warnings go to stderr.
 
 ## System behavior
 
-### Summaries and scoring
+### Descriptions and scoring
 
-Summaries are optional and disabled initially. `summaries enable` persists the selected summary model and keeps summaries current on later updates, including file-context and path changes. Use `slopdex summaries enable --summary-model <model-id>` to change it, or `slopdex summaries disable` to stop automatic updates and summary-based searching/scoring while retaining cached summaries. `status` exposes `summariesEnabled`, `summaryCount`, and `summaryProfile`.
+Descriptions are optional and disabled initially. `descriptions enable` persists the selected description model and keeps descriptions current on later updates, including file-context and path changes. Use `slopdex descriptions enable --description-model <model-id>` to change it, or `slopdex descriptions disable` to stop automatic updates and description-based searching/scoring while retaining cached descriptions. `status` exposes `descriptionsEnabled`, `descriptionCount`, and `descriptionProfile`.
 
-Tree-sitter extraction, generated summaries, and document/query vectors are content-addressed in the same SQLite database. Each validated result is committed immediately, independently of the final logical index update. If indexing is interrupted or a later provider call fails, rerunning reuses every completed result whose profile, operation, input, and source context hash still match.
+Tree-sitter extraction, generated descriptions, and document/query vectors are content-addressed in the same SQLite database. Each validated result is committed immediately, independently of the final logical index update. If indexing is interrupted or a later provider call fails, rerunning reuses every completed result whose profile, operation, input, and source context hash still match.
 
-`search` always searches code; `search-summary` always searches purpose summaries. When all callables have enabled summaries, cross-search and cohesion automatically use **50% code similarity + 50% summary similarity**. Cross-repository analysis needs complete summaries on both sides; otherwise the entire analysis uses code-only scores. Thresholds and neighbor limits apply to the selected score.
+`search` always searches code; `search-description` always searches purpose descriptions. When all callables have enabled descriptions, cross-search and cohesion automatically use **50% code similarity + 50% description similarity**. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Thresholds and neighbor limits apply to the selected score.
 
-Text output labels combined scores. JSON exposes `codeSimilarity`, `summarySimilarity`, and scoring mode/weights (`scoring` for cross-search, `parameters` for cohesion). Compare runs only with matching scoring mode, weights, embedding and summary-generator profiles, threshold, neighbor count, and source/candidate filters.
+Text output labels combined scores. JSON exposes `codeSimilarity`, `descriptionSimilarity`, and scoring mode/weights (`scoring` for cross-search, `parameters` for cohesion). Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, neighbor count, and source/candidate filters.
 
 ### Exclusions
 
@@ -246,7 +246,7 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina (requires `JINA
 | Property | Purpose / default |
 | --- | --- |
 | `provider`, `model`, `dimensions` | Embedding settings; defaults are listed in the CLI table. |
-| `summaryModel` | Summary model; initially `gpt-5.6-sol`. |
+| `descriptionModel` | Description model; initially `gpt-5.6-sol`. |
 | `indexPath` | Index location; `<root>/.slopdex/index.sqlite`. |
 | `include` | Repository-relative glob array; empty/unset includes all supported eligible files. |
 | `exclude` | Additional repository-relative exclusion globs. |

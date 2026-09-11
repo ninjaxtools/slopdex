@@ -48,8 +48,8 @@ export interface IndexedFunction extends ParsedCallable {
   lastSeenCommit: string | null;
   sourceMode: SourceMode;
   embeddingId: number;
-  summary: string | null;
-  summaryEmbeddingId: number | null;
+  description: string | null;
+  descriptionEmbeddingId: number | null;
 }
 
 export interface EmbeddingProfile {
@@ -65,33 +65,33 @@ export interface EmbeddingProvider {
   embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]>;
 }
 
-export interface SummaryProfile {
+export interface DescriptionProfile {
   provider: string;
   model: string;
   strategyVersion: string;
 }
 
-export interface SummaryInput {
+export interface DescriptionInput {
   repository: string;
   callable: ParsedCallable;
   fileSource: string;
 }
 
-export interface SummaryProvider {
-  readonly profile: SummaryProfile;
-  summarize(input: SummaryInput, options?: { signal?: AbortSignal }): Promise<string>;
+export interface DescriptionProvider {
+  readonly profile: DescriptionProfile;
+  describe(input: DescriptionInput, options?: { signal?: AbortSignal }): Promise<string>;
 }
 
-export interface SummaryStats {
-  summariesCreated: number;
-  summariesEnabled: boolean;
+export interface DescriptionStats {
+  descriptionsCreated: number;
+  descriptionsEnabled: boolean;
 }
 
 export interface CodeIndexOptions {
   rootDir: string;
   indexPath?: string;
   provider: EmbeddingProvider;
-  summaryProvider?: SummaryProvider;
+  descriptionProvider?: DescriptionProvider;
   onWarning?: (message: string) => void;
   include?: readonly string[];
   exclude?: readonly string[];
@@ -141,12 +141,12 @@ export interface SimilaritySearchOptions {
 export interface SimilarityScores {
   similarity: number;
   codeSimilarity?: number;
-  summarySimilarity?: number;
+  descriptionSimilarity?: number;
 }
 
 export interface AnalysisSimilarity {
-  similarityMode: "code" | "code-summary-average";
-  similarityWeights: { code: number; summary: number };
+  similarityMode: "code" | "code-description-average";
+  similarityWeights: { code: number; description: number };
 }
 
 export interface SimilarityResult extends SimilarityScores {
@@ -181,8 +181,8 @@ export interface CrossSearchResult {
   source: IndexedFunction;
   matches: SimilarityResult[];
   scoring?: AnalysisSimilarity & {
-    sourceSummaryProfile: SummaryProfile | null;
-    targetSummaryProfile: SummaryProfile | null;
+    sourceDescriptionProfile: DescriptionProfile | null;
+    targetDescriptionProfile: DescriptionProfile | null;
   };
 }
 
@@ -244,7 +244,7 @@ export interface CohesionGroup<FunctionValue = IndexedFunction> {
   members: FunctionValue[];
 }
 
-export interface CohesionSummary {
+export interface CohesionMetrics {
   scope: "repository" | "selected-sources";
   functionsAnalyzed: number;
   candidateFunctions: number;
@@ -269,12 +269,12 @@ export interface CohesionAnalysisOptions {
 }
 
 export interface CohesionReport<FunctionValue = IndexedFunction> {
-  schemaVersion: 1;
+  schemaVersion: 2;
   repository: {
     generation: number;
     gitCheckpoint: string | null;
     embeddingProfile: Required<EmbeddingProfile>;
-    summaryProfile: SummaryProfile | null;
+    descriptionProfile: DescriptionProfile | null;
   };
   parameters: AnalysisSimilarity & {
     neighbors: number;
@@ -285,7 +285,7 @@ export interface CohesionReport<FunctionValue = IndexedFunction> {
     nameRegex?: string;
     sourceFilter: CrossSearchSourceFilter;
   };
-  summary: CohesionSummary;
+  metrics: CohesionMetrics;
   pairs: CohesionPair<FunctionValue>[];
   files: CohesionFileReport<FunctionValue>[];
   groups: CohesionGroup<FunctionValue>[];
@@ -301,9 +301,9 @@ export interface IndexStatus {
   generation: number;
   gitCheckpoint: string | null;
   embeddingProfile: Required<EmbeddingProfile>;
-  summariesEnabled: boolean;
-  summaryCount: number;
-  summaryProfile: SummaryProfile | null;
+  descriptionsEnabled: boolean;
+  descriptionCount: number;
+  descriptionProfile: DescriptionProfile | null;
   indexingErrorCount: number;
   failedFileCount: number;
 }

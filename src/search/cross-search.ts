@@ -17,10 +17,10 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
   }
   const scoring = {
     ...analysisSimilarity(sourceStatus, targetStatus),
-    sourceSummaryProfile: sourceStatus.summaryProfile,
-    targetSummaryProfile: targetStatus.summaryProfile,
+    sourceDescriptionProfile: sourceStatus.descriptionProfile,
+    targetDescriptionProfile: targetStatus.descriptionProfile,
   };
-  const includeSummaries = scoring.similarityMode === "code-summary-average";
+  const includeDescriptions = scoring.similarityMode === "code-description-average";
 
   const limit = options.limitPerFunction ?? 5;
   assertPositiveInteger(limit, "limitPerFunction");
@@ -65,7 +65,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
     const excludePaths = excludedTargetPaths ? { excludePaths: excludedTargetPaths } : {};
     const candidates = sameIndex
       ? options.source.similarToFunction(source.id, {
-        includeSummaries,
+        includeDescriptions,
         limit,
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -74,7 +74,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         ...excludePaths,
       })
       : target.searchByVector(vector, {
-        ...(includeSummaries ? { summaryVector: options.source.vectorForFunction(source.id, "summary") } : {}),
+        ...(includeDescriptions ? { descriptionVector: options.source.vectorForFunction(source.id, "description") } : {}),
         limit,
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),

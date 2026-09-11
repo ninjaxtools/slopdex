@@ -11,9 +11,9 @@ import { FakeEmbeddingProvider, commitAll, git, initGit, temporaryRoot, write } 
 function openIndex(root: string, provider = new FakeEmbeddingProvider()): CodeIndex {
   const index = new CodeIndex({
     rootDir: root, provider,
-    summaryProvider: {
+    descriptionProvider: {
       profile: { provider: "test", model: "purpose", strategyVersion: "v1" },
-      summarize: async ({ callable }) => `Purpose of ${callable.name}`,
+      describe: async ({ callable }) => `Purpose of ${callable.name}`,
     },
   });
   onTestFinished(() => index.close());
@@ -83,7 +83,7 @@ dir.ts/
 });
 
 describe("gitignore-aware indexing", () => {
-  it("filters non-Git discovery and removes stale functions and summaries when rules change", async () => {
+  it("filters non-Git discovery and removes stale functions and descriptions when rules change", async () => {
     const root = temporaryRoot();
     write(root, ".gitignore", "ignored/\n*.generated.ts\n!keep.generated.ts\n");
     write(root, "src/.gitignore", "/local.ts\n");
@@ -92,12 +92,12 @@ describe("gitignore-aware indexing", () => {
     const index = openIndex(root);
     await index.updateFromWorkingTree();
     expect(index.allFunctions().map((item) => item.path)).toEqual(["keep.generated.ts", "keep.ts", "src/sub/local.ts"]);
-    await index.useSummaries();
+    await index.useDescriptions();
     write(root, ".gitignore", "ignored/\n*.generated.ts\nkeep.ts\n");
     await index.updateFromWorkingTree();
     expect(index.allFunctions().map((item) => item.path)).toEqual(["src/sub/local.ts"]);
-    expect(index.status()).toMatchObject({ functionCount: 1, summaryCount: 1 });
-    expect((await index.searchSummary({ query: "example" })).map((item) => item.function.path)).toEqual(["src/sub/local.ts"]);
+    expect(index.status()).toMatchObject({ functionCount: 1, descriptionCount: 1 });
+    expect((await index.searchDescription({ query: "example" })).map((item) => item.function.path)).toEqual(["src/sub/local.ts"]);
     rmSync(path.join(root, "src/.gitignore"));
     await index.updateFromWorkingTree();
     expect(index.allFunctions().map((item) => item.path)).toEqual(["src/local.ts", "src/sub/local.ts"]);

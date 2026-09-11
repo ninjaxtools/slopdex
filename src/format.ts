@@ -14,7 +14,7 @@ export function formatSimilaritySummary(
 }
 
 export function formatSimilarityClusters(results: readonly CrossSearchResult[], sameIndex: boolean): string {
-  const combined = results.some((result) => result.matches.some((match) => match.summarySimilarity !== undefined));
+  const combined = results.some((result) => result.matches.some((match) => match.descriptionSimilarity !== undefined));
   const nodes = new Map<string, { function: IndexedFunction; role: "source" | "target" }>();
   const neighbors = new Map<string, Set<string>>();
   const edges: Array<{ left: string; right: string; similarity: number }> = [];
@@ -70,21 +70,21 @@ export function formatSimilarityClusters(results: readonly CrossSearchResult[], 
       ? cluster.min.toFixed(4)
       : `${cluster.min.toFixed(4)}-${cluster.max.toFixed(4)}`;
     return [
-      `Cluster ${index + 1} (${cluster.members.length} functions, similarity ${similarity}${combined ? ", combined 50% code + 50% summary" : ""})`,
+      `Cluster ${index + 1} (${cluster.members.length} functions, similarity ${similarity}${combined ? ", combined 50% code + 50% description" : ""})`,
       ...cluster.members.map((member) => `  ${clusterFunctionName(member, sameIndex)}`),
     ].join("\n");
   }).join("\n\n");
 }
 
 export function formatCohesionSummary(report: CohesionReport): string {
-  const { summary } = report;
-  const edgeLabel = summary.semanticEdges === 1 ? "edge" : "edges";
+  const { metrics } = report;
+  const edgeLabel = metrics.semanticEdges === 1 ? "edge" : "edges";
   const lines = [
-    `Cohesion: ${summary.functionsAnalyzed} functions analyzed, ${summary.semanticEdges} semantic ${edgeLabel}`,
-    `  same file ${(summary.sameFileRatio * 100).toFixed(1)}%  same folder ${(summary.sameFolderRatio * 100).toFixed(1)}%  remote ${(summary.remoteRatio * 100).toFixed(1)}%  mean distance ${summary.weightedMeanDistance.toFixed(2)}`,
+    `Cohesion: ${metrics.functionsAnalyzed} functions analyzed, ${metrics.semanticEdges} semantic ${edgeLabel}`,
+    `  same file ${(metrics.sameFileRatio * 100).toFixed(1)}%  same folder ${(metrics.sameFolderRatio * 100).toFixed(1)}%  remote ${(metrics.remoteRatio * 100).toFixed(1)}%  mean distance ${metrics.weightedMeanDistance.toFixed(2)}`,
   ];
-  if (report.parameters.similarityMode === "code-summary-average") {
-    lines.push("  similarity: combined 50% code + 50% summary");
+  if (report.parameters.similarityMode === "code-description-average") {
+    lines.push("  similarity: combined 50% code + 50% description");
   }
   if (report.pairs.length === 0) return [...lines, "No cohesion gaps."].join("\n");
   lines.push("");
@@ -99,8 +99,8 @@ export function formatCohesionSummary(report: CohesionReport): string {
 }
 
 function scoreDetails(scores: SimilarityScores): string {
-  return scores.codeSimilarity !== undefined && scores.summarySimilarity !== undefined
-    ? `  [combined 50/50; code ${scores.codeSimilarity.toFixed(4)}, summary ${scores.summarySimilarity.toFixed(4)}]`
+  return scores.codeSimilarity !== undefined && scores.descriptionSimilarity !== undefined
+    ? `  [combined 50/50; code ${scores.codeSimilarity.toFixed(4)}, description ${scores.descriptionSimilarity.toFixed(4)}]`
     : "";
 }
 

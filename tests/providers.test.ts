@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { JinaEmbeddingProvider } from "../src/embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "../src/embeddings/openai.js";
-import { OpenAISummaryProvider } from "../src/summaries/openai.js";
+import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
 import { parseCallables } from "../src/parser/callable-parser.js";
 
 const servers: Server[] = [];
@@ -17,7 +17,7 @@ afterEach(async () => {
   })));
 });
 
-describe("OpenAI summary provider", () => {
+describe("OpenAI description provider", () => {
   const fileSource = "export function deliver() { send(); }";
   const input = { repository: "example", callable: parseCallables("client.ts", fileSource)[0]!, fileSource };
 
@@ -27,8 +27,8 @@ describe("OpenAI summary provider", () => {
       status: "completed",
       output: [{ type: "reasoning" }, { type: "message", content: [{ type: "output_text", text: "Delivers application messages." }] }],
     });
-    const provider = new OpenAISummaryProvider({ apiKey: "test", baseUrl: url });
-    await expect(provider.summarize(input)).resolves.toBe("Delivers application messages.");
+    const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
+    await expect(provider.describe(input)).resolves.toBe("Delivers application messages.");
     expect(requests[0]).toMatchObject({ model: "gpt-5.6-sol", store: false });
     expect(requests[0]!.instructions).toContain("purpose of the specified callable within its codebase");
     expect(JSON.parse(requests[0]!.input as string)).toMatchObject({ repository: "example", path: "client.ts", fileContext: fileSource });
@@ -38,10 +38,10 @@ describe("OpenAI summary provider", () => {
     { status: "incomplete", output: [] },
     { status: "completed", output: [] },
     { status: "completed", output: [{ type: "message", content: [{ type: "refusal", refusal: "no" }] }] },
-  ])("rejects unusable summaries: %j", async (response) => {
+  ])("rejects unusable descriptions: %j", async (response) => {
     const url = await startServer([], response);
-    const provider = new OpenAISummaryProvider({ apiKey: "test", baseUrl: url });
-    await expect(provider.summarize(input)).rejects.toThrow(/incomplete|empty/);
+    const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
+    await expect(provider.describe(input)).rejects.toThrow(/incomplete|empty/);
   });
 });
 

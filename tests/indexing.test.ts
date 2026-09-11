@@ -136,7 +136,7 @@ describe("filesystem indexing", () => {
     index.close();
   });
 
-  it("aborts if an oversized source file becomes eligible while indexing", async () => {
+  it("re-reads an oversized source file that becomes eligible while indexing", async () => {
     const root = temporaryRoot();
     write(root, "large.ts", " ".repeat(256));
     write(root, "trigger.ts", `export function trigger() { return 1; }\n`);
@@ -148,8 +148,8 @@ describe("filesystem indexing", () => {
     }
     const index = new CodeIndex({ rootDir: root, provider: new ShrinkingProvider(), maxFileSize: 128 });
 
-    await expect(index.updateFromWorkingTree()).rejects.toThrow(/Working-tree file changed while indexing/);
-    expect(index.status().fileCount).toBe(0);
+    await index.updateFromWorkingTree();
+    expect(index.allFunctions().map((item) => item.name)).toEqual(["appeared", "trigger"]);
     index.close();
   });
 });
@@ -594,7 +594,7 @@ export function added() { return "new"; }
     index.close();
   });
 
-  it("aborts if a working-tree file changes while embeddings are prepared", async () => {
+  it("re-reads a working-tree file that changes while embeddings are prepared", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "value.ts", `export function committed() { return 1; }\n`);
@@ -612,9 +612,9 @@ export function added() { return "new"; }
     }
     const index = new CodeIndex({ rootDir: root, provider: new MutatingProvider() });
 
-    await expect(index.updateFromGit()).rejects.toThrow(/changed while indexing/);
+    await index.updateFromGit();
     expect(index.status().gitCheckpoint).toBe(base);
-    expect(index.allFunctions().map((item) => item.name)).toEqual(["committed"]);
+    expect(index.allFunctions().map((item) => item.name)).toEqual(["changedAgain"]);
     index.close();
   });
 

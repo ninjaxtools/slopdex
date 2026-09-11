@@ -8,7 +8,7 @@ import { CodeIndex } from "../src/code-index.js";
 import { languageForPath, parseCallables } from "../src/parser/callable-parser.js";
 import { crossSearch } from "../src/search/cross-search.js";
 import { SourcePolicy } from "../src/source-policy.js";
-import type { CallableKind, SummaryInput, SupportedLanguage } from "../src/types.js";
+import type { CallableKind, DescriptionInput, SupportedLanguage } from "../src/types.js";
 import { FakeEmbeddingProvider, commitAll, initGit, temporaryRoot, write } from "./helpers.js";
 
 const fixtures: Array<{ language: SupportedLanguage; path: string; source: string; expected: Array<[string, CallableKind]> }> = [
@@ -208,19 +208,19 @@ def undocumented(value):
 });
 
 describe("multilingual indexing", () => {
-  it.each(["git", "working-tree"] as const)("indexes, searches, summarizes, refreshes, and removes languages from %s", async (mode) => {
+  it.each(["git", "working-tree"] as const)("indexes, searches, describes, refreshes, and removes languages from %s", async (mode) => {
     const root = temporaryRoot();
     if (mode === "git") initGit(root);
     for (const fixture of fixtures) write(root, fixture.path, fixture.source);
     write(root, ".venv/ignored.py", "def ignored(): pass\n");
     write(root, "target/ignored.rs", "fn ignored() {}\n");
     if (mode === "git") commitAll(root, "Add languages");
-    const inputs: SummaryInput[] = [];
+    const inputs: DescriptionInput[] = [];
     const index = new CodeIndex({
       rootDir: root, provider: new FakeEmbeddingProvider(),
-      summaryProvider: {
+      descriptionProvider: {
         profile: { provider: "test", model: "purpose", strategyVersion: "v1" },
-        async summarize(input) { inputs.push(input); return `Implement ${input.callable.qualifiedName} in ${input.callable.language}`; },
+        async describe(input) { inputs.push(input); return `Implement ${input.callable.qualifiedName} in ${input.callable.language}`; },
       },
     });
     onTestFinished(() => index.close());
@@ -234,18 +234,18 @@ describe("multilingual indexing", () => {
     expect(index.allFunctions().map((item) => item.id)).toEqual(functions.map((item) => item.id));
     expect(await index.similaritySearch({ query: "load values", limit: expectedCount })).toHaveLength(expectedCount);
 
-    await index.useSummaries();
-    expect(index.status().summaryCount).toBe(expectedCount);
+    await index.useDescriptions();
+    expect(index.status().descriptionCount).toBe(expectedCount);
     expect(new Set(inputs.map((input) => input.callable.language)).size).toBe(9);
     for (const input of inputs) expect(input.fileSource).toBe(fixtures.find((fixture) => fixture.path === input.callable.path)!.source);
-    expect(await index.searchSummary({ query: "load values", limit: expectedCount })).toHaveLength(expectedCount);
+    expect(await index.searchDescription({ query: "load values", limit: expectedCount })).toHaveLength(expectedCount);
     const report = await analyzeCohesion({ source: index, minLines: 1, minSimilarity: -1 });
-    expect(report.summary.functionsAnalyzed).toBe(expectedCount);
-    expect(report.parameters.similarityMode).toBe("code-summary-average");
+    expect(report.metrics.functionsAnalyzed).toBe(expectedCount);
+    expect(report.parameters.similarityMode).toBe("code-description-average");
     let crossLanguage = false;
     for await (const result of crossSearch({ source: index, minLines: 1, limitPerFunction: expectedCount })) {
       crossLanguage ||= result.matches.some((match) => match.function.language !== result.source.language);
-      expect(result.scoring?.similarityMode).toBe("code-summary-average");
+      expect(result.scoring?.similarityMode).toBe("code-description-average");
     }
     expect(crossLanguage).toBe(true);
 
@@ -260,6 +260,6 @@ describe("multilingual indexing", () => {
     expect(index.allFunctions().some((item) => item.language === "rust" && item.name === "added")).toBe(true);
     expect(index.allFunctions().some((item) => item.path === "src/renamed.py" && item.name === "load")).toBe(true);
     if (mode === "git") expect(index.allFunctions().find((item) => item.path === "src/renamed.py" && item.name === "load")!.id).toBe(previousId);
-    expect(index.status().summaryCount).toBe(index.status().functionCount);
+    expect(index.status().descriptionCount).toBe(index.status().functionCount);
   });
 });

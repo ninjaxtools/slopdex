@@ -32,7 +32,7 @@ describe("formatSimilaritySummary", () => {
     ].join("\n"));
   });
 
-  it("makes empty summaries explicit", () => {
+  it("makes empty summary output explicit", () => {
     expect(formatSimilaritySummary([])).toBe("No matches.");
     expect(formatSimilaritySummary([], indexedFunction("src/source.ts", "source"))).toBe([
       "src/source.ts :: source",

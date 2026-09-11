@@ -22,9 +22,9 @@ function openIndex(root: string, maxFileSize?: number): CodeIndex {
   const index = new CodeIndex({
     rootDir: root, provider: new FakeEmbeddingProvider(), onWarning: () => {},
     ...(maxFileSize === undefined ? {} : { maxFileSize }),
-    summaryProvider: {
+    descriptionProvider: {
       profile: { provider: "test", model: "purpose", strategyVersion: "v1" },
-      summarize: async ({ callable }) => `Purpose of ${callable.name}`,
+      describe: async ({ callable }) => `Purpose of ${callable.name}`,
     },
   });
   onTestFinished(() => index.close());
@@ -46,14 +46,14 @@ describe("persistent indexing diagnostics", () => {
     }]);
     expect(readIndexErrors(index.indexPath)).toEqual(index.indexErrors());
     expect(index.status()).toMatchObject({ fileCount: 2, functionCount: 2, indexingErrorCount: 1, failedFileCount: 1 });
-    await index.useSummaries();
-    expect(index.status().summaryCount).toBe(2);
+    await index.useDescriptions();
+    expect(index.status().descriptionCount).toBe(2);
     await index.updateFromWorkingTree();
     expect(index.indexErrors()).toHaveLength(1);
     write(root, "store.ts", fixedClass);
     await index.updateFiles({ upsert: ["store.ts"] });
     expect(index.indexErrors()).toEqual([]);
-    expect(index.status()).toMatchObject({ functionCount: 3, summaryCount: 3, indexingErrorCount: 0, failedFileCount: 0 });
+    expect(index.status()).toMatchObject({ functionCount: 3, descriptionCount: 3, indexingErrorCount: 0, failedFileCount: 0 });
     write(root, "store.ts", brokenClass);
     await index.updateFiles({ upsert: ["store.ts"] });
     renameSync(path.join(root, "store.ts"), path.join(root, "renamed.ts"));

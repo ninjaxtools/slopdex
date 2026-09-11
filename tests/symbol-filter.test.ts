@@ -15,9 +15,9 @@ const provider: EmbeddingProvider = {
 function openIndex(root: string, embeddingProvider = provider): CodeIndex {
   const index = new CodeIndex({
     rootDir: root, provider: embeddingProvider,
-    summaryProvider: {
+    descriptionProvider: {
       profile: { provider: "test", model: "purpose", strategyVersion: "v1" },
-      summarize: async ({ callable }) => `Purpose of ${callable.qualifiedName}`,
+      describe: async ({ callable }) => `Purpose of ${callable.qualifiedName}`,
     },
   });
   onTestFinished(() => index.close());
@@ -32,9 +32,9 @@ async function collect(options: CrossSearchOptions): Promise<CrossSearchResult[]
 
 describe("source symbol filtering", () => {
   it.each([
-    { separate: false, summaries: false }, { separate: true, summaries: false },
-    { separate: false, summaries: true }, { separate: true, summaries: true },
-  ])("searches unrestricted targets (separate=$separate, summaries=$summaries)", async ({ separate, summaries }) => {
+    { separate: false, descriptions: false }, { separate: true, descriptions: false },
+    { separate: false, descriptions: true }, { separate: true, descriptions: true },
+  ])("searches unrestricted targets (separate=$separate, descriptions=$descriptions)", async ({ separate, descriptions }) => {
     const root = temporaryRoot();
     const targetRoot = separate ? temporaryRoot() : root;
     write(root, "src/source.ts", `class Source {
@@ -52,9 +52,9 @@ describe("source symbol filtering", () => {
     const target = separate ? openIndex(targetRoot) : source;
     await source.updateFromWorkingTree();
     if (separate) await target.updateFromWorkingTree();
-    if (summaries) {
-      await source.useSummaries();
-      if (separate) await target.useSummaries();
+    if (descriptions) {
+      await source.useDescriptions();
+      if (separate) await target.useDescriptions();
     }
     const options: CrossSearchOptions = {
       source, target,
@@ -65,7 +65,7 @@ describe("source symbol filtering", () => {
     expect(results).toHaveLength(1);
     expect(results[0]!.source.qualifiedName).toBe("Source.keep");
     expect(results[0]!.matches.map((match) => match.function.qualifiedName)).toEqual(["other"]);
-    expect(results[0]!.scoring?.similarityMode).toBe(summaries ? "code-summary-average" : "code");
+    expect(results[0]!.scoring?.similarityMode).toBe(descriptions ? "code-description-average" : "code");
     expect(await collect({ ...options, sourceFilter: { type: "all", nameRegex: "^missing$" } })).toEqual([]);
     await expect(collect({ ...options, sourceFilter: { type: "all", nameRegex: "[" } })).rejects.toThrow("Invalid name regex");
   });
@@ -102,23 +102,23 @@ export function tinyKeep() { return ${value}; }\n`;
     const index = openIndex(root);
     await index.updateFromWorkingTree();
     const report = await analyzeCohesion({ source: index, sourceFilter: { type: "all", nameRegex: "^selected$" } });
-    expect(report.summary).toMatchObject({ scope: "selected-sources", functionsAnalyzed: 1, candidateFunctions: 2, semanticEdges: 1 });
+    expect(report.metrics).toMatchObject({ scope: "selected-sources", functionsAnalyzed: 1, candidateFunctions: 2, semanticEdges: 1 });
     expect(report.parameters.sourceFilter).toEqual({ type: "all", nameRegex: "^selected$" });
     expect(report.pairs[0]!.reciprocal).toBeNull();
     expect([report.pairs[0]!.left.name, report.pairs[0]!.right.name].sort()).toEqual(["other", "selected"]);
     const empty = await analyzeCohesion({ source: index, sourceFilter: { type: "all", nameRegex: "^missing$" } });
-    expect(empty.summary).toMatchObject({ scope: "selected-sources", functionsAnalyzed: 0, candidateFunctions: 2, semanticEdges: 0 });
+    expect(empty.metrics).toMatchObject({ scope: "selected-sources", functionsAnalyzed: 0, candidateFunctions: 2, semanticEdges: 0 });
   });
 });
 
 describe("query result symbol filtering", () => {
-  it.each(["similaritySearch", "searchSummary"] as const)("filters %s before applying the result limit", async (method) => {
+  it.each(["similaritySearch", "searchDescription"] as const)("filters %s before applying the result limit", async (method) => {
     const root = temporaryRoot();
     write(root, "functions.ts", "function skip() {}\nclass Wanted { keep() {} }\n");
     const embedQuery = vi.fn(provider.embedQuery);
     const index = openIndex(root, { ...provider, embedQuery });
     await index.updateFromWorkingTree();
-    await index.useSummaries();
+    await index.useDescriptions();
     expect((await index[method]({ query: "purpose", limit: 1 }))[0]!.function.name).toBe("skip");
     expect((await index[method]({ query: "purpose", limit: 1, nameRegex: "^Wanted\\.keep$" }))[0]!.function.qualifiedName).toBe("Wanted.keep");
     expect(await index[method]({ query: "purpose", nameRegex: "^missing$" })).toEqual([]);

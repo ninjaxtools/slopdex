@@ -49,7 +49,7 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
   const neighborsFor = (callable: IndexedFunction): SimilarityResult[] => {
     throwIfAborted(options.signal);
     const matches = options.source.similarToFunction(callable.id, {
-      includeSummaries: scoring.similarityMode === "code-summary-average",
+      includeDescriptions: scoring.similarityMode === "code-description-average",
       limit: neighbors,
       minSimilarity,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -88,24 +88,24 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
   });
 
   const repositoryScope = sourceFilter.type === "all" && sourceFilter.path === undefined && sourceFilter.nameRegex === undefined;
-  const summary = summarize(
+  const metrics = calculateMetrics(
     repositoryScope ? "repository" : "selected-sources",
     sourceFunctions.length,
     candidateFunctions.length,
     scoredPairs,
   );
   const reportedPairs = scoredPairs.slice(0, limit);
-  const files = summarizeFiles(sourceFunctions, scoredPairs)
+  const files = aggregateFiles(sourceFunctions, scoredPairs)
     .filter((file) => file.internalAffinity + file.sameFolderAffinity + file.externalAffinity > 0)
     .slice(0, limit);
   const groups = buildGroups(reportedPairs);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     repository: {
       generation: status.generation,
       gitCheckpoint: status.gitCheckpoint,
       embeddingProfile: status.embeddingProfile,
-      summaryProfile: status.summaryProfile,
+      descriptionProfile: status.descriptionProfile,
     },
     parameters: {
       ...scoring,
@@ -117,7 +117,7 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       sourceFilter,
     },
-    summary,
+    metrics,
     pairs: reportedPairs,
     files,
     groups,
@@ -160,7 +160,7 @@ function scorePair(edge: CandidateEdge, reciprocal: boolean | null, minSimilarit
     right: edge.right,
     similarity: edge.similarity,
     ...(edge.codeSimilarity !== undefined ? { codeSimilarity: edge.codeSimilarity } : {}),
-    ...(edge.summarySimilarity !== undefined ? { summarySimilarity: edge.summarySimilarity } : {}),
+    ...(edge.descriptionSimilarity !== undefined ? { descriptionSimilarity: edge.descriptionSimilarity } : {}),
     reciprocal,
     semanticWeight,
     separationWeight,
@@ -169,12 +169,12 @@ function scorePair(edge: CandidateEdge, reciprocal: boolean | null, minSimilarit
   };
 }
 
-function summarize(
-  scope: CohesionReport["summary"]["scope"],
+function calculateMetrics(
+  scope: CohesionReport["metrics"]["scope"],
   functionsAnalyzed: number,
   candidateFunctions: number,
   pairs: readonly CohesionPair[],
-): CohesionReport["summary"] {
+): CohesionReport["metrics"] {
   const totalWeight = pairs.reduce((sum, pair) => sum + pair.semanticWeight, 0);
   const sameFileWeight = pairs
     .filter((pair) => pair.location.category === "same-file")
@@ -201,7 +201,7 @@ function summarize(
   };
 }
 
-function summarizeFiles(
+function aggregateFiles(
   sourceFunctions: readonly IndexedFunction[],
   pairs: readonly CohesionPair[],
 ): CohesionFileReport[] {
@@ -255,7 +255,7 @@ function updateStrongestExternal(
       function: callable,
       similarity: pair.similarity,
       ...(pair.codeSimilarity !== undefined ? { codeSimilarity: pair.codeSimilarity } : {}),
-      ...(pair.summarySimilarity !== undefined ? { summarySimilarity: pair.summarySimilarity } : {}),
+      ...(pair.descriptionSimilarity !== undefined ? { descriptionSimilarity: pair.descriptionSimilarity } : {}),
       cohesionGap: pair.cohesionGap,
     };
   }
