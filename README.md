@@ -136,9 +136,38 @@ slopdex cohesion --uncommitted --format summary
 
 These options restrict the source functions. Slopdex still compares them with the full index.
 
+Filter source symbols by qualified name with `-e <regex>` (or `--regexp <regex>`):
+
+```bash
+slopdex cross-search -e '^UserService\.' --format summary
+slopdex cohesion -e 'validate|authenticate' --source-path src/auth
+```
+
+The regex uses case-sensitive JavaScript syntax and matches qualified names such as `UserService.authenticate`. It filters only the source symbols for cross-search and cohesion; matching candidates are still drawn from the whole eligible index, including symbols that do not match the regex. It works with code-only and combined code/summary scoring.
+
+Source restrictions combine by intersection:
+
+```bash
+slopdex cross-search -e 'validate' \
+  --source-path src \
+  --changed-since origin/main \
+  --uncommitted \
+  --min-lines 4 \
+  --cross-file-only
+```
+
+With both Git filters, a source must have changed since the specified commit and belong to an uncommitted file. Path, name, and minimum-line filters narrow the selection further. Existing target restrictions such as `--min-lines` and `--cross-file-only` continue to apply. The separate `--regex` option filters **both** analysis sources and matching candidates.
+
 ## Output And Filters
 
 `search` supports `json` and `summary` output. `cross-search` supports `json`, `summary`, and `clusters` output. Use `--format` to select one.
+
+For `search` and `search-summary`, `-e` restricts result symbols before the result limit is applied:
+
+```bash
+slopdex search "validate session" -e '^Session\.' --limit 10
+slopdex search-summary "persist user data" -e 'save|persist' --limit 5
+```
 
 Use `--threshold` with a minimum similarity or a range:
 
@@ -211,6 +240,8 @@ index.close();
 ```
 
 Exports also include `crossSearch`, `analyzeCohesion`, `JinaEmbeddingProvider`, and standalone functions for index updates and searches.
+
+Library callers can set `sourceFilter.nameRegex` on cross-search/cohesion options for source-only filtering, together with `path` and the Git filter type. A `changed-since` filter also accepts `uncommitted: true`. Query searches accept `nameRegex` in `SimilaritySearchOptions` to filter result symbols. Cohesion reports record source restrictions in `parameters.sourceFilter` and label filtered analyses as `selected-sources`.
 
 For summary search, call `await index.useSummaries()` after updating the index, then `await index.searchSummary({ query: "maintain the repository index" })`. Optionally pass `summaryProvider: new OpenAISummaryProvider({ model: "gpt-5.6-sol" })` when opening an index. Custom providers implement the exported `SummaryProvider` interface. The package also exports standalone `useSummaries` and `searchSummary` helpers.
 

@@ -1,9 +1,9 @@
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
-import { CodeIndexError, IncompatibleIndexError } from "../errors.js";
+import { IncompatibleIndexError } from "../errors.js";
 import type { CrossSearchOptions, CrossSearchResult } from "../types.js";
-import { assertPositiveInteger, throwIfAborted } from "../utils.js";
+import { assertPositiveInteger, compileNameRegex, throwIfAborted } from "../utils.js";
 import { analysisSimilarity } from "./similarity.js";
 
 export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<CrossSearchResult> {
@@ -94,15 +94,6 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
       : candidates;
     if (matches.length > 0) yield { source, matches, scoring };
     options.onProgress?.({ completed: index + 1, total: sourceFunctions.length });
-  }
-}
-
-function compileNameRegex(pattern: string | undefined): RegExp | undefined {
-  if (pattern === undefined) return undefined;
-  try {
-    return new RegExp(pattern);
-  } catch (error) {
-    throw new CodeIndexError(`Invalid name regex: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
 }
 

@@ -211,7 +211,15 @@ Cross-search excludes one-line callables by default. Raise `--min-lines` for mor
 slopdex cross-search --min-lines 4 --threshold 0.9
 ```
 
-Filter both source and matching candidates by qualified callable name with a JavaScript regular expression:
+Filter source symbols by qualified callable name while searching the whole eligible index:
+
+```bash
+slopdex cross-search -e '^(User|Session)\.' --source-path src --threshold 0.9
+```
+
+`-e` / `--regexp` uses a case-sensitive JavaScript regex. In cross-search and cohesion, it restricts sources only. Combine it with `--source-path`, `--changed-since`, `--uncommitted`, and other analysis options. When both Git filters are present, sources must have changed since the commit and belong to an uncommitted file. In `search` and `search-summary`, `-e` filters result names before applying `--limit`.
+
+To filter both source and matching candidates, use `--regex`:
 
 ```bash
 slopdex cross-search --regex '^(User|Session)\.' --threshold 0.9
@@ -253,7 +261,7 @@ Restrict source functions to a file or recursive directory while still matching 
 slopdex cross-search --source-path src/services --format summary --threshold 0.9
 ```
 
-`--source-path` restricts only source functions. It can be combined with `--changed-since` or `--uncommitted`.
+`--source-path` restricts only source functions. It can be combined with `-e`, `--changed-since`, and `--uncommitted`; all supplied restrictions must match.
 
 Restrict source functions to additions, modifications, and moves relative to a commit, including current working-tree changes:
 
@@ -320,7 +328,8 @@ Prefer JSON or JSONL when another command will consume the results. Prefer summa
 --include-source                    Include callable source in cohesion JSON
 --cross-file-only                   Exclude matches from the source file
 --min-lines <number>               Minimum cross-search callable length
---regex <regex>                    Match qualified callable names
+-e, --regexp <regex>               Match qualified symbols (analysis: sources only)
+--regex <regex>                    Match both analysis source and candidate names
 --target-config <path>             Target repository configuration file
 ```
 

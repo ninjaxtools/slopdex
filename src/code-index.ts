@@ -22,7 +22,7 @@ import type {
   UpdateFromWorkingTreeOptions,
   UpdateStats,
 } from "./types.js";
-import { assertPositiveInteger, chunk, normalizeEmbeddingVector, normalizeRelativePath, sha256, throwIfAborted } from "./utils.js";
+import { assertPositiveInteger, chunk, compileNameRegex, normalizeEmbeddingVector, normalizeRelativePath, sha256, throwIfAborted } from "./utils.js";
 
 const DEFAULT_MAX_FILE_SIZE = 1024 * 1024;
 const DEFAULT_BATCH_SIZE = 32;
@@ -607,11 +607,13 @@ export class CodeIndex {
     if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
     const limit = options.limit ?? 10;
     assertPositiveInteger(limit, "limit");
+    compileNameRegex(options.nameRegex);
     throwIfAborted(options.signal);
     const vector = await this.provider.embedQuery(options.query, options.signal ? { signal: options.signal } : undefined);
     throwIfAborted(options.signal);
     return this.#database.searchVector(normalizeEmbeddingVector(vector, this.provider.profile.dimensions), {
       summaries: true, limit, minSimilarity: options.minSimilarity ?? -1,
+      ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
   }
@@ -620,10 +622,12 @@ export class CodeIndex {
     if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
     const limit = options.limit ?? 10;
     assertPositiveInteger(limit, "limit");
+    compileNameRegex(options.nameRegex);
     throwIfAborted(options.signal);
     const vector = await this.provider.embedQuery(options.query, options.signal ? { signal: options.signal } : undefined);
     return this.searchByVector(vector, {
       limit,
+      ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       minSimilarity: options.minSimilarity ?? -1,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
@@ -672,14 +676,16 @@ export class CodeIndex {
   }
 
   public async sourceFunctions(filter: CrossSearchSourceFilter): Promise<IndexedFunction[]> {
-    const functions = filter.type === "all"
-      ? this.allFunctions()
-      : filter.type === "uncommitted"
-        ? this.allFunctions().filter((callable) => callable.sourceMode === "working-tree")
-        : await this.#functionsChangedSince(filter.commit);
-    if (!filter.path) return functions;
-    const sourcePath = normalizeRelativePath(this.rootDir, filter.path);
-    return functions.filter((callable) => callable.path === sourcePath || callable.path.startsWith(`${sourcePath}/`));
+    const nameRegex = compileNameRegex(filter.nameRegex);
+    const sourcePath = filter.path ? normalizeRelativePath(this.rootDir, filter.path) : undefined;
+    const uncommitted = filter.type === "uncommitted" || (filter.type === "changed-since" && filter.uncommitted);
+    const functions = filter.type === "changed-since"
+      ? await this.#functionsChangedSince(filter.commit)
+      : this.allFunctions();
+    return functions.filter((callable) =>
+      (!uncommitted || callable.sourceMode === "working-tree")
+      && (!sourcePath || callable.path === sourcePath || callable.path.startsWith(`${sourcePath}/`))
+      && (!nameRegex || nameRegex.test(callable.qualifiedName)));
   }
 
   async #functionsChangedSince(baseRef: string): Promise<IndexedFunction[]> {

@@ -13,7 +13,7 @@ import type {
   SimilarityResult,
   SimilarityScores,
 } from "../types.js";
-import { assertPositiveInteger, throwIfAborted } from "../utils.js";
+import { assertPositiveInteger, compileNameRegex, throwIfAborted } from "../utils.js";
 
 interface CandidateEdge extends SimilarityScores {
   left: IndexedFunction;
@@ -87,7 +87,7 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
     pair.rank = index + 1;
   });
 
-  const repositoryScope = sourceFilter.type === "all" && sourceFilter.path === undefined;
+  const repositoryScope = sourceFilter.type === "all" && sourceFilter.path === undefined && sourceFilter.nameRegex === undefined;
   const summary = summarize(
     repositoryScope ? "repository" : "selected-sources",
     sourceFunctions.length,
@@ -303,15 +303,6 @@ function buildGroups(pairs: readonly CohesionPair[]): CohesionGroup[] {
     group.rank = index + 1;
   });
   return groups;
-}
-
-function compileNameRegex(pattern: string | undefined): RegExp | undefined {
-  if (pattern === undefined) return undefined;
-  try {
-    return new RegExp(pattern);
-  } catch (error) {
-    throw new CodeIndexError(`Invalid name regex: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
-  }
 }
 
 function directoryParts(filePath: string): string[] {

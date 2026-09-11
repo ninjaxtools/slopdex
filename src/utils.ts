@@ -37,6 +37,15 @@ export function assertPositiveInteger(value: number, name: string): void {
   }
 }
 
+export function compileNameRegex(pattern: string | undefined, label = "name regex"): RegExp | undefined {
+  if (pattern === undefined) return undefined;
+  try {
+    return new RegExp(pattern);
+  } catch (error) {
+    throw new CodeIndexError(`Invalid ${label}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+}
+
 export function normalizeEmbeddingVector(value: unknown, dimensions: number): number[] {
   if (!Array.isArray(value) || value.length !== dimensions) {
     throw new CodeIndexError(`Expected a finite ${dimensions}-dimensional embedding vector.`);

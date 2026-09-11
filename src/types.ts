@@ -110,6 +110,8 @@ export interface UpdateStats {
 
 export interface SimilaritySearchOptions {
   query: string;
+  /** Restrict result qualified names before ranking and limiting. */
+  nameRegex?: string;
   limit?: number;
   minSimilarity?: number;
   maxSimilarity?: number;
@@ -131,10 +133,14 @@ export interface SimilarityResult extends SimilarityScores {
   function: IndexedFunction;
 }
 
-export type CrossSearchSourceFilter =
+export type CrossSearchSourceFilter = (
   | { type: "all"; path?: string }
-  | { type: "changed-since"; commit: string; path?: string }
-  | { type: "uncommitted"; path?: string };
+  | { type: "changed-since"; commit: string; path?: string; uncommitted?: boolean }
+  | { type: "uncommitted"; path?: string }
+) & {
+  /** Restrict source qualified names; does not restrict target candidates. */
+  nameRegex?: string;
+};
 
 export interface CrossSearchOptions {
   source: import("./code-index.js").CodeIndex;

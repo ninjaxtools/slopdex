@@ -13,6 +13,7 @@ import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./e
 import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
 import { OpenAISummaryProvider } from "./summaries/openai.js";
+import { compileNameRegex } from "./utils.js";
 import type {
   CodeIndexOptions,
   CohesionFunctionReference,
@@ -63,6 +64,7 @@ const parsed = (() => {
         "source-path": { type: "string" },
         "min-lines": { type: "string" },
         regex: { type: "string" },
+        regexp: { type: "string", short: "e" },
         limit: { type: "string" },
         neighbors: { type: "string" },
         threshold: { type: "string" },
@@ -149,6 +151,7 @@ async function main(): Promise<void> {
         const threshold = similarityThreshold();
         const results = await (command === "search-summary" ? index.searchSummary.bind(index) : index.similaritySearch.bind(index))({
           query,
+          ...(parsed.values.regexp !== undefined ? { nameRegex: parsed.values.regexp } : {}),
           limit: numberOption(parsed.values.limit, 10, "limit"),
           minSimilarity: threshold.min,
           ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
@@ -440,6 +443,12 @@ function numberOption(value: string | undefined, defaultValue: number, name: str
 }
 
 function validateInvocation(): void {
+  if (parsed.values.regexp !== undefined) {
+    if (!["search", "search-summary", "cross-search", "cohesion"].includes(command!)) {
+      throw new CodeIndexError("-e/--regexp is only available for search, search-summary, cross-search, and cohesion.");
+    }
+    compileNameRegex(parsed.values.regexp, "-e/--regexp value");
+  }
   switch (command) {
     case "status":
     case "update-git":
@@ -534,23 +543,19 @@ function minimumLines(): number {
 }
 
 function functionNameRegex(): RegExp | undefined {
-  const pattern = parsed.values.regex;
-  if (pattern === undefined) return undefined;
-  try {
-    return new RegExp(pattern);
-  } catch (error) {
-    throw new CodeIndexError(`Invalid --regex value: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
-  }
+  return compileNameRegex(parsed.values.regex, "--regex value");
 }
 
 function crossSearchSourceFilter(): CrossSearchSourceFilter {
   const changedSince = parsed.values["changed-since"];
   const uncommitted = parsed.values.uncommitted;
-  if (changedSince && uncommitted) throw new CodeIndexError("Use either --changed-since or --uncommitted, not both.");
-  const pathOption = parsed.values["source-path"] ? { path: parsed.values["source-path"] } : {};
-  if (changedSince) return { type: "changed-since", commit: changedSince, ...pathOption };
-  if (uncommitted) return { type: "uncommitted", ...pathOption };
-  return { type: "all", ...pathOption };
+  const restrictions = {
+    ...(parsed.values["source-path"] ? { path: parsed.values["source-path"] } : {}),
+    ...(parsed.values.regexp !== undefined ? { nameRegex: parsed.values.regexp } : {}),
+  };
+  if (changedSince) return { type: "changed-since", commit: changedSince, ...(uncommitted ? { uncommitted: true } : {}), ...restrictions };
+  if (uncommitted) return { type: "uncommitted", ...restrictions };
+  return { type: "all", ...restrictions };
 }
 
 function presentFunction(value: IndexedFunction) {
@@ -716,7 +721,8 @@ Options:
   --include-symmetric-duplicates      Show both directions of same-index matches
   --cross-file-only                   Exclude matches from the source file
   --min-lines <number>               Minimum callable length for cross-search (default: 2)
-  --regex <regex>                    Restrict cross-search to matching qualified names
+  -e, --regexp <regex>               Filter qualified symbols (analysis: sources only)
+  --regex <regex>                    Filter both analysis sources and matching candidates
   --changed-since <commit>            Search added, modified, or moved functions
   --uncommitted                       Search functions from uncommitted files
   --source-path <path>                Restrict cross-search sources to a file or directory
@@ -746,5 +752,19 @@ Other Examples:
 
   Review functions under a path against the whole codebase:
     slopdex cross-search --source-path src/services --format summary
+
+  Review matching source symbols against the whole index:
+    slopdex cross-search -e '^UserService\\.' --source-path src --format summary
+
+  Combine source restrictions (all must match):
+    slopdex cross-search -e 'validate' --source-path src --changed-since origin/main --uncommitted
+
+  Filter semantic search results by qualified symbol before applying the limit:
+    slopdex search "validate session" -e '^Session\\.' --limit 10
+
+  -e/--regexp uses a case-sensitive JavaScript regex on qualified names. For cross-search
+  and cohesion it filters sources only; targets keep their normal eligibility rules.
+  With --changed-since and --uncommitted, sources must be changed since the commit and
+  belong to an uncommitted file. --source-path and -e further narrow that intersection.
 `);
 }
