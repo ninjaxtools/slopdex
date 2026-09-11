@@ -4,6 +4,26 @@ export type CallableKind = "function" | "method" | "constructor" | "generator";
 
 export type SourceMode = "git" | "working-tree";
 
+export interface IndexingIssue {
+  path: string;
+  language: SupportedLanguage | null;
+  scope: "file" | "function";
+  code: "parse-error" | "parse-failed" | "extraction-error" | "read-error" | "file-too-large";
+  message: string;
+  qualifiedName: string | null;
+  startLine: number | null;
+  startColumn: number | null;
+  endLine: number | null;
+  endColumn: number | null;
+  source: string | null;
+}
+
+export interface IndexingError extends IndexingIssue {
+  id: number;
+  sourceMode: SourceMode;
+  indexedCommit: string | null;
+}
+
 export interface ParsedCallable {
   path: string;
   language: SupportedLanguage;
@@ -284,4 +304,6 @@ export interface IndexStatus {
   summariesEnabled: boolean;
   summaryCount: number;
   summaryProfile: SummaryProfile | null;
+  indexingErrorCount: number;
+  failedFileCount: number;
 }

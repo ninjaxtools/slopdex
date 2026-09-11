@@ -9,6 +9,8 @@ import type {
   EmbeddingProfile,
   IndexStatus,
   IndexedFunction,
+  IndexingError,
+  IndexingIssue,
   ParsedCallable,
   SourceMode,
   SimilarityResult,
@@ -16,7 +18,7 @@ import type {
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "3";
+const SCHEMA_VERSION = "4";
 
 export interface PreparedSummary {
   key: string;
@@ -42,6 +44,8 @@ export interface PreparedFile {
   previousPath?: string;
   replacePath?: string;
   callables: PreparedCallable[];
+  errors: IndexingIssue[];
+  unavailable?: boolean;
 }
 
 export interface IndexedFileState {
@@ -176,6 +180,12 @@ export class IndexDatabase {
       );
       CREATE INDEX IF NOT EXISTS functions_path ON functions(path);
       CREATE INDEX IF NOT EXISTS functions_embedding ON functions(embedding_id);
+      CREATE TABLE IF NOT EXISTS indexing_errors (
+        id INTEGER PRIMARY KEY,
+        path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE ON UPDATE CASCADE,
+        diagnostic TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS indexing_errors_path ON indexing_errors(path);
       INSERT OR IGNORE INTO callable_provenance(identity_key, source_hash, first_seen_commit)
         SELECT identity_key, source_hash, first_seen_commit FROM functions WHERE first_seen_commit IS NOT NULL;
     `);
@@ -198,7 +208,10 @@ export class IndexDatabase {
         this.#db.exec("ALTER TABLE functions ADD COLUMN summary_embedding_id INTEGER REFERENCES summary_embeddings(id)");
       }
       this.#db.exec("CREATE INDEX IF NOT EXISTS functions_summary_embedding ON functions(summary_embedding_id)");
-      if (schemaVersion === "1" || schemaVersion === "2") this.#setMetadata("schema_version", SCHEMA_VERSION);
+      if (schemaVersion === "1" || schemaVersion === "2" || schemaVersion === "3") {
+        this.#setMetadata("schema_version", SCHEMA_VERSION);
+        this.#setMetadata("diagnostics_scan_pending", "true");
+      }
     });
   }
 
@@ -337,6 +350,7 @@ export class IndexDatabase {
     checkpoint?: string | null;
     expectedCheckpoint?: string | null;
     expectedGeneration?: number;
+    completeDiagnosticsScan?: boolean;
   }): UpdateStats {
     return this.#transaction(() => {
       if (options.expectedCheckpoint !== undefined && this.getCheckpoint() !== options.expectedCheckpoint) {
@@ -383,6 +397,7 @@ export class IndexDatabase {
 
       const generation = this.getGeneration() + 1;
       this.#setMetadata("generation", String(generation));
+      if (options.completeDiagnosticsScan) this.#deleteMetadata("diagnostics_scan_pending");
       if (options.checkpoint === null) this.#deleteMetadata("git_checkpoint");
       else if (options.checkpoint !== undefined) this.#setMetadata("git_checkpoint", options.checkpoint);
       return stats;
@@ -421,6 +436,8 @@ export class IndexDatabase {
       file.language,
       file.byteSize,
     );
+    const insertError = this.#db.prepare("INSERT INTO indexing_errors(path, diagnostic) VALUES (?, ?)");
+    for (const error of file.errors) insertError.run(file.path, JSON.stringify(error));
 
     const usedIds = new Set<number>();
     const orderedCallables = [
@@ -592,8 +609,57 @@ export class IndexDatabase {
       summariesEnabled: this.summariesEnabled(),
       summaryCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM functions WHERE summary_embedding_id IS NOT NULL").get() as { count: number }).count),
       summaryProfile: this.summaryProfile(),
+      indexingErrorCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM indexing_errors").get() as { count: number }).count),
+      failedFileCount: this.filesWithErrors().length,
     };
   }
+
+  public indexErrors(): IndexingError[] {
+    return errorsFromDatabase(this.#db);
+  }
+
+  public filesWithErrors(): string[] {
+    return (this.#db.prepare("SELECT DISTINCT path FROM indexing_errors").all() as Array<{ path: string }>).map((row) => row.path);
+  }
+
+  public needsDiagnosticsScan(): boolean {
+    return this.#metadata("diagnostics_scan_pending") === "true";
+  }
+}
+
+export function readIndexErrors(indexPath: string): IndexingError[] {
+  const database = new DatabaseSync(indexPath, { readOnly: true });
+  try {
+    if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'indexing_errors'").get()) return [];
+    return errorsFromDatabase(database);
+  } finally {
+    database.close();
+  }
+}
+
+export function readIndexErrorCounts(indexPath: string): { errors: number; files: number } {
+  const database = new DatabaseSync(indexPath, { readOnly: true });
+  try {
+    if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'indexing_errors'").get()) {
+      return { errors: 0, files: 0 };
+    }
+    const counts = database.prepare("SELECT COUNT(*) AS errors, COUNT(DISTINCT path) AS files FROM indexing_errors").get() as { errors: number; files: number };
+    return { errors: Number(counts.errors), files: Number(counts.files) };
+  } finally {
+    database.close();
+  }
+}
+
+function errorsFromDatabase(database: DatabaseSync): IndexingError[] {
+  const rows = database.prepare(`
+    SELECT e.id, e.diagnostic, f.source_mode, f.indexed_commit
+    FROM indexing_errors e JOIN files f ON f.path = e.path
+    ORDER BY e.path, e.id
+  `).all() as Array<{ id: number; diagnostic: string; source_mode: SourceMode; indexed_commit: string | null }>;
+  return rows.map((row) => ({
+    ...JSON.parse(row.diagnostic) as IndexingIssue,
+    id: row.id, sourceMode: row.source_mode, indexedCommit: row.indexed_commit,
+  }));
 }
 
 function vectorBuffer(vector: readonly number[]): Uint8Array {

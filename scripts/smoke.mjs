@@ -27,8 +27,11 @@ const sources = [
 ];
 const root = mkdtempSync(path.join(tmpdir(), "slopdex-smoke-"));
 let index;
+const warnings = [];
 try {
   for (const [, file, source] of sources) writeFileSync(path.join(root, file), source);
+  writeFileSync(path.join(root, ".gitignore"), "ignored.py\n");
+  writeFileSync(path.join(root, "ignored.py"), "def ignored():\n    return 1\n");
   index = library.openCodeIndex({
     rootDir: root,
     provider: {
@@ -36,15 +39,21 @@ try {
       embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
       embedQuery: async () => [1, 0],
     },
-    onWarning: (message) => { throw new Error(message); },
+    onWarning: (message) => { warnings.push(message); },
   });
   await index.updateFromWorkingTree();
   const functions = index.allFunctions();
+  if (warnings.length > 0) throw new Error(warnings.join("\n"));
   if (functions.length !== sources.length) throw new Error("Built library did not index all language fixtures.");
   for (const [language, file] of sources) {
     if (!functions.some((item) => item.path === file && item.language === language && item.name === "run")) {
       throw new Error(`Built library failed to parse ${file}.`);
     }
+  }
+  writeFileSync(path.join(root, "broken.py"), "def broken(\n");
+  await index.updateFiles({ upsert: ["broken.py"] });
+  if (index.indexErrors().length === 0 || library.readIndexErrors(index.indexPath).length === 0) {
+    throw new Error("Built library did not persist indexing diagnostics.");
   }
 } finally {
   index?.close();

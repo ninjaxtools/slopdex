@@ -13,6 +13,7 @@ import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./e
 import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
 import { OpenAISummaryProvider } from "./summaries/openai.js";
+import { readIndexErrorCounts, readIndexErrors } from "./storage/database.js";
 import { compileNameRegex } from "./utils.js";
 import type {
   CodeIndexOptions,
@@ -75,6 +76,7 @@ const parsed = (() => {
         "rebuild-on-divergence": { type: "boolean", default: false },
         "force-reindex": { type: "boolean", default: false },
         "no-reindex": { type: "boolean", default: false },
+        "ignore-errors": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
     });
@@ -85,6 +87,31 @@ const parsed = (() => {
 })();
 
 const [command, ...positionals] = parsed.positionals;
+
+// Read persisted diagnostics at exit so cached, failed, and help invocations also
+// report them, and update/delete commands report the final state rather than stale errors.
+const diagnosticIndexes = new Set<string>();
+process.on("exit", () => {
+  if (parsed.values["ignore-errors"]) return;
+  try {
+    const rootDir = path.resolve(parsed.values.root!);
+    const config = loadConfig(rootDir, parsed.values.config);
+    diagnosticIndexes.add(path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex/index.sqlite")));
+    if (parsed.values["target-index"]) diagnosticIndexes.add(path.resolve(parsed.values["target-index"]));
+  } catch {
+    // Invalid configuration is reported by main; diagnostics must not mask it.
+  }
+  for (const indexPath of diagnosticIndexes) {
+    try {
+      if (!existsSync(indexPath)) continue;
+      const { errors, files } = readIndexErrorCounts(indexPath);
+      if (errors === 0) continue;
+      process.stderr.write(`slopdex: warning: ${errors} unresolved indexing error(s) in ${files} file(s); run slopdex index-errors --index ${JSON.stringify(indexPath)} to inspect, or use --ignore-errors to silence this warning.\n`);
+    } catch {
+      // Opening an invalid index is handled by the command's normal error path.
+    }
+  }
+});
 
 if (parsed.values.help || !command) {
   printHelp();
@@ -101,12 +128,22 @@ async function main(): Promise<void> {
   validateInvocation();
   const rootDir = path.resolve(parsed.values.root!);
   const config = loadConfig(rootDir, parsed.values.config);
+  if (command === "index-errors") {
+    const indexPath = path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex/index.sqlite"));
+    const errors = existsSync(indexPath) ? readIndexErrors(indexPath) : [];
+    if (outputFormat("json") === "summary") {
+      process.stdout.write(errors.length === 0 ? "No indexing errors.\n" : `${errors.map((error) =>
+        `${error.path}${error.startLine === null ? "" : `:${error.startLine}:${error.startColumn}`} ${error.qualifiedName ? `:: ${error.qualifiedName} ` : ""}[${error.code}]\n  ${error.message}`,
+      ).join("\n")}\n`);
+    } else printJson(errors);
+    return;
+  }
   const provider = createProvider(config);
   const indexOptions: CodeIndexOptions = {
     rootDir,
     provider,
     ...(config.summaryModel ? { summaryProvider: new OpenAISummaryProvider({ model: config.summaryModel }) } : {}),
-    onWarning: (message) => process.stderr.write(`slopdex: warning: ${message}\n`),
+    onWarning: () => {}, // Persisted diagnostics are reported once per index at exit.
     ...(parsed.values.index || config.indexPath ? { indexPath: parsed.values.index ?? config.indexPath } : {}),
     ...(config.include ? { include: config.include } : {}),
     ...(config.exclude ? { exclude: config.exclude } : {}),
@@ -277,6 +314,7 @@ async function ensureIndexUpdated(
   forceRebuild: boolean,
   noReindex: boolean,
 ): Promise<UpdateStats> {
+  diagnosticIndexes.add(resolveIndexPath(options));
   const initialized = await initializeMissingIndex(options, label, target, noReindex);
   if (initialized) return initialized;
   try {
@@ -450,6 +488,9 @@ function validateInvocation(): void {
     compileNameRegex(parsed.values.regexp, "-e/--regexp value");
   }
   switch (command) {
+    case "index-errors":
+      if (outputFormat("json") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      return;
     case "status":
     case "update-git":
     case "use-summaries":
@@ -613,6 +654,7 @@ function printHelp(): void {
 
 Commands:
   status                              Show index metadata
+  index-errors                        List persisted file and function indexing failures
   update-files <path...>              Index specific working-tree files
   delete-files <path...>              Remove specific files from the index
   update-git                          Index a Git snapshot plus working-tree changes
@@ -626,6 +668,9 @@ Languages (automatically detected with Tree-sitter):
   Python (.py, .pyw), JavaScript (.js, .mjs, .cjs), JSX (.jsx),
   TypeScript (.ts, .mts, .cts), TSX (.tsx), Rust (.rs), Go (.go),
   Java (.java), and C (.c, .h). Indexes named callables with bodies.
+
+File discovery respects root and nested .gitignore rules, including for tracked files.
+Working-tree updates use current rules; committed-only snapshots use rules from that commit.
 
 Analysis Examples:
   Duplicate Analysis:
@@ -713,6 +758,7 @@ Options:
   --rebuild-on-divergence             Rebuild after a rebase or branch change
   --force-reindex                     Rebuild an incompatible existing index
   --no-reindex                        Skip worktree overlays or reuse a non-Git index
+  --ignore-errors                     Silence warnings about persisted indexing errors
   --limit <number>                    Search result limit
   --neighbors <number>                Semantic neighbors per function for cohesion (default: 20)
   --threshold <number|range>          Show similarities at/above a value or within a range
@@ -733,6 +779,9 @@ Options:
 Other Examples:
   Show metadata for the current index:
     slopdex status
+
+  Inspect indexing failures without refreshing the index or calling providers:
+    slopdex index-errors --format summary
 
   Index specific working-tree files:
     slopdex update-files src/service.ts src/model.ts

@@ -47,7 +47,7 @@ describe("cross search", () => {
     expect(migrated.allFunctions()[0]!.lineCount).toBe(3);
     migrated.close();
     const verified = new DatabaseSync(indexPath, { readOnly: true });
-    expect(verified.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "3" });
+    expect(verified.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "4" });
     verified.close();
   });
 

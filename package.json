@@ -42,6 +42,7 @@
     "check:parser-parity": "node --import tsx scripts/check-parser-parity.mjs"
   },
   "dependencies": {
+    "ignore": "^7.0.9",
     "install": "^0.13.0",
     "js-tiktoken": "^1.0.21",
     "sqlite-vec": "^0.1.9",

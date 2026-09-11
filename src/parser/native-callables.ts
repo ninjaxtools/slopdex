@@ -44,14 +44,14 @@ export function collectNativeCallables(root: Node, content: string, language: Su
 
   const add = (node: Node, name: string, kind: CallableKind, scope: readonly string[], bound = false): boolean => {
     const body = node.childForFieldName("body");
-    if (!body || body.isMissing) return false;
+    if ((!body || body.isMissing) && !node.hasError) return false;
     const sourceNode = language === "python" && node.parent?.type === "decorated_definition" ? node.parent : node;
-    const header = content.slice(node.startIndex, body.startIndex).trimEnd();
+    const header = content.slice(node.startIndex, body?.startIndex ?? node.endIndex).trimEnd();
     candidates.push({
       node: sourceNode, name, kind, scope,
       signature: bound ? `${name} = ${header}` : header,
     });
-    walk(body, [...scope, name]);
+    if (body) walk(body, [...scope, name]);
     return true;
   };
 

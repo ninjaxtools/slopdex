@@ -204,6 +204,10 @@ Tree-sitter grammars ship as package dependencies; no language server or project
 
 Default exclusions cover dependency and build directories: `.git`, `.slopdex`, `node_modules`, `dist`, `build`, `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`, and `target`. Optional `include` and `exclude` glob arrays in `.slopdex/config.json` further restrict the indexed files.
 
+Slopdex also respects root and nested `.gitignore` files using the [`ignore`](https://www.npmjs.com/package/ignore) package. Patterns, directory rules, anchoring, escapes, and `!` exceptions follow Git ignore semantics. A nested rule cannot re-include files beneath an excluded parent directory. These exclusions apply even to tracked files and when Git is unavailable; explicit `update-files` requests for ignored files are rejected.
+
+Working-tree indexing and HEAD overlays use the current `.gitignore` files. Historical snapshots and committed-only Git indexing use the ignore files stored in the selected commit. Normal refreshes remove previously indexed files that become ignored and discover files that become eligible again, including when only ignore rules change. Configuration includes and negated ignore rules cannot override the built-in exclusions.
+
 ### Index Updates
 
 Before each analysis command, Slopdex updates its index from the current Git commit and the staged, unstaged, and untracked files in the working tree. The index is created at `.slopdex/index.sqlite` by default.
@@ -213,6 +217,27 @@ Add `.slopdex/` to the repository's `.gitignore` so the local index is not commi
 Slopdex sends extracted function source to the configured embedding provider. The function metadata and embeddings are stored in the local SQLite index.
 
 Whole-repository cohesion analysis compares neighbors for every selected function. Use `--source-path`, `--changed-since`, or `--uncommitted` to reduce the scope in large repositories.
+
+### Inspecting Indexing Errors
+
+Slopdex persists file and function indexing diagnostics in the SQLite `indexing_errors` table. Parse errors, parser exceptions, callable-extraction failures, file-read failures, and files exceeding `maxFileSize` retain references instead of silently disappearing. Healthy functions in partially parsed files and other healthy files remain searchable; malformed callables are omitted from semantic search and listed in the diagnostics.
+
+```bash
+slopdex index-errors
+slopdex index-errors --format summary
+slopdex index-errors --index /path/to/another/index.sqlite
+```
+
+This command reads the saved diagnostics without refreshing the index or calling an embedding/summary provider, so it works without API credentials. JSON includes the path, language, error code and message, file/function scope, recovered qualified name when available, line/column ranges, available source text, and Git/working-tree provenance. If Tree-sitter cannot identify a function, the unparsed region is still retained as a file diagnostic.
+
+Every invocation warns on stderr while saved errors remain, including cached runs and cross-search target indexes. Suppress this warning with `--ignore-errors`:
+
+```bash
+slopdex cross-search --ignore-errors
+slopdex index-errors --format summary --ignore-errors
+```
+
+Silencing warnings does not delete diagnostics. `status` reports `indexingErrorCount` and `failedFileCount`; `functionCount` counts searchable callables. Normal updates retry failed files, including unchanged Git blobs. Errors clear when a file is successfully indexed, deleted, or excluded. Existing indexes migrate automatically and rescan once on their next full update to detect previously unreported parse failures. Diagnostics are committed atomically with the corresponding file update.
 
 ## Library
 
@@ -242,6 +267,8 @@ index.close();
 Exports also include `crossSearch`, `analyzeCohesion`, `JinaEmbeddingProvider`, and standalone functions for index updates and searches.
 
 Library callers can set `sourceFilter.nameRegex` on cross-search/cohesion options for source-only filtering, together with `path` and the Git filter type. A `changed-since` filter also accepts `uncommitted: true`. Query searches accept `nameRegex` in `SimilaritySearchOptions` to filter result symbols. Cohesion reports record source restrictions in `parameters.sourceFilter` and label filtered analyses as `selected-sources`.
+
+Use `index.indexErrors()` to inspect diagnostics through an open index, or the exported `readIndexErrors(indexPath)` to inspect a saved database without a provider. Error records use the exported `IndexingError` type.
 
 For summary search, call `await index.useSummaries()` after updating the index, then `await index.searchSummary({ query: "maintain the repository index" })`. Optionally pass `summaryProvider: new OpenAISummaryProvider({ model: "gpt-5.6-sol" })` when opening an index. Custom providers implement the exported `SummaryProvider` interface. The package also exports standalone `useSummaries` and `searchSummary` helpers.
 

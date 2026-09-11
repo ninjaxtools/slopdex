@@ -10,10 +10,11 @@ import Rust from "tree-sitter-rust";
 import TypeScript from "tree-sitter-typescript";
 
 import { CodeIndexError } from "../errors.js";
-import type { CallableKind, ParsedCallable, SupportedLanguage } from "../types.js";
+import type { CallableKind, IndexingIssue, ParsedCallable, SupportedLanguage } from "../types.js";
 import { sha256 } from "../utils.js";
 import type { CallableCandidate } from "./candidate.js";
 import { collectNativeCallables } from "./native-callables.js";
+import { parseDiagnostics } from "./diagnostics.js";
 
 const parsers = new Map<SupportedLanguage, Parser>();
 
@@ -213,9 +214,9 @@ function walk(
   if (["function_declaration", "generator_function_declaration"].includes(node.type)) {
     const name = fieldText(content, node, "name");
     const body = node.childForFieldName("body");
-    if (name && body) {
+    if (name && (body || node.hasError)) {
       candidates.push({ node, name, kind: callableKind(node, name), scope });
-      walk(body, content, [...scope, name], candidates);
+      if (body) walk(body, content, [...scope, name], candidates);
     }
     return;
   }
@@ -223,9 +224,9 @@ function walk(
   if (node.type === "method_definition") {
     const name = fieldText(content, node, "name")?.replace(/^#/, "");
     const body = node.childForFieldName("body");
-    if (name && body) {
+    if (name && (body || node.hasError)) {
       candidates.push({ node, name, kind: callableKind(node, name), scope });
-      walk(body, content, [...scope, name], candidates);
+      if (body) walk(body, content, [...scope, name], candidates);
     }
     return;
   }
@@ -304,18 +305,40 @@ export function parseCallables(
   content: string,
   onWarning: (message: string) => void = console.warn,
 ): ParsedCallable[] {
+  return parseFileCallables(relativePath, content, onWarning).callables;
+}
+
+export function parseFileCallables(
+  relativePath: string,
+  content: string,
+  onWarning: (message: string) => void = console.warn,
+): { callables: ParsedCallable[]; errors: IndexingIssue[] } {
+  let result: { callables: ParsedCallable[]; errors: IndexingIssue[] };
+  try {
+    result = extractCallables(relativePath, content);
+  } catch (error) {
+    const message = `Cannot index ${relativePath}: ${error instanceof Error ? error.message : String(error)}`;
+    onWarning(message);
+    return { callables: [], errors: [{
+      path: relativePath, language: languageForPath(relativePath), scope: "file", code: "parse-failed", message,
+      qualifiedName: null, startLine: null, startColumn: null, endLine: null, endColumn: null, source: content,
+    }] };
+  }
+  if (result.errors.length > 0) {
+    onWarning(`Cannot fully parse ${relativePath}: tree-sitter reported syntax errors; indexing recoverable callables only.`);
+  }
+  return result;
+}
+
+function extractCallables(relativePath: string, content: string): { callables: ParsedCallable[]; errors: IndexingIssue[] } {
   const language = languageForPath(relativePath);
-  if (!language) return [];
+  if (!language) return { callables: [], errors: [] };
 
   const parser = getParser(language);
   const parsedTree = parseTree(parser, content, relativePath);
   const tree = parsedTree.rootNode.hasError && (language === "typescript" || language === "tsx")
     ? recoverUnsupportedTypeScriptSyntax(parser, parsedTree, content, relativePath) ?? parsedTree
     : parsedTree;
-  if (tree.rootNode.hasError) {
-    onWarning(`Cannot fully parse ${relativePath}: tree-sitter reported syntax errors; indexing recoverable callables only.`);
-  }
-
   const candidates: CallableCandidate[] = [];
   if (["typescript", "tsx", "javascript", "jsx"].includes(language)) {
     walk(tree.rootNode, content, [], candidates);
@@ -323,41 +346,54 @@ export function parseCallables(
     candidates.push(...collectNativeCallables(tree.rootNode, content, language));
   }
   candidates.sort((left, right) => left.node.startIndex - right.node.startIndex);
+  const errors = parseDiagnostics(tree.rootNode, content, relativePath, language, candidates);
 
   const occurrences = new Map<string, number>();
-  return candidates.map(({ node, name, kind, scope, signature: candidateSignature }) => {
+  const callables: ParsedCallable[] = [];
+  for (const { node, name, kind, scope, signature: candidateSignature } of candidates) {
     const qualifiedName = [...scope, name].join(".");
     const baseIdentity = `${relativePath}\0${qualifiedName}\0${kind}`;
     const occurrence = occurrences.get(baseIdentity) ?? 0;
     occurrences.set(baseIdentity, occurrence + 1);
-    const identityKey = sha256(`${baseIdentity}\0${occurrence}`);
-    const source = textFor(content, node);
-    const signature = candidateSignature ?? signatureFor(content, node, name);
-    const embeddingInput = [
-      `language: ${language}`,
-      `kind: ${kind}`,
-      `symbol: ${qualifiedName}`,
-      signature ? `signature: ${signature}` : null,
-      "source:",
-      source,
-    ].filter((value): value is string => value !== null).join("\n");
+    if (node.hasError) continue;
+    try {
+      const identityKey = sha256(`${baseIdentity}\0${occurrence}`);
+      const source = textFor(content, node);
+      const signature = candidateSignature ?? signatureFor(content, node, name);
+      const embeddingInput = [
+        `language: ${language}`,
+        `kind: ${kind}`,
+        `symbol: ${qualifiedName}`,
+        signature ? `signature: ${signature}` : null,
+        "source:",
+        source,
+      ].filter((value): value is string => value !== null).join("\n");
 
-    return {
-      path: relativePath,
-      language,
-      kind,
-      name,
-      qualifiedName,
-      signature,
-      identityKey,
-      startLine: node.startPosition.row + 1,
-      startColumn: node.startPosition.column + 1,
-      endLine: node.endPosition.row + 1,
-      endColumn: node.endPosition.column + 1,
-      lineCount: node.endPosition.row - node.startPosition.row + 1,
-      source,
-      sourceHash: sha256(source),
-      embeddingInput,
-    };
-  });
+      callables.push({
+        path: relativePath,
+        language,
+        kind,
+        name,
+        qualifiedName,
+        signature,
+        identityKey,
+        startLine: node.startPosition.row + 1,
+        startColumn: node.startPosition.column + 1,
+        endLine: node.endPosition.row + 1,
+        endColumn: node.endPosition.column + 1,
+        lineCount: node.endPosition.row - node.startPosition.row + 1,
+        source,
+        sourceHash: sha256(source),
+        embeddingInput,
+      });
+    } catch (error) {
+      errors.push({
+        path: relativePath, language, scope: "function", code: "extraction-error", qualifiedName,
+        message: `Cannot extract ${qualifiedName}: ${error instanceof Error ? error.message : String(error)}`,
+        startLine: node.startPosition.row + 1, startColumn: node.startPosition.column + 1,
+        endLine: node.endPosition.row + 1, endColumn: node.endPosition.column + 1, source: textFor(content, node),
+      });
+    }
+  }
+  return { callables, errors };
 }

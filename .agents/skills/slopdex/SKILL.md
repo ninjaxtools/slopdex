@@ -39,6 +39,10 @@ Do not expose API keys in commands, output, configuration files, or commits.
 
 ## Indexing
 
+Root and nested `.gitignore` files restrict indexing, including tracked files. Working-tree updates use current ignore files; historical or committed-only Git updates use ignore files from the selected commit. A normal refresh removes newly ignored files from the index. Explicit updates reject ignored paths.
+
+Indexing records parse, callable-extraction, file-read, and file-size failures in SQLite while retaining healthy callables. Commands warn on stderr when unresolved diagnostics remain. Inspect them with `slopdex index-errors --format summary` (or JSON by default); this reads saved errors without refreshing the index or calling providers. Records include paths, source locations, recoverable function names, messages, and available source text. `status` reports `indexingErrorCount` and `failedFileCount`. Failed files are retried during updates; fixes, deletions, and exclusions clear their diagnostics. `--ignore-errors` silences diagnostic warnings without discarding the records.
+
 If a CLI command cannot find its source index, Slopdex prints a notice to stderr and automatically creates and populates it from committed `HEAD`, then overlays working-tree changes. Missing cross-search target indexes are initialized from the target repository's `HEAD` and working tree as well.
 
 Index the current committed snapshot and working-tree overlay:

@@ -3,7 +3,8 @@ import path from "node:path";
 
 import { CodeIndexError, GitDivergenceError } from "./errors.js";
 import { GitRepository, type GitChange, type GitTreeEntry } from "./git/repository.js";
-import { languageForPath, parseCallables } from "./parser/callable-parser.js";
+import { GitignoreRules } from "./gitignore.js";
+import { languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
 import { SourcePolicy } from "./source-policy.js";
 import { IndexDatabase, type PreparedCallable, type PreparedFile, type PreparedSummary } from "./storage/database.js";
 import { OpenAISummaryProvider } from "./summaries/openai.js";
@@ -13,6 +14,7 @@ import type {
   EmbeddingProfile,
   IndexStatus,
   IndexedFunction,
+  IndexingError,
   SimilarityResult,
   SimilaritySearchOptions,
   SummaryProvider,
@@ -70,8 +72,13 @@ export class CodeIndex {
     return this.#database.allFunctions();
   }
 
+  public indexErrors(): IndexingError[] {
+    return this.#database.indexErrors();
+  }
+
   public async updateFiles(options: UpdateFilesOptions): Promise<UpdateStats> {
     throwIfAborted(options.signal);
+    const gitignore = GitignoreRules.workingTree(this.rootDir);
     const generation = this.#database.getGeneration();
     const normalizedRenames = (options.renames ?? []).map(({ from, to }) => ({
       from: normalizeRelativePath(this.rootDir, from),
@@ -90,24 +97,22 @@ export class CodeIndex {
     const prepared: PreparedFile[] = [];
     for (const relativePath of upsertPaths) {
       throwIfAborted(options.signal);
-      if (!this.#policy.includes(relativePath)) throw new CodeIndexError(`Unsupported or excluded source file: ${relativePath}`);
-      const absolutePath = path.join(this.rootDir, relativePath);
-      const info = await lstat(absolutePath);
-      if (info.isSymbolicLink()) throw new CodeIndexError(`Symbolic links are not supported: ${relativePath}`);
-      if (!info.isFile()) throw new CodeIndexError(`Not a regular file: ${relativePath}`);
-      if (info.size > this.#maxFileSize) throw new CodeIndexError(`File exceeds maxFileSize: ${relativePath}`);
-      const content = await readFile(absolutePath);
+      if (!this.#policy.includes(relativePath) || await gitignore.ignores(relativePath)) {
+        throw new CodeIndexError(`Unsupported or excluded source file: ${relativePath}`);
+      }
       const renameSource = renameMap.get(relativePath);
       const originalPath = renameSource ? this.#database.previousPath(renameSource) ?? renameSource : undefined;
-      prepared.push(this.#prepareFile(relativePath, content, {
+      const file = await this.#prepareWorkingFile(relativePath, {
         blobOid: null,
         sourceMode: "working-tree",
         indexedCommit: null,
         ...(originalPath ? { previousPath: originalPath } : {}),
         ...(renameSource ? { replacePath: renameSource } : {}),
-      }));
+      }, true);
+      if (file) prepared.push(file);
     }
     await this.#attachEmbeddings(prepared, options.signal);
+    await gitignore.assertUnchanged(options.signal);
     return this.#database.applyUpdate({
       files: prepared,
       deletePaths: [...deletePaths, ...renameMap.values()],
@@ -119,31 +124,29 @@ export class CodeIndex {
     throwIfAborted(options.signal);
     const generation = this.#database.getGeneration();
     const indexedFiles = this.#database.getFileStates();
-    const sourcePaths = await this.#workingTreeSourcePaths(options.signal);
+    const gitignore = GitignoreRules.workingTree(this.rootDir);
+    const sourcePaths = await this.#workingTreeSourcePaths(gitignore, options.signal);
     const prepared: PreparedFile[] = [];
     const skippedPaths = new Set<string>();
     for (const relativePath of sourcePaths) {
       throwIfAborted(options.signal);
-      const absolutePath = path.join(this.rootDir, relativePath);
-      const info = await lstat(absolutePath);
-      if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize) {
-        skippedPaths.add(relativePath);
-        continue;
-      }
-      const content = await readFile(absolutePath);
-      prepared.push(this.#prepareFile(relativePath, content, {
+      const file = await this.#prepareWorkingFile(relativePath, {
         blobOid: null,
         sourceMode: "working-tree",
         indexedCommit: null,
-      }));
+      });
+      if (!file || file.errors.some((error) => error.code === "file-too-large")) skippedPaths.add(relativePath);
+      if (file) prepared.push(file);
     }
     await this.#attachEmbeddings(prepared, options.signal);
 
-    const pathsAgain = await this.#workingTreeSourcePaths(options.signal);
+    await gitignore.assertUnchanged(options.signal);
+    const pathsAgain = await this.#workingTreeSourcePaths(gitignore, options.signal);
     if (JSON.stringify(pathsAgain) !== JSON.stringify(sourcePaths)) {
       throw new CodeIndexError("Working-tree files changed while indexing; retry the update.");
     }
     for (const file of prepared) {
+      if (file.unavailable) continue;
       try {
         const info = await lstat(path.join(this.rootDir, file.path));
         const content = await readFile(path.join(this.rootDir, file.path));
@@ -162,11 +165,13 @@ export class CodeIndex {
       }
     }
 
+    await gitignore.assertUnchanged(options.signal);
     return this.#database.applyUpdate({
       files: prepared,
       deletePaths: indexedFiles.map((file) => file.path),
       checkpoint: null,
       expectedGeneration: generation,
+      completeDiagnosticsScan: true,
     });
   }
 
@@ -182,6 +187,8 @@ export class CodeIndex {
     const overlayWorkingTree = target === head && options.includeWorkingTree !== false;
     const checkpoint = this.#database.getCheckpoint();
     const generation = this.#database.getGeneration();
+    const diagnosticsScan = this.#database.needsDiagnosticsScan();
+    const retryPaths = new Set(this.#database.filesWithErrors());
     let reconcileAll = checkpoint === null;
     if (checkpoint && !(await this.#git.isAncestor(checkpoint, target))) {
       if (!options.rebuildOnDivergence) throw new GitDivergenceError(checkpoint, target);
@@ -193,6 +200,18 @@ export class CodeIndex {
     const indexedByPath = new Map(indexedFiles.map((file) => [file.path, file]));
     const workingFiles = indexedFiles.filter((file) => file.sourceMode === "working-tree");
     const workingChanges = overlayWorkingTree ? await this.#git.workTreeChanges(target, indexArtifacts) : [];
+    const gitignore = overlayWorkingTree ? GitignoreRules.workingTree(this.rootDir) : new GitignoreRules(async (filePath) => {
+      const entry = tree.get(filePath);
+      return entry ? (await this.#git.readBlob(entry.oid)).toString("utf8") : null;
+    });
+    const allowedPaths = new Set<string>();
+    const candidatePaths = new Set([
+      ...tree.keys(), ...workingChanges.map((change) => change.path), ...indexedFiles.map((file) => file.path),
+    ]);
+    for (const filePath of candidatePaths) {
+      throwIfAborted(options.signal);
+      if (this.#policy.includes(filePath) && !await gitignore.ignores(filePath)) allowedPaths.add(filePath);
+    }
     const visibleWorkingPaths = new Set(
       workingChanges.filter((change) => change.status !== "D").map((change) => change.path),
     );
@@ -200,7 +219,7 @@ export class CodeIndex {
     const upserts = new Map<string, { entry: GitTreeEntry; previousPath?: string }>();
     const deletes = new Set<string>();
     const eligibleEntries = [...tree.values()]
-      .filter((entry) => this.#policy.includes(entry.path) && entry.size <= this.#maxFileSize);
+      .filter((entry) => allowedPaths.has(entry.path));
     const eligibleTargetPaths = new Set(eligibleEntries.map((entry) => entry.path));
     if (reconcileAll) {
       const renameCandidates = indexedFiles.filter((file) => (
@@ -209,7 +228,7 @@ export class CodeIndex {
       const claimedRenameSources = new Set<string>();
       for (const entry of eligibleEntries) {
         const indexed = indexedByPath.get(entry.path);
-        if (indexed?.sourceMode === "git" && indexed.blobOid === entry.oid) continue;
+        if (indexed?.sourceMode === "git" && indexed.blobOid === entry.oid && !diagnosticsScan && !retryPaths.has(entry.path)) continue;
         const matches = renameCandidates.filter((candidate) => (
           candidate.blobOid === entry.oid && !claimedRenameSources.has(candidate.path)
         ));
@@ -221,13 +240,13 @@ export class CodeIndex {
         if (!eligibleTargetPaths.has(indexed.path)) deletes.add(indexed.path);
       }
     } else {
-      this.#classifyGitChanges(changes, tree, upserts, deletes);
+      this.#classifyGitChanges(changes, tree, upserts, deletes, allowedPaths);
       const indexedPaths = new Set(indexedByPath.keys());
       for (const targetPath of eligibleTargetPaths) {
         const indexed = indexedByPath.get(targetPath);
         const entry = tree.get(targetPath)!;
         if (
-          (!indexed || (indexed.sourceMode === "git" && indexed.blobOid !== entry.oid))
+          (diagnosticsScan || retryPaths.has(targetPath) || !indexed || (indexed.sourceMode === "git" && indexed.blobOid !== entry.oid))
           && !upserts.has(targetPath)
         ) {
           upserts.set(targetPath, { entry });
@@ -242,20 +261,19 @@ export class CodeIndex {
       const previousEntry = dirtyFile.previousPath ? tree.get(dirtyFile.previousPath) : undefined;
       if (
         previousEntry
-        && this.#policy.includes(previousEntry.path)
-        && previousEntry.size <= this.#maxFileSize
+        && allowedPaths.has(previousEntry.path)
         && (entry !== undefined || !visibleWorkingPaths.has(dirtyFile.path))
       ) {
         const currentPlan = entry ? upserts.get(dirtyFile.path) : undefined;
         upserts.delete(dirtyFile.path);
         upserts.delete(previousEntry.path);
         upserts.set(previousEntry.path, { entry: previousEntry, previousPath: dirtyFile.path });
-        if (entry && this.#policy.includes(entry.path) && entry.size <= this.#maxFileSize) {
+        if (entry && allowedPaths.has(entry.path)) {
           upserts.set(dirtyFile.path, currentPlan ?? { entry });
         }
         continue;
       }
-      if (entry && this.#policy.includes(dirtyFile.path) && entry.size <= this.#maxFileSize) {
+      if (entry && allowedPaths.has(dirtyFile.path)) {
         const planned = upserts.get(dirtyFile.path);
         if (planned?.previousPath && !indexedByPath.has(planned.previousPath)) {
           upserts.set(dirtyFile.path, { entry, previousPath: dirtyFile.path });
@@ -264,7 +282,7 @@ export class CodeIndex {
         }
         continue;
       }
-      if (previousEntry && this.#policy.includes(previousEntry.path) && previousEntry.size <= this.#maxFileSize) {
+      if (previousEntry && allowedPaths.has(previousEntry.path)) {
         upserts.set(previousEntry.path, { entry: previousEntry, previousPath: dirtyFile.path });
       } else {
         deletes.add(dirtyFile.path);
@@ -272,7 +290,7 @@ export class CodeIndex {
     }
     for (const [filePath, { entry, previousPath }] of upserts) {
       const indexed = indexedByPath.get(filePath);
-      if (!previousPath && indexed?.sourceMode === "git" && indexed.blobOid === entry.oid) upserts.delete(filePath);
+      if (!previousPath && indexed?.sourceMode === "git" && indexed.blobOid === entry.oid && !diagnosticsScan && !retryPaths.has(filePath)) upserts.delete(filePath);
     }
 
     const workingPrepared: PreparedFile[] = [];
@@ -321,22 +339,23 @@ export class CodeIndex {
         if (replacePath) deletes.delete(replacePath);
       }
       const relativePath = change.path;
-      if (!this.#policy.includes(relativePath)) {
+      if (!allowedPaths.has(relativePath)) {
         if (replacePath) workingDeletes.add(replacePath);
         workingDeletes.add(relativePath);
         continue;
       }
-      const absolutePath = path.join(this.rootDir, relativePath);
-      const info = await lstat(absolutePath);
-      if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize) {
+      const file = await this.#prepareWorkingFile(relativePath, {
+        blobOid: null, sourceMode: "working-tree", indexedCommit: null,
+      });
+      if (!file) {
         if (replacePath) workingDeletes.add(replacePath);
         workingDeletes.add(relativePath);
         skippedWorkingPaths.add(relativePath);
         continue;
       }
-      const content = await readFile(absolutePath);
-      if (!replacePath && change.status === "A") {
-        const contentHash = sha256(content.toString("utf8"));
+      if (file.errors.some((error) => error.code === "file-too-large")) skippedWorkingPaths.add(relativePath);
+      if (!file.unavailable && !replacePath && change.status === "A") {
+        const contentHash = file.contentHash;
         const renameCandidates = workingFiles.filter((file) => (
           file.path !== relativePath
           && !visibleWorkingPaths.has(file.path)
@@ -350,33 +369,37 @@ export class CodeIndex {
           deletes.delete(renamed.path);
         }
       }
-      workingPrepared.push(this.#prepareFile(relativePath, content, {
-        blobOid: null,
-        sourceMode: "working-tree",
-        indexedCommit: null,
+      workingPrepared.push({
+        ...file,
         ...(previousPath ? { previousPath } : {}),
         ...(replacePath ? { replacePath } : {}),
-      }));
+      });
     }
 
     const prepared: PreparedFile[] = [];
     for (const { entry, previousPath } of upserts.values()) {
       throwIfAborted(options.signal);
-      const content = await this.#git.readBlob(entry.oid);
-      if (content.byteLength > this.#maxFileSize) {
-        deletes.add(entry.path);
-        continue;
-      }
-      prepared.push(this.#prepareFile(entry.path, content, {
+      const provenance = {
         blobOid: entry.oid,
-        sourceMode: "git",
+        sourceMode: "git" as const,
         indexedCommit: target,
         ...(previousPath ? { replacePath: previousPath } : {}),
-      }));
+      };
+      if (entry.size > this.#maxFileSize) {
+        prepared.push(this.#failedFile(entry.path, "file-too-large", `File exceeds maxFileSize (${this.#maxFileSize} bytes).`, provenance, entry.size));
+        continue;
+      }
+      try {
+        const content = await this.#git.readBlob(entry.oid);
+        prepared.push(this.#prepareFile(entry.path, content, provenance));
+      } catch (error) {
+        prepared.push(this.#failedFile(entry.path, "read-error", error instanceof Error ? error.message : String(error), provenance, entry.size));
+      }
     }
     await this.#attachEmbeddings([...prepared, ...workingPrepared], options.signal);
     const noChanges = (
       !reconcileAll
+      && !diagnosticsScan
       && checkpoint === target
       && prepared.length === 0
       && deletes.size === 0
@@ -393,6 +416,7 @@ export class CodeIndex {
         throw new CodeIndexError("Git HEAD or working-tree changes changed while indexing; retry the update.");
       }
       for (const file of workingPrepared) {
+        if (file.unavailable) continue;
         const info = await lstat(path.join(this.rootDir, file.path));
         const content = await readFile(path.join(this.rootDir, file.path));
         if (!info.isFile() || info.isSymbolicLink() || info.size > this.#maxFileSize || sha256(content.toString("utf8")) !== file.contentHash) {
@@ -405,6 +429,7 @@ export class CodeIndex {
           throw new CodeIndexError(`Working-tree file changed while indexing: ${relativePath}`);
         }
       }
+      await gitignore.assertUnchanged(options.signal);
     }
     if (noChanges) {
       if (this.#database.getCheckpoint() !== checkpoint || this.#database.getGeneration() !== generation) {
@@ -422,6 +447,7 @@ export class CodeIndex {
       checkpoint: target,
       expectedCheckpoint: checkpoint,
       expectedGeneration: generation,
+      completeDiagnosticsScan: true,
     });
   }
 
@@ -430,6 +456,7 @@ export class CodeIndex {
     tree: ReadonlyMap<string, GitTreeEntry>,
     upserts: Map<string, { entry: GitTreeEntry; previousPath?: string }>,
     deletes: Set<string>,
+    allowedPaths: ReadonlySet<string>,
   ): void {
     for (const change of changes) {
       if (change.status === "D") {
@@ -439,18 +466,18 @@ export class CodeIndex {
       if (change.status === "R") {
         deletes.add(change.oldPath);
         const entry = tree.get(change.path);
-        if (entry && this.#policy.includes(change.path) && entry.size <= this.#maxFileSize) {
+        if (entry && allowedPaths.has(change.path)) {
           upserts.set(change.path, { entry, previousPath: change.oldPath });
         }
         continue;
       }
       const entry = tree.get(change.path);
-      if (entry && this.#policy.includes(change.path) && entry.size <= this.#maxFileSize) upserts.set(change.path, { entry });
+      if (entry && allowedPaths.has(change.path)) upserts.set(change.path, { entry });
       else deletes.add(change.path);
     }
   }
 
-  async #workingTreeSourcePaths(signal?: AbortSignal): Promise<string[]> {
+  async #workingTreeSourcePaths(gitignore: GitignoreRules, signal?: AbortSignal): Promise<string[]> {
     const relativeIndexPath = path.relative(this.rootDir, this.indexPath).replaceAll(path.sep, "/");
     const indexArtifacts = new Set(relativeIndexPath && !relativeIndexPath.startsWith("../")
       ? [relativeIndexPath, `${relativeIndexPath}-shm`, `${relativeIndexPath}-wal`, `${relativeIndexPath}-journal`]
@@ -467,8 +494,8 @@ export class CodeIndex {
           ? `${relativeDirectory.replaceAll(path.sep, "/")}/${entry.name}`
           : entry.name;
         if (entry.isDirectory()) {
-          if (this.#policy.traversesDirectory(relativePath)) directories.push(relativePath);
-        } else if (entry.isFile() && !indexArtifacts.has(relativePath) && this.#policy.includes(relativePath)) {
+          if (this.#policy.traversesDirectory(relativePath) && !await gitignore.ignores(relativePath, true)) directories.push(relativePath);
+        } else if (entry.isFile() && !indexArtifacts.has(relativePath) && this.#policy.includes(relativePath) && !await gitignore.ignores(relativePath)) {
           sourcePaths.push(relativePath);
         }
       }
@@ -483,7 +510,7 @@ export class CodeIndex {
     provenance: Pick<PreparedFile, "blobOid" | "sourceMode" | "indexedCommit" | "previousPath" | "replacePath">,
   ): PreparedFile {
     const content = buffer.toString("utf8");
-    const callables = parseCallables(relativePath, content, this.#onWarning) as PreparedCallable[];
+    const { callables, errors } = parseFileCallables(relativePath, content, this.#onWarning);
     const language = languageForPath(relativePath) ?? path.extname(relativePath).slice(1);
     return {
       path: relativePath,
@@ -496,7 +523,48 @@ export class CodeIndex {
       source: content,
       ...(provenance.previousPath ? { previousPath: provenance.previousPath } : {}),
       ...(provenance.replacePath ? { replacePath: provenance.replacePath } : {}),
-      callables,
+      callables: callables as PreparedCallable[],
+      errors,
+    };
+  }
+
+  async #prepareWorkingFile(
+    relativePath: string,
+    provenance: Pick<PreparedFile, "blobOid" | "sourceMode" | "indexedCommit" | "previousPath" | "replacePath">,
+    strict = false,
+  ): Promise<PreparedFile | null> {
+    let size = 0;
+    try {
+      const absolutePath = path.join(this.rootDir, relativePath);
+      const info = await lstat(absolutePath);
+      if (info.isSymbolicLink() || !info.isFile()) {
+        if (strict) throw new CodeIndexError(`Not a regular file or symbolic links are not supported: ${relativePath}`);
+        return null;
+      }
+      size = info.size;
+      if (size > this.#maxFileSize) {
+        return this.#failedFile(relativePath, "file-too-large", `File exceeds maxFileSize (${this.#maxFileSize} bytes).`, provenance, size);
+      }
+      return this.#prepareFile(relativePath, await readFile(absolutePath), provenance);
+    } catch (error) {
+      if (error instanceof CodeIndexError) throw error;
+      return this.#failedFile(relativePath, "read-error", error instanceof Error ? error.message : String(error), provenance, size);
+    }
+  }
+
+  #failedFile(
+    relativePath: string, code: "read-error" | "file-too-large", message: string,
+    provenance: Pick<PreparedFile, "blobOid" | "sourceMode" | "indexedCommit" | "previousPath" | "replacePath">,
+    byteSize: number,
+  ): PreparedFile {
+    this.#onWarning(`Cannot index ${relativePath}: ${message}`);
+    return {
+      ...provenance, path: relativePath, contentHash: sha256(""), source: "", byteSize,
+      language: languageForPath(relativePath) ?? "unknown", callables: [], unavailable: true,
+      errors: [{
+        path: relativePath, language: languageForPath(relativePath), scope: "file", code, message,
+        qualifiedName: null, startLine: null, startColumn: null, endLine: null, endColumn: null, source: null,
+      }],
     };
   }
 
@@ -591,6 +659,7 @@ export class CodeIndex {
         path: file.path, contentHash: file.contentHash, blobOid: file.blobOid,
         sourceMode: file.sourceMode, indexedCommit: null, language: callables[0]!.language,
         byteSize: buffer.byteLength, source,
+        errors: [],
         callables: callables.map((callable) => ({ ...callable, embeddingKey: "" })),
       });
     }

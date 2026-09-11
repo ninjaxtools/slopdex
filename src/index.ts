@@ -1,4 +1,5 @@
 export { CodeIndex } from "./code-index.js";
+export { readIndexErrors } from "./storage/database.js";
 export { analyzeCohesion, cohesionLocation } from "./analysis/cohesion.js";
 export { crossSearch } from "./search/cross-search.js";
 export { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
