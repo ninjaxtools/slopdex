@@ -38,6 +38,19 @@ describe("cohesion location", () => {
     expect(cohesionLocation("src/auth.ts", "tests/auth.test.ts").sourceTestPair).toBe(true);
     expect(cohesionLocation("tests/auth.test.ts", "tests/session.test.ts").sourceTestPair).toBe(false);
   });
+
+  it.each([
+    ["auth.py", "test_auth.py"], ["auth.py", "auth_test.py"],
+    ["auth.go", "auth_test.go"], ["Auth.java", "AuthTest.java"],
+    ["Auth.java", "TestAuth.java"], ["auth.c", "test_auth.c"], ["auth.rs", "auth_test.rs"],
+  ])("recognizes language-specific test names for %s", (source, test) => {
+    expect(cohesionLocation(`src/${source}`, `src/${test}`).sourceTestPair).toBe(true);
+    expect(cohesionLocation(`src/${test}`, `tests/${test}`).sourceTestPair).toBe(false);
+  });
+
+  it("does not treat Java names ending in lowercase test as test classes", () => {
+    expect(cohesionLocation("src/Contest.java", "src/Contestant.java").sourceTestPair).toBe(false);
+  });
 });
 
 describe("cohesion analysis", () => {

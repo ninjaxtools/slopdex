@@ -1,6 +1,6 @@
 # slopdex
 
-Slopdex indexes named functions in TypeScript and JavaScript repositories. It uses embeddings to search code by meaning, find similar implementations, and measure whether related functions are stored near each other.
+Slopdex uses Tree-sitter to index named functions in Python, JavaScript, JSX, TypeScript, TSX, Rust, Go, Java, and C repositories. It uses embeddings to search code by meaning, find similar implementations, and measure whether related functions are stored near each other.
 
 ## Install
 
@@ -153,6 +153,30 @@ Run `slopdex --help` for all commands and options.
 
 ## Indexing And Data
 
+### Supported Languages
+
+Languages are detected automatically from file extensions. A single index can contain multiple languages; search, purpose summaries, cross-search, and cohesion work across all of them.
+
+| Language | Extensions | Extracted callables |
+| --- | --- | --- |
+| Python | `.py`, `.pyw` | Functions, async functions, class methods, constructors, generators, and bound lambdas; includes decorators in source |
+| JavaScript | `.js`, `.mjs`, `.cjs` | Functions, generators, methods, constructors, and named function expressions/arrows |
+| JSX | `.jsx` | JavaScript callables, including components returning JSX |
+| TypeScript | `.ts`, `.mts`, `.cts` | Typed functions, methods, constructors, and named function expressions/arrows |
+| TSX | `.tsx` | TypeScript callables, including generic components returning JSX |
+| Rust | `.rs` | Functions, `impl` methods/associated functions, trait default methods, and `let`-bound closures |
+| Go | `.go` | Functions, receiver methods, and function literals bound to variables or assignments |
+| Java | `.java` | Methods, constructors (including compact record constructors), and variable-bound lambdas |
+| C | `.c`, `.h` | Function definitions, including static/inline functions and functions returning pointers |
+
+Qualified names include enclosing classes, functions, and explicit modules. Go methods include their receiver type (`Store[T].Get`); Rust trait implementations include the type and trait (`<Store<T> as Read>.read`). Definitions retain their source, signature, line/column locations, and stable identity for incremental updates. Declarations without bodies and anonymous callbacks are omitted. Extraction is syntactic: Rust macros and C macros are not expanded, and C preprocessor branches are indexed as written. `.h` files use the C grammar.
+
+Tree-sitter grammars ship as package dependencies; no language server or project compiler configuration is required. Syntax errors produce warnings while recoverable callables are still indexed. Existing indexes pick up newly supported files during the next normal refresh.
+
+Default exclusions cover dependency and build directories: `.git`, `.slopdex`, `node_modules`, `dist`, `build`, `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`, and `target`. Optional `include` and `exclude` glob arrays in `.slopdex/config.json` further restrict the indexed files.
+
+### Index Updates
+
 Before each analysis command, Slopdex updates its index from the current Git commit and the staged, unstaged, and untracked files in the working tree. The index is created at `.slopdex/index.sqlite` by default.
 
 Add `.slopdex/` to the repository's `.gitignore` so the local index is not committed.
@@ -195,6 +219,20 @@ For summary search, call `await index.useSummaries()` after updating the index, 
 ```bash
 npm run check
 ```
+
+To cross-check the shared-language fixtures against a built sibling checkout of `treesitter-index`, run:
+
+```bash
+npm run check:parser-parity
+# Or provide another reference executable:
+npm run check:parser-parity -- /path/to/treesitter-index
+```
+
+The default reference is `../treesitter-index/target/debug/treesitter-index`. The check covers eight shared languages; that project has no C grammar. Callable regression tests also run as part of `npm run check` without requiring the sibling checkout.
+
+The projects index different information: `treesitter-index` includes declarations, types, imports, and `.pyi` stubs, while Slopdex indexes callable implementations (including nested callables and bound closures). Slopdex also supports `.pyw` and C. Its native Node grammar versions are pinned for compatibility with `tree-sitter@0.21`; the reference uses newer Python and Rust grammars. In particular, Rust `unsafe extern` blocks and async closures currently produce syntax-recovery warnings in Slopdex, so those cases are not covered by the passing parity fixtures.
+
+After upgrading parser behavior, explicitly reparse previously indexed files with `slopdex update-files <path...>` to refresh their symbols, signatures, and embeddings even when the file contents are unchanged.
 
 ## Configuration
 

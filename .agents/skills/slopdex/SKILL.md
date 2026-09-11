@@ -1,11 +1,11 @@
 ---
 name: slopdex
-description: Use when indexing TypeScript or JavaScript code, running semantic function search, finding duplicate function candidates, or analyzing physical code cohesion with the slopdex command-line tool.
+description: Use when indexing Python, JavaScript, JSX, TypeScript, TSX, Rust, Go, Java, or C code, running semantic function search, finding duplicate function candidates, or analyzing physical code cohesion with the slopdex command-line tool.
 ---
 
 # Slopdex CLI
 
-Use `slopdex` to index named JavaScript and TypeScript callables, search them by meaning, identify similar or duplicated functions, and find related functions scattered across a repository.
+Use `slopdex` to index named Python, JavaScript, JSX, TypeScript, TSX, Rust, Go, Java, and C callables with Tree-sitter, search them by meaning, identify similar or duplicated functions, and find related functions scattered across a repository. Languages are detected by extension and can coexist in one index.
 
 ## Default Workflow
 

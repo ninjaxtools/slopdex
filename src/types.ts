@@ -1,4 +1,4 @@
-export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "jsx";
+export type SupportedLanguage = "python" | "javascript" | "jsx" | "typescript" | "tsx" | "rust" | "go" | "java" | "c";
 
 export type CallableKind = "function" | "method" | "constructor" | "generator";
 

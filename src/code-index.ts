@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { CodeIndexError, GitDivergenceError } from "./errors.js";
 import { GitRepository, type GitChange, type GitTreeEntry } from "./git/repository.js";
-import { parseCallables } from "./parser/callable-parser.js";
+import { languageForPath, parseCallables } from "./parser/callable-parser.js";
 import { SourcePolicy } from "./source-policy.js";
 import { IndexDatabase, type PreparedCallable, type PreparedFile, type PreparedSummary } from "./storage/database.js";
 import { OpenAISummaryProvider } from "./summaries/openai.js";
@@ -484,7 +484,7 @@ export class CodeIndex {
   ): PreparedFile {
     const content = buffer.toString("utf8");
     const callables = parseCallables(relativePath, content, this.#onWarning) as PreparedCallable[];
-    const language = callables[0]?.language ?? path.extname(relativePath).slice(1);
+    const language = languageForPath(relativePath) ?? path.extname(relativePath).slice(1);
     return {
       path: relativePath,
       contentHash: sha256(content),

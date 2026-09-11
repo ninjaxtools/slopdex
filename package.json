@@ -1,7 +1,7 @@
 {
   "name": "@ninjaxtools/slopdex",
   "version": "0.6.0",
-  "description": "Callable-level semantic indexing, search, and duplicate discovery for TypeScript and JavaScript codebases",
+  "description": "Tree-sitter callable-level semantic indexing, search, and duplicate discovery for Python, JavaScript, TypeScript, Rust, Go, Java, and C",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -38,14 +38,20 @@
     "install:skill:opencode": "node scripts/install-opencode-skill.mjs",
     "publish:minor": "npm version minor && npm publish --access public",
     "prepack": "npm run build && npm run smoke",
-    "check": "npm run typecheck && npm run test:run && npm run build && npm run smoke"
+    "check": "npm run typecheck && npm run test:run && npm run build && npm run smoke",
+    "check:parser-parity": "node --import tsx scripts/check-parser-parity.mjs"
   },
   "dependencies": {
     "install": "^0.13.0",
     "js-tiktoken": "^1.0.21",
     "sqlite-vec": "^0.1.9",
     "tree-sitter": "^0.21.1",
+    "tree-sitter-c": "0.21.4",
+    "tree-sitter-go": "0.23.4",
+    "tree-sitter-java": "0.23.5",
     "tree-sitter-javascript": "^0.23.1",
+    "tree-sitter-python": "0.23.2",
+    "tree-sitter-rust": "0.21.0",
     "tree-sitter-typescript": "^0.23.2"
   },
   "devDependencies": {

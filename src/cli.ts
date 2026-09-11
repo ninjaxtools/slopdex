@@ -617,6 +617,11 @@ Commands:
   cross-search                        Find nearest functions for each source function
   cohesion                            Rank related functions separated across the repository
 
+Languages (automatically detected with Tree-sitter):
+  Python (.py, .pyw), JavaScript (.js, .mjs, .cjs), JSX (.jsx),
+  TypeScript (.ts, .mts, .cts), TSX (.tsx), Rust (.rs), Go (.go),
+  Java (.java), and C (.c, .h). Indexes named callables with bodies.
+
 Analysis Examples:
   Duplicate Analysis:
     slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5

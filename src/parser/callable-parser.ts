@@ -1,19 +1,19 @@
 import path from "node:path";
 
 import Parser from "tree-sitter";
+import C from "tree-sitter-c";
+import Go from "tree-sitter-go";
+import Java from "tree-sitter-java";
 import JavaScript from "tree-sitter-javascript";
+import Python from "tree-sitter-python";
+import Rust from "tree-sitter-rust";
 import TypeScript from "tree-sitter-typescript";
 
 import { CodeIndexError } from "../errors.js";
 import type { CallableKind, ParsedCallable, SupportedLanguage } from "../types.js";
 import { sha256 } from "../utils.js";
-
-interface CallableCandidate {
-  node: Parser.SyntaxNode;
-  name: string;
-  kind: CallableKind;
-  scope: readonly string[];
-}
+import type { CallableCandidate } from "./candidate.js";
+import { collectNativeCallables } from "./native-callables.js";
 
 const parsers = new Map<SupportedLanguage, Parser>();
 
@@ -31,6 +31,18 @@ export function languageForPath(filePath: string): SupportedLanguage | null {
       return "javascript";
     case ".jsx":
       return "jsx";
+    case ".py":
+    case ".pyw":
+      return "python";
+    case ".rs":
+      return "rust";
+    case ".go":
+      return "go";
+    case ".java":
+      return "java";
+    case ".c":
+    case ".h":
+      return "c";
     default:
       return null;
   }
@@ -43,6 +55,11 @@ function getParser(language: SupportedLanguage): Parser {
   const parser = new Parser();
   if (language === "typescript") parser.setLanguage(TypeScript.typescript);
   else if (language === "tsx") parser.setLanguage(TypeScript.tsx);
+  else if (language === "python") parser.setLanguage(Python);
+  else if (language === "rust") parser.setLanguage(Rust);
+  else if (language === "go") parser.setLanguage(Go);
+  else if (language === "java") parser.setLanguage(Java);
+  else if (language === "c") parser.setLanguage(C);
   else parser.setLanguage(JavaScript);
   parsers.set(language, parser);
   return parser;
@@ -130,7 +147,7 @@ function fieldText(content: string, node: Parser.SyntaxNode, field: string): str
 }
 
 function callableKind(node: Parser.SyntaxNode, name: string): CallableKind {
-  if (name === "constructor") return "constructor";
+  if (node.type === "method_definition" && name === "constructor") return "constructor";
   if (node.type.includes("generator") || /^\s*(?:async\s+)?\*/.test(node.text)) return "generator";
   return node.type === "method_definition" ? "method" : "function";
 }
@@ -172,7 +189,7 @@ function walk(
   scope: readonly string[],
   candidates: CallableCandidate[],
 ): void {
-  if (node.type === "class_declaration" || node.type === "class") {
+  if (["class_declaration", "abstract_class_declaration", "class"].includes(node.type)) {
     const name = fieldText(content, node, "name") ?? objectScopeName(content, node);
     const nextScope = name ? [...scope, name] : scope;
     for (const child of node.namedChildren) walk(child, content, nextScope, candidates);
@@ -213,7 +230,7 @@ function walk(
     return;
   }
 
-  if (node.type === "public_field_definition" || node.type === "field_definition") {
+  if (["public_field_definition", "property_definition", "field_definition"].includes(node.type)) {
     const name = (fieldText(content, node, "name") ?? fieldText(content, node, "property"))?.replace(/^#/, "");
     const value = node.childForFieldName("value");
     if (name && value && ["arrow_function", "function_expression", "generator_function"].includes(value.type)) {
@@ -273,9 +290,13 @@ function walk(
 
 function signatureFor(content: string, node: Parser.SyntaxNode, name: string): string | null {
   const parameters = node.childForFieldName("parameters");
-  if (!parameters) return name;
+  const parameter = node.childForFieldName("parameter");
+  const typeParameters = node.childForFieldName("type_parameters");
   const returnType = node.childForFieldName("return_type");
-  return `${name}${textFor(content, parameters)}${returnType ? textFor(content, returnType) : ""}`;
+  const async = node.children.some((child) => child.type === "async") ? "async " : "";
+  const generator = node.children.some((child) => child.type === "*") ? "*" : "";
+  const parameterText = parameters ? textFor(content, parameters) : parameter ? `(${textFor(content, parameter)})` : "";
+  return `${async}${generator}${name}${typeParameters ? textFor(content, typeParameters) : ""}${parameterText}${returnType ? textFor(content, returnType) : ""}`;
 }
 
 export function parseCallables(
@@ -288,7 +309,7 @@ export function parseCallables(
 
   const parser = getParser(language);
   const parsedTree = parseTree(parser, content, relativePath);
-  const tree = parsedTree.rootNode.hasError
+  const tree = parsedTree.rootNode.hasError && (language === "typescript" || language === "tsx")
     ? recoverUnsupportedTypeScriptSyntax(parser, parsedTree, content, relativePath) ?? parsedTree
     : parsedTree;
   if (tree.rootNode.hasError) {
@@ -296,18 +317,22 @@ export function parseCallables(
   }
 
   const candidates: CallableCandidate[] = [];
-  walk(tree.rootNode, content, [], candidates);
+  if (["typescript", "tsx", "javascript", "jsx"].includes(language)) {
+    walk(tree.rootNode, content, [], candidates);
+  } else {
+    candidates.push(...collectNativeCallables(tree.rootNode, content, language));
+  }
   candidates.sort((left, right) => left.node.startIndex - right.node.startIndex);
 
   const occurrences = new Map<string, number>();
-  return candidates.map(({ node, name, kind, scope }) => {
+  return candidates.map(({ node, name, kind, scope, signature: candidateSignature }) => {
     const qualifiedName = [...scope, name].join(".");
     const baseIdentity = `${relativePath}\0${qualifiedName}\0${kind}`;
     const occurrence = occurrences.get(baseIdentity) ?? 0;
     occurrences.set(baseIdentity, occurrence + 1);
     const identityKey = sha256(`${baseIdentity}\0${occurrence}`);
     const source = textFor(content, node);
-    const signature = signatureFor(content, node, name);
+    const signature = candidateSignature ?? signatureFor(content, node, name);
     const embeddingInput = [
       `language: ${language}`,
       `kind: ${kind}`,

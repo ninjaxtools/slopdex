@@ -320,11 +320,15 @@ function directoryParts(filePath: string): string[] {
 }
 
 function isTestPath(filePath: string): boolean {
-  const normalized = filePath.replaceAll("\\", "/").toLowerCase();
+  const original = filePath.replaceAll("\\", "/");
+  const normalized = original.toLowerCase();
   const segments = normalized.split("/");
   const fileName = segments.at(-1) ?? "";
   return segments.some((segment) => segment === "test" || segment === "tests" || segment === "__tests__")
-    || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(fileName);
+    || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(fileName)
+    || /_test\.go$/.test(fileName)
+    || /^(?:test_.+|.+_test)\.(?:py|pyw|rs|c|h)$/.test(fileName)
+    || /^(?:Test.+|.+Tests?|.+TestCase)\.java$/.test(original.split("/").at(-1) ?? "");
 }
 
 function orderedFunctions(left: IndexedFunction, right: IndexedFunction): [IndexedFunction, IndexedFunction] {

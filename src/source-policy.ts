@@ -11,6 +11,13 @@ const DEFAULT_EXCLUDED_SEGMENTS = new Set([
   "coverage",
   "vendor",
   "generated",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".tox",
+  ".mypy_cache",
+  ".pytest_cache",
+  "target",
 ]);
 
 export class SourcePolicy {
