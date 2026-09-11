@@ -350,7 +350,7 @@ function extractCallables(relativePath: string, content: string): { callables: P
 
   const occurrences = new Map<string, number>();
   const callables: ParsedCallable[] = [];
-  for (const { node, name, kind, scope, signature: candidateSignature } of candidates) {
+  for (const { node, name, kind, scope, signature: candidateSignature, documentation } of candidates) {
     const qualifiedName = [...scope, name].join(".");
     const baseIdentity = `${relativePath}\0${qualifiedName}\0${kind}`;
     const occurrence = occurrences.get(baseIdentity) ?? 0;
@@ -365,6 +365,7 @@ function extractCallables(relativePath: string, content: string): { callables: P
         `kind: ${kind}`,
         `symbol: ${qualifiedName}`,
         signature ? `signature: ${signature}` : null,
+        documentation ? `documentation:\n${documentation}` : null,
         "source:",
         source,
       ].filter((value): value is string => value !== null).join("\n");

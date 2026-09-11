@@ -8,4 +8,5 @@ export interface CallableCandidate {
   kind: CallableKind;
   scope: readonly string[];
   signature?: string;
+  documentation?: string;
 }

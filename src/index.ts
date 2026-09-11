@@ -48,6 +48,10 @@ export function useSummaries(index: CodeIndex, options?: { signal?: AbortSignal 
   return index.useSummaries(options);
 }
 
+export function disableSummaries(index: CodeIndex) {
+  return index.disableSummaries();
+}
+
 export function searchSummary(index: CodeIndex, options: SimilaritySearchOptions) {
   return index.searchSummary(options);
 }

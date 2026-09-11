@@ -32,6 +32,14 @@ function pythonIsMethod(node: Node): boolean {
   return definition.parent?.parent?.type === "class_definition";
 }
 
+function pythonDocstring(body: Node | null, content: string): string | null {
+  const statement = body?.namedChildren[0];
+  if (statement?.type !== "expression_statement") return null;
+  const value = statement.namedChildren[0];
+  if (value?.type !== "string" && value?.type !== "concatenated_string") return null;
+  return content.slice(value.startIndex, value.endIndex);
+}
+
 function goReceiver(node: Node): string | null {
   let type = node.childForFieldName("receiver")?.namedChildren[0]?.childForFieldName("type");
   while (type?.type === "pointer_type") type = type.namedChildren[0] ?? null;
@@ -47,9 +55,11 @@ export function collectNativeCallables(root: Node, content: string, language: Su
     if ((!body || body.isMissing) && !node.hasError) return false;
     const sourceNode = language === "python" && node.parent?.type === "decorated_definition" ? node.parent : node;
     const header = content.slice(node.startIndex, body?.startIndex ?? node.endIndex).trimEnd();
+    const documentation = language === "python" && body ? pythonDocstring(body, content) : null;
     candidates.push({
       node: sourceNode, name, kind, scope,
       signature: bound ? `${name} = ${header}` : header,
+      ...(documentation ? { documentation } : {}),
     });
     if (body) walk(body, [...scope, name]);
     return true;

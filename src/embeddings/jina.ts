@@ -23,7 +23,7 @@ export class JinaEmbeddingProvider implements EmbeddingProvider {
       provider: "jina",
       model,
       dimensions,
-      strategyVersion: "callable-v1:code-query-passage",
+      strategyVersion: "callable-v2:code-query-passage",
     } as const;
     this.#url = options.baseUrl ?? "https://api.jina.ai/v1/embeddings";
   }

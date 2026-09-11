@@ -34,7 +34,7 @@ export class Client { constructor() {} send() { deliver(); } }
     expect(index.status()).toMatchObject({ summariesEnabled: false, summaryCount: 0 });
     expect(index.allFunctions().every((value) => value.summary === null)).toBe(true);
     expect(summaries.inputs).toHaveLength(0);
-    await expect(index.searchSummary({ query: "workflow" })).rejects.toThrow(/use-summaries/);
+    await expect(index.searchSummary({ query: "workflow" })).rejects.toThrow(/summaries enable/);
 
     const functionsBefore = index.allFunctions();
     const vectorsBefore = functionsBefore.map((value) => index.vectorForFunction(value.id));
@@ -43,6 +43,10 @@ export class Client { constructor() {} send() { deliver(); } }
     expect(summaries.inputs.every((input) => input.fileSource === source && input.repository === path.basename(root))).toBe(true);
     expect(index.allFunctions().map((value) => value.id)).toEqual(functionsBefore.map((value) => value.id));
     expect(index.allFunctions().map((value) => index.vectorForFunction(value.id))).toEqual(vectorsBefore);
+    await expect(index.useSummaries()).resolves.toEqual({ summariesCreated: 0, summariesEnabled: true });
+    expect(index.disableSummaries()).toEqual({ summariesCreated: 0, summariesEnabled: false });
+    expect(index.status()).toMatchObject({ summariesEnabled: false, summaryCount: 3 });
+    await expect(index.searchSummary({ query: "workflow" })).rejects.toThrow(/summaries enable/);
     await expect(index.useSummaries()).resolves.toEqual({ summariesCreated: 0, summariesEnabled: true });
     index.close();
 

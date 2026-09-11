@@ -275,7 +275,7 @@ describe("CLI index initialization", () => {
     expect(clusters.status).toBe(0);
     expect(clusters.stdout).toBe("No clusters.\n");
 
-    const uncommitted = runCli(root, "cohesion", "--uncommitted", "--changed-since", base, "--source-path", "src", "-e", "keep$");
+    const uncommitted = runCli(root, "cohesion", "--uncommitted", "--changed-since", base, "--source-path", "src", "-e", "keep$", "--format", "json");
     expect(uncommitted.status).toBe(0);
     expect(JSON.parse(uncommitted.stdout).parameters.sourceFilter).toEqual({
       type: "changed-since", commit: base, uncommitted: true, path: "src", nameRegex: "keep$",
@@ -340,17 +340,21 @@ export function two(value: string) {
       root,
       "cross-search",
       "--regex",
-      "^(one|external)$",
-      "--include-symmetric-duplicates",
+      "^one$",
+      "--cross-file-only",
+      "--min-lines",
+      "3",
       "--limit",
       "1",
+      "--threshold",
+      "0.8-1.1",
       "--format",
       "json",
     );
     expect(regex.status).toBe(0);
-    const regexRows = regex.stdout.trim().split("\n").map((line) => JSON.parse(line));
-    expect(regexRows.map((row) => row.source.qualifiedName).sort()).toEqual(["external", "one"]);
-    expect(regexRows.every((row) => /^(one|external)$/.test(row.matches[0].function.qualifiedName))).toBe(true);
+    const regexRow = JSON.parse(regex.stdout);
+    expect(regexRow.source.qualifiedName).toBe("one");
+    expect(regexRow.matches.map((match: { function: { qualifiedName: string } }) => match.function.qualifiedName)).toEqual(["external"]);
 
     const sourceRegex = runCli(root, "cross-search", "-e", "^one$", "--source-path", "same.ts",
       "--cross-file-only", "--min-lines", "3", "--limit", "1", "--threshold", "0.8-1.1", "--format", "json");
@@ -358,12 +362,14 @@ export function two(value: string) {
     const selected = JSON.parse(sourceRegex.stdout);
     expect(selected.source.qualifiedName).toBe("one");
     expect(selected.matches.map((match: { function: { qualifiedName: string } }) => match.function.qualifiedName)).toEqual(["external"]);
+    expect(runCli(root, "cross-search", "--regex", "^one$", "--source-path", "same.ts",
+      "--cross-file-only", "--min-lines", "3", "--limit", "1", "--threshold", "0.8-1.1", "--format", "json").stdout).toBe(sourceRegex.stdout);
     const empty = runCli(root, "cross-search", "--regexp", "^missing$", "--format", "json");
     expect(empty.status).toBe(0);
     expect(empty.stdout).toBe("");
   });
 
-  it("reports cohesion as compact JSON or a summary", async () => {
+  it("reports cohesion as a summary by default or compact JSON", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "src/one.ts", `export function one() {
@@ -386,7 +392,12 @@ export function two(value: string) {
     await index.updateFromGit();
     index.close();
 
-    const json = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1");
+    const summary = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1");
+    expect(summary.status).toBe(0);
+    expect(summary.stdout).toContain("Cohesion: 2 functions analyzed, 1 semantic edge");
+    expect(summary.stdout).toContain("distance 4");
+
+    const json = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--format", "json");
     expect(json.status).toBe(0);
     const report = JSON.parse(json.stdout);
     expect(report.summary).toMatchObject({ functionsAnalyzed: 2, semanticEdges: 1, remoteRatio: 1 });
@@ -394,15 +405,11 @@ export function two(value: string) {
     expect(report.pairs[0].left).not.toHaveProperty("source");
     expect(report.groups[0].members[0]).not.toHaveProperty("source");
 
-    const included = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--include-source", "--regexp", "^one$");
+    const included = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--include-source", "--regexp", "^one$", "--format", "json");
     expect(JSON.parse(included.stdout).pairs[0].left).toHaveProperty("source");
     expect(JSON.parse(included.stdout).parameters.sourceFilter).toEqual({ type: "all", nameRegex: "^one$" });
     expect(JSON.parse(included.stdout).summary).toMatchObject({ scope: "selected-sources", functionsAnalyzed: 1, candidateFunctions: 2 });
 
-    const summary = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--format", "summary");
-    expect(summary.status).toBe(0);
-    expect(summary.stdout).toContain("Cohesion: 2 functions analyzed, 1 semantic edge");
-    expect(summary.stdout).toContain("distance 4");
   });
 
   it.each(["--min-similarity", "--added-since"])("rejects removed option %s cleanly", (option) => {
@@ -423,16 +430,23 @@ export function two(value: string) {
     expect(invalidRegex.stderr).toContain("Invalid --regex value");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
+    const conflictingAliases = runCli(root, "search", "query", "-e", "one", "--regex", "two");
+    expect(conflictingAliases.status).toBe(2);
+    expect(conflictingAliases.stderr).toContain("are aliases and cannot use different values");
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
     const emptyRange = runCli(root, "cross-search", "--threshold", "0.9-0.9");
     expect(emptyRange.status).toBe(2);
     expect(emptyRange.stderr).toContain("minimum must be less than its maximum");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
     for (const command of ["cross-search", "cohesion", "search", "search-summary"]) {
-      const invalidSourceRegex = runCli(root, command, ...(command.startsWith("search") ? ["query"] : []), "-e", "[");
-      expect(invalidSourceRegex.status).toBe(2);
-      expect(invalidSourceRegex.stderr).toContain("Invalid -e/--regexp value");
-      expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+      for (const option of ["-e", "--regex"]) {
+        const invalidSourceRegex = runCli(root, command, ...(command.startsWith("search") ? ["query"] : []), option, "[");
+        expect(invalidSourceRegex.status).toBe(2);
+        expect(invalidSourceRegex.stderr).toContain(option === "--regex" ? "Invalid --regex value" : "Invalid -e/--regexp value");
+        expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+      }
     }
 
     const invalidNeighbors = runCli(root, "cohesion", "--neighbors", "0");
@@ -467,7 +481,7 @@ describe("CLI help", () => {
       "slopdex delete-files",
       "slopdex update-git",
       "slopdex search",
-      "slopdex use-summaries",
+      "slopdex summaries enable",
       "slopdex search-summary",
       "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5",
       "slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary",
@@ -529,16 +543,23 @@ globalThis.fetch = async (url, options) => {
 `);
     const env = { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}` };
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
-    const initialized = run("use-summaries");
+    const initialized = run("summaries", "enable");
     expect(initialized.status, initialized.stderr).toBe(0);
     expect(JSON.parse(initialized.stdout)).toEqual({ summariesCreated: 1, summariesEnabled: true });
-    expect(JSON.parse(run("use-summaries").stdout).summariesCreated).toBe(0);
+    expect(JSON.parse(run("summaries", "enable").stdout).summariesCreated).toBe(0);
 
-    const search = run("search-summary", "workflow", "--threshold", "0.9", "--limit", "1");
+    const disabled = run("summaries", "disable");
+    expect(disabled.status, disabled.stderr).toBe(0);
+    expect(JSON.parse(disabled.stdout)).toEqual({ summariesCreated: 0, summariesEnabled: false });
+    expect(JSON.parse(run("status").stdout)).toMatchObject({ summaryCount: 0, summariesEnabled: false });
+    expect(run("search-summary", "workflow").stderr).toContain("run summaries enable first");
+    expect(JSON.parse(run("summaries", "enable").stdout)).toEqual({ summariesCreated: 0, summariesEnabled: true });
+
+    const search = run("search-summary", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
     expect(search.status, search.stderr).toBe(0);
     expect(JSON.parse(search.stdout)[0].function.summary).toBe("Purpose of one using gpt-5.6-sol");
     expect(JSON.parse(search.stdout)[0].function).not.toHaveProperty("summaryEmbeddingId");
-    const text = run("search-summary", "workflow", "--format", "summary");
+    const text = run("search-summary", "workflow");
     expect(text.stdout).toContain("Purpose of one using gpt-5.6-sol");
 
     write(root, "src/b.ts", "export function two() { return 2; }\n");
@@ -546,11 +567,11 @@ globalThis.fetch = async (url, options) => {
     expect(updated.status, updated.stderr).toBe(0);
     expect(JSON.parse(updated.stdout)).toMatchObject({ functionCount: 2, summaryCount: 2, summariesEnabled: true });
     for (const command of ["search", "search-summary"]) {
-      const filtered = run(command, "workflow", "-e", "^two$", "--limit", "1");
+      const filtered = run(command, "workflow", "-e", "^two$", "--limit", "1", "--format", "json");
       expect(filtered.status, filtered.stderr).toBe(0);
       expect(JSON.parse(filtered.stdout).map((match: { function: { name: string } }) => match.function.name)).toEqual(["two"]);
     }
-    const changedModel = run("use-summaries", "--summary-model", "custom-summary-model");
+    const changedModel = run("summaries", "enable", "--summary-model", "custom-summary-model");
     expect(changedModel.status, changedModel.stderr).toBe(0);
     expect(JSON.parse(changedModel.stdout).summariesCreated).toBe(2);
     expect(JSON.parse(run("status").stdout).summaryProfile.model).toBe("custom-summary-model");
@@ -564,7 +585,7 @@ globalThis.fetch = async (url, options) => {
       sourceSummaryProfile: { model: "custom-summary-model" }, targetSummaryProfile: { model: "custom-summary-model" },
     });
     expect(run("cross-search", "--min-lines", "1").stdout).toContain("combined 50% code + 50% summary");
-    const cohesion = run("cohesion", "--min-lines", "1");
+    const cohesion = run("cohesion", "--min-lines", "1", "--format", "json");
     expect(cohesion.status, cohesion.stderr).toBe(0);
     const report = JSON.parse(cohesion.stdout);
     expect(report.pairs[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, summarySimilarity: 1 });
@@ -587,6 +608,12 @@ globalThis.fetch = async (url, options) => {
     expect(existsSync(path.join(root, ".slopdex/index.sqlite"))).toBe(false);
     const disabled = runCli(root, "search-summary", "workflow");
     expect(disabled.status).toBe(2);
-    expect(disabled.stderr).toContain("run use-summaries first");
+    expect(disabled.stderr).toContain("run summaries enable first");
+
+    for (const args of [["summaries"], ["summaries", "maybe"], ["summaries", "enable", "extra"]]) {
+      const invalid = runCli(root, ...args);
+      expect(invalid.status).toBe(2);
+      expect(invalid.stderr).toContain("summaries requires enable or disable");
+    }
   });
 });

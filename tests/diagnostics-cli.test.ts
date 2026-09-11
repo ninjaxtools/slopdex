@@ -38,12 +38,12 @@ describe("CLI indexing diagnostics", () => {
     const indexPath = await brokenIndex(root);
     const stored = readIndexErrors(indexPath);
     expect(stored.length).toBeGreaterThan(0);
-    const json = run(root, "index-errors");
+    const json = run(root, "index-errors", "--format", "json");
     expect(json.status, json.stderr).toBe(0);
     expect(JSON.parse(json.stdout)).toEqual(stored);
     expect(json.stderr).toContain("unresolved indexing error(s)");
     expect(json.stderr).toContain("1 file(s)");
-    const summary = run(root, "index-errors", "--format", "summary", "--ignore-errors");
+    const summary = run(root, "index-errors", "--ignore-errors");
     expect(summary.status).toBe(0);
     expect(summary.stdout).toContain("broken.ts:1:1");
     expect(summary.stdout).toContain(":: broken");
@@ -73,7 +73,7 @@ describe("CLI indexing diagnostics", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ fileCount: 1, functionCount: 0, failedFileCount: 1 });
     expect(result.stderr).toContain("unresolved indexing error(s)");
-    expect(JSON.parse(run(root, "index-errors", "--ignore-errors").stdout).some((error: { qualifiedName: string | null }) => error.qualifiedName === "broken")).toBe(true);
+    expect(JSON.parse(run(root, "index-errors", "--format", "json", "--ignore-errors").stdout).some((error: { qualifiedName: string | null }) => error.qualifiedName === "broken")).toBe(true);
     const quiet = run(root, "status", "--ignore-errors");
     expect(quiet.status).toBe(0);
     expect(quiet.stderr).not.toMatch(/unresolved indexing|Cannot fully parse|Cannot index/);
@@ -93,7 +93,7 @@ describe("CLI indexing diagnostics", () => {
 
   it("does not create an index just to inspect errors", () => {
     const root = temporaryRoot();
-    const result = run(root, "index-errors");
+    const result = run(root, "index-errors", "--format", "json");
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual([]);
     expect(result.stderr).toBe("");

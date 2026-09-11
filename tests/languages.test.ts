@@ -132,6 +132,20 @@ int fallback(void) { return 0; }
 ];
 
 describe("Tree-sitter languages", () => {
+  it("adds Python function docstrings to the embedding input as documentation", () => {
+    const [documented, undocumented] = parseCallables("service.py", `
+def documented(value):
+    """Normalize a value for storage."""
+    return value.strip()
+
+def undocumented(value):
+    return value
+`);
+
+    expect(documented!.embeddingInput).toContain('documentation:\n"""Normalize a value for storage."""\nsource:');
+    expect(undocumented!.embeddingInput).not.toContain("documentation:");
+  });
+
   it.each(fixtures)("extracts $language callables with scopes, kinds, signatures, and source locations", (fixture) => {
     const warnings: string[] = [];
     const callables = parseCallables(fixture.path, fixture.source, (message) => warnings.push(message));

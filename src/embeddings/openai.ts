@@ -31,7 +31,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     const model = options.model ?? "text-embedding-3-large";
     const dimensions = options.dimensions ?? 3072;
     if (!Number.isInteger(dimensions) || dimensions < 1) throw new Error("dimensions must be a positive integer.");
-    this.profile = { provider: "openai", model, dimensions, strategyVersion: "callable-v1" } as const;
+    this.profile = { provider: "openai", model, dimensions, strategyVersion: "callable-v2" } as const;
     this.#url = `${(options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "")}/embeddings`;
   }
 

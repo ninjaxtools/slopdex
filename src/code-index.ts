@@ -571,7 +571,7 @@ export class CodeIndex {
   async #attachEmbeddings(files: PreparedFile[], signal?: AbortSignal): Promise<void> {
     if (this.#database.summariesEnabled()) {
       if (JSON.stringify(this.#database.summaryProfile()) !== JSON.stringify(this.summaryProvider.profile)) {
-        throw new CodeIndexError("Summary provider or model differs from this index; run use-summaries (useSummaries() in the library) with the new provider first.");
+        throw new CodeIndexError("Summary provider or model differs from this index; run summaries enable (useSummaries() in the library) with the new provider first.");
       }
       await this.#attachSummaries(files, signal);
     }
@@ -671,8 +671,13 @@ export class CodeIndex {
     return { summariesCreated, summariesEnabled: true };
   }
 
+  public disableSummaries(): SummaryStats {
+    this.#database.disableSummaries();
+    return { summariesCreated: 0, summariesEnabled: false };
+  }
+
   public async searchSummary(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
-    if (!this.#database.summariesEnabled()) throw new CodeIndexError("Summaries are not enabled; run use-summaries first.");
+    if (!this.#database.summariesEnabled()) throw new CodeIndexError("Summaries are not enabled; run summaries enable first.");
     if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
     const limit = options.limit ?? 10;
     assertPositiveInteger(limit, "limit");
@@ -843,7 +848,7 @@ function normalizeProfile(profile: EmbeddingProfile): Required<EmbeddingProfile>
     provider: profile.provider,
     model: profile.model,
     dimensions: profile.dimensions,
-    strategyVersion: profile.strategyVersion ?? "callable-v1",
+    strategyVersion: profile.strategyVersion ?? "callable-v2",
   };
 }
 

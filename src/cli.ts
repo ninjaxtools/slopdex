@@ -90,6 +90,7 @@ const parsed = (() => {
 })();
 
 const [command, ...positionals] = parsed.positionals;
+const summariesAction = command === "summaries" ? positionals[0] : undefined;
 
 if (parsed.values.version) {
   const version = typeof __SLOPDEX_VERSION__ === "string"
@@ -142,7 +143,7 @@ async function main(): Promise<void> {
   if (command === "index-errors") {
     const indexPath = path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex/index.sqlite"));
     const errors = existsSync(indexPath) ? readIndexErrors(indexPath) : [];
-    if (outputFormat("json") === "summary") {
+    if (outputFormat("summary") === "summary") {
       process.stdout.write(errors.length === 0 ? "No indexing errors.\n" : `${errors.map((error) =>
         `${error.path}${error.startLine === null ? "" : `:${error.startLine}:${error.startColumn}`} ${error.qualifiedName ? `:: ${error.qualifiedName} ` : ""}[${error.code}]\n  ${error.message}`,
       ).join("\n")}\n`);
@@ -164,12 +165,15 @@ async function main(): Promise<void> {
   const updateTarget = command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD";
   const { summaryProvider: _summaryProvider, ...refreshOptions } = indexOptions;
   const updateStats = await ensureIndexUpdated(
-    command === "use-summaries" ? refreshOptions : indexOptions,
+    command === "summaries" && summariesAction === "enable" ? refreshOptions : indexOptions,
     "index",
     updateTarget,
     parsed.values["rebuild-on-divergence"],
     parsed.values["force-reindex"],
     parsed.values["no-reindex"],
+    command === "summaries" && summariesAction === "disable"
+      ? (refreshIndex) => { refreshIndex.disableSummaries(); }
+      : undefined,
   );
   const index = new CodeIndex(indexOptions);
   try {
@@ -189,22 +193,23 @@ async function main(): Promise<void> {
         printJson(updateStats);
         break;
       }
-      case "use-summaries":
-        printJson(await index.useSummaries());
+      case "summaries":
+        printJson(summariesAction === "enable" ? await index.useSummaries() : index.disableSummaries());
         break;
       case "search":
       case "search-summary": {
         const query = positionals.join(" ").trim();
         if (!query) throw new CodeIndexError(`${command} requires a query.`);
         const threshold = similarityThreshold();
+        const nameRegex = qualifiedNameRegex();
         const results = await (command === "search-summary" ? index.searchSummary.bind(index) : index.similaritySearch.bind(index))({
           query,
-          ...(parsed.values.regexp !== undefined ? { nameRegex: parsed.values.regexp } : {}),
+          ...(nameRegex !== undefined ? { nameRegex } : {}),
           limit: numberOption(parsed.values.limit, 10, "limit"),
           minSimilarity: threshold.min,
           ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
         });
-        const format = outputFormat("json");
+        const format = outputFormat("summary");
         if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
         if (format === "summary") {
           process.stdout.write(`${command === "search-summary"
@@ -226,9 +231,8 @@ async function main(): Promise<void> {
           minSimilarity: threshold.min,
           ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
           minLines: minimumLines(),
-          ...(parsed.values.regex !== undefined ? { nameRegex: parsed.values.regex } : {}),
         });
-        const format = outputFormat("json");
+        const format = outputFormat("summary");
         if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
         if (format === "summary") process.stdout.write(`${formatCohesionSummary(report)}\n`);
         else printJson(presentCohesionReport(report, parsed.values["include-source"]));
@@ -292,7 +296,6 @@ async function runCrossSearch(
     includeSymmetricDuplicates: parsed.values["include-symmetric-duplicates"],
     crossFileOnly: parsed.values["cross-file-only"],
     minLines: minimumLines(),
-    ...(parsed.values.regex !== undefined ? { nameRegex: parsed.values.regex } : {}),
   };
   try {
     if (format === "clusters") {
@@ -324,6 +327,7 @@ async function ensureIndexUpdated(
   rebuildOnDivergence: boolean,
   forceRebuild: boolean,
   noReindex: boolean,
+  beforeRefresh?: (index: CodeIndex) => void,
 ): Promise<UpdateStats> {
   diagnosticIndexes.add(resolveIndexPath(options));
   const initialized = await initializeMissingIndex(options, label, target, noReindex);
@@ -331,6 +335,7 @@ async function ensureIndexUpdated(
   try {
     const index = new CodeIndex(options);
     try {
+      beforeRefresh?.(index);
       return await refreshIndex(index, label, target, rebuildOnDivergence, noReindex);
     } finally {
       index.close();
@@ -492,19 +497,24 @@ function numberOption(value: string | undefined, defaultValue: number, name: str
 }
 
 function validateInvocation(): void {
-  if (parsed.values.regexp !== undefined) {
+  const nameRegex = qualifiedNameRegex();
+  if (nameRegex !== undefined) {
     if (!["search", "search-summary", "cross-search", "cohesion"].includes(command!)) {
-      throw new CodeIndexError("-e/--regexp is only available for search, search-summary, cross-search, and cohesion.");
+      throw new CodeIndexError("-e/--regexp/--regex is only available for search, search-summary, cross-search, and cohesion.");
     }
-    compileNameRegex(parsed.values.regexp, "-e/--regexp value");
+    compileNameRegex(nameRegex, parsed.values.regex !== undefined ? "--regex value" : "-e/--regexp value");
   }
   switch (command) {
     case "index-errors":
-      if (outputFormat("json") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
     case "status":
     case "update-git":
-    case "use-summaries":
+      return;
+    case "summaries":
+      if (positionals.length !== 1 || (summariesAction !== "enable" && summariesAction !== "disable")) {
+        throw new CodeIndexError("summaries requires enable or disable.");
+      }
       return;
     case "update-files":
       if (positionals.length === 0) throw new CodeIndexError("update-files requires at least one path.");
@@ -517,7 +527,7 @@ function validateInvocation(): void {
       if (!positionals.join(" ").trim()) throw new CodeIndexError(`${command} requires a query.`);
       validateLimit(10);
       similarityThreshold();
-      if (outputFormat("json") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
     }
     case "cross-search":
@@ -531,16 +541,14 @@ function validateInvocation(): void {
       similarityThreshold();
       outputFormat("clusters");
       minimumLines();
-      functionNameRegex();
       crossSearchSourceFilter();
       return;
     case "cohesion":
       positiveIntegerOption(parsed.values.limit, 50, "limit");
       positiveIntegerOption(parsed.values.neighbors, 20, "neighbors");
       cohesionThreshold();
-      if (outputFormat("json") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       minimumLines();
-      functionNameRegex();
       crossSearchSourceFilter();
       return;
     default:
@@ -580,7 +588,7 @@ function cohesionThreshold(): { min: number; max?: number } {
   return threshold;
 }
 
-function outputFormat(defaultValue: "json" | "clusters"): "json" | "summary" | "clusters" {
+function outputFormat(defaultValue: "json" | "summary" | "clusters"): "json" | "summary" | "clusters" {
   const value = parsed.values.format ?? defaultValue;
   if (value !== "json" && value !== "summary" && value !== "clusters") {
     throw new CodeIndexError("format must be json, summary, or clusters.");
@@ -594,16 +602,20 @@ function minimumLines(): number {
   return value;
 }
 
-function functionNameRegex(): RegExp | undefined {
-  return compileNameRegex(parsed.values.regex, "--regex value");
+function qualifiedNameRegex(): string | undefined {
+  if (parsed.values.regexp !== undefined && parsed.values.regex !== undefined && parsed.values.regexp !== parsed.values.regex) {
+    throw new CodeIndexError("-e/--regexp and --regex are aliases and cannot use different values.");
+  }
+  return parsed.values.regexp ?? parsed.values.regex;
 }
 
 function crossSearchSourceFilter(): CrossSearchSourceFilter {
   const changedSince = parsed.values["changed-since"];
   const uncommitted = parsed.values.uncommitted;
+  const nameRegex = qualifiedNameRegex();
   const restrictions = {
     ...(parsed.values["source-path"] ? { path: parsed.values["source-path"] } : {}),
-    ...(parsed.values.regexp !== undefined ? { nameRegex: parsed.values.regexp } : {}),
+    ...(nameRegex !== undefined ? { nameRegex } : {}),
   };
   if (changedSince) return { type: "changed-since", commit: changedSince, ...(uncommitted ? { uncommitted: true } : {}), ...restrictions };
   if (uncommitted) return { type: "uncommitted", ...restrictions };
@@ -670,7 +682,7 @@ Commands:
   delete-files <path...>              Remove specific files from the index
   update-git                          Index a Git snapshot plus working-tree changes
   search <query>                      Search functions by semantic similarity
-  use-summaries                       Generate purpose summaries and enable automatic updates
+  summaries <enable|disable>          Enable or disable automatic purpose summaries
   search-summary <query>              Search functions using summary embeddings
   cross-search                        Find nearest functions for each source function
   cohesion                            Rank related functions separated across the repository
@@ -774,13 +786,13 @@ Options:
   --limit <number>                    Search result limit
   --neighbors <number>                Semantic neighbors per function for cohesion (default: 20)
   --threshold <number|range>          Show similarities at/above a value or within a range
-  --format <json|summary|clusters>    Output format (search: json; cross-search: clusters)
+  --format <json|summary|clusters>    Output format (default: summary; cross-search: clusters)
   --include-source                    Include function source in cohesion JSON
   --include-symmetric-duplicates      Show both directions of same-index matches
   --cross-file-only                   Exclude matches from the source file
   --min-lines <number>               Minimum callable length for cross-search (default: 2)
   -e, --regexp <regex>               Filter qualified symbols (analysis: sources only)
-  --regex <regex>                    Filter both analysis sources and matching candidates
+  --regex <regex>                    Alias for -e/--regexp
   --changed-since <commit>            Search added, modified, or moved functions
   --uncommitted                       Search functions from uncommitted files
   --source-path <path>                Restrict cross-search sources to a file or directory
@@ -808,7 +820,7 @@ Other Examples:
     slopdex search "validate an authenticated session" --limit 10
 
   Enable purpose summaries, then search by their meaning:
-    slopdex use-summaries
+    slopdex summaries enable
     slopdex search-summary "maintain the repository index" --format summary
 
   Review functions under a path against the whole codebase:
@@ -823,9 +835,9 @@ Other Examples:
   Filter semantic search results by qualified symbol before applying the limit:
     slopdex search "validate session" -e '^Session\\.' --limit 10
 
-  -e/--regexp uses a case-sensitive JavaScript regex on qualified names. For cross-search
+  -e/--regexp/--regex uses a case-sensitive JavaScript regex on qualified names. For cross-search
   and cohesion it filters sources only; targets keep their normal eligibility rules.
   With --changed-since and --uncommitted, sources must be changed since the commit and
-  belong to an uncommitted file. --source-path and -e further narrow that intersection.
+  belong to an uncommitted file. --source-path and the regex filter further narrow that intersection.
 `);
 }

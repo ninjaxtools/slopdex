@@ -1,15 +1,11 @@
 ---
 name: slopdex
-description: Use when using the slopdex CLI to search code by meaning or purpose, find duplicate-function candidates, analyze physical code cohesion, or maintain indexes of Python, JavaScript/JSX, TypeScript/TSX, Rust, Go, Java, and C code.
+description: Semantic code search, find duplicate-function candidates, analyze physical code cohesion
 ---
 
 # Slopdex operator guide for agents
 
-Slopdex searches named functions by meaning, finds similar-code candidates, and identifies related functions stored far apart. Languages are detected automatically and can coexist in one index.
-
-## Choose the command that answers the task
-
-Run the requested operation directly. Do not precede it with status, help, version, executable lookup, or credential probes unless those are the user's task or needed to diagnose a reported failure. Missing indexes initialize automatically.
+Slopdex does semantic code search, finds similar-code candidates, and identifies related functions stored far apart.
 
 ### Find code by meaning
 
@@ -18,24 +14,29 @@ slopdex search "validate an authenticated session" --format summary --limit 10
 slopdex search "persist user data" -e 'save|persist' --format summary --limit 5
 ```
 
-Describe behavior rather than guessing a symbol name. `-e` restricts result qualified names before limiting. Read the matched source to establish behavior and callers.
+Describe behavior rather than guessing a symbol name. `-e` is a regex that restricts which symbols (functions) are searched.
 
 ### Search function purpose
 
+Code purpose-summary generation needs to be enabled once:
+
 ```bash
-slopdex use-summaries
+slopdex summaries enable # only needed once
+```
+
+Then purpose-summaries can be searched:
+
+```bash
 slopdex search-summary "keep the repository index synchronized" --format summary --limit 10
 ```
 
-Use this workflow when purpose-summary generation/search is requested. `use-summaries` enables persistent automatic updates and adds API generation work. It needs `OPENAI_API_KEY` even with Jina embeddings. Repeating it with unchanged inputs reuses summaries. `search-summary` requires summaries to be enabled and includes summary text in results.
+Enabling needs `OPENAI_API_KEY` in the environment.
 
 To select another model:
 
 ```bash
-slopdex use-summaries --summary-model <model-id>
+slopdex summaries enable --summary-model <model-id>
 ```
-
-The model persists for future updates. Do not enable summaries as a routine prerequisite for ordinary code search or duplicate discovery.
 
 ### Find duplicate candidates
 
@@ -43,7 +44,7 @@ The model persists for future updates. Do not enable summaries as a routine prer
 slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
 ```
 
-The default output is connected clusters. This excludes same-file matches and short functions. `--limit` is neighbors **per source**, not a limit on total findings or clusters. For source-by-source matches, add `--format summary`.
+The default output is connected clusters. This excludes same-file matches and short functions. For source-by-source matches, add `--format summary`.
 
 Broaden discovery through adjacent score bands when needed:
 
@@ -52,7 +53,7 @@ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limi
 slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.8-0.85 --limit 5
 ```
 
-Ranges include the lower bound and exclude the upper bound. Use `--min-lines 1` when one-line wrappers are relevant. Treat matches as review candidates; inspect source before suggesting consolidation.
+Ranges include the lower bound and exclude the upper bound. Use `--min-lines 1` when one-line wrappers are relevant.
 
 ### Review changes or a module
 
@@ -70,7 +71,7 @@ slopdex cross-search --source-path src -e 'validate' \
   --cross-file-only --min-lines 4 --threshold 0.9
 ```
 
-Here a source must have changed since the commit and belong to an uncommitted file, within the selected path/name scope. `--regex` is different from `-e`: it restricts **both** sources and candidates.
+Here a source must have changed since the commit and belong to an uncommitted file, within the selected path/name scope. `--regex` is an alias for `-e/--regexp`.
 
 ### Review physical cohesion
 
@@ -79,7 +80,7 @@ slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
 slopdex cohesion --source-path src/services --threshold 0.8 --format summary
 ```
 
-Ranks related functions by semantic affinity and file/folder separation. For structured processing use `--format json`; add `--include-source` only when full callable bodies are needed.
+Ranks related functions by semantic affinity and file/folder separation. add `--include-source` only when full callable bodies are needed.
 
 ### Compare repositories
 
@@ -138,8 +139,7 @@ Explicit relative config/index paths resolve from the current directory. Source 
 | `--limit <number>` | Positive integer. `search`/`search-summary`: matches, default `10`. Cross-search: neighbors per source, default `5`. Cohesion: reported pairs and file rows, default `50`. |
 | `--threshold <number\|min-max>` | Both query searches and analyses. Inclusive minimum or half-open range. Default `-1` for query/cross-search; `0.8` for cohesion. Cohesion minimum must be in `[-1, 1)`. |
 | `--format <json\|summary\|clusters>` | Both query searches, cross-search, cohesion, index-errors. `clusters` only supports cross-search; output defaults below. |
-| `-e <regex>`, `--regexp <regex>` | Case-sensitive JavaScript regex on qualified names. Query searches filter results before limiting; cross-search/cohesion filter sources only. |
-| `--regex <regex>` | Cross-search/cohesion: filter both source and candidate qualified names. |
+| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Equivalent case-sensitive JavaScript regex options on qualified names. Query searches filter results before limiting; cross-search/cohesion filter sources only. |
 | `--min-lines <number>` | Cross-search/cohesion: positive source/candidate length minimum, default `2`. |
 | `--source-path <path>` | Cross-search/cohesion: source file or recursive directory within the root. |
 | `--changed-since <commit>` | Cross-search/cohesion: added, modified, or moved functions since an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
@@ -169,11 +169,11 @@ Use `--no-reindex` when the task calls for committed-only results or reuse of an
 
 | Command | Default | Alternatives |
 | --- | --- | --- |
-| `search`, `search-summary` | JSON array | `summary`; purpose search includes generated summary text |
+| `search`, `search-summary` | `summary` | JSON array; purpose search includes generated summary text |
 | `cross-search` | `clusters` | `summary`, or `json` for JSONL with one row per matched source |
-| `cohesion` | One JSON report | `summary` for ranked pairs |
-| `index-errors` | JSON array | `summary` |
-| `status`, update commands, `use-summaries` | JSON object | — |
+| `cohesion` | `summary` | One JSON report |
+| `index-errors` | `summary` | JSON array |
+| `status`, update commands, `summaries` | JSON object | — |
 
 Prefer summary output for compact source review, clusters for duplicate families, and JSON/JSONL for structured processing. Stdout carries results; stderr carries notices and warnings. Cross-search omits sources without emitted matches. Empty output means no findings under the chosen coverage/filters, not proof that no similar code exists.
 
@@ -218,46 +218,3 @@ Cohesion: 184 functions analyzed, 37 semantic edges
 - **JSON details:** `semanticWeight` reflects similarity above threshold; `separationWeight` reflects distance; `sourceTestPair` flags a path-inferred source/test relationship; file `externalAffinityRatio` measures affinity outside that file's folder.
 
 The example merits reviewing separated authentication responsibilities, while accounting for intentional layering. There is no universal pass/fail threshold. Use comparable runs to evaluate changes. Filtered reports describe selected sources, not the full repository. Summary metrics use all qualifying edges; pairs/files are limited, and groups use reported pairs.
-
-## Operational properties
-
-- Requires Node.js 24+. Install with `npm install -g @ninjaxtools/slopdex` if installation is the task.
-- Run from the repository root or pass `--root`. The default local index is `.slopdex/index.sqlite`; add `.slopdex/` to `.gitignore`.
-- Most commands, including `status`, refresh before operating. With Git, the default is HEAD plus current working-tree changes; the checkpoint records the committed base. Without Git, refresh scans the working tree and warns. `index-errors`, help, and version do not refresh.
-- Source filters narrow analysis, not the preceding refresh. Indexing and summary generation can make many API calls; unchanged inputs reuse cached results.
-- Embedding keys are `OPENAI_API_KEY` or `JINA_API_KEY`; other than diagnostics/help/version, CLI commands require the configured embedding key even for cached analyses. Summaries also require OpenAI credentials when generation is needed.
-- Function source and queries go to the embedding provider. Enabled summary generation sends repository name, path, callable source, and file context to OpenAI, and summary text to the embedding provider. Results and diagnostics remain in the local index. Never expose key values in tool calls, output, or commits.
-- Coverage: Python `.py/.pyw`; JavaScript `.js/.mjs/.cjs/.jsx`; TypeScript `.ts/.mts/.cts/.tsx`; Rust `.rs`; Go `.go`; Java `.java`; C `.c/.h`. Named callables with bodies, including supported bound closures and nested functions, are indexed. Anonymous callbacks, bodyless declarations, macro expansion, and runtime relationships are outside coverage.
-- Root/nested `.gitignore` rules apply even to tracked files and without Git. Current overlays use current rules; committed-only snapshots use committed rules. Refresh removes newly ignored files; explicit updates reject ignored paths.
-- Dependency/build directories are excluded: `.git`, `.slopdex`, `node_modules`, `dist`, `build`, `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`, `target`. Config/ignore exceptions cannot override built-in exclusions or an ignored parent directory.
-
-### Optional configuration
-
-`<root>/.slopdex/config.json`:
-
-```json
-{
-  "provider": "jina",
-  "model": "jina-embeddings-v4",
-  "dimensions": 1024,
-  "exclude": ["**/fixtures/**"]
-}
-```
-
-Supported properties: `provider`, `model`, `dimensions`, `summaryModel`, `indexPath`, `include`, `exclude`, `maxFileSize`, `embeddingBatchSize`. Includes/excludes are repository-relative globs; an empty include list permits all eligible supported files. `maxFileSize` defaults to `1048576` bytes; `embeddingBatchSize` to `32`; both are positive integers. Keep credentials in the environment. Embedding-profile changes require `--force-reindex`.
-
-## Failures and incomplete coverage
-
-Parse, extraction, read, and file-size failures are saved while healthy functions remain searchable. Inspect `slopdex index-errors --format summary`; JSON adds locations, recovered names, source, and snapshot provenance. `status` reports `indexingErrorCount` and `failedFileCount`, and `functionCount` counts searchable callables.
-
-Saved errors warn on stderr, including on cached runs and target indexes. `--ignore-errors` only silences the warning. Updates retry failed files; successful indexing, deletion, or exclusion clears records. Mention relevant incomplete coverage when interpreting results.
-
-Preserve the exact command and error when an operation fails. Fix the reported cause instead of retrying equivalent initialization commands:
-
-- Missing credentials or provider/configuration errors: report the actionable message without displaying keys.
-- Divergent checkpoint: use `--rebuild-on-divergence` when proceeding with the requested snapshot.
-- Incompatible index: `--force-reindex` recreates it with the requested profile.
-- Source changed during indexing: rerun after edits settle.
-- Bare runtime errors such as `Invalid argument`: report the failure and diagnose the runtime/tool rather than trying unrelated refresh commands.
-
-Exit codes: `0` success, `2` argument/domain errors, `1` other failures or missing command. Use help to resolve capability questions and version to report the installed package version when needed.

@@ -316,6 +316,14 @@ export class IndexDatabase {
     });
   }
 
+  public disableSummaries(): void {
+    if (!this.summariesEnabled()) return;
+    this.#transaction(() => {
+      this.#setMetadata("summaries_enabled", "false");
+      this.#setMetadata("generation", String(this.getGeneration() + 1));
+    });
+  }
+
   public getWorkingTreeFiles(): Array<{ path: string; previousPath: string | null }> {
     return this.#db.prepare(`
       SELECT path, previous_path AS previousPath

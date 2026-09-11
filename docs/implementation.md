@@ -67,12 +67,14 @@ Diagnostics commit with their corresponding file update. Updates retry failed fi
 
 Embedding profiles consist of provider, model, dimensions, and strategy version. Cross-index analysis requires matching profiles. Vectors are validated and normalized before storage/search.
 
-- OpenAI defaults to `text-embedding-3-large`, 3072 dimensions, strategy `callable-v1`. Inputs are truncated to 8192 `cl100k_base` tokens.
-- Jina defaults to `jina-embeddings-v4`, 1024 dimensions, strategy `callable-v1:code-query-passage`. Requests distinguish `code.passage` documents from `code.query` queries and enable truncation.
+- OpenAI defaults to `text-embedding-3-large`, 3072 dimensions, strategy `callable-v2`. Inputs are truncated to 8192 `cl100k_base` tokens.
+- Jina defaults to `jina-embeddings-v4`, 1024 dimensions, strategy `callable-v2:code-query-passage`. Requests distinguish `code.passage` documents from `code.query` queries and enable truncation.
+
+Embedding inputs identify language, callable kind, qualified symbol, signature, documentation, and source. For Python, a function's first-statement docstring is included in a separate `documentation` section in addition to remaining part of the callable source.
 
 Purpose generation uses OpenAI's Responses API with `gpt-5.6-sol` and strategy `callable-purpose-v1`. The prompt asks for one to three sentences describing responsibility and visible relationships, using repository name, path, callable source, and full file context. Requests use `store: false`. Generated text is embedded with the configured embedding provider.
 
-Summary inputs include contextual and profile information so file-context, path, or model changes invalidate relevant cached results. Unchanged inputs reuse summaries and vectors. `useSummaries` persists the profile and enabled state; later updates attach summaries automatically. Summary generation and embedding preparation finish before the corresponding database transaction, preventing partially updated callable records on provider failure. Deleting a function removes it from summary search.
+Summary inputs include contextual and profile information so file-context, path, or model changes invalidate relevant cached results. Unchanged inputs reuse summaries and vectors. `useSummaries` persists the profile and enabled state; `disableSummaries` turns automatic updates and summary search/scoring off without deleting cached summaries. Summary generation and embedding preparation finish before the corresponding database transaction, preventing partially updated callable records on provider failure. Deleting a function removes it from summary search.
 
 ## Similarity and analysis
 
