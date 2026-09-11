@@ -1,81 +1,173 @@
 # slopdex
 
-Slopdex uses Tree-sitter to index named functions in Python, JavaScript, JSX, TypeScript, TSX, Rust, Go, Java, and C repositories. It uses embeddings to search code by meaning, find similar implementations, and measure whether related functions are stored near each other.
+Search functions by meaning, find duplicate-code candidates, and locate related functions spread across a codebase. Supports Python, JavaScript/JSX, TypeScript/TSX, Rust, Go, Java, and C in the same repository.
 
-## Install
+## Start here
+
+Requires **Node.js 24+** and an embedding-provider API key. Install, set your key, and run commands from the repository you want to analyze (or pass `--root /path/to/repo`):
 
 ```bash
 npm install -g @ninjaxtools/slopdex
-```
-
-## Getting Started
-
-Set your OpenAI API key:
-
-```bash
 export OPENAI_API_KEY="your-api-key"
-```
-
-Run a semantic search from the repository you want to analyze:
-
-```bash
 slopdex search "validate an authenticated session" --format summary --limit 10
 ```
 
-## Analysis Examples
+The first command creates the index automatically. Later commands refresh it before searching. Add `.slopdex/` to your repository's `.gitignore`.
 
-### Search By Function Purpose
+### Find code by purpose
 
-Enable optional purpose summaries for every indexed callable:
+```bash
+slopdex search "keep the repository index synchronized" --format summary --limit 10
+```
+
+Describe the behavior you need. Results show similarity, file paths, and qualified function names. To search generated descriptions of each function's role instead:
 
 ```bash
 slopdex use-summaries
-slopdex search-summary "keep the repository index synchronized" --limit 10 --format summary
+slopdex search-summary "keep the repository index synchronized" --format summary --limit 10
 ```
 
-Summaries describe a function's responsibility and role in its codebase, using its repository name, path, source, and surrounding file context. Generation uses the OpenAI Responses API with **`gpt-5.6-sol`** by default and requires `OPENAI_API_KEY`, including when Jina supplies the embeddings.
+`use-summaries` enables persistent, automatic summary updates. It requires `OPENAI_API_KEY` even when Jina supplies embeddings, and adds generation costs. See [summaries and scoring](#summaries-and-scoring).
 
-`use-summaries` stores each summary and its embedding in SQLite and enables a persistent repository-index setting. Subsequent indexing operations automatically generate summaries for new and changed files, including changes to surrounding context and file paths. Unchanged inputs reuse cached summaries and vectors; deleted functions disappear from summary search. Running `use-summaries` again is a no-op when summaries are already complete. Summary generation and embeddings are saved atomically, so a failed request does not leave partially updated callables.
-
-`search-summary` uses a separate summary embedding store with the configured embedding provider and supports the same query, limit, threshold, and output options as `search`. JSON results include the summary; `--format summary` prints it alongside each match. `status` reports `summariesEnabled`, `summaryCount`, and `summaryProfile`.
-
-To choose a different summary model, run `slopdex use-summaries --summary-model <model-id>` or set `summaryModel` in `.slopdex/config.json`. The chosen model is persisted for future updates. Existing indexes migrate automatically; summaries remain disabled until enabled explicitly.
-
-### Combined Code And Purpose Analysis
-
-Once summaries are enabled and every indexed callable has a summary embedding, `cross-search` and `cohesion` automatically combine implementation and purpose similarity:
-
-```text
-similarity = 0.5 * codeSimilarity + 0.5 * summarySimilarity
-```
+### Find duplicate-code candidates
 
 ```bash
-slopdex use-summaries
-slopdex cross-search --threshold 0.8 --format json
-slopdex cohesion --threshold 0.8 --format summary
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
 ```
 
-Both cosine scores and their average are calculated in one SQLite query. Thresholds (including half-open ranges), ranking, and neighbor/result limits apply to the combined score. Cohesion uses these combined neighbors for reciprocity, gap scores, file affinities, and groups.
+Compare functions across files, exclude short wrappers, and group strong matches into clusters. `--limit 5` selects up to five neighbors **per source function**, not five clusters. Review the source before consolidating a match.
 
-For cross-repository search, both indexes must have complete, enabled summaries. If either index lacks them, the entire analysis uses code-only similarity. Cohesion likewise uses code-only scoring if its summary index is incomplete or disabled. The existing embedding profiles must match across repositories; summary-generator models may differ.
+### Review changed code or one module
 
-Combined JSON matches and cohesion pairs expose `codeSimilarity` and `summarySimilarity` alongside `similarity`. Cross-search rows include a `scoring` object with `similarityMode`, `similarityWeights`, and both summary-generator profiles. Cohesion records the mode and weights in `parameters` and the summary-generator profile in `repository.summaryProfile`. The mode is `"code-summary-average"` with weights `{ "code": 0.5, "summary": 0.5 }`, or `"code"` with weights `{ "code": 1, "summary": 0 }`. Text output labels combined scores.
+```bash
+slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9
+slopdex cross-search --changed-since origin/main --format summary --threshold 0.9
+slopdex cross-search --source-path src/services -e '^UserService\.' --format summary --threshold 0.9
+```
 
-Compare analysis results only when the similarity mode and weights match, as well as the embedding profile, summary-generator profiles, thresholds, and analysis scope. Enabling summaries can change rankings and cohesion metrics. `search` continues to use only code vectors, and `search-summary` uses only summary vectors.
+These select source functions while keeping the full eligible index available for matches. The same source filters work with `cohesion`. Combine filters to require all of them to match.
 
-### Duplicate Analysis
+### Find related code stored far apart
 
-Compare functions in different files and include functions that span at least four lines:
+```bash
+slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
+```
+
+Ranks semantically related pairs by their physical separation. Use it to review module boundaries; it is not a pass/fail architecture check.
+
+### Compare repositories
 
 ```bash
 slopdex cross-search \
-  --cross-file-only \
-  --min-lines 4 \
-  --threshold 0.9 \
-  --limit 5
+  --target-root /path/to/other/repo \
+  --target-index /path/to/other/repo/.slopdex/index.sqlite \
+  --threshold 0.9 --format summary
 ```
 
-The default output groups related functions into clusters:
+Both indexes refresh automatically and must use identical embedding profiles. The target is refreshed with the source command's embedding provider; target configuration supplies file-selection and summary settings. Use `--target-config` for a non-default target config.
+
+### Inspect index health
+
+```bash
+slopdex status
+slopdex index-errors --format summary
+slopdex --version
+```
+
+`status` refreshes the index and reports coverage, profiles, checkpoint, and error counts. `index-errors` reads saved failures without refreshing or requiring credentials. `--version` prints the built package version.
+
+## Commands
+
+Usage: `slopdex <command> [arguments] [options]`.
+
+| Command | Purpose | Output |
+| --- | --- | --- |
+| `search <query>` | Search function code by meaning. Quote multiword queries. | JSON array; optional `summary` |
+| `use-summaries` | Generate missing purpose summaries and enable automatic updates. Repeating with unchanged inputs reuses existing summaries. | JSON statistics |
+| `search-summary <query>` | Search purpose summaries after enabling them. | JSON array; optional `summary` including summary text |
+| `cross-search` | Find neighbors for each selected function in this or another index. | `clusters` by default; optional `summary` or JSONL |
+| `cohesion` | Analyze semantic relationships versus file/folder separation. | JSON report; optional `summary` |
+| `status` | Refresh and show index metadata, counts, and profiles. | JSON object |
+| `index-errors` | Read saved file/function indexing failures. | JSON array; optional `summary` |
+| `update-git` | Explicitly refresh a Git snapshot, with current working-tree changes when targeting HEAD. | JSON update statistics |
+| `update-files <path...>` | After automatic refresh, explicitly reparse selected working-tree files. Paths are repository-relative or absolute within the root. | JSON update statistics |
+| `delete-files <path...>` | After automatic refresh, remove paths from the index; source files are not deleted. A later refresh can restore eligible files. | JSON update statistics |
+
+Manual maintenance examples:
+
+```bash
+slopdex update-git
+slopdex update-files src/service.ts src/model.ts
+slopdex delete-files src/removed.ts
+slopdex update-git --target HEAD --rebuild-on-divergence
+slopdex update-git --force-reindex
+```
+
+## Command-line arguments
+
+Options are command-specific where indicated. Boolean flags default to off.
+
+### Location, providers, and diagnostics
+
+| Argument | Meaning / default |
+| --- | --- |
+| `--root <path>` | Repository root; current directory by default. |
+| `--config <path>` | Config file; `<root>/.slopdex/config.json` by default. |
+| `--index <path>` | Index file; `<root>/.slopdex/index.sqlite` by default. Overrides `indexPath` in config. |
+| `--provider <openai\|jina>` | Embedding provider; `openai` by default. |
+| `--model <name>` | Embedding model; `text-embedding-3-large` for OpenAI, `jina-embeddings-v4` for Jina. |
+| `--dimensions <number>` | Positive embedding dimension count; OpenAI `3072`, Jina `1024`. Must be supported by the model. |
+| `--summary-model <name>` | OpenAI summary model; `gpt-5.6-sol` initially, then the persisted model unless overridden. |
+| `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
+| `-h`, `--help` | Show CLI usage without refreshing. |
+| `--version` | Print the package version and exit. |
+
+Explicit relative config and index paths resolve from the current directory, not `--root`. CLI settings override config settings.
+
+### Search and analysis
+
+| Argument | Applies to | Meaning / default |
+| --- | --- | --- |
+| `--limit <number>` | Both query searches, cross-search, cohesion | Positive integer. Query matches: `10`; cross-search neighbors per source: `5`; cohesion reported pairs and file rows: `50`. |
+| `--threshold <number\|min-max>` | Both query searches, cross-search, cohesion | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `-1` for query/cross-search, `0.8` for cohesion. Cohesion minimum must be at least `-1` and below `1`. |
+| `--format <json\|summary\|clusters>` | Both query searches, cross-search, cohesion, index-errors | Output format; see the commands table. `clusters` is only for cross-search. |
+| `-e <regex>`, `--regexp <regex>` | Both query searches, cross-search, cohesion | Case-sensitive JavaScript regex over qualified names. Query searches: filters results before limiting. Analysis: filters sources only. |
+| `--regex <regex>` | Cross-search, cohesion | Filter **both** source and candidate qualified names. |
+| `--min-lines <number>` | Cross-search, cohesion | Minimum source and candidate callable length; positive integer, default `2`. Use `1` to include one-line wrappers. |
+| `--source-path <path>` | Cross-search, cohesion | Select sources in a file or recursive directory, relative to the repository root (or absolute within it). |
+| `--changed-since <commit>` | Cross-search, cohesion | Select added, modified, or moved functions relative to an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
+| `--uncommitted` | Cross-search, cohesion | Select functions indexed from working-tree files: staged, unstaged, or untracked changes in Git; all working-tree functions without Git. |
+| `--cross-file-only` | Cross-search | Exclude matches from the same physical file. |
+| `--include-symmetric-duplicates` | Cross-search | Allow both directions of same-index matches; otherwise each unordered pair is emitted once. |
+| `--neighbors <number>` | Cohesion | Neighbors considered per source; positive integer, default `20`. Changes the analysis graph. |
+| `--include-source` | Cohesion JSON | Include callable bodies; omitted by default. |
+| `--target-root <path>` | Cross-search | Second repository root; requires `--target-index`. |
+| `--target-index <path>` | Cross-search | Second index file; requires `--target-root`. |
+| `--target-config <path>` | Cross-search | Target config; defaults to `<target-root>/.slopdex/config.json`. Requires both target options. |
+
+Source restrictions intersect: with both Git filters, a function must have changed since the commit **and** belong to an uncommitted file. `-e`, `--source-path`, and Git filters do not restrict candidates; `--regex` and `--min-lines` do.
+
+Review adjacent similarity bands without repeating boundary matches:
+
+```bash
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limit 5
+```
+
+### Refresh and recovery
+
+| Argument | Meaning |
+| --- | --- |
+| `--target <ref>` | Git snapshot for `update-git`; default `HEAD`. Non-HEAD targets exclude working-tree changes. Later commands normally refresh back to HEAD. |
+| `--rebuild-on-divergence` | Allow reconciliation when the saved checkpoint is not an ancestor of the target, such as after a rebase or branch switch. |
+| `--force-reindex` | Recreate an **incompatible** index (repository, provider, model, dimensions, strategy, or schema mismatch). A compatible index still follows normal refresh behavior. |
+| `--no-reindex` | With Git, still reconcile the committed snapshot but skip working-tree overlays. Without Git, reuse a non-empty index; missing/empty indexes are still populated. Not a general offline switch. |
+
+## Reading results
+
+### Similarity and duplicate clusters
+
+Similarity is a model-dependent score, not a probability of duplication. Higher scores mean greater semantic resemblance. Query summaries show `score  path :: qualifiedName`; cross-search summaries group those lines beneath each source. Functions without matches are omitted from cross-search output.
 
 ```text
 Cluster 1 (3 functions, similarity 0.9124-0.9568)
@@ -84,19 +176,11 @@ Cluster 1 (3 functions, similarity 0.9124-0.9568)
   src/users/user-service.ts:27:3 :: UserService.authenticate
 ```
 
-A cluster contains functions connected by similarity matches. The similarity range covers the observed links in the cluster. Connected functions may be linked through another function, so review the source before deciding that code is duplicated.
+- A cluster groups functions connected by matches. Its range covers observed links; not every pair necessarily matches directly.
+- Clusters sort by member count, then name. Cluster number is not severity.
+- Locations identify where to inspect behavior, callers, and architectural roles. Wrappers, adapters, tests, and separate interface implementations can legitimately resemble one another.
 
-### Cohesion Analysis
-
-Find related functions that are separated across files and directories:
-
-```bash
-slopdex cohesion \
-  --threshold 0.8 \
-  --neighbors 20 \
-  --limit 50 \
-  --format summary
-```
+### Cohesion
 
 ```text
 Cohesion: 184 functions analyzed, 37 semantic edges
@@ -107,196 +191,67 @@ Cohesion: 184 functions analyzed, 37 semantic edges
    packages/http/middleware.ts:42:1 :: authenticate
 ```
 
-The summary divides semantic relationships into the same file, the same folder, and different folders. Mean distance increases when related functions are stored farther apart. The gap score combines semantic similarity with path distance and ranks pairs for review. `reciprocal` means both functions are among each other's nearest semantic matches.
+| Field | Interpretation |
+| --- | --- |
+| Functions analyzed / semantic edges | Selected-source coverage / unique qualifying neighbor pairs, before report limiting. Not quality scores. |
+| Same file / same folder / remote | Shares of weighted semantic affinity. Higher remote affinity means more related code crosses folder boundaries. |
+| Mean distance | Weighted physical separation: `0` for the same file, `1` for different files in one folder, larger across folders. |
+| Gap / rank | A `0–1` review score combining similarity above the threshold and separation; higher gap ranks first. Same-file pairs have zero gap. |
+| Reciprocal | Both functions selected each other as neighbors. JSON `null` means the other endpoint was not evaluated under source filtering. |
+| `sourceTestPair` | A source/test relationship inferred from paths; separation may be intentional. |
+| `externalAffinityRatio` | In JSON file reports, the share of observed affinity outside that file's folder. |
 
-Cohesion does not have a universal pass threshold. Compare results only when the similarity mode and weights, embedding and summary-generator profiles, threshold, neighbor count, and source scope are the same.
+The example suggests reviewing separated authentication responsibilities. It does not establish that they belong in one module. There is no universal cohesion pass threshold. Filtered reports describe selected sources, not the entire repository. Summary metrics cover all qualifying edges; reported pairs/files are limited, and groups are built from reported pairs.
 
-## Limit Analysis Scope
+For automation, query searches and diagnostics return JSON arrays; cross-search returns **JSONL**, one row per matched source; cohesion returns one JSON object containing `repository`, `parameters`, `summary`, `pairs`, `files`, and `groups`. Results go to stdout; notices and warnings go to stderr.
 
-Restrict source functions to a file or directory:
+## System behavior
 
-```bash
-slopdex cross-search --source-path src/services --format summary
-slopdex cohesion --source-path src/services --format summary
-```
+### Freshness and cost
 
-Analyze functions added, changed, or moved since a commit:
+- Indexing, search, analysis, `use-summaries`, and `status` automatically refresh. With Git, results normally reflect HEAD plus staged, unstaged, and untracked working-tree contents. `gitCheckpoint` records the committed base, not the overlay.
+- Without Git, commands warn and scan the working tree. `--no-reindex` has the limited behavior described above.
+- `index-errors`, help, and version do not refresh. Other commands require the configured embedding key, even when cached data supplies the analysis.
+- Function source and search queries go to the embedding provider. Source metadata, vectors, diagnostics, and enabled summaries stay in the local index. Summary generation also sends repository name, path, callable source, and surrounding file context to OpenAI; summary text goes to the embedding provider.
+- Unchanged embedding and summary inputs reuse cached results. Initial indexing and enabling summaries can make many API calls. Source filters reduce analysis work, not the preceding index refresh.
 
-```bash
-slopdex cross-search --changed-since origin/main --format summary
-slopdex cohesion --changed-since origin/main --format summary
-```
+### Summaries and scoring
 
-Analyze functions in files with uncommitted changes:
+Summaries are optional and disabled initially. `use-summaries` persists the selected summary model and keeps summaries current on later updates, including file-context and path changes. Use `slopdex use-summaries --summary-model <model-id>` to change it. `status` exposes `summariesEnabled`, `summaryCount`, and `summaryProfile`.
 
-```bash
-slopdex cross-search --uncommitted --format summary
-slopdex cohesion --uncommitted --format summary
-```
+`search` always searches code; `search-summary` always searches purpose summaries. When all callables have enabled summaries, cross-search and cohesion automatically use **50% code similarity + 50% summary similarity**. Cross-repository analysis needs complete summaries on both sides; otherwise the entire analysis uses code-only scores. Thresholds and neighbor limits apply to the selected score.
 
-These options restrict the source functions. Slopdex still compares them with the full index.
+Text output labels combined scores. JSON exposes `codeSimilarity`, `summarySimilarity`, and scoring mode/weights (`scoring` for cross-search, `parameters` for cohesion). Compare runs only with matching scoring mode, weights, embedding and summary-generator profiles, threshold, neighbor count, and source/candidate filters.
 
-Filter source symbols by qualified name with `-e <regex>` (or `--regexp <regex>`):
+### Coverage and exclusions
 
-```bash
-slopdex cross-search -e '^UserService\.' --format summary
-slopdex cohesion -e 'validate|authenticate' --source-path src/auth
-```
+| Language | File extensions |
+| --- | --- |
+| Python | `.py`, `.pyw` |
+| JavaScript / JSX | `.js`, `.mjs`, `.cjs`, `.jsx` |
+| TypeScript / TSX | `.ts`, `.mts`, `.cts`, `.tsx` |
+| Rust | `.rs` |
+| Go | `.go` |
+| Java | `.java` |
+| C | `.c`, `.h` |
 
-The regex uses case-sensitive JavaScript syntax and matches qualified names such as `UserService.authenticate`. It filters only the source symbols for cross-search and cohesion; matching candidates are still drawn from the whole eligible index, including symbols that do not match the regex. It works with code-only and combined code/summary scoring.
+Indexes named functions, methods, constructors, and supported variable-bound closures with bodies, including nested callables. Anonymous callbacks and bodyless declarations are omitted. No language server or project compiler setup is needed. Macro expansion and runtime behavior are not analyzed; `.h` files are treated as C.
 
-Source restrictions combine by intersection:
+Root and nested `.gitignore` rules apply even to tracked files and without Git. Working-tree refreshes use current rules; committed-only snapshots use the target commit's rules. Refresh removes newly excluded files and discovers newly eligible ones. Explicit `update-files` rejects ignored files.
 
-```bash
-slopdex cross-search -e 'validate' \
-  --source-path src \
-  --changed-since origin/main \
-  --uncommitted \
-  --min-lines 4 \
-  --cross-file-only
-```
+Built-in exclusions: `.git`, `.slopdex`, `node_modules`, `dist`, `build`, `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`, and `target`. Config `include`/`exclude` globs narrow coverage; they cannot override built-in exclusions. Ignore exceptions cannot re-include files beneath an excluded parent directory. Files over 1 MiB are skipped unless `maxFileSize` is raised.
 
-With both Git filters, a source must have changed since the specified commit and belong to an uncommitted file. Path, name, and minimum-line filters narrow the selection further. Existing target restrictions such as `--min-lines` and `--cross-file-only` continue to apply. The separate `--regex` option filters **both** analysis sources and matching candidates.
+### Failures and recovery
 
-## Output And Filters
+Parse, extraction, read, and file-size failures are saved while healthy callables remain searchable. Inspect them with `slopdex index-errors --format summary`. JSON includes paths, locations, recoverable names, messages, available source, and snapshot provenance. `status` reports `indexingErrorCount` and `failedFileCount`; `functionCount` counts searchable callables.
 
-`search` supports `json` and `summary` output. `cross-search` supports `json`, `summary`, and `clusters` output. Use `--format` to select one.
+Saved failures trigger stderr warnings, including on cached runs, help, and cross-search targets. `--ignore-errors` silences warnings without clearing records. Updates retry failed files; successful indexing, deletion, or exclusion clears their diagnostics. Version output bypasses diagnostics.
 
-For `search` and `search-summary`, `-e` restricts result symbols before the result limit is applied:
-
-```bash
-slopdex search "validate session" -e '^Session\.' --limit 10
-slopdex search-summary "persist user data" -e 'save|persist' --limit 5
-```
-
-Use `--threshold` with a minimum similarity or a range:
-
-```bash
-slopdex search "validate session" --threshold 0.8 --format summary
-slopdex cross-search --threshold 0.85-0.9 --format summary
-```
-
-For a range, the lower bound is included and the upper bound is excluded. Similarity values depend on the embedding model, so use them to rank results from the same index profile.
-
-Run `slopdex --help` for all commands and options.
-
-## Indexing And Data
-
-### Supported Languages
-
-Languages are detected automatically from file extensions. A single index can contain multiple languages; search, purpose summaries, cross-search, and cohesion work across all of them.
-
-| Language | Extensions | Extracted callables |
-| --- | --- | --- |
-| Python | `.py`, `.pyw` | Functions, async functions, class methods, constructors, generators, and bound lambdas; includes decorators in source |
-| JavaScript | `.js`, `.mjs`, `.cjs` | Functions, generators, methods, constructors, and named function expressions/arrows |
-| JSX | `.jsx` | JavaScript callables, including components returning JSX |
-| TypeScript | `.ts`, `.mts`, `.cts` | Typed functions, methods, constructors, and named function expressions/arrows |
-| TSX | `.tsx` | TypeScript callables, including generic components returning JSX |
-| Rust | `.rs` | Functions, `impl` methods/associated functions, trait default methods, and `let`-bound closures |
-| Go | `.go` | Functions, receiver methods, and function literals bound to variables or assignments |
-| Java | `.java` | Methods, constructors (including compact record constructors), and variable-bound lambdas |
-| C | `.c`, `.h` | Function definitions, including static/inline functions and functions returning pointers |
-
-Qualified names include enclosing classes, functions, and explicit modules. Go methods include their receiver type (`Store[T].Get`); Rust trait implementations include the type and trait (`<Store<T> as Read>.read`). Definitions retain their source, signature, line/column locations, and stable identity for incremental updates. Declarations without bodies and anonymous callbacks are omitted. Extraction is syntactic: Rust macros and C macros are not expanded, and C preprocessor branches are indexed as written. `.h` files use the C grammar.
-
-Tree-sitter grammars ship as package dependencies; no language server or project compiler configuration is required. Syntax errors produce warnings while recoverable callables are still indexed. Existing indexes pick up newly supported files during the next normal refresh.
-
-Default exclusions cover dependency and build directories: `.git`, `.slopdex`, `node_modules`, `dist`, `build`, `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`, and `target`. Optional `include` and `exclude` glob arrays in `.slopdex/config.json` further restrict the indexed files.
-
-Slopdex also respects root and nested `.gitignore` files using the [`ignore`](https://www.npmjs.com/package/ignore) package. Patterns, directory rules, anchoring, escapes, and `!` exceptions follow Git ignore semantics. A nested rule cannot re-include files beneath an excluded parent directory. These exclusions apply even to tracked files and when Git is unavailable; explicit `update-files` requests for ignored files are rejected.
-
-Working-tree indexing and HEAD overlays use the current `.gitignore` files. Historical snapshots and committed-only Git indexing use the ignore files stored in the selected commit. Normal refreshes remove previously indexed files that become ignored and discover files that become eligible again, including when only ignore rules change. Configuration includes and negated ignore rules cannot override the built-in exclusions.
-
-### Index Updates
-
-Before each analysis command, Slopdex updates its index from the current Git commit and the staged, unstaged, and untracked files in the working tree. The index is created at `.slopdex/index.sqlite` by default.
-
-Add `.slopdex/` to the repository's `.gitignore` so the local index is not committed.
-
-Slopdex sends extracted function source to the configured embedding provider. The function metadata and embeddings are stored in the local SQLite index.
-
-Whole-repository cohesion analysis compares neighbors for every selected function. Use `--source-path`, `--changed-since`, or `--uncommitted` to reduce the scope in large repositories.
-
-### Inspecting Indexing Errors
-
-Slopdex persists file and function indexing diagnostics in the SQLite `indexing_errors` table. Parse errors, parser exceptions, callable-extraction failures, file-read failures, and files exceeding `maxFileSize` retain references instead of silently disappearing. Healthy functions in partially parsed files and other healthy files remain searchable; malformed callables are omitted from semantic search and listed in the diagnostics.
-
-```bash
-slopdex index-errors
-slopdex index-errors --format summary
-slopdex index-errors --index /path/to/another/index.sqlite
-```
-
-This command reads the saved diagnostics without refreshing the index or calling an embedding/summary provider, so it works without API credentials. JSON includes the path, language, error code and message, file/function scope, recovered qualified name when available, line/column ranges, available source text, and Git/working-tree provenance. If Tree-sitter cannot identify a function, the unparsed region is still retained as a file diagnostic.
-
-Every invocation warns on stderr while saved errors remain, including cached runs and cross-search target indexes. Suppress this warning with `--ignore-errors`:
-
-```bash
-slopdex cross-search --ignore-errors
-slopdex index-errors --format summary --ignore-errors
-```
-
-Silencing warnings does not delete diagnostics. `status` reports `indexingErrorCount` and `failedFileCount`; `functionCount` counts searchable callables. Normal updates retry failed files, including unchanged Git blobs. Errors clear when a file is successfully indexed, deleted, or excluded. Existing indexes migrate automatically and rescan once on their next full update to detect previously unreported parse failures. Diagnostics are committed atomically with the corresponding file update.
-
-## Library
-
-The package also exports the index and analysis APIs:
-
-```ts
-import {
-  OpenAIEmbeddingProvider,
-  openCodeIndex,
-} from "@ninjaxtools/slopdex";
-
-const index = openCodeIndex({
-  rootDir: "/path/to/repository",
-  provider: new OpenAIEmbeddingProvider(),
-});
-
-await index.updateFromGit();
-
-const results = await index.similaritySearch({
-  query: "validate an authenticated session",
-  limit: 10,
-});
-
-index.close();
-```
-
-Exports also include `crossSearch`, `analyzeCohesion`, `JinaEmbeddingProvider`, and standalone functions for index updates and searches.
-
-Library callers can set `sourceFilter.nameRegex` on cross-search/cohesion options for source-only filtering, together with `path` and the Git filter type. A `changed-since` filter also accepts `uncommitted: true`. Query searches accept `nameRegex` in `SimilaritySearchOptions` to filter result symbols. Cohesion reports record source restrictions in `parameters.sourceFilter` and label filtered analyses as `selected-sources`.
-
-Use `index.indexErrors()` to inspect diagnostics through an open index, or the exported `readIndexErrors(indexPath)` to inspect a saved database without a provider. Error records use the exported `IndexingError` type.
-
-For summary search, call `await index.useSummaries()` after updating the index, then `await index.searchSummary({ query: "maintain the repository index" })`. Optionally pass `summaryProvider: new OpenAISummaryProvider({ model: "gpt-5.6-sol" })` when opening an index. Custom providers implement the exported `SummaryProvider` interface. The package also exports standalone `useSummaries` and `searchSummary` helpers.
-
-## Development
-
-```bash
-npm run check
-```
-
-To cross-check the shared-language fixtures against a built sibling checkout of `treesitter-index`, run:
-
-```bash
-npm run check:parser-parity
-# Or provide another reference executable:
-npm run check:parser-parity -- /path/to/treesitter-index
-```
-
-The default reference is `../treesitter-index/target/debug/treesitter-index`. The check covers eight shared languages; that project has no C grammar. Callable regression tests also run as part of `npm run check` without requiring the sibling checkout.
-
-The projects index different information: `treesitter-index` includes declarations, types, imports, and `.pyi` stubs, while Slopdex indexes callable implementations (including nested callables and bound closures). Slopdex also supports `.pyw` and C. Its native Node grammar versions are pinned for compatibility with `tree-sitter@0.21`; the reference uses newer Python and Rust grammars. In particular, Rust `unsafe extern` blocks and async closures currently produce syntax-recovery warnings in Slopdex, so those cases are not covered by the passing parity fixtures.
-
-After upgrading parser behavior, explicitly reparse previously indexed files with `slopdex update-files <path...>` to refresh their symbols, signatures, and embeddings even when the file contents are unchanged.
+Use the recovery flag named in the error: `--rebuild-on-divergence` for Git history changes, `--force-reindex` for incompatible indexes. For provider/authentication failures, fix the reported configuration. For source-change-during-indexing errors, rerun after edits settle. Exit status is `0` on success, `2` for argument/domain errors, and `1` for other failures (or invocation without a command).
 
 ## Configuration
 
-Configuration is optional. Without `.slopdex/config.json`, Slopdex uses OpenAI's `text-embedding-3-large` model with 3072 dimensions and the built-in source exclusions.
-
-Create `.slopdex/config.json` to change these settings:
+Optional file: `<root>/.slopdex/config.json`. Example using Jina (requires `JINA_API_KEY`):
 
 ```json
 {
@@ -307,4 +262,19 @@ Create `.slopdex/config.json` to change these settings:
 }
 ```
 
-Use `OPENAI_API_KEY` for OpenAI and `JINA_API_KEY` for Jina AI. The provider, model, dimensions, and embedding strategy define the index profile. Rebuild the index with `--force-reindex` after changing the profile.
+| Property | Purpose / default |
+| --- | --- |
+| `provider`, `model`, `dimensions` | Embedding settings; defaults are listed in the CLI table. |
+| `summaryModel` | Summary model; initially `gpt-5.6-sol`. |
+| `indexPath` | Index location; `<root>/.slopdex/index.sqlite`. |
+| `include` | Repository-relative glob array; empty/unset includes all supported eligible files. |
+| `exclude` | Additional repository-relative exclusion globs. |
+| `maxFileSize` | Maximum source-file size in bytes; positive integer, default `1048576`. |
+| `embeddingBatchSize` | Embedding inputs per batch; positive integer, default `32`. |
+
+Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`). Changing the embedding profile requires rebuilding with `--force-reindex`.
+
+## Agent and developer documentation
+
+- [Agent skill](.agents/skills/slopdex/SKILL.md): task-oriented CLI guidance for coding agents.
+- [Implementation and library API](docs/implementation.md): internals, programmatic usage, build, and development checks.

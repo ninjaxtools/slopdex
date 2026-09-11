@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -448,6 +448,15 @@ export function two(value: string) {
 });
 
 describe("CLI help", () => {
+  it("prints the package version", () => {
+    const { version } = JSON.parse(readFileSync(path.join(projectRoot, "package.json"), "utf8")) as { version: string };
+    const result = runCli("/", "--version");
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(`${version}\n`);
+    expect(result.stderr).toBe("");
+  });
+
   it("includes an example for every command", () => {
     const result = runCli("/", "--help");
 
@@ -476,6 +485,7 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("-e, --regexp <regex>");
     expect(result.stdout).toContain("--neighbors <number>");
     expect(result.stdout).toContain("--include-source");
+    expect(result.stdout).toContain("--version");
     expect(result.stdout).toContain("Cluster 1 (3 functions, similarity 0.9124-0.9568)");
     expect(result.stdout).toContain("Review them for repeated validation or session logic that could be shared");
     expect(result.stdout).toContain("transitive links, so every function need not directly match every other function");

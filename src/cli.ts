@@ -30,6 +30,8 @@ import type {
   UpdateStats,
 } from "./types.js";
 
+declare const __SLOPDEX_VERSION__: string;
+
 interface FileConfig {
   provider?: "openai" | "jina";
   model?: string;
@@ -77,6 +79,7 @@ const parsed = (() => {
         "force-reindex": { type: "boolean", default: false },
         "no-reindex": { type: "boolean", default: false },
         "ignore-errors": { type: "boolean", default: false },
+        version: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
     });
@@ -87,6 +90,14 @@ const parsed = (() => {
 })();
 
 const [command, ...positionals] = parsed.positionals;
+
+if (parsed.values.version) {
+  const version = typeof __SLOPDEX_VERSION__ === "string"
+    ? __SLOPDEX_VERSION__
+    : (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
+  process.stdout.write(`${version}\n`);
+  process.exit(0);
+}
 
 // Read persisted diagnostics at exit so cached, failed, and help invocations also
 // report them, and update/delete commands report the final state rather than stale errors.
@@ -747,6 +758,7 @@ Reading Analysis Output:
                        Higher means more of a file's related affinity lies outside its folder
 
 Options:
+  --version                           Show the package version
   --root <path>                       Repository root (default: current directory)
   --config <path>                     Config file (default: .slopdex/config.json)
   --index <path>                      SQLite index path

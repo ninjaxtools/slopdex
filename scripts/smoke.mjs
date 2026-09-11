@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -11,6 +11,9 @@ if (typeof library.openCodeIndex !== "function"
 }
 
 execFileSync(process.execPath, ["dist/cli.js", "--help"], { stdio: "ignore" });
+const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const cliVersion = execFileSync(process.execPath, ["dist/cli.js", "--version"], { encoding: "utf8" }).trim();
+if (cliVersion !== version) throw new Error(`Built CLI reported version ${cliVersion} instead of ${version}.`);
 
 // Exercise the native grammars through the built library, with no network calls.
 const sources = [

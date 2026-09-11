@@ -1,0 +1,161 @@
+# Implementation and library API
+
+For installation, command examples, configuration, and result interpretation, see the [operator README](../README.md). This document covers the implementation and programmatic interface.
+
+## Code map
+
+| Module | Responsibility |
+| --- | --- |
+| `src/cli.ts` | Argument parsing, configuration, automatic refresh/recovery, diagnostics, and output selection. |
+| `src/code-index.ts` | Index lifecycle, file preparation, Git/working-tree reconciliation, embedding/summary caching, and search facade. |
+| `src/parser/` | Language dispatch, native Tree-sitter extraction, callable identity, and recoverable diagnostics. |
+| `src/source-policy.ts`, `src/gitignore.ts` | Supported paths, built-in/config exclusions, nested ignore rules. |
+| `src/git/repository.ts` | Git commits, trees, blobs, diffs, ancestry, and working-tree changes. |
+| `src/embeddings/`, `src/summaries/` | Provider requests and provider profiles. |
+| `src/storage/database.ts` | SQLite schema, migrations, transactions, metadata, and vector queries. |
+| `src/search/` | Analysis scoring selection and cross-index neighbor discovery. |
+| `src/analysis/cohesion.ts` | Physical distance, gap scores, aggregate affinity, and groups. |
+| `src/format.ts` | Human-readable search, cluster, and cohesion output. |
+| `src/index.ts`, `src/types.ts` | Public exports and data contracts. |
+
+## Callable extraction
+
+Language selection uses file extensions. Native Tree-sitter grammars ship as dependencies; extraction does not require a language server, type checker, or project compiler configuration.
+
+| Language | Extracted callables |
+| --- | --- |
+| Python | Functions, async functions, class methods, constructors, generators, and bound lambdas; decorators are included in source. |
+| JavaScript / JSX | Functions, generators, methods, constructors, named function expressions/arrows, and components returning JSX. |
+| TypeScript / TSX | Typed functions, methods, constructors, named function expressions/arrows, and generic JSX components. |
+| Rust | Functions, `impl` methods/associated functions, trait default methods, and `let`-bound closures. |
+| Go | Functions, receiver methods, and function literals bound to variables or assignments. |
+| Java | Methods, constructors (including compact record constructors), and variable-bound lambdas. |
+| C | Function definitions, including static/inline functions and functions returning pointers. |
+
+Qualified names include enclosing classes, functions, and explicit modules. Go methods include receiver types (`Store[T].Get`); Rust trait implementations include type and trait (`<Store<T> as Read>.read`). Records retain source, signature, line/column locations, source hash, and identity used during incremental reconciliation.
+
+Bodyless declarations and anonymous callbacks are omitted. Extraction is syntactic: Rust and C macros are not expanded, C preprocessor branches are indexed as written, and `.h` files use the C grammar. Recoverable callables survive syntax errors; malformed regions produce file or function diagnostics.
+
+Source policy combines extension detection, built-in excluded path segments, and Node glob matching for configured includes/excludes. The `ignore` package implements root and nested `.gitignore` semantics, including anchoring, escaping, negation, and excluded-parent behavior. Working-tree updates read current rules; committed-only updates read rules from Git blobs. Rule changes are checked before applying prepared updates.
+
+## Index lifecycle and storage
+
+The CLI reconciles an index before most commands. Library callers choose when to update explicitly.
+
+Git updates resolve the target commit, validate ancestry against the checkpoint, reconcile committed blobs, and optionally overlay current working-tree files when the target equals HEAD. Overlays account for staged, unstaged, untracked, renamed, and deleted paths. The saved checkpoint remains the committed base. Historical/other-branch targets are committed-only. Explicit `updateFiles` operations do not advance the checkpoint.
+
+File preparation and provider calls precede database updates. Generation checks detect concurrent index changes; working-tree updates also verify source and ignore-rule stability. SQLite transactions apply related file, function, vector, summary, diagnostic, and checkpoint changes together. Failed initialization removes its incomplete index artifacts.
+
+Storage uses Node's `node:sqlite` and `sqlite-vec`. Writable connections enable WAL, foreign keys, and normal synchronization. The schema contains:
+
+- `metadata`: repository root, embedding and summary profiles, generation, checkpoint, schema version, and feature/scan state.
+- `files`: paths, content hashes, blob IDs, source mode, previous paths, language, and size.
+- `functions`: identity, names, signatures, locations, source, provenance, and embedding/summary references.
+- `embeddings` and `summary_embeddings`: cached vectors, with summary text in the latter.
+- `callable_provenance`: first-seen committed source identity.
+- `indexing_errors`: diagnostics associated with files.
+
+Current schema version is `4`. Supported older versions migrate automatically; the diagnostics migration marks a full rescan pending. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. CLI `--force-reindex` recreates incompatible indexes, preserving enabled OpenAI summary settings for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`.
+
+### Diagnostics
+
+Diagnostics cover parse errors, parser exceptions, extraction failures, read failures, and file-size limits. Records include scope, code, message, language, path, recoverable qualified name, location, available source, and Git/working-tree provenance. Healthy callables remain searchable.
+
+Diagnostics commit with their corresponding file update. Updates retry failed files even when their Git blobs are unchanged; successful replacement, deletion, and exclusion clear failures. Standalone readers inspect saved diagnostics without constructing an embedding provider. The CLI's exit handler reports remaining failures for source and target indexes; version exits before registering that handler.
+
+## Embeddings and summaries
+
+Embedding profiles consist of provider, model, dimensions, and strategy version. Cross-index analysis requires matching profiles. Vectors are validated and normalized before storage/search.
+
+- OpenAI defaults to `text-embedding-3-large`, 3072 dimensions, strategy `callable-v1`. Inputs are truncated to 8192 `cl100k_base` tokens.
+- Jina defaults to `jina-embeddings-v4`, 1024 dimensions, strategy `callable-v1:code-query-passage`. Requests distinguish `code.passage` documents from `code.query` queries and enable truncation.
+
+Purpose generation uses OpenAI's Responses API with `gpt-5.6-sol` and strategy `callable-purpose-v1`. The prompt asks for one to three sentences describing responsibility and visible relationships, using repository name, path, callable source, and full file context. Requests use `store: false`. Generated text is embedded with the configured embedding provider.
+
+Summary inputs include contextual and profile information so file-context, path, or model changes invalidate relevant cached results. Unchanged inputs reuse summaries and vectors. `useSummaries` persists the profile and enabled state; later updates attach summaries automatically. Summary generation and embedding preparation finish before the corresponding database transaction, preventing partially updated callable records on provider failure. Deleting a function removes it from summary search.
+
+## Similarity and analysis
+
+`search` embeds a query and searches code vectors; `search-summary` searches summary vectors. Analysis uses code-only cosine similarity unless all indexed callables have enabled summary embeddings. Cross-index analysis requires completeness on both sides. Summary-generator models may differ across indexes even though embedding profiles must match.
+
+When summaries are complete:
+
+```text
+similarity = 0.5 * codeSimilarity + 0.5 * summarySimilarity
+```
+
+Both component scores and the average are computed in one SQLite query. Name, line-count, and path exclusions plus similarity bounds apply before ranking/limiting. Range upper bounds are exclusive. Combined JSON includes component scores; analysis metadata records mode, weights, and summary profiles.
+
+Cross-search selects sources, queries neighbors per source, and deduplicates unordered same-index pairs unless symmetric results are requested. Self-matches are excluded in same-index queries. Same-file exclusion uses canonical roots and file identity to handle aliases. Cluster formatting builds connected components from emitted matches and sorts by member count, then name; transitive connectivity does not imply all-to-all similarity.
+
+### Cohesion metrics
+
+Cohesion builds a graph from selected-source top neighbors, retaining unique unordered edges. Reciprocity is true when both endpoints selected each other, false when both were evaluated but only one selected the other, and null when an endpoint was not evaluated.
+
+```text
+physicalDistance = 0                         # same file
+physicalDistance = 1 + directory-tree hops  # different files
+semanticWeight = clamp((similarity - threshold) / (1 - threshold), 0, 1)
+separationWeight = 1 - exp(-physicalDistance / 2)
+cohesionGap = semanticWeight * separationWeight
+```
+
+Affinity ratios and mean distance are weighted by `semanticWeight`. Summary metrics use all qualifying edges before output limiting. File reports aggregate internal, same-folder, and external affinity for selected-source files. Pairs rank by gap and tie-breakers; groups are connected components of reported pairs. Source/test classification is a path heuristic, not a dependency or call-graph analysis.
+
+## Library API
+
+```ts
+import { OpenAIEmbeddingProvider, openCodeIndex } from "@ninjaxtools/slopdex";
+
+const index = openCodeIndex({
+  rootDir: "/path/to/repository",
+  provider: new OpenAIEmbeddingProvider(),
+});
+
+try {
+  await index.updateFromGit();
+  const results = await index.similaritySearch({
+    query: "validate an authenticated session",
+    limit: 10,
+  });
+  console.log(results);
+} finally {
+  index.close();
+}
+```
+
+Exports include `CodeIndex`, `crossSearch`, `analyzeCohesion`, `cohesionLocation`, `JinaEmbeddingProvider`, `OpenAISummaryProvider`, error types, and the contracts in `src/types.ts`. Standalone update/search helpers wrap the corresponding index methods.
+
+- Use `updateFromWorkingTree()` when Git is unavailable. Unlike the CLI, the library does not automatically refresh before queries or fall back from Git.
+- Set `sourceFilter.nameRegex` for source-only cross-search/cohesion filtering; combine it with `path` and a filter type (`all`, `changed-since`, or `uncommitted`). `changed-since` also accepts `uncommitted: true`.
+- Top-level analysis `nameRegex` filters both sources and candidates. Query `SimilaritySearchOptions.nameRegex` filters result names before limiting.
+- Call `await index.useSummaries()`, then `await index.searchSummary({ query: "maintain the repository index" })`. Select a model via `summaryProvider: new OpenAISummaryProvider({ model: "gpt-5.6-sol" })` in index options. Custom providers implement `EmbeddingProvider` or `SummaryProvider`.
+- Inspect failures through `index.indexErrors()` or exported `readIndexErrors(indexPath)` without a provider. Records use `IndexingError`.
+- Public cohesion reports retain indexed-function data; the CLI presents compact function references and includes source bodies only with `--include-source`.
+
+## Build and development
+
+```bash
+npm install
+npm run check
+```
+
+`check` runs TypeScript checking, Vitest, the tsup build, and smoke tests. The smoke script verifies built exports, CLI help/version, language parsing, ignore behavior, and saved diagnostics without network calls. `npm run dev -- <arguments>` runs the source CLI through tsx.
+
+The build produces ESM library and CLI files with declarations and source maps in `dist/`. `tsup.config.ts` reads `package.json` and injects `__SLOPDEX_VERSION__`; source-mode version output falls back to reading package metadata. `prepack` runs build and smoke checks.
+
+The repository skill lives at `.agents/skills/slopdex/SKILL.md` and is included in the package. `npm run install:skill:opencode` copies it into the OpenCode skill directory.
+
+### Parser parity
+
+```bash
+npm run check:parser-parity
+# Or supply another built reference executable:
+npm run check:parser-parity -- /path/to/treesitter-index
+```
+
+The default reference is `../treesitter-index/target/debug/treesitter-index`. The check covers eight shared languages; the reference has no C grammar. Callable regression tests also run in `npm run check` without a sibling checkout.
+
+The tools index different information: `treesitter-index` includes declarations, types, imports, and `.pyi` stubs; Slopdex extracts callable implementations, nested callables, and bound closures, and also supports `.pyw` and C. Native Node grammar versions are pinned for compatibility with `tree-sitter@0.21`; the reference uses newer Python and Rust grammars. Rust `unsafe extern` blocks and async closures currently produce syntax-recovery warnings in Slopdex and are excluded from passing parity fixtures.
+
+After parser behavior changes, explicitly run `slopdex update-files <path...>` to reparse unchanged files and refresh their symbols, signatures, and embeddings.

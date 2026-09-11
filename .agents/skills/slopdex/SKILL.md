@@ -1,115 +1,183 @@
 ---
 name: slopdex
-description: Use when indexing Python, JavaScript, JSX, TypeScript, TSX, Rust, Go, Java, or C code, running semantic function search, finding duplicate function candidates, or analyzing physical code cohesion with the slopdex command-line tool.
+description: Use when using the slopdex CLI to search code by meaning or purpose, find duplicate-function candidates, analyze physical code cohesion, or maintain indexes of Python, JavaScript/JSX, TypeScript/TSX, Rust, Go, Java, and C code.
 ---
 
-# Slopdex CLI
+# Slopdex operator guide for agents
 
-Use `slopdex` to index named Python, JavaScript, JSX, TypeScript, TSX, Rust, Go, Java, and C callables with Tree-sitter, search them by meaning, identify similar or duplicated functions, and find related functions scattered across a repository. Languages are detected by extension and can coexist in one index.
+Slopdex searches named functions by meaning, finds similar-code candidates, and identifies related functions stored far apart. Languages are detected automatically and can coexist in one index.
 
-## Default Workflow
+## Choose the command that answers the task
 
-Run the command that satisfies the user's request immediately. Do not begin with `slopdex status`, `slopdex --help`, executable lookup, API-key probes, or version probes. Slopdex performs its own validation and reports missing credentials or incompatible state.
+Run the requested operation directly. Do not precede it with status, help, version, executable lookup, or credential probes unless those are the user's task or needed to diagnose a reported failure. Missing indexes initialize automatically.
 
-- For semantic search, run `slopdex search "<query>" --format summary --limit 10`.
-- For duplicate-code clusters, run `slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5`.
-- For related functions that are physically separated, run `slopdex cohesion --format summary --threshold 0.8 --neighbors 20 --limit 50`.
-- For an explicit request to refresh the current index, run `slopdex update-git`.
-- Use `slopdex status` only when the user asks for index metadata or checkpoint information.
-
-Every command refreshes its index from committed `HEAD`, then overlays working-tree changes. A missing index is created automatically; let the requested command perform the refresh rather than initializing separately. Without Git or a Git repository, every command warns on stderr and fully re-indexes the working tree. Use `--no-reindex` only when explicitly asked to skip Git working-tree overlays or reuse an existing non-empty index without Git.
-
-## Prerequisites
-
-- Run commands from the repository root or pass `--root <path>`.
-- Set `OPENAI_API_KEY` or `JINA_API_KEY` for the configured embedding provider.
-- Use Node.js 24 or newer.
-- Store optional configuration in `.slopdex/config.json`:
-
-```json
-{
-  "provider": "jina",
-  "model": "jina-embeddings-v4",
-  "dimensions": 1024,
-  "exclude": ["**/fixtures/**"]
-}
-```
-
-Do not expose API keys in commands, output, configuration files, or commits.
-
-## Indexing
-
-Root and nested `.gitignore` files restrict indexing, including tracked files. Working-tree updates use current ignore files; historical or committed-only Git updates use ignore files from the selected commit. A normal refresh removes newly ignored files from the index. Explicit updates reject ignored paths.
-
-Indexing records parse, callable-extraction, file-read, and file-size failures in SQLite while retaining healthy callables. Commands warn on stderr when unresolved diagnostics remain. Inspect them with `slopdex index-errors --format summary` (or JSON by default); this reads saved errors without refreshing the index or calling providers. Records include paths, source locations, recoverable function names, messages, and available source text. `status` reports `indexingErrorCount` and `failedFileCount`. Failed files are retried during updates; fixes, deletions, and exclusions clear their diagnostics. `--ignore-errors` silences diagnostic warnings without discarding the records.
-
-If a CLI command cannot find its source index, Slopdex prints a notice to stderr and automatically creates and populates it from committed `HEAD`, then overlays working-tree changes. Missing cross-search target indexes are initialized from the target repository's `HEAD` and working tree as well.
-
-Index the current committed snapshot and working-tree overlay:
+### Find code by meaning
 
 ```bash
-slopdex update-git
+slopdex search "validate an authenticated session" --format summary --limit 10
+slopdex search "persist user data" -e 'save|persist' --format summary --limit 5
 ```
 
-`update-git` reconciles the committed snapshot and, when the target is the checked-out `HEAD`, indexes staged, unstaged, and untracked changes. Historical or other-branch targets remain exact committed snapshots. The Git checkpoint remains the committed base hash. After the mandatory automatic refresh, explicitly re-index selected working-tree files with:
+Describe behavior rather than guessing a symbol name. `-e` restricts result qualified names before limiting. Read the matched source to establish behavior and callers.
+
+### Search function purpose
 
 ```bash
-slopdex update-files src/service.ts src/model.ts
+slopdex use-summaries
+slopdex search-summary "keep the repository index synchronized" --format summary --limit 10
 ```
 
-Remove deleted files from the index when using explicit updates:
+Use this workflow when purpose-summary generation/search is requested. `use-summaries` enables persistent automatic updates and adds API generation work. It needs `OPENAI_API_KEY` even with Jina embeddings. Repeating it with unchanged inputs reuses summaries. `search-summary` requires summaries to be enabled and includes summary text in results.
+
+To select another model:
 
 ```bash
-slopdex delete-files src/removed.ts
+slopdex use-summaries --summary-model <model-id>
 ```
 
-Index another commit or recover after changing to a divergent branch:
+The model persists for future updates. Do not enable summaries as a routine prerequisite for ordinary code search or duplicate discovery.
+
+### Find duplicate candidates
 
 ```bash
-slopdex update-git --target HEAD
-slopdex update-git --target HEAD --rebuild-on-divergence
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
 ```
 
-Rebuild automatically when an existing index is incompatible with the current provider, model, dimensions, strategy, schema, or repository:
+The default output is connected clusters. This excludes same-file matches and short functions. `--limit` is neighbors **per source**, not a limit on total findings or clusters. For source-by-source matches, add `--format summary`.
+
+Broaden discovery through adjacent score bands when needed:
 
 ```bash
-slopdex update-git --force-rebuild
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.8-0.85 --limit 5
 ```
 
-This removes the incompatible index and prints a warning before rebuilding it.
+Ranges include the lower bound and exclude the upper bound. Use `--min-lines 1` when one-line wrappers are relevant. Treat matches as review candidates; inspect source before suggesting consolidation.
 
-Skip the otherwise mandatory full working-tree refresh when Git is unavailable and a non-empty index already exists:
+### Review changes or a module
 
 ```bash
-slopdex search "query" --no-reindex
+slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9
+slopdex cross-search --changed-since origin/main --format summary --threshold 0.9
+slopdex cross-search --source-path src/services -e '^UserService\.' --format summary --threshold 0.9
 ```
 
-Check index metadata and its Git checkpoint:
+These restrict sources while searching the full eligible index. The same filters work with `cohesion`. All supplied restrictions intersect:
 
 ```bash
-slopdex status
+slopdex cross-search --source-path src -e 'validate' \
+  --changed-since origin/main --uncommitted \
+  --cross-file-only --min-lines 4 --threshold 0.9
 ```
 
-Git updates reconcile committed blobs first, then overlay working-tree contents. Explicit file updates do not advance the Git checkpoint.
+Here a source must have changed since the commit and belong to an uncommitted file, within the selected path/name scope. `--regex` is different from `-e`: it restricts **both** sources and candidates.
 
-## Failure Handling
+### Review physical cohesion
 
-- Preserve and report the exact failure from the requested command. Do not retry equivalent initialization commands.
-- Provider authentication and configuration failures are actionable as printed. Never display key values, and do not probe whether keys are set unless the error specifically indicates missing credentials and the user asks for diagnosis.
-- A bare system error such as `Invalid argument` is a Slopdex/runtime failure, not evidence that a different indexing command is needed. Stop retrying, report the command and error, and recommend diagnosing or updating Slopdex.
-- `slopdex --help` is the supported capability reference. There is no `slopdex --version` option; never invoke it.
+```bash
+slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
+slopdex cohesion --source-path src/services --threshold 0.8 --format summary
+```
 
-## Analysis Examples
+Ranks related functions by semantic affinity and file/folder separation. For structured processing use `--format json`; add `--include-source` only when full callable bodies are needed.
 
-### Duplicate Analysis
+### Compare repositories
 
 ```bash
 slopdex cross-search \
-  --cross-file-only \
-  --min-lines 4 \
-  --threshold 0.9 \
-  --limit 5
+  --target-root /path/to/other/repo \
+  --target-index /path/to/other/repo/.slopdex/index.sqlite \
+  --threshold 0.9 --format summary
 ```
+
+Both target options are required. Both indexes refresh and must have identical embedding profiles. The target refresh uses the source command's embedding provider and the target's file-selection/summary configuration. Use `--target-config <path>` for a custom target config.
+
+### Inspect or maintain the index
+
+```bash
+slopdex status
+slopdex index-errors --format summary
+slopdex update-git
+slopdex update-files src/service.ts src/model.ts
+slopdex delete-files src/removed.ts
+slopdex --version
+```
+
+- `status` refreshes, then reports coverage, checkpoint, profiles, and error counts; use when metadata is requested.
+- `index-errors` reads saved failures without refreshing or needing API credentials.
+- `update-git` explicitly refreshes HEAD and working-tree changes.
+- `update-files` reparses specified working-tree files after automatic refresh, even when their contents are unchanged.
+- `delete-files` removes index entries after automatic refresh, not source files. Eligible files can return on later refresh.
+- `--version` prints the built package version. `--help` describes available commands/options.
+
+## Command-line reference
+
+Usage: `slopdex <command> [arguments] [options]`. Quote queries and regexes. Boolean flags default to off. Use options only with their applicable commands.
+
+### General settings
+
+| Argument | Meaning / default |
+| --- | --- |
+| `--root <path>` | Repository root; current directory by default. |
+| `--config <path>` | Config; `<root>/.slopdex/config.json`. |
+| `--index <path>` | Index; `<root>/.slopdex/index.sqlite`. Overrides config `indexPath`. |
+| `--provider <openai\|jina>` | Embedding provider; `openai`. |
+| `--model <name>` | Embedding model; OpenAI `text-embedding-3-large`, Jina `jina-embeddings-v4`. |
+| `--dimensions <number>` | Positive dimensions supported by the model; OpenAI `3072`, Jina `1024`. |
+| `--summary-model <name>` | OpenAI summary model; initially `gpt-5.6-sol`, then the persisted selection. |
+| `--ignore-errors` | Silence saved-diagnostic warnings without deleting records. |
+| `-h`, `--help` | Usage; no refresh. |
+| `--version` | Package version; exits without refresh or saved-diagnostic warnings. |
+
+Explicit relative config/index paths resolve from the current directory. Source paths and explicit file arguments resolve within `--root`. Prefer absolute paths when operating across repositories. CLI settings override config.
+
+### Query and analysis options
+
+| Argument | Applies to / behavior |
+| --- | --- |
+| `--limit <number>` | Positive integer. `search`/`search-summary`: matches, default `10`. Cross-search: neighbors per source, default `5`. Cohesion: reported pairs and file rows, default `50`. |
+| `--threshold <number\|min-max>` | Both query searches and analyses. Inclusive minimum or half-open range. Default `-1` for query/cross-search; `0.8` for cohesion. Cohesion minimum must be in `[-1, 1)`. |
+| `--format <json\|summary\|clusters>` | Both query searches, cross-search, cohesion, index-errors. `clusters` only supports cross-search; output defaults below. |
+| `-e <regex>`, `--regexp <regex>` | Case-sensitive JavaScript regex on qualified names. Query searches filter results before limiting; cross-search/cohesion filter sources only. |
+| `--regex <regex>` | Cross-search/cohesion: filter both source and candidate qualified names. |
+| `--min-lines <number>` | Cross-search/cohesion: positive source/candidate length minimum, default `2`. |
+| `--source-path <path>` | Cross-search/cohesion: source file or recursive directory within the root. |
+| `--changed-since <commit>` | Cross-search/cohesion: added, modified, or moved functions since an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
+| `--uncommitted` | Cross-search/cohesion: functions indexed from working-tree files; in Git these are staged, unstaged, or untracked changes. Without Git this selects all working-tree functions. |
+| `--cross-file-only` | Cross-search: exclude same-physical-file matches. |
+| `--include-symmetric-duplicates` | Cross-search: allow both directions of same-index matches; otherwise each unordered pair appears once. |
+| `--neighbors <number>` | Cohesion: positive neighbor count per source, default `20`; changes analysis scope. |
+| `--include-source` | Cohesion JSON: include callable bodies; omitted by default. |
+| `--target-root <path>` | Cross-search: second repository; requires `--target-index`. |
+| `--target-index <path>` | Cross-search: second index file; requires `--target-root`. |
+| `--target-config <path>` | Cross-search: target config, default `<target-root>/.slopdex/config.json`; requires both target options. |
+
+### Refresh and recovery options
+
+| Argument | Behavior |
+| --- | --- |
+| `--target <ref>` | `update-git` snapshot, default `HEAD`. Non-HEAD targets are committed-only; later commands normally return to HEAD. |
+| `--rebuild-on-divergence` | Permit reconciliation after non-descendant history changes, such as a rebase/branch switch. |
+| `--force-reindex` | Recreate an incompatible index. Compatible indexes still use normal refresh; this is not an unconditional reparse flag. |
+| `--no-reindex` | With Git, reconcile the committed snapshot but omit working-tree overlays. Without Git, reuse a non-empty index; missing/empty indexes still populate. Not an offline mode. |
+
+Use `--no-reindex` when the task calls for committed-only results or reuse of an existing non-Git index, rather than silently weakening freshness.
+
+## Interpret and report results
+
+### Output formats
+
+| Command | Default | Alternatives |
+| --- | --- | --- |
+| `search`, `search-summary` | JSON array | `summary`; purpose search includes generated summary text |
+| `cross-search` | `clusters` | `summary`, or `json` for JSONL with one row per matched source |
+| `cohesion` | One JSON report | `summary` for ranked pairs |
+| `index-errors` | JSON array | `summary` |
+| `status`, update commands, `use-summaries` | JSON object | — |
+
+Prefer summary output for compact source review, clusters for duplicate families, and JSON/JSONL for structured processing. Stdout carries results; stderr carries notices and warnings. Cross-search omits sources without emitted matches. Empty output means no findings under the chosen coverage/filters, not proof that no similar code exists.
+
+### Similarity and clusters
 
 ```text
 Cluster 1 (3 functions, similarity 0.9124-0.9568)
@@ -118,13 +186,20 @@ Cluster 1 (3 functions, similarity 0.9124-0.9568)
   src/users/user-service.ts:27:3 :: UserService.authenticate
 ```
 
-This result found three substantial authentication functions in three files with very high similarity. Review them for repeated validation or session-handling logic that could move into one shared implementation. The middleware and service locations may represent intentional architectural layers, so treat the result as evidence to inspect rather than proof that the functions should be merged. The range describes observed links in a connected component; transitive clustering means every function is not necessarily directly similar to every other function.
+- Similarity is a model-dependent resemblance score, not a duplication probability.
+- The range describes observed links. Members can be connected transitively; not all pairs necessarily match.
+- Cluster numbers reflect ordering by member count and name, not severity.
+- Inspect listed locations and callers. Tests, facades, adapters, and intentional layers can resemble each other without being redundant.
 
-### Cohesion Analysis
+When reporting candidates, identify paths/symbols, summarize the shared behavior you verified, and explain whether consolidation is appropriate. Do not infer equivalence from the score alone.
 
-```bash
-slopdex cohesion --format summary --threshold 0.8 --neighbors 20 --limit 50
-```
+### Purpose-aware scoring
+
+`search` uses code only; `search-summary` uses purpose summaries only. Cross-search and cohesion automatically use **50% code + 50% summary similarity** when summaries are enabled and complete. Cross-repository analysis needs completeness on both sides; otherwise all scores are code-only. Summary-generator models may differ even though embedding profiles must match.
+
+Thresholds and limits apply to the selected score. Text labels combined scoring; JSON includes component scores and mode/weights (`scoring` in cross-search, `parameters` in cohesion). Compare runs only with matching scoring mode, weights, embedding and summary-generator profiles, threshold, neighbor count, and source/candidate filters.
+
+### Cohesion
 
 ```text
 Cohesion: 184 functions analyzed, 37 semantic edges
@@ -135,206 +210,54 @@ Cohesion: 184 functions analyzed, 37 semantic edges
    packages/http/middleware.ts:42:1 :: authenticate
 ```
 
-There is no universal pass/fail cutoff for cohesion, but this example has several warning signs. More than a third of weighted semantic affinity crosses folder boundaries, and the mean distance of 1.84 is above the same-folder distance of one. The top pair is strongly related at 0.94 similarity yet four distance units apart, producing a relatively high gap of 0.6053; the reciprocal match strengthens that signal. A more cohesive result under the same settings would concentrate affinity in the same-file and same-folder percentages, have a lower mean distance, and contain few high-gap remote pairs. Inspect whether shared authentication behavior belongs in one module, while accounting for the possibility that session and middleware responsibilities are intentionally separated. Compare modules or repository history rather than treating one percentage as a fixed quality threshold.
+- **Functions analyzed / edges:** selected-source coverage and unique qualifying neighbor pairs before report limiting, not quality grades.
+- **Same file / same folder / remote:** shares of weighted semantic affinity. More remote affinity means more related code crosses folder boundaries.
+- **Mean distance:** weighted physical separation; `0` is same file, `1` is different files in one folder, larger means farther apart.
+- **Gap / rank:** a `0–1` review score combining similarity above the threshold with separation. Higher gap ranks earlier; same-file pairs have zero gap.
+- **Reciprocal:** both functions selected each other as neighbors. JSON `null` means an endpoint was not evaluated because of source filtering.
+- **JSON details:** `semanticWeight` reflects similarity above threshold; `separationWeight` reflects distance; `sourceTestPair` flags a path-inferred source/test relationship; file `externalAffinityRatio` measures affinity outside that file's folder.
 
-## Reading Analysis Output
+The example merits reviewing separated authentication responsibilities, while accounting for intentional layering. There is no universal pass/fail threshold. Use comparable runs to evaluate changes. Filtered reports describe selected sources, not the full repository. Summary metrics use all qualifying edges; pairs/files are limited, and groups use reported pairs.
 
-Interpret values only within the same embedding profile and similar command settings. Changing the model, threshold, neighbor count, source scope, or minimum line count changes the candidate graph and makes direct comparisons unreliable.
+## Operational properties
 
-### Duplicate Clusters
+- Requires Node.js 24+. Install with `npm install -g @ninjaxtools/slopdex` if installation is the task.
+- Run from the repository root or pass `--root`. The default local index is `.slopdex/index.sqlite`; add `.slopdex/` to `.gitignore`.
+- Most commands, including `status`, refresh before operating. With Git, the default is HEAD plus current working-tree changes; the checkpoint records the committed base. Without Git, refresh scans the working tree and warns. `index-errors`, help, and version do not refresh.
+- Source filters narrow analysis, not the preceding refresh. Indexing and summary generation can make many API calls; unchanged inputs reuse cached results.
+- Embedding keys are `OPENAI_API_KEY` or `JINA_API_KEY`; other than diagnostics/help/version, CLI commands require the configured embedding key even for cached analyses. Summaries also require OpenAI credentials when generation is needed.
+- Function source and queries go to the embedding provider. Enabled summary generation sends repository name, path, callable source, and file context to OpenAI, and summary text to the embedding provider. Results and diagnostics remain in the local index. Never expose key values in tool calls, output, or commits.
+- Coverage: Python `.py/.pyw`; JavaScript `.js/.mjs/.cjs/.jsx`; TypeScript `.ts/.mts/.cts/.tsx`; Rust `.rs`; Go `.go`; Java `.java`; C `.c/.h`. Named callables with bodies, including supported bound closures and nested functions, are indexed. Anonymous callbacks, bodyless declarations, macro expansion, and runtime relationships are outside coverage.
+- Root/nested `.gitignore` rules apply even to tracked files and without Git. Current overlays use current rules; committed-only snapshots use committed rules. Refresh removes newly ignored files; explicit updates reject ignored paths.
+- Dependency/build directories are excluded: `.git`, `.slopdex`, `node_modules`, `dist`, `build`, `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`, `target`. Config/ignore exceptions cannot override built-in exclusions or an ignored parent directory.
 
-For `Cluster 1 (3 functions, similarity 0.9124-0.9568)`:
+### Optional configuration
 
-- `Cluster 1` is the display identifier. Clusters are ordered by function count and then name, not severity, so a lower number is not inherently worse.
-- `3 functions` counts unique callables connected by observed edges. Higher can indicate a larger duplicate family, but may also result from generic helpers or transitive links.
-- `similarity 0.9124-0.9568` is the weakest-to-strongest raw cosine similarity among observed edges. Higher means greater semantic resemblance according to the configured model. A high minimum means every observed link is strong; a wide range can identify a weaker bridge.
-- Callable lines use `path:line:column :: qualifiedFunctionName`. Location is contextual rather than scored; inspect architectural roles before consolidating code.
+`<root>/.slopdex/config.json`:
 
-### Cohesion Summary
-
-For `Cohesion: 184 functions analyzed, 37 semantic edges`:
-
-- `functions analyzed` is coverage after filters, not a quality value.
-- `semantic edges` counts unique top-neighbor pairs meeting the threshold before output limiting. Higher can reflect more overlapping responsibilities, but also increases with more neighbors or a lower threshold.
-
-For `same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84`:
-
-- Higher `same file` generally means stronger co-location, though very high values can indicate oversized files.
-- Higher `same folder` means related code is split into nearby modules but remains locally grouped.
-- Higher `remote` means more semantic affinity crosses folder boundaries and indicates weaker physical cohesion.
-- Lower `mean distance` generally means stronger physical cohesion. Zero is entirely within files, one reaches only other files in the same folder, and larger values indicate greater dispersion.
-
-### Cohesion Findings
-
-For `1. gap 0.6053  similarity 0.9400  distance 4  reciprocal`:
-
-- A lower rank number is a higher review priority.
-- Higher `gap` means stronger semantic affinity combined with greater physical separation; same-file pairs have zero gap.
-- Higher `similarity` means stronger model-assessed resemblance, but does not prove duplication and is not comparable across embedding profiles.
-- Higher `distance` means more file and directory-tree separation: zero is the same file and one is different files in the same folder.
-- `reciprocal` strengthens confidence because both functions rank each other as neighbors. Its absence means one-directional or unevaluated under a source filter.
-
-In JSON, higher `semanticWeight` means similarity lies farther above the threshold, and higher `separationWeight` means greater path distance. `sourceTestPair: true` flags an often-intentional source/test relationship. Higher file `externalAffinityRatio` means more observed related-function affinity lies outside that file's folder; lower means relationships are primarily internal or local.
-
-## Semantic Search
-
-Search indexed functions by intent:
-
-```bash
-slopdex search "validate an authenticated session" --limit 10
+```json
+{
+  "provider": "jina",
+  "model": "jina-embeddings-v4",
+  "dimensions": 1024,
+  "exclude": ["**/fixtures/**"]
+}
 ```
 
-Use compact human-readable output and filter weak results:
+Supported properties: `provider`, `model`, `dimensions`, `summaryModel`, `indexPath`, `include`, `exclude`, `maxFileSize`, `embeddingBatchSize`. Includes/excludes are repository-relative globs; an empty include list permits all eligible supported files. `maxFileSize` defaults to `1048576` bytes; `embeddingBatchSize` to `32`; both are positive integers. Keep credentials in the environment. Embedding-profile changes require `--force-reindex`.
 
-```bash
-slopdex search "validate an authenticated session" \
-  --format summary \
-  --threshold 0.8 \
-  --limit 10
-```
+## Failures and incomplete coverage
 
-`--threshold` is the minimum raw cosine similarity. Use a half-open range such as `--threshold 0.85-0.95` to include the left bound and exclude the right bound.
+Parse, extraction, read, and file-size failures are saved while healthy functions remain searchable. Inspect `slopdex index-errors --format summary`; JSON adds locations, recovered names, source, and snapshot provenance. `status` reports `indexingErrorCount` and `failedFileCount`, and `functionCount` counts searchable callables.
 
-## Duplicate Discovery
+Saved errors warn on stderr, including on cached runs and target indexes. `--ignore-errors` only silences the warning. Updates retry failed files; successful indexing, deletion, or exclusion clears records. Mention relevant incomplete coverage when interpreting results.
 
-Cross-search defaults to connected clusters. Treat each cluster as a source-review candidate rather than proof of duplication. Lower `--threshold` to broaden discovery, or lower `--min-lines` when short wrappers are relevant.
+Preserve the exact command and error when an operation fails. Fix the reported cause instead of retrying equivalent initialization commands:
 
-Summary output can instead group matches beneath each source:
+- Missing credentials or provider/configuration errors: report the actionable message without displaying keys.
+- Divergent checkpoint: use `--rebuild-on-divergence` when proceeding with the requested snapshot.
+- Incompatible index: `--force-reindex` recreates it with the requested profile.
+- Source changed during indexing: rerun after edits settle.
+- Bare runtime errors such as `Invalid argument`: report the failure and diagnose the runtime/tool rather than trying unrelated refresh commands.
 
-```text
-src/users.ts :: Users.authenticate
-  0.9321  src/session.ts :: validateSession
-  0.8475  src/auth.ts :: authenticate
-```
-
-Interpret high similarity as a candidate requiring source review, not proof of duplication. Public facade methods, API wrappers, interface implementations, and test doubles often score highly while serving distinct roles.
-
-Cross-search excludes one-line callables by default. Raise `--min-lines` for more substantial duplicate candidates, or use `--min-lines 1` when short wrappers are relevant:
-
-```bash
-slopdex cross-search --min-lines 4 --threshold 0.9
-```
-
-Filter source symbols by qualified callable name while searching the whole eligible index:
-
-```bash
-slopdex cross-search -e '^(User|Session)\.' --source-path src --threshold 0.9
-```
-
-`-e` / `--regexp` uses a case-sensitive JavaScript regex. In cross-search and cohesion, it restricts sources only. Combine it with `--source-path`, `--changed-since`, `--uncommitted`, and other analysis options. When both Git filters are present, sources must have changed since the commit and belong to an uncommitted file. In `search` and `search-summary`, `-e` filters result names before applying `--limit`.
-
-To filter both source and matching candidates, use `--regex`:
-
-```bash
-slopdex cross-search --regex '^(User|Session)\.' --threshold 0.9
-```
-
-Use `--threshold <minimum>-<maximum>` for a half-open similarity range, such as `--threshold 0.85-0.95`. It includes the minimum, excludes the maximum, and is applied before `--limit`.
-
-Review duplicate candidates iteratively from high confidence to lower-confidence bands instead of requesting one broad result set:
-
-```bash
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limit 5
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.8-0.85 --limit 5
-```
-
-Because range upper bounds are exclusive, adjacent passes do not repeat boundary candidates.
-
-Same-index search reports each unordered pair once by default. Include both `A -> B` and `B -> A` only when explicitly needed:
-
-```bash
-slopdex cross-search --include-symmetric-duplicates
-```
-
-Exclude candidates from the source function's file when looking for duplication across files:
-
-```bash
-slopdex cross-search --cross-file-only --format summary --threshold 0.9
-```
-
-Group overlapping pairs into connected components and list each function once:
-
-```bash
-slopdex cross-search --format clusters --threshold 0.9
-```
-
-Restrict source functions to a file or recursive directory while still matching them against the whole codebase:
-
-```bash
-slopdex cross-search --source-path src/services --format summary --threshold 0.9
-```
-
-`--source-path` restricts only source functions. It can be combined with `-e`, `--changed-since`, and `--uncommitted`; all supplied restrictions must match.
-
-Restrict source functions to additions, modifications, and moves relative to a commit, including current working-tree changes:
-
-```bash
-slopdex cross-search --changed-since origin/main --format summary --threshold 0.9
-```
-
-Restrict source functions to uncommitted files:
-
-```bash
-slopdex cross-search --uncommitted --format summary --threshold 0.9
-```
-
-Search against another compatible index:
-
-```bash
-slopdex cross-search \
-  --target-root /path/to/other/repository \
-  --target-index /path/to/other/repository/.slopdex/index.sqlite \
-  --format summary \
-  --threshold 0.8
-```
-
-Cross-index searches require identical provider, model, dimensions, and embedding strategy profiles.
-Use `--target-config <path>` when the target repository does not use `.slopdex/config.json`.
-
-## Cohesion Analysis
-
-Use JSON when passing the report to another tool or an LLM:
-
-```bash
-slopdex cohesion --format json --threshold 0.8 --neighbors 20 --limit 50
-```
-
-The report includes raw similarity, physical path distance, a combined cohesion-gap score, reciprocal-neighbor status, repository metrics, file-level external affinity, and connected groups for navigation. Reciprocity is `null` when the other endpoint was not searched because a source filter is active. Source code is omitted from JSON by default; add `--include-source` only when the consumer needs complete callable bodies.
-
-Treat findings as review candidates. Tests, facades, adapters, and intentionally layered implementations can be semantically related while correctly living in separate locations.
-
-## Output Formats
-
-- `--format summary` is intended for human review and includes file and qualified function names.
-- `--format clusters` groups overlapping pairs and lists each function once with its source line.
-- The default `search` output is formatted JSON.
-- The default `cross-search` output is connected clusters. Use `--format json` for JSONL with one object per source function.
-- The default `cohesion` output is one compact JSON report. Use `--format summary` for ranked pairs.
-- Functions with no matches after threshold filtering are omitted from cross-search output.
-
-Prefer JSON or JSONL when another command will consume the results. Prefer summary output when presenting candidates to a user.
-
-## Common Options
-
-```text
---root <path>                       Repository root
---config <path>                     Configuration file
---index <path>                      SQLite index path
---provider <openai|jina>            Embedding provider
---model <name>                      Embedding model
---dimensions <number>               Embedding dimensions
---force-rebuild                     Rebuild an incompatible existing index
---limit <number>                    Result limit
---neighbors <number>                Semantic neighbors per function for cohesion
---threshold <number|range>          Similarity threshold or half-open range
---format <json|summary|clusters>    Output format
---include-source                    Include callable source in cohesion JSON
---cross-file-only                   Exclude matches from the source file
---min-lines <number>               Minimum cross-search callable length
--e, --regexp <regex>               Match qualified symbols (analysis: sources only)
---regex <regex>                    Match both analysis source and candidate names
---target-config <path>             Target repository configuration file
-```
-
-Run `slopdex --help` for the complete current option list.
+Exit codes: `0` success, `2` argument/domain errors, `1` other failures or missing command. Use help to resolve capability questions and version to report the installed package version when needed.
