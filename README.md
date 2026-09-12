@@ -150,6 +150,7 @@ slopdex update-git --force-reindex
 | `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use Zen or Go with `OPENCODE_API_KEY`. |
 | `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go, then the persisted model unless overridden. Published OpenCode models use their documented protocol. |
 | `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
+| `--verbose` | Write one stderr notice for every external model call instead of one per call kind/provider/model. |
 | `-h`, `--help` | Show CLI usage without refreshing. |
 | `--version` | Print the package version and exit. |
 
@@ -233,6 +234,8 @@ Ordinary updates preserve an existing file description even when its source chan
 
 Tree-sitter extraction, generated descriptions, and document/query vectors are content-addressed in the same SQLite database. Each validated result is committed immediately, independently of the final logical index update. If indexing is interrupted or a later provider call fails, rerunning reuses every completed result whose profile, operation, input, and source context hash still match.
 
+When Slopdex makes external vector, description, or reranking model calls, stderr identifies the call kind, provider, and model. By default each combination is reported once per process regardless of request count. Pass `--verbose`, or set `"verbose": true` in config, to report every request. Cache hits do not produce notices because they do not call a model.
+
 With complete descriptions, `search` and cross-search average **one-third code similarity + one-third callable-description similarity + one-third file-description similarity**. `search-description` averages callable and file descriptions without code. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Stale file descriptions remain searchable until explicitly reindexed. Thresholds and limits apply to the selected score.
 
 Text output labels combined scores. JSON exposes `codeSimilarity`, `descriptionSimilarity`, `fileDescriptionSimilarity`, and cross-search scoring mode/weights. Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, and source/candidate filters.
@@ -265,6 +268,7 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Ope
   "rerankerModel": "gpt-5.6-luna",
   "rerankerCandidates": 10,
   "descriptionProvider": "opencode-go",
+  "verbose": true,
   "exclude": ["**/fixtures/**"]
 }
 ```
@@ -284,6 +288,7 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Ope
 | `exclude` | Additional repository-relative exclusion globs. |
 | `maxFileSize` | Maximum source-file size in bytes; positive integer, default `1048576`. |
 | `embeddingBatchSize` | Embedding inputs per batch; positive integer, default `32`. |
+| `verbose` | When true, report every external model request on stderr; false/unset reports each call kind/provider/model once per process. |
 
 Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`). Reranker settings do not change the stored index and do not require a rebuild. Changing the embedding profile requires rebuilding with `--force-reindex`.
 

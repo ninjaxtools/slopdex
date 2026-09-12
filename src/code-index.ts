@@ -68,6 +68,7 @@ export class CodeIndex {
       ...(storedDescriptionProfile && isDescriptionProviderName(storedDescriptionProfile.provider)
         ? { provider: storedDescriptionProfile.provider, model: storedDescriptionProfile.model }
         : {}),
+      ...(options.verbose ? { verbose: true } : {}),
     });
     this.#policy = new SourcePolicy(options.include, options.exclude);
     this.#maxFileSize = options.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;

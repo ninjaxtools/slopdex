@@ -4,6 +4,7 @@ import { Tiktoken } from "js-tiktoken/lite";
 import cl100kBase from "js-tiktoken/ranks/cl100k_base";
 
 import type { EmbeddingProvider } from "../types.js";
+import { reportModelCall } from "../model-call-notice.js";
 import { requestEmbeddings } from "./ai-sdk.js";
 
 const MAX_INPUT_TOKENS = 8192;
@@ -20,11 +21,13 @@ export interface OpenAIEmbeddingProviderOptions {
   model?: string;
   dimensions?: number;
   baseUrl?: string;
+  verbose?: boolean;
 }
 
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   public readonly profile;
   readonly #model;
+  readonly #verbose: boolean;
 
   public constructor(options: OpenAIEmbeddingProviderOptions = {}) {
     const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? "";
@@ -33,6 +36,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     const dimensions = options.dimensions ?? 3072;
     if (!Number.isInteger(dimensions) || dimensions < 1) throw new Error("dimensions must be a positive integer.");
     this.profile = { provider: "openai", model, dimensions, strategyVersion: "callable-v2" } as const;
+    this.#verbose = options.verbose ?? false;
     this.#model = createOpenAI({
       apiKey,
       baseURL: (options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, ""),
@@ -41,6 +45,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
   public async embedDocuments(inputs: readonly string[], options?: { signal?: AbortSignal }): Promise<number[][]> {
     if (inputs.length === 0) return [];
+    reportModelCall("vectors", this.profile, this.#verbose);
     return requestEmbeddings(
       embedMany({
         model: this.#model,
@@ -54,6 +59,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   public async embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]> {
+    reportModelCall("vectors", this.profile, this.#verbose);
     return (await requestEmbeddings(
       embed({
         model: this.#model,

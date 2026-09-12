@@ -4,6 +4,7 @@ import { Tiktoken } from "js-tiktoken/lite";
 import cl100kBase from "js-tiktoken/ranks/cl100k_base";
 
 import { CodeIndexError } from "../errors.js";
+import { reportModelCall } from "../model-call-notice.js";
 import type { Reranker } from "../types.js";
 import { assertPositiveInteger, throwIfAborted } from "../utils.js";
 
@@ -22,6 +23,7 @@ export interface OpenAILLMRerankerOptions {
   model?: string;
   baseUrl?: string;
   candidateCount?: number;
+  verbose?: boolean;
 }
 
 interface RankingOutput {
@@ -34,10 +36,12 @@ export class OpenAILLMReranker implements Reranker {
   public readonly maximumCandidateCount = MAX_CANDIDATES;
   readonly #apiKey: string;
   readonly #baseUrl: string;
+  readonly #verbose: boolean;
 
   public constructor(options: OpenAILLMRerankerOptions = {}) {
     this.#apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? "";
     this.#baseUrl = (options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "");
+    this.#verbose = options.verbose ?? false;
     this.candidateCount = options.candidateCount ?? 10;
     assertPositiveInteger(this.candidateCount, "reranker candidate count");
     if (this.candidateCount > MAX_CANDIDATES) {
@@ -94,6 +98,7 @@ export class OpenAILLMReranker implements Reranker {
           document: tokens.length <= candidateTokenLimit ? document : tokenizer!.decode(tokens.slice(0, candidateTokenLimit)),
         };
       });
+      reportModelCall("reranking", this.profile, this.#verbose);
       ({ output } = await generateText({
         model: createOpenAI({ apiKey: this.#apiKey, baseURL: this.#baseUrl }).responses(this.profile.model),
         prompt: JSON.stringify({

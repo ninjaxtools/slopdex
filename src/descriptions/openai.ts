@@ -3,6 +3,7 @@ import { APICallError, generateText, type ModelMessage } from "ai";
 import { randomUUID } from "node:crypto";
 
 import { CodeIndexError } from "../errors.js";
+import { reportModelCall } from "../model-call-notice.js";
 import type {
   DescriptionFileInput,
   DescriptionFileSession,
@@ -17,6 +18,7 @@ export interface OpenAIDescriptionProviderOptions {
   model?: string;
   baseUrl?: string;
   provider?: DescriptionProviderName;
+  verbose?: boolean;
 }
 
 export const DESCRIPTION_PROVIDER_NAMES = ["openai", "opencode", "opencode-go"] as const;
@@ -49,6 +51,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
   readonly #apiKeyName: string;
   readonly #baseUrl: string;
   readonly #openCode: boolean;
+  readonly #verbose: boolean;
 
   public constructor(options: OpenAIDescriptionProviderOptions = {}) {
     const provider = options.provider ?? "openai";
@@ -57,6 +60,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     this.#apiKey = options.apiKey ?? process.env[this.#apiKeyName] ?? "";
     this.#baseUrl = (options.baseUrl ?? defaults.baseUrl).replace(/\/$/, "");
     this.#openCode = provider !== "openai";
+    this.#verbose = options.verbose ?? false;
     this.profile = {
       provider,
       model: options.model ?? defaults.model,
@@ -114,6 +118,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     throwIfAborted(options?.signal);
     if (!this.#apiKey) throw new CodeIndexError(`${this.#apiKeyName} is required to generate descriptions.`);
     const { model, responses } = await this.#languageModel(headers);
+    reportModelCall("descriptions", this.profile, this.#verbose);
     let text: string;
     try {
       ({ text } = await generateText({

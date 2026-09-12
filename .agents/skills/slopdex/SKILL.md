@@ -154,6 +154,7 @@ Usage: `slopdex <command> [arguments] [options]`. Quote queries and regexes. Boo
 | `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go. |
 | `--reranker-candidates <number>` | With `config reranker openai`, embedding-ranked functions sent to the LLM; range `1`-`100`, default `10`. |
 | `--ignore-errors` | Silence saved-diagnostic warnings without deleting records. |
+| `--verbose` | Report every external model request on stderr instead of once per call kind/provider/model. Config `"verbose": true` has the same effect. |
 | `-h`, `--help` | Usage; no refresh. |
 | `--version` | Package version; exits without refresh or saved-diagnostic warnings. |
 
@@ -201,7 +202,7 @@ Use `--no-reindex` when the task calls for committed-only results or reuse of an
 | `index-errors` | `summary` | JSON array |
 | `status`, update commands, `descriptions` | JSON object | — |
 
-Prefer summary output for compact source review, clusters for duplicate families, and JSON/JSONL for structured processing. Stdout carries results; stderr carries notices and warnings. Cross-search omits sources without emitted matches. Empty output means no findings under the chosen coverage/filters, not proof that no similar code exists.
+Prefer summary output for compact source review, clusters for duplicate families, and JSON/JSONL for structured processing. Stdout carries results; stderr carries notices and warnings. External vector, description, and reranking requests identify their provider and model once per combination, or for every request with `--verbose`. Cross-search omits sources without emitted matches. Empty output means no findings under the chosen coverage/filters, not proof that no similar code exists.
 
 With reranking enabled, query summaries display both reranker relevance and embedding similarity. Similarity thresholds filter candidates before reranking; limits apply to the reranked output. LLM candidate documents include descriptions when available and function metadata/source code.
 

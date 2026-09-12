@@ -52,6 +52,7 @@ interface FileConfig {
   rerankerModel?: string;
   rerankerCandidates?: number;
   rerankingEnabled?: boolean;
+  verbose?: boolean;
 }
 
 type OpenCodeDescriptionProvider = Exclude<DescriptionProviderName, "openai">;
@@ -103,6 +104,7 @@ const parsed = (() => {
         "no-reindex": { type: "boolean", default: false },
         callables: { type: "boolean", default: false },
         "ignore-errors": { type: "boolean", default: false },
+        verbose: { type: "boolean", default: false },
         version: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
@@ -196,6 +198,7 @@ async function main(): Promise<void> {
     ...(config.exclude ? { exclude: config.exclude } : {}),
     ...(config.maxFileSize ? { maxFileSize: config.maxFileSize } : {}),
     ...(config.embeddingBatchSize ? { embeddingBatchSize: config.embeddingBatchSize } : {}),
+    ...(config.verbose ? { verbose: true } : {}),
   };
   const updateTarget = command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD";
   const updateStats = await ensureIndexUpdated(
@@ -290,6 +293,7 @@ async function runCrossSearch(
     ...(targetConfig?.exclude ? { exclude: targetConfig.exclude } : {}),
     ...(targetConfig?.maxFileSize ? { maxFileSize: targetConfig.maxFileSize } : {}),
     ...(targetConfig?.embeddingBatchSize ? { embeddingBatchSize: targetConfig.embeddingBatchSize } : {}),
+    ...(targetConfig?.verbose ? { verbose: true } : {}),
     ...(targetDescriptionProvider ? { descriptionProvider: targetDescriptionProvider } : {}),
   } : undefined;
   if (targetOptions) {
@@ -411,6 +415,7 @@ async function initializeIndex(
       ? { descriptionProvider: new OpenAIDescriptionProvider({
         provider: descriptionProfile.provider as DescriptionProviderName,
         model: descriptionProfile.model,
+        ...(options.verbose ? { verbose: true } : {}),
       }) } : {}),
   });
   try {
@@ -506,6 +511,9 @@ function commandLineConfig(config: FileConfig): FileConfig {
   if (config.rerankingEnabled !== undefined && typeof config.rerankingEnabled !== "boolean") {
     throw new CodeIndexError("rerankingEnabled must be a boolean.");
   }
+  if (config.verbose !== undefined && typeof config.verbose !== "boolean") {
+    throw new CodeIndexError("verbose must be a boolean.");
+  }
   if (config.rerankingEnabled === true) {
     if (config.rerankerProvider !== "cohere" && config.rerankerProvider !== "jina" && config.rerankerProvider !== "openai") {
       throw new CodeIndexError(`Unsupported reranker provider: ${String(config.rerankerProvider)}`);
@@ -529,6 +537,7 @@ function commandLineConfig(config: FileConfig): FileConfig {
     ...(descriptionProviderValue ? { descriptionProvider: descriptionProviderValue } : {}),
     ...(parsed.values["description-model"] ? { descriptionModel: parsed.values["description-model"] } : {}),
     ...(dimensions ? { dimensions } : {}),
+    ...(parsed.values.verbose ? { verbose: true } : {}),
   };
 }
 
@@ -537,6 +546,7 @@ function createDescriptionProvider(config: FileConfig): OpenAIDescriptionProvide
   return new OpenAIDescriptionProvider({
     ...(config.descriptionProvider ? { provider: config.descriptionProvider } : {}),
     ...(config.descriptionModel ? { model: config.descriptionModel } : {}),
+    ...(config.verbose ? { verbose: true } : {}),
   });
 }
 
@@ -728,26 +738,35 @@ function createProvider(config: FileConfig): EmbeddingProvider {
     return new JinaEmbeddingProvider({
       ...(config.model ? { model: config.model } : {}),
       ...(config.dimensions ? { dimensions: config.dimensions } : {}),
+      ...(config.verbose ? { verbose: true } : {}),
     });
   }
   return new OpenAIEmbeddingProvider({
     ...(config.model ? { model: config.model } : {}),
     ...(config.dimensions ? { dimensions: config.dimensions } : {}),
+    ...(config.verbose ? { verbose: true } : {}),
   });
 }
 
 function createReranker(config: FileConfig): Reranker | undefined {
   if (config.rerankingEnabled !== true) return undefined;
   if (config.rerankerProvider === "cohere") {
-    return new CohereReranker(config.rerankerModel ? { model: config.rerankerModel } : {});
+    return new CohereReranker({
+      ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
+      ...(config.verbose ? { verbose: true } : {}),
+    });
   }
   if (config.rerankerProvider === "jina") {
-    return new JinaReranker(config.rerankerModel ? { model: config.rerankerModel } : {});
+    return new JinaReranker({
+      ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
+      ...(config.verbose ? { verbose: true } : {}),
+    });
   }
   if (config.rerankerProvider === "openai") {
     return new OpenAILLMReranker({
       ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
       ...(config.rerankerCandidates ? { candidateCount: config.rerankerCandidates } : {}),
+      ...(config.verbose ? { verbose: true } : {}),
     });
   }
   throw new CodeIndexError("rerankerProvider is required when rerankingEnabled is true.");
@@ -1025,6 +1044,7 @@ Options:
   --no-reindex                        Skip worktree overlays or reuse a non-Git index
   --callables                         With reindex-files, also regenerate callable descriptions
   --ignore-errors                     Silence warnings about persisted indexing errors
+  --verbose                           Log every external model call instead of one per kind/model
   --limit <number>                    Search result limit
   --threshold <number|range>          Show similarities at/above a value or within a range
   --format <json|summary|clusters>    Output format (default: summary; cross-search: clusters)

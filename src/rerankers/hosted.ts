@@ -1,4 +1,5 @@
 import { CodeIndexError } from "../errors.js";
+import { reportModelCall } from "../model-call-notice.js";
 import type { Reranker } from "../types.js";
 import { assertPositiveInteger, throwIfAborted } from "../utils.js";
 
@@ -6,6 +7,7 @@ interface HostedRerankerOptions {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
+  verbose?: boolean;
 }
 
 interface HostedRerankerSettings {
@@ -21,6 +23,7 @@ abstract class HostedReranker implements Reranker {
   readonly #apiKey: string;
   readonly #url: string;
   readonly #returnDocuments: boolean | undefined;
+  readonly #verbose: boolean;
 
   protected constructor(options: HostedRerankerOptions, settings: HostedRerankerSettings) {
     this.#apiKey = options.apiKey ?? process.env[settings.apiKeyName] ?? "";
@@ -28,6 +31,7 @@ abstract class HostedReranker implements Reranker {
     const model = options.model ?? settings.defaultModel;
     if (!model.trim()) throw new Error("reranker model must not be empty.");
     this.profile = { provider: settings.provider, model } as const;
+    this.#verbose = options.verbose ?? false;
     const url = (options.baseUrl ?? settings.defaultUrl).replace(/\/$/, "");
     this.#url = url.endsWith("/rerank") ? url : `${url}/rerank`;
     this.#returnDocuments = settings.returnDocuments;
@@ -42,6 +46,7 @@ abstract class HostedReranker implements Reranker {
     const limit = options.limit ?? documents.length;
     assertPositiveInteger(limit, "rerank limit");
     throwIfAborted(options.signal);
+    reportModelCall("reranking", this.profile, this.#verbose);
     let response: Response;
     try {
       response = await fetch(this.#url, {

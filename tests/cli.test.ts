@@ -83,6 +83,33 @@ describe("CLI index initialization", { timeout: testTimeoutMs }, () => {
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(true);
   });
 
+  it.each([
+    { name: "the --verbose flag", configVerbose: false, args: ["--verbose"] },
+    { name: "verbose config", configVerbose: true, args: [] },
+  ])("logs every external request with $name", async ({ configVerbose, args }) => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    write(root, ".slopdex/config.json", JSON.stringify({
+      dimensions: 2,
+      embeddingBatchSize: 1,
+      verbose: configVerbose,
+    }));
+    write(root, ".slopdex/mock-api.mjs", `
+globalThis.fetch = async (_url, options) => {
+  const body = JSON.parse(options.body);
+  return Response.json({data: body.input.map((_, index) => ({index, embedding: [1, 0]}))});
+};
+`);
+    const result = await runCliWithEnv(root, {
+      ...process.env,
+      NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}`,
+    }, "status", ...args);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr.match(/external model call: kind=vectors/g)).toHaveLength(2);
+    expect(result.stderr).toContain('provider="openai" model="text-embedding-3-large"');
+  });
+
   it("retains a partial initialization cache and resumes without repeating completed API calls", async () => {
     const root = temporaryRoot();
     const statePath = path.join(root, ".slopdex", "api-state.json");

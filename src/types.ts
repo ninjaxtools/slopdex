@@ -133,6 +133,8 @@ export interface CodeIndexOptions {
   exclude?: readonly string[];
   maxFileSize?: number;
   embeddingBatchSize?: number;
+  /** Emit a stderr notice for every call made by the default description provider. */
+  verbose?: boolean;
   readOnly?: boolean;
 }
 

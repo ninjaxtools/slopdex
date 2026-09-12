@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http";
 
 import { Tiktoken } from "js-tiktoken/lite";
 import cl100kBase from "js-tiktoken/ranks/cl100k_base";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { JinaEmbeddingProvider } from "../src/embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "../src/embeddings/openai.js";
@@ -404,6 +404,68 @@ describe("rerankers", () => {
       { index: 0, score: 1 },
     ]);
     expect(JSON.stringify(requests[0]!.input)).toContain("<|endoftext|>");
+  });
+});
+
+describe("external model call notices", () => {
+  it("reports each kind once by default and every request in verbose mode", async () => {
+    const fileSource = "export function deliver() { send(); }";
+    const descriptionInput = {
+      repository: "example",
+      callable: parseCallables("client.ts", fileSource)[0]!,
+      fileSource,
+    };
+    const embeddingUrl = await startServer([], { data: [{ index: 0, embedding: [1, 0] }] });
+    const descriptionUrl = await startServer([], {
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{ type: "output_text", text: "Describes the callable.", annotations: [] }],
+      }],
+    });
+    const rerankerUrl = await startServer([], { results: [{ index: 0, relevance_score: 0.8 }] });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    try {
+      const defaultEmbedding = new OpenAIEmbeddingProvider({
+        apiKey: "test", baseUrl: embeddingUrl, model: "notice-vectors-default", dimensions: 2,
+      });
+      const verboseEmbedding = new OpenAIEmbeddingProvider({
+        apiKey: "test", baseUrl: embeddingUrl, model: "notice-vectors-verbose", dimensions: 2, verbose: true,
+      });
+      const defaultDescriptions = new OpenAIDescriptionProvider({
+        apiKey: "test", baseUrl: descriptionUrl, model: "notice-descriptions-default",
+      });
+      const verboseDescriptions = new OpenAIDescriptionProvider({
+        apiKey: "test", baseUrl: descriptionUrl, model: "notice-descriptions-verbose", verbose: true,
+      });
+      const defaultReranker = new CohereReranker({
+        apiKey: "test", baseUrl: rerankerUrl, model: "notice-reranking-default",
+      });
+      const verboseReranker = new CohereReranker({
+        apiKey: "test", baseUrl: rerankerUrl, model: "notice-reranking-verbose", verbose: true,
+      });
+
+      for (let call = 0; call < 2; call += 1) {
+        await defaultEmbedding.embedDocuments(["one"]);
+        await verboseEmbedding.embedDocuments(["one"]);
+        await defaultDescriptions.describe(descriptionInput);
+        await verboseDescriptions.describe(descriptionInput);
+        await defaultReranker.rerank("query", ["one"]);
+        await verboseReranker.rerank("query", ["one"]);
+      }
+
+      const notices = stderr.mock.calls.map(([value]) => String(value));
+      for (const kind of ["vectors", "descriptions", "reranking"]) {
+        expect(notices.filter((line) => line.includes(`kind=${kind}`) && line.includes(`notice-${kind}-default`))).toHaveLength(1);
+        expect(notices.filter((line) => line.includes(`kind=${kind}`) && line.includes(`notice-${kind}-verbose`))).toHaveLength(2);
+      }
+      expect(notices.every((line) => line.startsWith("slopdex: notice: external model call:") && line.endsWith("\n"))).toBe(true);
+    } finally {
+      stderr.mockRestore();
+    }
   });
 });
 

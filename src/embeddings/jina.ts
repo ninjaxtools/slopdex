@@ -2,6 +2,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { embed, embedMany } from "ai";
 
 import type { EmbeddingProvider } from "../types.js";
+import { reportModelCall } from "../model-call-notice.js";
 import { requestEmbeddings } from "./ai-sdk.js";
 
 export interface JinaEmbeddingProviderOptions {
@@ -9,12 +10,14 @@ export interface JinaEmbeddingProviderOptions {
   model?: string;
   dimensions?: number;
   baseUrl?: string;
+  verbose?: boolean;
 }
 
 export class JinaEmbeddingProvider implements EmbeddingProvider {
   public readonly profile;
   readonly #apiKey: string;
   readonly #baseUrl: string;
+  readonly #verbose: boolean;
 
   public constructor(options: JinaEmbeddingProviderOptions = {}) {
     this.#apiKey = options.apiKey ?? process.env.JINA_API_KEY ?? "";
@@ -28,12 +31,14 @@ export class JinaEmbeddingProvider implements EmbeddingProvider {
       dimensions,
       strategyVersion: "callable-v2:code-query-passage",
     } as const;
+    this.#verbose = options.verbose ?? false;
     const url = (options.baseUrl ?? "https://api.jina.ai/v1/embeddings").replace(/\/$/, "");
     this.#baseUrl = url.endsWith("/embeddings") ? url.slice(0, -"/embeddings".length) : url;
   }
 
   public async embedDocuments(inputs: readonly string[], options?: { signal?: AbortSignal }): Promise<number[][]> {
     if (inputs.length === 0) return [];
+    reportModelCall("vectors", this.profile, this.#verbose);
     return requestEmbeddings(
       embedMany({
         model: this.#model("code.passage"),
@@ -47,6 +52,7 @@ export class JinaEmbeddingProvider implements EmbeddingProvider {
   }
 
   public async embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]> {
+    reportModelCall("vectors", this.profile, this.#verbose);
     return (await requestEmbeddings(
       embed({
         model: this.#model("code.query"),
