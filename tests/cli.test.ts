@@ -514,6 +514,7 @@ describe("CLI help", () => {
       "slopdex models opencode-go",
       "slopdex config model opencode-go/gpt-5.6-luna",
       "slopdex config descriptions enable",
+      "slopdex config reranker cohere",
       "slopdex update-files",
       "slopdex reindex-files",
       "slopdex delete-files",
@@ -639,6 +640,83 @@ globalThis.fetch = async (input, options) => {
     const disabled = run("status");
     expect(disabled.status, disabled.stderr).toBe(0);
     expect(JSON.parse(disabled.stdout).descriptionsEnabled).toBe(false);
+  });
+});
+
+describe("CLI reranker configuration", () => {
+  it("enables, uses, changes, and disables hosted reranking without opening an index during config", () => {
+    const root = temporaryRoot();
+    const configPath = path.join(root, ".slopdex", "config.json");
+    write(root, "functions.ts", [
+      "export function one() { return 1; }",
+      "export function two() { return 2; }",
+    ].join("\n"));
+    write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2 }));
+    write(root, ".slopdex/mock-api.mjs", `
+globalThis.fetch = async (url, options) => {
+  const body = JSON.parse(options.body);
+  if (String(url) === 'https://api.openai.com/v1/embeddings') {
+    return Response.json({data: body.input.map((_, index) => ({index, embedding: [1, 0]}))});
+  }
+  if (String(url) === 'https://api.cohere.com/v2/rerank') {
+    return Response.json({results: [
+      {index: 1, relevance_score: 0.95},
+      {index: 0, relevance_score: 0.25}
+    ].slice(0, body.top_n)});
+  }
+  throw new Error('Unexpected API URL: ' + url);
+};
+`);
+    const env = {
+      ...process.env,
+      NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}`,
+      COHERE_API_KEY: "test",
+    };
+    const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
+
+    const enabled = run("config", "reranker", "cohere", "rerank-v4.0-fast", "--format", "json");
+    expect(enabled.status, enabled.stderr).toBe(0);
+    expect(JSON.parse(enabled.stdout)).toMatchObject({
+      configPath,
+      rerankingEnabled: true,
+      rerankerProvider: "cohere",
+      rerankerModel: "rerank-v4.0-fast",
+    });
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
+    const search = run("search", "find two", "--limit", "1", "--format", "json");
+    expect(search.status, search.stderr).toBe(0);
+    expect(JSON.parse(search.stdout)).toMatchObject([
+      { similarity: 1, rerankScore: 0.95, function: { name: "two" } },
+    ]);
+
+    const jina = run("config", "reranker", "jina");
+    expect(jina.status, jina.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({
+      rerankingEnabled: true,
+      rerankerProvider: "jina",
+      rerankerModel: "jina-reranker-v3.5",
+    });
+    const disabled = run("config", "reranker", "disable");
+    expect(disabled.status, disabled.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(configPath, "utf8")).rerankingEnabled).toBe(false);
+  });
+
+  it("rejects invalid reranker configuration before creating an index", () => {
+    const root = temporaryRoot();
+    const invalid = runCli(root, "config", "reranker", "unknown");
+    expect(invalid.status).toBe(2);
+    expect(invalid.stderr).toContain("requires cohere, jina, or disable");
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
+    write(root, ".slopdex/config.json", JSON.stringify({ rerankingEnabled: true, rerankerProvider: "cohere", rerankerModel: 3 }));
+    const malformed = runCli(root, "status");
+    expect(malformed.status).toBe(2);
+    expect(malformed.stderr).toContain("rerankerModel must be a non-empty string");
+
+    const disabled = runCli(root, "config", "reranker", "disable");
+    expect(disabled.status, disabled.stderr).toBe(0);
+    expect(runCli(root, "status").status).toBe(0);
   });
 });
 

@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { CodeIndex } from "../src/code-index.js";
 import { crossSearch } from "../src/search/cross-search.js";
 import { FakeEmbeddingProvider, temporaryRoot, write } from "./helpers.js";
-import type { EmbeddingProvider } from "../src/types.js";
+import type { DescriptionProvider, EmbeddingProvider, Reranker } from "../src/types.js";
 
 describe("similarity search", () => {
   it("returns multiple results in descending similarity order", async () => {
@@ -49,6 +49,96 @@ export function addNumbers(a: number, b: number) { return a + b; }
     await reopened.similaritySearch({ query: "same query" });
     expect(provider.queries).toEqual(["same query"]);
     reopened.close();
+  });
+
+  it("reranks a wider candidate set while preserving embedding similarity", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", ["one", "two", "three", "four", "five"]
+      .map((name) => `export function ${name}() { return ${JSON.stringify(name)}; }`)
+      .join("\n"));
+    const requests: Array<{ query: string; documents: readonly string[]; limit?: number }> = [];
+    const reranker: Reranker = {
+      profile: { provider: "test", model: "controlled" },
+      rerank: async (query, documents, options) => {
+        requests.push({ query, documents, ...(options?.limit !== undefined ? { limit: options.limit } : {}) });
+        return [{ index: 4, score: 0.98 }];
+      },
+    };
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: {
+        profile: { provider: "controlled", model: "equal", dimensions: 2 },
+        embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+        embedQuery: async () => [1, 0],
+      },
+      reranker,
+    });
+    await index.updateFiles({ upsert: ["functions.ts"] });
+
+    const results = await index.similaritySearch({ query: "find the fifth function", limit: 1 });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ query: "find the fifth function", limit: 1 });
+    expect(requests[0]!.documents).toHaveLength(5);
+    expect(requests[0]!.documents[4]).toContain("symbol: five");
+    expect(results).toMatchObject([{ similarity: 1, rerankScore: 0.98, function: { name: "five" } }]);
+    index.close();
+  });
+
+  it("reranks description searches using candidate purpose text", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    const documents: string[][] = [];
+    const descriptionProvider: DescriptionProvider = {
+      profile: { provider: "test", model: "purposes", strategyVersion: "test-v1" },
+      describeFile: async () => "Contains numbered functions.",
+      describe: async ({ callable }) => `Purpose of ${callable.name}.`,
+    };
+    const reranker: Reranker = {
+      profile: { provider: "test", model: "controlled" },
+      rerank: async (_query, inputs) => {
+        documents.push([...inputs]);
+        return [{ index: 1, score: 0.9 }];
+      },
+    };
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: {
+        profile: { provider: "controlled", model: "equal", dimensions: 2 },
+        embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+        embedQuery: async () => [1, 0],
+      },
+      descriptionProvider,
+      reranker,
+    });
+    await index.updateFiles({ upsert: ["functions.ts"] });
+    await index.useDescriptions();
+
+    const results = await index.searchDescription({ query: "second purpose", limit: 1 });
+
+    expect(documents[0]).toEqual([
+      "path: functions.ts\nsymbol: one\ndescription: Purpose of one.",
+      "path: functions.ts\nsymbol: two\ndescription: Purpose of two.",
+    ]);
+    expect(results).toMatchObject([{ rerankScore: 0.9, function: { name: "two" } }]);
+    index.close();
+  });
+
+  it("rejects invalid output from custom rerankers", async () => {
+    const root = temporaryRoot();
+    write(root, "function.ts", "export function one() { return 1; }\n");
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: new FakeEmbeddingProvider(),
+      reranker: {
+        profile: { provider: "broken", model: "test" },
+        rerank: async () => [{ index: 5, score: Number.NaN }],
+      },
+    });
+    await index.updateFiles({ upsert: ["function.ts"] });
+
+    await expect(index.similaritySearch({ query: "one" })).rejects.toThrow(/broken returned invalid reranking results/);
+    index.close();
   });
 });
 

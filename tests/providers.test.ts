@@ -8,6 +8,7 @@ import { JinaEmbeddingProvider } from "../src/embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "../src/embeddings/openai.js";
 import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
 import { parseCallables } from "../src/parser/callable-parser.js";
+import { CohereReranker, JinaReranker } from "../src/rerankers/hosted.js";
 
 const servers: Server[] = [];
 
@@ -225,6 +226,52 @@ describe("embedding providers", () => {
     const provider = new OpenAIEmbeddingProvider({ apiKey: "test", baseUrl: url, dimensions: 2 });
 
     await expect(provider.embedDocuments(["one"])).rejects.toThrow(/Embedding request failed/);
+  });
+});
+
+describe("rerankers", () => {
+  it("sends Cohere rerank requests and maps ranked indexes to scores", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const paths: string[] = [];
+    const url = await startServer(requests, {
+      results: [
+        { index: 1, relevance_score: 0.9 },
+        { index: 0, relevance_score: 0.2 },
+      ],
+    }, false, paths);
+    const reranker = new CohereReranker({ apiKey: "test", baseUrl: url });
+
+    await expect(reranker.rerank("find validation", ["first", "second"], { limit: 2 })).resolves.toEqual([
+      { index: 1, score: 0.9 },
+      { index: 0, score: 0.2 },
+    ]);
+    expect(reranker.profile).toEqual({ provider: "cohere", model: "rerank-v4.0-pro" });
+    expect(paths).toEqual(["/v1/rerank"]);
+    expect(requests[0]).toEqual({
+      model: "rerank-v4.0-pro",
+      query: "find validation",
+      documents: ["first", "second"],
+      top_n: 2,
+    });
+  });
+
+  it("uses Jina's current model and omits documents from the response", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, { results: [{ index: 0, relevance_score: 0.75 }] });
+    const reranker = new JinaReranker({ apiKey: "test", baseUrl: url });
+
+    await expect(reranker.rerank("find parsing", ["parser"], { limit: 1 })).resolves.toEqual([
+      { index: 0, score: 0.75 },
+    ]);
+    expect(reranker.profile).toEqual({ provider: "jina", model: "jina-reranker-v3.5" });
+    expect(requests[0]).toMatchObject({ return_documents: false, top_n: 1 });
+  });
+
+  it("rejects malformed reranking responses", async () => {
+    const url = await startServer([], { results: [{ index: 3, relevance_score: "high" }] });
+    const reranker = new CohereReranker({ apiKey: "test", baseUrl: url });
+
+    await expect(reranker.rerank("query", ["document"])).rejects.toThrow(/malformed reranking response/);
   });
 });
 

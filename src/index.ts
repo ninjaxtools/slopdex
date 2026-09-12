@@ -8,6 +8,8 @@ export type { DescriptionProviderName, OpenAIDescriptionProviderOptions } from "
 export type { OpenAIEmbeddingProviderOptions } from "./embeddings/openai.js";
 export { JinaEmbeddingProvider } from "./embeddings/jina.js";
 export type { JinaEmbeddingProviderOptions } from "./embeddings/jina.js";
+export { CohereReranker, JinaReranker } from "./rerankers/hosted.js";
+export type { CohereRerankerOptions, JinaRerankerOptions } from "./rerankers/hosted.js";
 export { CodeIndexError, GitDivergenceError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 export type * from "./types.js";
 

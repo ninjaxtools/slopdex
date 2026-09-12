@@ -11,7 +11,7 @@ For installation, command examples, configuration, and result interpretation, se
 | `src/parser/` | Language dispatch, native Tree-sitter extraction, callable identity, and recoverable diagnostics. |
 | `src/source-policy.ts`, `src/gitignore.ts` | Supported paths, built-in/config exclusions, nested ignore rules. |
 | `src/git/repository.ts` | Git commits, trees, blobs, diffs, ancestry, and working-tree changes. |
-| `src/embeddings/`, `src/descriptions/` | Provider requests and provider profiles. |
+| `src/embeddings/`, `src/descriptions/`, `src/rerankers/` | Provider requests and provider profiles. |
 | `src/storage/database.ts` | SQLite schema, durable artifact caches, transactions, metadata, and vector queries. |
 | `src/search/` | Analysis scoring selection and cross-index neighbor discovery. |
 | `src/analysis/cohesion.ts` | Physical distance, gap scores, aggregate affinity, and groups. |
@@ -82,6 +82,8 @@ Description inputs include contextual and profile information so file-context, p
 
 `search` embeds a query and, when descriptions are complete, scores code, callable-description, and containing-file-description vectors. `search-description` scores callable and file descriptions. Analysis uses code-only cosine similarity unless all indexed callables and files have enabled description embeddings. Cross-index analysis requires completeness on both sides. Description-generator models may differ across indexes even though embedding profiles must match.
 
+An optional `Reranker` performs a hosted second-stage pass for the two natural-language query methods. The vector query retrieves five times the requested result limit after applying name and similarity filters. The reranker receives the query plus candidate code metadata/source, or candidate purpose text for description search, and returns the requested number in relevance order. Results preserve the embedding/fused `similarity` and add `rerankScore`. Cohere defaults to `rerank-v4.0-pro` with `COHERE_API_KEY`; Jina defaults to `jina-reranker-v3.5` with `JINA_API_KEY`. Reranking does not participate in index metadata or cross-search because it creates no persisted artifacts and cross-search is callable-to-callable analysis rather than natural-language retrieval.
+
 When descriptions are complete:
 
 ```text
@@ -109,11 +111,12 @@ Affinity ratios and mean distance are weighted by `semanticWeight`. Cohesion met
 ## Library API
 
 ```ts
-import { OpenAIEmbeddingProvider, openCodeIndex } from "@ninjaxtools/slopdex";
+import { CohereReranker, OpenAIEmbeddingProvider, openCodeIndex } from "@ninjaxtools/slopdex";
 
 const index = openCodeIndex({
   rootDir: "/path/to/repository",
   provider: new OpenAIEmbeddingProvider(),
+  reranker: new CohereReranker(),
 });
 
 try {
@@ -128,7 +131,7 @@ try {
 }
 ```
 
-Exports include `CodeIndex`, `crossSearch`, `analyzeCohesion`, `cohesionLocation`, `JinaEmbeddingProvider`, `OpenAIDescriptionProvider`, error types, and the contracts in `src/types.ts`. Standalone update/search helpers wrap the corresponding index methods.
+Exports include `CodeIndex`, `crossSearch`, `analyzeCohesion`, `cohesionLocation`, embedding/description providers, `CohereReranker`, `JinaReranker`, error types, and the contracts in `src/types.ts`. Standalone update/search helpers wrap the corresponding index methods.
 
 - Use `updateFromWorkingTree()` when Git is unavailable. Unlike the CLI, the library does not automatically refresh before queries or fall back from Git.
 - Set `sourceFilter.nameRegex` for source-only cross-search/cohesion filtering; combine it with `path` and a filter type (`all`, `changed-since`, or `uncommitted`). `changed-since` also accepts `uncommitted: true`.

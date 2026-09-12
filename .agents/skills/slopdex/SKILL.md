@@ -16,6 +16,15 @@ slopdex search "persist user data" -e 'save|persist' --format summary --limit 5
 
 Describe behavior rather than guessing a symbol name. `-e` is a regex that restricts which symbols (functions) are searched.
 
+Hosted reranking is optional and persists in repository config:
+
+```bash
+slopdex config reranker cohere
+# Or: slopdex config reranker jina
+```
+
+Set `COHERE_API_KEY` or `JINA_API_KEY` respectively. Disable it with `slopdex config reranker disable`. Reranking applies to `search` and `search-description`, not cross-search. It preserves embedding `similarity`, adds `rerankScore`, and orders a wider candidate set by that score.
+
 ### Search function purpose
 
 Code purpose-description generation needs to be enabled once:
@@ -191,6 +200,8 @@ Use `--no-reindex` when the task calls for committed-only results or reuse of an
 | `status`, update commands, `descriptions` | JSON object | — |
 
 Prefer summary output for compact source review, clusters for duplicate families, and JSON/JSONL for structured processing. Stdout carries results; stderr carries notices and warnings. Cross-search omits sources without emitted matches. Empty output means no findings under the chosen coverage/filters, not proof that no similar code exists.
+
+With hosted reranking enabled, query summaries display both reranker relevance and embedding similarity. Similarity thresholds filter candidates before reranking; limits apply to the reranked output.
 
 ### Similarity and clusters
 

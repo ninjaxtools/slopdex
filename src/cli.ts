@@ -10,6 +10,7 @@ import { JinaEmbeddingProvider } from "./embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
+import { CohereReranker, JinaReranker } from "./rerankers/hosted.js";
 import { crossSearch } from "./search/cross-search.js";
 import {
   descriptionProviderBaseUrl,
@@ -27,6 +28,7 @@ import type {
   EmbeddingProvider,
   IndexedFunction,
   SimilarityResult,
+  Reranker,
   DescriptionProfile,
   UpdateStats,
 } from "./types.js";
@@ -45,6 +47,9 @@ interface FileConfig {
   descriptionProvider?: DescriptionProviderName;
   descriptionModel?: string;
   descriptionsEnabled?: boolean;
+  rerankerProvider?: "cohere" | "jina";
+  rerankerModel?: string;
+  rerankingEnabled?: boolean;
 }
 
 type OpenCodeDescriptionProvider = Exclude<DescriptionProviderName, "openai">;
@@ -175,10 +180,12 @@ async function main(): Promise<void> {
     return;
   }
   const provider = createProvider(config);
+  const reranker = command === "search" || command === "search-description" ? createReranker(config) : undefined;
   const descriptionProvider = createDescriptionProvider(config);
   const indexOptions: CodeIndexOptions = {
     rootDir,
     provider,
+    ...(reranker ? { reranker } : {}),
     ...(descriptionProvider ? { descriptionProvider } : {}),
     onWarning: () => {}, // Persisted diagnostics are reported once per index at exit.
     ...(parsed.values.index || config.indexPath ? { indexPath: parsed.values.index ?? config.indexPath } : {}),
@@ -493,6 +500,18 @@ function commandLineConfig(config: FileConfig): FileConfig {
   if (descriptionProviderValue !== undefined && !isDescriptionProviderName(descriptionProviderValue)) {
     throw new CodeIndexError(`Unsupported description provider: ${descriptionProviderValue}`);
   }
+  if (config.rerankingEnabled !== undefined && typeof config.rerankingEnabled !== "boolean") {
+    throw new CodeIndexError("rerankingEnabled must be a boolean.");
+  }
+  if (config.rerankingEnabled === true) {
+    if (config.rerankerProvider !== "cohere" && config.rerankerProvider !== "jina") {
+      throw new CodeIndexError(`Unsupported reranker provider: ${String(config.rerankerProvider)}`);
+    }
+    if (config.rerankerModel !== undefined
+      && (typeof config.rerankerModel !== "string" || !config.rerankerModel.trim())) {
+      throw new CodeIndexError("rerankerModel must be a non-empty string.");
+    }
+  }
   return {
     ...config,
     ...(provider ? { provider } : {}),
@@ -566,11 +585,23 @@ async function runConfig(rootDir: string): Promise<void> {
   if (action === "descriptions") {
     config.descriptionsEnabled = positionals[1] === "enable";
     result = { descriptionsEnabled: config.descriptionsEnabled };
-  } else {
+  } else if (action === "model") {
     const selected = await resolveConfiguredModel(positionals[1]);
     config.descriptionProvider = selected.provider;
     config.descriptionModel = selected.model;
     result = { descriptionProvider: selected.provider, descriptionModel: selected.model };
+  } else {
+    const provider = positionals[1] as "cohere" | "jina" | "disable";
+    if (provider === "disable") {
+      config.rerankingEnabled = false;
+      result = { rerankingEnabled: false };
+    } else {
+      const model = positionals[2] ?? (provider === "cohere" ? "rerank-v4.0-pro" : "jina-reranker-v3.5");
+      config.rerankerProvider = provider;
+      config.rerankerModel = model;
+      config.rerankingEnabled = true;
+      result = { rerankingEnabled: true, rerankerProvider: provider, rerankerModel: model };
+    }
   }
   writeConfigFile(configPath, config);
   const format = outputFormat("summary");
@@ -674,6 +705,17 @@ function createProvider(config: FileConfig): EmbeddingProvider {
   });
 }
 
+function createReranker(config: FileConfig): Reranker | undefined {
+  if (config.rerankingEnabled !== true) return undefined;
+  if (config.rerankerProvider === "cohere") {
+    return new CohereReranker(config.rerankerModel ? { model: config.rerankerModel } : {});
+  }
+  if (config.rerankerProvider === "jina") {
+    return new JinaReranker(config.rerankerModel ? { model: config.rerankerModel } : {});
+  }
+  throw new CodeIndexError("rerankerProvider is required when rerankingEnabled is true.");
+}
+
 function numberOption(value: string | undefined, defaultValue: number, name: string): number {
   if (value === undefined) return defaultValue;
   const parsedValue = Number(value);
@@ -711,7 +753,16 @@ function validateInvocation(): void {
         }
         return;
       }
-      throw new CodeIndexError("config requires descriptions or model.");
+      if (positionals[0] === "reranker") {
+        const provider = positionals[1];
+        if ((provider !== "cohere" && provider !== "jina" && provider !== "disable")
+          || positionals.length > (provider === "disable" ? 2 : 3)
+          || (positionals[2] !== undefined && !positionals[2].trim())) {
+          throw new CodeIndexError("config reranker requires cohere, jina, or disable, optionally followed by a model ID.");
+        }
+        return;
+      }
+      throw new CodeIndexError("config requires descriptions, model, or reranker.");
     case "index-errors":
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
@@ -840,6 +891,7 @@ Commands:
   models [opencode|opencode-go]        List current published OpenCode models
   config model <model|provider/model>  Validate and save an OpenCode description model
   config descriptions <enable|disable> Save description state without opening an index
+  config reranker <cohere|jina|disable> Save query-search reranking settings
   status                              Show index metadata
   index-errors                        List persisted file and function indexing failures
   update-files <path...>              Index specific working-tree files
@@ -967,6 +1019,9 @@ Other Examples:
 
   Find functions matching a semantic query:
     slopdex search "validate an authenticated session" --limit 10
+
+  Enable hosted reranking for query searches:
+    slopdex config reranker cohere
 
   Enable purpose descriptions, then search by their meaning:
     slopdex descriptions enable

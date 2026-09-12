@@ -65,6 +65,20 @@ export interface EmbeddingProvider {
   embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]>;
 }
 
+export interface RerankerProfile {
+  provider: string;
+  model: string;
+}
+
+export interface Reranker {
+  readonly profile: RerankerProfile;
+  rerank(
+    query: string,
+    documents: readonly string[],
+    options?: { limit?: number; signal?: AbortSignal },
+  ): Promise<Array<{ index: number; score: number }>>;
+}
+
 export interface DescriptionProfile {
   provider: string;
   model: string;
@@ -107,6 +121,8 @@ export interface CodeIndexOptions {
   rootDir: string;
   indexPath?: string;
   provider: EmbeddingProvider;
+  /** Optional second-stage ranker for natural-language query searches. */
+  reranker?: Reranker;
   descriptionProvider?: DescriptionProvider;
   onWarning?: (message: string) => void;
   include?: readonly string[];
@@ -179,6 +195,8 @@ export interface AnalysisSimilarity {
 
 export interface SimilarityResult extends SimilarityScores {
   function: IndexedFunction;
+  /** Provider relevance score when a second-stage reranker ordered this result. */
+  rerankScore?: number;
 }
 
 export type CrossSearchSourceFilter = (

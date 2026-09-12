@@ -32,6 +32,12 @@ describe("formatSimilaritySummary", () => {
     ].join("\n"));
   });
 
+  it("shows reranker and embedding scores for reranked query results", () => {
+    expect(formatSimilaritySummary([
+      { similarity: 0.75, rerankScore: 0.91234, function: indexedFunction("src/target.ts", "Target.fetch") },
+    ])).toBe("0.9123 rerank (0.7500 similarity)  src/target.ts :: Target.fetch");
+  });
+
   it("includes physical distance for cohesion-ranked matches", () => {
     expect(formatSimilaritySummary([
       { similarity: 0.75, physicalDistance: 4, function: indexedFunction("packages/target.ts", "Target.fetch") },

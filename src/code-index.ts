@@ -30,11 +30,13 @@ import { assertPositiveInteger, chunk, compileNameRegex, normalizeEmbeddingVecto
 
 const DEFAULT_MAX_FILE_SIZE = 1024 * 1024;
 const DEFAULT_BATCH_SIZE = 32;
+const RERANK_CANDIDATE_MULTIPLIER = 5;
 
 export class CodeIndex {
   public readonly rootDir: string;
   public readonly indexPath: string;
   public readonly provider;
+  public readonly reranker;
   public readonly descriptionProvider: DescriptionProvider;
   readonly #database: IndexDatabase;
   readonly #policy: SourcePolicy;
@@ -47,6 +49,7 @@ export class CodeIndex {
     this.rootDir = path.resolve(options.rootDir);
     this.indexPath = path.resolve(options.indexPath ?? path.join(this.rootDir, ".slopdex", "index.sqlite"));
     this.provider = options.provider;
+    this.reranker = options.reranker;
     const profile = normalizeProfile(options.provider.profile);
     assertPositiveInteger(profile.dimensions, "embedding dimensions");
     this.#database = new IndexDatabase(this.indexPath, this.rootDir, profile, options.readOnly ?? false);
@@ -847,12 +850,13 @@ export class CodeIndex {
     const vector = await this.#queryEmbedding(options.query, options.signal);
     throwIfAborted(options.signal);
     const includeFileDescriptions = this.#descriptionScoringAvailable();
-    return this.#database.searchVector(vector, {
-      descriptions: true, limit, minSimilarity: options.minSimilarity ?? -1,
+    const results = this.#database.searchVector(vector, {
+      descriptions: true, limit: this.#candidateLimit(limit), minSimilarity: options.minSimilarity ?? -1,
       ...(includeFileDescriptions ? { fileDescriptionVector: vector } : {}),
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
+    return await this.#rerank(options.query, results, limit, options.signal, true);
   }
 
   public async similaritySearch(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
@@ -863,13 +867,47 @@ export class CodeIndex {
     throwIfAborted(options.signal);
     const vector = await this.#queryEmbedding(options.query, options.signal);
     const includeDescriptions = this.#descriptionScoringAvailable();
-    return this.searchByVector(vector, {
+    const results = this.searchByVector(vector, {
       ...(includeDescriptions ? { descriptionVector: vector, fileDescriptionVector: vector } : {}),
-      limit,
+      limit: this.#candidateLimit(limit),
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       minSimilarity: options.minSimilarity ?? -1,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
+    return await this.#rerank(options.query, results, limit, options.signal);
+  }
+
+  #candidateLimit(limit: number): number {
+    return this.reranker ? limit * RERANK_CANDIDATE_MULTIPLIER : limit;
+  }
+
+  async #rerank(
+    query: string,
+    candidates: SimilarityResult[],
+    limit: number,
+    signal?: AbortSignal,
+    descriptionsOnly = false,
+  ): Promise<SimilarityResult[]> {
+    if (!this.reranker || candidates.length === 0) return candidates.slice(0, limit);
+    const documents = candidates.map(({ function: callable }) => descriptionsOnly
+      ? [`path: ${callable.path}`, `symbol: ${callable.qualifiedName}`, `description: ${callable.description ?? ""}`].join("\n")
+      : [`path: ${callable.path}`, callable.embeddingInput, callable.description ? `description:\n${callable.description}` : null]
+        .filter((value): value is string => value !== null).join("\n"));
+    const rerankLimit = Math.min(limit, candidates.length);
+    const rankings = await this.reranker.rerank(query, documents, signal ? { limit: rerankLimit, signal } : { limit: rerankLimit });
+    throwIfAborted(signal);
+    const seen = new Set<number>();
+    if (rankings.length !== rerankLimit) {
+      throw new CodeIndexError(`${this.reranker.profile.provider} returned invalid reranking results.`);
+    }
+    for (const { index, score } of rankings) {
+      if (!Number.isInteger(index) || index < 0 || index >= candidates.length
+        || typeof score !== "number" || !Number.isFinite(score) || seen.has(index)) {
+        throw new CodeIndexError(`${this.reranker.profile.provider} returned invalid reranking results.`);
+      }
+      seen.add(index);
+    }
+    return rankings.map(({ index, score }) => ({ ...candidates[index]!, rerankScore: score }));
   }
 
   async #queryEmbedding(query: string, signal?: AbortSignal): Promise<number[]> {

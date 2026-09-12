@@ -6,7 +6,9 @@ import path from "node:path";
 const library = await import("../dist/index.js");
 if (typeof library.openCodeIndex !== "function"
   || typeof library.crossSearch !== "function"
-  || typeof library.analyzeCohesion !== "function") {
+  || typeof library.analyzeCohesion !== "function"
+  || typeof library.CohereReranker !== "function"
+  || typeof library.JinaReranker !== "function") {
   throw new Error("Built library exports are incomplete.");
 }
 

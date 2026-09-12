@@ -8,9 +8,15 @@ export function formatSimilaritySummary(
   matches: readonly (SimilarityResult | CrossSearchMatch)[],
   source?: IndexedFunction,
 ): string {
-  const lines = matches.map((match) => `${source ? "  " : ""}${match.similarity.toFixed(4)}  ${functionName(match.function)}${distanceDetails(match)}${scoreDetails(match)}`);
+  const lines = matches.map((match) => `${source ? "  " : ""}${rankDetails(match)}  ${functionName(match.function)}${distanceDetails(match)}${scoreDetails(match)}`);
   if (!source) return lines.length > 0 ? lines.join("\n") : "No matches.";
   return [functionName(source), ...(lines.length > 0 ? lines : ["  No matches."])].join("\n");
+}
+
+function rankDetails(match: SimilarityResult | CrossSearchMatch): string {
+  return match.rerankScore === undefined
+    ? match.similarity.toFixed(4)
+    : `${match.rerankScore.toFixed(4)} rerank (${match.similarity.toFixed(4)} similarity)`;
 }
 
 function distanceDetails(match: SimilarityResult | CrossSearchMatch): string {
