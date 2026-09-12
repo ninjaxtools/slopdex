@@ -1,16 +1,22 @@
-import type { CohesionReport, CrossSearchResult, IndexedFunction, SimilarityResult, SimilarityScores } from "./types.js";
+import type { CohesionReport, CrossSearchMatch, CrossSearchResult, IndexedFunction, SimilarityResult, SimilarityScores } from "./types.js";
 
 function functionName(value: Pick<IndexedFunction, "path" | "qualifiedName">): string {
   return `${value.path} :: ${value.qualifiedName}`;
 }
 
 export function formatSimilaritySummary(
-  matches: readonly SimilarityResult[],
+  matches: readonly (SimilarityResult | CrossSearchMatch)[],
   source?: IndexedFunction,
 ): string {
-  const lines = matches.map((match) => `${source ? "  " : ""}${match.similarity.toFixed(4)}  ${functionName(match.function)}${scoreDetails(match)}`);
+  const lines = matches.map((match) => `${source ? "  " : ""}${match.similarity.toFixed(4)}  ${functionName(match.function)}${distanceDetails(match)}${scoreDetails(match)}`);
   if (!source) return lines.length > 0 ? lines.join("\n") : "No matches.";
   return [functionName(source), ...(lines.length > 0 ? lines : ["  No matches."])].join("\n");
+}
+
+function distanceDetails(match: SimilarityResult | CrossSearchMatch): string {
+  return "physicalDistance" in match && match.physicalDistance !== undefined
+    ? `  [distance ${match.physicalDistance}]`
+    : "";
 }
 
 export function formatSimilarityClusters(results: readonly CrossSearchResult[], sameIndex: boolean): string {

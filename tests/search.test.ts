@@ -93,6 +93,36 @@ export function three(value: number) { return value * 2; }
     index.close();
   });
 
+  it("can re-rank semantic matches by physical distance", async () => {
+    const root = temporaryRoot();
+    write(root, "src/feature/functions.ts", `
+export function source() { return 1; }
+export function sameFile() { return 2; }
+`);
+    write(root, "src/feature/sibling.ts", "export function sibling() { return 3; }\n");
+    write(root, "packages/remote.ts", "export function remote() { return 4; }\n");
+    const index = new CodeIndex({ rootDir: root, provider: {
+      profile: { provider: "controlled", model: "equal", dimensions: 2, strategyVersion: "callable-v1" },
+      embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+      embedQuery: async () => [1, 0],
+    } });
+    await index.updateFiles({ upsert: ["src/feature/functions.ts", "src/feature/sibling.ts", "packages/remote.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({
+      source: index,
+      sourceFilter: { type: "all", path: "src/feature/functions.ts" },
+      limitPerFunction: 3,
+      includeSymmetricDuplicates: true,
+      cohesion: true,
+      minLines: 1,
+    })) results.push(result);
+
+    expect(results[0]!.matches.map((match) => match.function.name)).toEqual(["remote", "sibling", "sameFile"]);
+    expect(results[0]!.matches.map((match) => match.physicalDistance)).toEqual([4, 1, 0]);
+    index.close();
+  });
+
   it("lists each same-index function pair only once by default", async () => {
     const root = temporaryRoot();
     write(root, "functions.ts", `

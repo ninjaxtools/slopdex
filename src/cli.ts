@@ -6,11 +6,10 @@ import { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
 
 import { CodeIndex } from "./code-index.js";
-import { analyzeCohesion } from "./analysis/cohesion.js";
 import { JinaEmbeddingProvider } from "./embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
-import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
+import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
 import {
   descriptionProviderBaseUrl,
@@ -22,9 +21,6 @@ import { readIndexErrorCounts, readIndexErrors, resetIndexState } from "./storag
 import { compileNameRegex } from "./utils.js";
 import type {
   CodeIndexOptions,
-  CohesionFunctionReference,
-  CohesionJsonReport,
-  CohesionReport,
   CrossSearchOptions,
   CrossSearchResult,
   CrossSearchSourceFilter,
@@ -89,10 +85,9 @@ const parsed = (() => {
         regex: { type: "string" },
         regexp: { type: "string", short: "e" },
         limit: { type: "string" },
-        neighbors: { type: "string" },
         threshold: { type: "string" },
         format: { type: "string" },
-        "include-source": { type: "boolean", default: false },
+        cohesion: { type: "boolean", default: false },
         "include-symmetric-duplicates": { type: "boolean", default: false },
         "cross-file-only": { type: "boolean", default: false },
         "rebuild-on-divergence": { type: "boolean", default: false },
@@ -251,23 +246,6 @@ async function main(): Promise<void> {
       case "cross-search":
         await runCrossSearch(index, indexOptions, provider);
         break;
-      case "cohesion": {
-        const threshold = cohesionThreshold();
-        const report = await analyzeCohesion({
-          source: index,
-          sourceFilter: crossSearchSourceFilter(),
-          neighbors: positiveIntegerOption(parsed.values.neighbors, 20, "neighbors"),
-          limit: positiveIntegerOption(parsed.values.limit, 50, "limit"),
-          minSimilarity: threshold.min,
-          ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
-          minLines: minimumLines(),
-        });
-        const format = outputFormat("summary");
-        if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
-        if (format === "summary") process.stdout.write(`${formatCohesionSummary(report)}\n`);
-        else printJson(presentCohesionReport(report, parsed.values["include-source"]));
-        break;
-      }
       default:
         throw new CodeIndexError(`Unknown command: ${command}`);
     }
@@ -316,7 +294,7 @@ async function runCrossSearch(
     );
   }
   const target = targetOptions ? new CodeIndex({ ...targetOptions, readOnly: true }) : undefined;
-  const format = outputFormat("clusters");
+  const format = outputFormat(parsed.values.cohesion ? "summary" : "clusters");
   const threshold = similarityThreshold();
   const searchOptions: CrossSearchOptions = {
     source,
@@ -327,6 +305,7 @@ async function runCrossSearch(
     ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
     includeSymmetricDuplicates: parsed.values["include-symmetric-duplicates"],
     crossFileOnly: parsed.values["cross-file-only"],
+    cohesion: parsed.values.cohesion,
     minLines: minimumLines(),
   };
   try {
@@ -703,10 +682,13 @@ function numberOption(value: string | undefined, defaultValue: number, name: str
 }
 
 function validateInvocation(): void {
+  if (parsed.values.cohesion && command !== "cross-search") {
+    throw new CodeIndexError("--cohesion is only available for cross-search.");
+  }
   const nameRegex = qualifiedNameRegex();
   if (nameRegex !== undefined) {
-    if (!["search", "search-description", "cross-search", "cohesion"].includes(command!)) {
-      throw new CodeIndexError("-e/--regexp/--regex is only available for search, search-description, cross-search, and cohesion.");
+    if (!["search", "search-description", "cross-search"].includes(command!)) {
+      throw new CodeIndexError("-e/--regexp/--regex is only available for search, search-description, and cross-search.");
     }
     compileNameRegex(nameRegex, parsed.values.regex !== undefined ? "--regex value" : "-e/--regexp value");
   }
@@ -767,15 +749,10 @@ function validateInvocation(): void {
       }
       validateLimit(5);
       similarityThreshold();
-      outputFormat("clusters");
-      minimumLines();
-      crossSearchSourceFilter();
-      return;
-    case "cohesion":
-      positiveIntegerOption(parsed.values.limit, 50, "limit");
-      positiveIntegerOption(parsed.values.neighbors, 20, "neighbors");
-      cohesionThreshold();
-      if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      if (parsed.values.cohesion && outputFormat("summary") === "clusters") {
+        throw new CodeIndexError("clusters format does not preserve cohesion match order; use summary or json.");
+      }
+      outputFormat(parsed.values.cohesion ? "summary" : "clusters");
       minimumLines();
       crossSearchSourceFilter();
       return;
@@ -806,14 +783,6 @@ function similarityThreshold(defaultMin = -1): { min: number; max?: number } {
   if (!Number.isFinite(min) || !Number.isFinite(max)) throw new CodeIndexError("threshold range bounds must be numbers.");
   if (min >= max) throw new CodeIndexError("threshold range minimum must be less than its maximum.");
   return { min, max };
-}
-
-function cohesionThreshold(): { min: number; max?: number } {
-  const threshold = similarityThreshold(0.8);
-  if (threshold.min < -1 || threshold.min >= 1) {
-    throw new CodeIndexError("cohesion threshold must be at least -1 and less than 1.");
-  }
-  return threshold;
 }
 
 function outputFormat(defaultValue: "json" | "summary" | "clusters"): "json" | "summary" | "clusters" {
@@ -860,42 +829,6 @@ function presentMatch(value: SimilarityResult) {
   return { ...scores, function: presentFunction(callable) };
 }
 
-function presentCohesionReport(report: CohesionReport, includeSource: boolean): CohesionJsonReport {
-  const presentCohesionFunction = (value: IndexedFunction): CohesionFunctionReference => ({
-    path: value.path,
-    qualifiedName: value.qualifiedName,
-    kind: value.kind,
-    signature: value.signature,
-    startLine: value.startLine,
-    startColumn: value.startColumn,
-    endLine: value.endLine,
-    endColumn: value.endColumn,
-    lineCount: value.lineCount,
-    ...(includeSource ? { source: value.source } : {}),
-  });
-  return {
-    ...report,
-    pairs: report.pairs.map((pair) => ({
-      ...pair,
-      left: presentCohesionFunction(pair.left),
-      right: presentCohesionFunction(pair.right),
-    })),
-    files: report.files.map((file) => ({
-      ...file,
-      ...(file.strongestExternalMatch ? {
-        strongestExternalMatch: {
-          ...file.strongestExternalMatch,
-          function: presentCohesionFunction(file.strongestExternalMatch.function),
-        },
-      } : {}),
-    })),
-    groups: report.groups.map((group) => ({
-      ...group,
-      members: group.members.map(presentCohesionFunction),
-    })),
-  };
-}
-
 function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
@@ -917,7 +850,6 @@ Commands:
   descriptions <enable|disable>       Enable or disable automatic purpose descriptions
   search-description <query>          Search functions using description embeddings
   cross-search                        Find nearest functions for each source function
-  cohesion                            Rank related functions separated across the repository
 
 Languages (automatically detected with Tree-sitter):
   Python (.py, .pyw), JavaScript (.js, .mjs, .cjs), JSX (.jsx),
@@ -942,31 +874,25 @@ Analysis Examples:
     evidence to inspect rather than proof they should merge. Connected components may use
     transitive links, so every function need not directly match every other function.
 
-  Cohesion Analysis:
-    slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
+  Physical Cohesion Review:
+    slopdex cross-search --cohesion --threshold 0.8 --limit 20 --format summary
 
-    Cohesion: 184 functions analyzed, 37 semantic edges
-      same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84
+    src/auth/session.ts :: validateSession
+      0.9400  packages/http/middleware.ts :: authenticate  [distance 4]
+      0.9300  src/auth/token.ts :: validateToken  [distance 1]
 
-    1. gap 0.6053  similarity 0.9400  distance 4  reciprocal
-       src/auth/session.ts:18:1 :: validateSession
-       packages/http/middleware.ts:42:1 :: authenticate
-
-    There is no universal pass/fail cutoff, but this warrants review: 35.2% of weighted
-    semantic affinity crosses folders, mean distance 1.84 exceeds the same-folder distance
-    of one, and the top pair is 0.94 similar but four units apart. A more cohesive result
-    would concentrate affinity in the same file or folder and have few high-gap remote
-    pairs. Compare modules or history rather than treating one percentage as a fixed
-    threshold, and allow for intentionally separate architectural responsibilities.
+    --cohesion keeps cross-search's semantic matches but orders each source's matches
+    from greatest to least path distance. Similarity breaks distance ties. This highlights
+    related functions stored far apart without introducing a separate analysis command.
 
 Reading Analysis Output:
-  With complete description indexes, search, cross-search, and cohesion combine code, callable
+  With complete description indexes, search and cross-search combine code, callable
   description, and file description similarity equally. Cross-repository search requires complete descriptions on both sides;
   otherwise the analysis uses code-only similarity. Thresholds and limits apply after fusion.
   JSON includes component scores and description-generator profiles for reproducibility.
   Compare results only when similarity mode and weights match.
-  Compare values only with the same embedding profile and similar threshold, neighbor,
-  source-filter, and minimum-line settings.
+  Compare values only with the same embedding profile and similar threshold, source-filter,
+  and minimum-line settings.
 
   Duplicate cluster line:
     Cluster N           Display order by function count, then name; not severity
@@ -976,30 +902,11 @@ Reading Analysis Output:
                        indicate that a weaker transitive edge joined tighter matches
     callable location   path:line:column :: qualifiedFunctionName; inspect architectural roles
 
-  Cohesion headline:
-    functions analyzed  Filtered source coverage; higher or lower does not mean better or worse
-    semantic edges      Unique qualifying neighbor pairs before --limit; not a quality score
-                       More neighbors or a lower threshold generally increases this count
-
-  Cohesion distribution:
-    same file           Higher generally means related implementation is co-located
-    same folder         Higher means related modules remain locally grouped
-    remote              Higher means more affinity crosses folders and weaker physical cohesion
-    mean distance       Lower is generally more cohesive (same file 0, same folder 1)
-
-  Ranked cohesion finding:
-    rank                Lower number means higher review priority
-    gap                 0-to-1 combined signal; higher means strongly related and farther apart
-    similarity          Higher means greater resemblance; values are model-specific
-    distance            Higher means more file and directory-tree separation
-    reciprocal          Mutual top-neighbor relationship; strengthens confidence when present
-
-  JSON diagnostics:
-    semanticWeight      Higher means similarity is farther above --threshold
-    separationWeight    Higher means greater path distance, saturating near one
-    sourceTestPair      True flags a possibly intentional source/test relationship
-    externalAffinityRatio
-                       Higher means more of a file's related affinity lies outside its folder
+  Cohesion re-ranking:
+    distance            0 for the same file, 1 for files in the same folder, and
+                       1 plus directory-tree hops for files in different folders
+    ordering            Greater distance first; similarity breaks ties
+    JSON                Each match includes physicalDistance when --cohesion is enabled
 
 Options:
   --version                           Show the package version
@@ -1018,10 +925,9 @@ Options:
   --callables                         With reindex-files, also regenerate callable descriptions
   --ignore-errors                     Silence warnings about persisted indexing errors
   --limit <number>                    Search result limit
-  --neighbors <number>                Semantic neighbors per function for cohesion (default: 20)
   --threshold <number|range>          Show similarities at/above a value or within a range
   --format <json|summary|clusters>    Output format (default: summary; cross-search: clusters)
-  --include-source                    Include function source in cohesion JSON
+  --cohesion                          Re-rank cross-search matches by physical distance
   --include-symmetric-duplicates      Show both directions of same-index matches
   --cross-file-only                   Exclude matches from the source file
   --min-lines <number>               Minimum callable length for cross-search (default: 2)
@@ -1079,7 +985,7 @@ Other Examples:
     slopdex search "validate session" -e '^Session\\.' --limit 10
 
   -e/--regexp/--regex uses a case-sensitive JavaScript regex on qualified names. For cross-search
-  and cohesion it filters sources only; targets keep their normal eligibility rules.
+  it filters sources only; targets keep their normal eligibility rules.
   With --changed-since and --uncommitted, sources must be changed since the commit and
   belong to an uncommitted file. --source-path and the regex filter further narrow that intersection.
 `);

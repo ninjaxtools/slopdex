@@ -62,15 +62,15 @@ slopdex cross-search --changed-since origin/main --format summary --threshold 0.
 slopdex cross-search --source-path src/services -e '^UserService\.' --format summary --threshold 0.9
 ```
 
-These select source functions while keeping the full eligible index available for matches. The same source filters work with `cohesion`.
+These select source functions while keeping the full eligible index available for matches.
 
 ### Find related code stored far apart
 
 ```bash
-slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
+slopdex cross-search --cohesion --threshold 0.8 --limit 20 --format summary
 ```
 
-Ranks semantically related pairs by their physical separation.
+`--cohesion` keeps the semantic matches selected by cross-search, annotates them with physical distance, and orders each source's matches from farthest to nearest. Similarity breaks distance ties.
 
 ### Compare repositories
 
@@ -106,7 +106,6 @@ Usage: `slopdex <command> [arguments] [options]`.
 | `descriptions <enable\|disable>` | Enable or disable automatic purpose descriptions. Re-enabling with unchanged inputs reuses cached descriptions. | JSON statistics |
 | `search-description <query>` | Search purpose descriptions after enabling them. | Summary including description text; optional JSON array |
 | `cross-search` | Find neighbors for each selected function in this or another index. | `clusters` by default; optional `summary` or JSONL |
-| `cohesion` | Analyze semantic relationships versus file/folder separation. | Summary; optional JSON report |
 | `status` | Refresh and show index metadata, counts, and profiles. | JSON object |
 | `index-errors` | Read saved file/function indexing failures. | Summary; optional JSON array |
 | `update-git` | Explicitly refresh a Git snapshot, with current working-tree changes when targeting HEAD. | JSON update statistics |
@@ -148,18 +147,17 @@ Explicit relative config and index paths resolve from the current directory, not
 
 | Argument | Applies to | Meaning / default |
 | --- | --- | --- |
-| `--limit <number>` | Both query searches, cross-search, cohesion | Positive integer. Query matches: `10`; cross-search neighbors per source: `5`; cohesion reported pairs and file rows: `50`. |
-| `--threshold <number\|min-max>` | Both query searches, cross-search, cohesion | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `-1` for query/cross-search, `0.8` for cohesion. Cohesion minimum must be at least `-1` and below `1`. |
-| `--format <json\|summary\|clusters>` | Both query searches, cross-search, cohesion, index-errors | Output format; see the commands table. `clusters` is only for cross-search. |
-| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Both query searches, cross-search, cohesion | Equivalent case-sensitive JavaScript regex options over qualified names. Query searches: filter results before limiting. Analysis: filter sources only. |
-| `--min-lines <number>` | Cross-search, cohesion | Minimum source and candidate callable length; positive integer, default `2`. Use `1` to include one-line wrappers. |
-| `--source-path <path>` | Cross-search, cohesion | Select sources in a file or recursive directory, relative to the repository root (or absolute within it). |
-| `--changed-since <commit>` | Cross-search, cohesion | Select added, modified, or moved functions relative to an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
-| `--uncommitted` | Cross-search, cohesion | Select functions indexed from working-tree files: staged, unstaged, or untracked changes in Git; all working-tree functions without Git. |
+| `--limit <number>` | Both query searches, cross-search | Positive integer. Query matches: `10`; cross-search neighbors per source: `5`. |
+| `--threshold <number\|min-max>` | Both query searches, cross-search | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `-1`. |
+| `--format <json\|summary\|clusters>` | Both query searches, cross-search, index-errors | Output format; see the commands table. `clusters` is only for ordinary cross-search. |
+| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Both query searches, cross-search | Equivalent case-sensitive JavaScript regex options over qualified names. Query searches filter results before limiting; cross-search filters sources only. |
+| `--min-lines <number>` | Cross-search | Minimum source and candidate callable length; positive integer, default `2`. Use `1` to include one-line wrappers. |
+| `--source-path <path>` | Cross-search | Select sources in a file or recursive directory, relative to the repository root (or absolute within it). |
+| `--changed-since <commit>` | Cross-search | Select added, modified, or moved functions relative to an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
+| `--uncommitted` | Cross-search | Select functions indexed from working-tree files: staged, unstaged, or untracked changes in Git; all working-tree functions without Git. |
 | `--cross-file-only` | Cross-search | Exclude matches from the same physical file. |
 | `--include-symmetric-duplicates` | Cross-search | Allow both directions of same-index matches; otherwise each unordered pair is emitted once. |
-| `--neighbors <number>` | Cohesion | Neighbors considered per source; positive integer, default `20`. Changes the analysis graph. |
-| `--include-source` | Cohesion JSON | Include callable bodies; omitted by default. |
+| `--cohesion` | Cross-search | Add `physicalDistance` and re-rank each source's matches by descending distance, with similarity as the tie-breaker. Defaults to summary output; incompatible with clusters. |
 | `--target-root <path>` | Cross-search | Second repository root; requires `--target-index`. |
 | `--target-index <path>` | Cross-search | Second index file; requires `--target-root`. |
 | `--target-config <path>` | Cross-search | Target config; defaults to `<target-root>/.slopdex/config.json`. Requires both target options. |
@@ -197,30 +195,17 @@ Cluster 1 (3 functions, similarity 0.9124-0.9568)
 - Clusters sort by member count, then name. Cluster number is not severity.
 - Locations identify where to inspect behavior, callers, and architectural roles. Wrappers, adapters, tests, and separate interface implementations can legitimately resemble one another.
 
-### Cohesion
+### Physical cohesion
 
 ```text
-Cohesion: 184 functions analyzed, 37 semantic edges
-  same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84
-
-1. gap 0.6053  similarity 0.9400  distance 4  reciprocal
-   src/auth/session.ts:18:1 :: validateSession
-   packages/http/middleware.ts:42:1 :: authenticate
+src/auth/session.ts :: validateSession
+  0.9400  packages/http/middleware.ts :: authenticate  [distance 4]
+  0.9300  src/auth/token.ts :: validateToken  [distance 1]
 ```
 
-| Field | Interpretation |
-| --- | --- |
-| Functions analyzed / semantic edges | Selected-source coverage / unique qualifying neighbor pairs, before report limiting. Not quality scores. |
-| Same file / same folder / remote | Shares of weighted semantic affinity. Higher remote affinity means more related code crosses folder boundaries. |
-| Mean distance | Weighted physical separation: `0` for the same file, `1` for different files in one folder, larger across folders. |
-| Gap / rank | A `0–1` review score combining similarity above the threshold and separation; higher gap ranks first. Same-file pairs have zero gap. |
-| Reciprocal | Both functions selected each other as neighbors. JSON `null` means the other endpoint was not evaluated under source filtering. |
-| `sourceTestPair` | A source/test relationship inferred from paths; separation may be intentional. |
-| `externalAffinityRatio` | In JSON file reports, the share of observed affinity outside that file's folder. |
+Run cross-search with `--cohesion` to put physically distant matches first. Distance is `0` within one file, `1` between files in one folder, and `1` plus directory-tree hops across folders. The option only changes the order of each source's selected semantic matches; it does not change similarity scores or establish that distant code belongs together.
 
-The example suggests reviewing separated authentication responsibilities. It does not establish that they belong in one module. There is no universal cohesion pass threshold. Filtered reports describe selected sources, not the entire repository. Cohesion metrics cover all qualifying edges; reported pairs/files are limited, and groups are built from reported pairs.
-
-For automation, pass `--format json`: query searches and diagnostics return JSON arrays; cross-search returns **JSONL**, one row per matched source; cohesion returns one JSON object containing `repository`, `parameters`, `metrics`, `pairs`, `files`, and `groups`. Results go to stdout; notices and warnings go to stderr.
+For automation, pass `--format json`: query searches and diagnostics return JSON arrays; cross-search returns **JSONL**, one row per matched source. With `--cohesion`, each match includes `physicalDistance`. Results go to stdout; notices and warnings go to stderr.
 
 ## System behavior
 
@@ -234,9 +219,9 @@ Ordinary updates preserve an existing file description even when its source chan
 
 Tree-sitter extraction, generated descriptions, and document/query vectors are content-addressed in the same SQLite database. Each validated result is committed immediately, independently of the final logical index update. If indexing is interrupted or a later provider call fails, rerunning reuses every completed result whose profile, operation, input, and source context hash still match.
 
-With complete descriptions, `search`, cross-search, and cohesion average **one-third code similarity + one-third callable-description similarity + one-third file-description similarity**. `search-description` averages callable and file descriptions without code. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Stale file descriptions remain searchable until explicitly reindexed. Thresholds and neighbor limits apply to the selected score.
+With complete descriptions, `search` and cross-search average **one-third code similarity + one-third callable-description similarity + one-third file-description similarity**. `search-description` averages callable and file descriptions without code. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Stale file descriptions remain searchable until explicitly reindexed. Thresholds and limits apply to the selected score.
 
-Text output labels combined scores. JSON exposes `codeSimilarity`, `descriptionSimilarity`, `fileDescriptionSimilarity`, and scoring mode/weights (`scoring` for cross-search, `parameters` for cohesion). Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, neighbor count, and source/candidate filters.
+Text output labels combined scores. JSON exposes `codeSimilarity`, `descriptionSimilarity`, `fileDescriptionSimilarity`, and cross-search scoring mode/weights. Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, and source/candidate filters.
 
 ### Exclusions
 

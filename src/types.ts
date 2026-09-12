@@ -199,15 +199,22 @@ export interface CrossSearchOptions {
   maxSimilarity?: number;
   includeSymmetricDuplicates?: boolean;
   crossFileOnly?: boolean;
+  /** Re-rank each source's semantic matches from greatest to least physical path distance. */
+  cohesion?: boolean;
   minLines?: number;
   nameRegex?: string;
   signal?: AbortSignal;
   onProgress?: (progress: { completed: number; total: number }) => void;
 }
 
+export interface CrossSearchMatch extends SimilarityResult {
+  /** Present when cohesion re-ranking is enabled. */
+  physicalDistance?: number;
+}
+
 export interface CrossSearchResult {
   source: IndexedFunction;
-  matches: SimilarityResult[];
+  matches: CrossSearchMatch[];
   scoring?: AnalysisSimilarity & {
     sourceDescriptionProfile: DescriptionProfile | null;
     targetDescriptionProfile: DescriptionProfile | null;

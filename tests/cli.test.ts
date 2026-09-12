@@ -311,11 +311,9 @@ globalThis.fetch = async (_url, options) => {
     expect(clusters.status).toBe(0);
     expect(clusters.stdout).toBe("No clusters.\n");
 
-    const uncommitted = runCli(root, "cohesion", "--uncommitted", "--changed-since", base, "--source-path", "src", "-e", "keep$", "--format", "json");
+    const uncommitted = runCli(root, "cross-search", "--cohesion", "--uncommitted", "--changed-since", base, "--source-path", "src", "-e", "keep$", "--format", "json");
     expect(uncommitted.status).toBe(0);
-    expect(JSON.parse(uncommitted.stdout).parameters.sourceFilter).toEqual({
-      type: "changed-since", commit: base, uncommitted: true, path: "src", nameRegex: "keep$",
-    });
+    expect(uncommitted.stdout).toBe("");
   });
 
   it("filters same-file cross-search matches with --cross-file-only", async () => {
@@ -405,14 +403,17 @@ export function two(value: string) {
     expect(empty.stdout).toBe("");
   });
 
-  it("reports cohesion as a summary by default or compact JSON", async () => {
+  it("re-ranks cross-search matches by physical distance", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "src/one.ts", `export function one() {
   return 1;
 }\n`);
-    write(root, "packages/feature/two.ts", `export function two() {
+    write(root, "src/two.ts", `export function two() {
   return 2;
+}\n`);
+    write(root, "packages/feature/three.ts", `export function three() {
+  return 3;
 }\n`);
     commitAll(root, "functions");
     const openAI = new OpenAIEmbeddingProvider({ apiKey: "test" });
@@ -428,24 +429,25 @@ export function two(value: string) {
     await index.updateFromGit();
     index.close();
 
-    const summary = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1");
+    const summary = runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--limit", "2");
     expect(summary.status).toBe(0);
-    expect(summary.stdout).toContain("Cohesion: 2 functions analyzed, 1 semantic edge");
-    expect(summary.stdout).toContain("distance 4");
+    expect(summary.stdout).toContain("[distance 4]");
+    expect(summary.stdout.indexOf("packages/feature/three.ts")).toBeLessThan(summary.stdout.indexOf("src/two.ts"));
 
-    const json = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--format", "json");
+    const json = runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--limit", "2", "--format", "json");
     expect(json.status).toBe(0);
-    const report = JSON.parse(json.stdout);
-    expect(report.metrics).toMatchObject({ functionsAnalyzed: 2, semanticEdges: 1, remoteRatio: 1 });
-    expect(report.pairs).toHaveLength(1);
-    expect(report.pairs[0].left).not.toHaveProperty("source");
-    expect(report.groups[0].members[0]).not.toHaveProperty("source");
+    const rows = json.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    const one = rows.find((row) => row.source.qualifiedName === "one");
+    expect(one.matches.map((match: { function: { qualifiedName: string } }) => match.function.qualifiedName)).toEqual(["three", "two"]);
+    expect(one.matches.map((match: { physicalDistance: number }) => match.physicalDistance)).toEqual([4, 1]);
 
-    const included = runCli(root, "cohesion", "--neighbors", "5", "--limit", "1", "--include-source", "--regexp", "^one$", "--format", "json");
-    expect(JSON.parse(included.stdout).pairs[0].left).toHaveProperty("source");
-    expect(JSON.parse(included.stdout).parameters.sourceFilter).toEqual({ type: "all", nameRegex: "^one$" });
-    expect(JSON.parse(included.stdout).metrics).toMatchObject({ scope: "selected-sources", functionsAnalyzed: 1, candidateFunctions: 2 });
+    const clusters = runCli(root, "cross-search", "--cohesion", "--format", "clusters");
+    expect(clusters.status).toBe(2);
+    expect(clusters.stderr).toContain("does not preserve cohesion match order");
 
+    const removed = runCli(root, "cohesion");
+    expect(removed.status).toBe(2);
+    expect(removed.stderr).toContain("Unknown command: cohesion");
   });
 
   it.each(["--min-similarity", "--added-since"])("rejects removed option %s cleanly", (option) => {
@@ -476,7 +478,7 @@ export function two(value: string) {
     expect(emptyRange.stderr).toContain("minimum must be less than its maximum");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    for (const command of ["cross-search", "cohesion", "search", "search-description"]) {
+    for (const command of ["cross-search", "search", "search-description"]) {
       for (const option of ["-e", "--regex"]) {
         const invalidSourceRegex = runCli(root, command, ...(command.startsWith("search") ? ["query"] : []), option, "[");
         expect(invalidSourceRegex.status).toBe(2);
@@ -485,20 +487,11 @@ export function two(value: string) {
       }
     }
 
-    const invalidNeighbors = runCli(root, "cohesion", "--neighbors", "0");
-    expect(invalidNeighbors.status).toBe(2);
-    expect(invalidNeighbors.stderr).toContain("neighbors must be a positive integer");
-    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
-
     const invalidDescriptionProvider = runCli(root, "status", "--description-provider", "unknown");
     expect(invalidDescriptionProvider.status).toBe(2);
     expect(invalidDescriptionProvider.stderr).toContain("Unsupported description provider: unknown");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    const invalidCohesionThreshold = runCli(root, "cohesion", "--threshold", "1");
-    expect(invalidCohesionThreshold.status).toBe(2);
-    expect(invalidCohesionThreshold.stderr).toContain("cohesion threshold must be at least -1 and less than 1");
-    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
   });
 });
 
@@ -529,7 +522,7 @@ describe("CLI help", () => {
       "slopdex descriptions enable",
       "slopdex search-description",
       "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5",
-      "slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary",
+      "slopdex cross-search --cohesion --threshold 0.8 --limit 20 --format summary",
     ]) expect(result.stdout).toContain(example);
     expect(result.stdout).toContain("--source-path <path>");
     expect(result.stdout).toContain("--description-provider <name>");
@@ -543,21 +536,15 @@ describe("CLI help", () => {
     expect(result.stdout).toContain("--min-lines <number>");
     expect(result.stdout).toContain("--regex <regex>");
     expect(result.stdout).toContain("-e, --regexp <regex>");
-    expect(result.stdout).toContain("--neighbors <number>");
-    expect(result.stdout).toContain("--include-source");
+    expect(result.stdout).toContain("--cohesion");
     expect(result.stdout).toContain("--version");
     expect(result.stdout).toContain("Cluster 1 (3 functions, similarity 0.9124-0.9568)");
     expect(result.stdout).toContain("Review them for repeated validation or session logic that could be shared");
     expect(result.stdout).toContain("transitive links, so every function need not directly match every other function");
-    expect(result.stdout).toContain("Cohesion: 184 functions analyzed, 37 semantic edges");
-    expect(result.stdout).toContain("same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84");
-    expect(result.stdout).toContain("There is no universal pass/fail cutoff, but this warrants review");
-    expect(result.stdout).toContain("top pair is 0.94 similar but four units apart");
-    expect(result.stdout).toContain("Compare modules or history rather than treating one percentage as a fixed");
+    expect(result.stdout).toContain("[distance 4]");
+    expect(result.stdout).toContain("orders each source's matches");
     expect(result.stdout).toContain("Reading Analysis Output:");
-    expect(result.stdout).toContain("remote              Higher means more affinity crosses folders and weaker physical cohesion");
-    expect(result.stdout).toContain("gap                 0-to-1 combined signal; higher means strongly related and farther apart");
-    expect(result.stdout).toContain("externalAffinityRatio");
+    expect(result.stdout).toContain("Greater distance first; similarity breaks ties");
     expect(result.stdout.indexOf("Commands:")).toBeLessThan(result.stdout.indexOf("Analysis Examples:"));
     expect(result.stdout.indexOf("Analysis Examples:")).toBeLessThan(result.stdout.indexOf("Reading Analysis Output:"));
     expect(result.stdout.indexOf("Reading Analysis Output:")).toBeLessThan(result.stdout.indexOf("Options:"));
@@ -751,15 +738,14 @@ globalThis.fetch = async (url, options) => {
       sourceDescriptionProfile: { model: "custom-description-model" }, targetDescriptionProfile: { model: "custom-description-model" },
     });
     expect(run("cross-search", "--min-lines", "1").stdout).toContain("combined code + callable description + file description");
-    const cohesion = run("cohesion", "--min-lines", "1", "--format", "json");
+    const cohesion = run("cross-search", "--cohesion", "--min-lines", "1", "--format", "json");
     expect(cohesion.status, cohesion.stderr).toBe(0);
-    const report = JSON.parse(cohesion.stdout);
-    expect(report.pairs[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, descriptionSimilarity: 1 });
-    expect(report.parameters).toMatchObject({
+    const report = JSON.parse(cohesion.stdout.trim());
+    expect(report.matches[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, descriptionSimilarity: 1, physicalDistance: 1 });
+    expect(report.scoring).toMatchObject({
       similarityMode: "code-description-file-average",
       similarityWeights: { code: 1 / 3, description: 1 / 3, fileDescription: 1 / 3 },
     });
-    expect(report.repository.descriptionProfile.model).toBe("custom-description-model");
 
     const rebuilt = run("status", "--model", "text-embedding-3-small", "--force-reindex");
     expect(rebuilt.status, rebuilt.stderr).toBe(0);

@@ -32,6 +32,12 @@ describe("formatSimilaritySummary", () => {
     ].join("\n"));
   });
 
+  it("includes physical distance for cohesion-ranked matches", () => {
+    expect(formatSimilaritySummary([
+      { similarity: 0.75, physicalDistance: 4, function: indexedFunction("packages/target.ts", "Target.fetch") },
+    ], indexedFunction("src/source.ts", "Source.load"))).toContain("[distance 4]");
+  });
+
   it("makes empty summary output explicit", () => {
     expect(formatSimilaritySummary([])).toBe("No matches.");
     expect(formatSimilaritySummary([], indexedFunction("src/source.ts", "source"))).toBe([

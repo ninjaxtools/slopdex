@@ -1,6 +1,6 @@
 ---
 name: slopdex
-description: Semantic code search, find duplicate-function candidates, analyze physical code cohesion
+description: Semantic code search, duplicate-function candidates, and physical-distance re-ranking
 ---
 
 # Slopdex operator guide for agents
@@ -75,7 +75,7 @@ slopdex cross-search --changed-since origin/main --format summary --threshold 0.
 slopdex cross-search --source-path src/services -e '^UserService\.' --format summary --threshold 0.9
 ```
 
-These restrict sources while searching the full eligible index. The same filters work with `cohesion`. All supplied restrictions intersect:
+These restrict sources while searching the full eligible index. All supplied restrictions intersect:
 
 ```bash
 slopdex cross-search --source-path src -e 'validate' \
@@ -88,11 +88,11 @@ Here a source must have changed since the commit and belong to an uncommitted fi
 ### Review physical cohesion
 
 ```bash
-slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary
-slopdex cohesion --source-path src/services --threshold 0.8 --format summary
+slopdex cross-search --cohesion --threshold 0.8 --limit 20 --format summary
+slopdex cross-search --cohesion --source-path src/services --threshold 0.8 --format summary
 ```
 
-Ranks related functions by semantic affinity and file/folder separation. add `--include-source` only when full callable bodies are needed.
+`--cohesion` keeps cross-search's semantic matches and orders each source's matches from greatest to least physical path distance. Similarity breaks distance ties. Summary output includes the distance; JSONL matches include `physicalDistance`.
 
 ### Compare repositories
 
@@ -152,18 +152,17 @@ Explicit relative config/index paths resolve from the current directory. Source 
 
 | Argument | Applies to / behavior |
 | --- | --- |
-| `--limit <number>` | Positive integer. `search`/`search-description`: matches, default `10`. Cross-search: neighbors per source, default `5`. Cohesion: reported pairs and file rows, default `50`. |
-| `--threshold <number\|min-max>` | Both query searches and analyses. Inclusive minimum or half-open range. Default `-1` for query/cross-search; `0.8` for cohesion. Cohesion minimum must be in `[-1, 1)`. |
-| `--format <json\|summary\|clusters>` | Both query searches, cross-search, cohesion, index-errors. `clusters` only supports cross-search; output defaults below. |
-| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Equivalent case-sensitive JavaScript regex options on qualified names. Query searches filter results before limiting; cross-search/cohesion filter sources only. |
-| `--min-lines <number>` | Cross-search/cohesion: positive source/candidate length minimum, default `2`. |
-| `--source-path <path>` | Cross-search/cohesion: source file or recursive directory within the root. |
-| `--changed-since <commit>` | Cross-search/cohesion: added, modified, or moved functions since an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
-| `--uncommitted` | Cross-search/cohesion: functions indexed from working-tree files; in Git these are staged, unstaged, or untracked changes. Without Git this selects all working-tree functions. |
+| `--limit <number>` | Positive integer. `search`/`search-description`: matches, default `10`. Cross-search: neighbors per source, default `5`. |
+| `--threshold <number\|min-max>` | Both query searches and cross-search. Inclusive minimum or half-open range; default `-1`. |
+| `--format <json\|summary\|clusters>` | Both query searches, cross-search, and index-errors. Cohesion-ranked cross-search supports summary or JSONL, not clusters. |
+| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Equivalent case-sensitive JavaScript regex options on qualified names. Query searches filter results before limiting; cross-search filters sources only. |
+| `--min-lines <number>` | Cross-search: positive source/candidate length minimum, default `2`. |
+| `--source-path <path>` | Cross-search: source file or recursive directory within the root. |
+| `--changed-since <commit>` | Cross-search: added, modified, or moved functions since an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
+| `--uncommitted` | Cross-search: functions indexed from working-tree files; in Git these are staged, unstaged, or untracked changes. Without Git this selects all working-tree functions. |
 | `--cross-file-only` | Cross-search: exclude same-physical-file matches. |
 | `--include-symmetric-duplicates` | Cross-search: allow both directions of same-index matches; otherwise each unordered pair appears once. |
-| `--neighbors <number>` | Cohesion: positive neighbor count per source, default `20`; changes analysis scope. |
-| `--include-source` | Cohesion JSON: include callable bodies; omitted by default. |
+| `--cohesion` | Cross-search: add physical distance and order each source's matches from farthest to nearest. Defaults to summary output. |
 | `--target-root <path>` | Cross-search: second repository; requires `--target-index`. |
 | `--target-index <path>` | Cross-search: second index file; requires `--target-root`. |
 | `--target-config <path>` | Cross-search: target config, default `<target-root>/.slopdex/config.json`; requires both target options. |
@@ -188,7 +187,6 @@ Use `--no-reindex` when the task calls for committed-only results or reuse of an
 | --- | --- | --- |
 | `search`, `search-description` | `summary` | JSON array; purpose search includes generated description text |
 | `cross-search` | `clusters` | `summary`, or `json` for JSONL with one row per matched source |
-| `cohesion` | `summary` | One JSON report |
 | `index-errors` | `summary` | JSON array |
 | `status`, update commands, `descriptions` | JSON object | — |
 
@@ -212,26 +210,16 @@ When reporting candidates, identify paths/symbols, summarize the shared behavior
 
 ### Purpose-aware scoring
 
-When descriptions are complete, `search`, cross-search, and cohesion average code, callable-description, and file-description similarity with equal one-third weights. `search-description` averages callable and file descriptions. Cross-repository analysis needs completeness on both sides; otherwise all scores are code-only. Stale file descriptions remain in scoring until `reindex-files` refreshes them. Description-generator models may differ even though embedding profiles must match.
+When descriptions are complete, `search` and cross-search average code, callable-description, and file-description similarity with equal one-third weights. `search-description` averages callable and file descriptions. Cross-repository analysis needs completeness on both sides; otherwise all scores are code-only. Stale file descriptions remain in scoring until `reindex-files` refreshes them. Description-generator models may differ even though embedding profiles must match.
 
-Thresholds and limits apply to the selected score. Text labels combined scoring; JSON includes component scores and mode/weights (`scoring` in cross-search, `parameters` in cohesion). Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, neighbor count, and source/candidate filters.
+Thresholds and limits apply to the selected score. Text labels combined scoring; JSON includes component scores and mode/weights in `scoring`. Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, and source/candidate filters.
 
 ### Cohesion
 
 ```text
-Cohesion: 184 functions analyzed, 37 semantic edges
-  same file 35.1%  same folder 29.7%  remote 35.2%  mean distance 1.84
-
-1. gap 0.6053  similarity 0.9400  distance 4  reciprocal
-   src/auth/session.ts:18:1 :: validateSession
-   packages/http/middleware.ts:42:1 :: authenticate
+src/auth/session.ts :: validateSession
+  0.9400  packages/http/middleware.ts :: authenticate  [distance 4]
+  0.9300  src/auth/token.ts :: validateToken  [distance 1]
 ```
 
-- **Functions analyzed / edges:** selected-source coverage and unique qualifying neighbor pairs before report limiting, not quality grades.
-- **Same file / same folder / remote:** shares of weighted semantic affinity. More remote affinity means more related code crosses folder boundaries.
-- **Mean distance:** weighted physical separation; `0` is same file, `1` is different files in one folder, larger means farther apart.
-- **Gap / rank:** a `0–1` review score combining similarity above the threshold with separation. Higher gap ranks earlier; same-file pairs have zero gap.
-- **Reciprocal:** both functions selected each other as neighbors. JSON `null` means an endpoint was not evaluated because of source filtering.
-- **JSON details:** `semanticWeight` reflects similarity above threshold; `separationWeight` reflects distance; `sourceTestPair` flags a path-inferred source/test relationship; file `externalAffinityRatio` measures affinity outside that file's folder.
-
-The example merits reviewing separated authentication responsibilities, while accounting for intentional layering. There is no universal pass/fail threshold. Use comparable runs to evaluate changes. Filtered reports describe selected sources, not the full repository. Cohesion metrics use all qualifying edges; pairs/files are limited, and groups use reported pairs.
+Physical distance is `0` within one file, `1` between files in one folder, and `1` plus directory-tree hops across folders. The option only reorders the selected semantic matches; it does not change similarity or prove that distant code should be moved. Review architectural layers, tests, adapters, and other intentional separation before recommending consolidation.

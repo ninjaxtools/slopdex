@@ -2,6 +2,7 @@ import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { IncompatibleIndexError } from "../errors.js";
+import { cohesionLocation } from "../analysis/cohesion.js";
 import type { CrossSearchOptions, CrossSearchResult } from "../types.js";
 import { assertPositiveInteger, compileNameRegex, throwIfAborted } from "../utils.js";
 import { analysisSimilarity } from "./similarity.js";
@@ -85,8 +86,18 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
         ...excludePaths,
       });
+    const rankedCandidates = options.cohesion
+      ? candidates.map((match) => ({
+        ...match,
+        physicalDistance: cohesionLocation(source.path, match.function.path).physicalDistance,
+      })).sort((left, right) => right.physicalDistance - left.physicalDistance
+        || right.similarity - left.similarity
+        || left.function.path.localeCompare(right.function.path)
+        || left.function.startLine - right.function.startLine
+        || left.function.id - right.function.id)
+      : candidates;
     const matches = sameIndex && !options.includeSymmetricDuplicates
-      ? candidates.filter((match) => {
+      ? rankedCandidates.filter((match) => {
         const pair = source.id < match.function.id
           ? `${source.id}:${match.function.id}`
           : `${match.function.id}:${source.id}`;
@@ -94,7 +105,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         seenPairs.add(pair);
         return true;
       })
-      : candidates;
+      : rankedCandidates;
     if (matches.length > 0) yield { source, matches, scoring };
     options.onProgress?.({ completed: index + 1, total: sourceFunctions.length });
   }

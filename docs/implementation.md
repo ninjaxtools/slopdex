@@ -15,7 +15,7 @@ For installation, command examples, configuration, and result interpretation, se
 | `src/storage/database.ts` | SQLite schema, durable artifact caches, transactions, metadata, and vector queries. |
 | `src/search/` | Analysis scoring selection and cross-index neighbor discovery. |
 | `src/analysis/cohesion.ts` | Physical distance, gap scores, aggregate affinity, and groups. |
-| `src/format.ts` | Human-readable search, cluster, and cohesion output. |
+| `src/format.ts` | Human-readable search and cluster output, plus library cohesion-report formatting. |
 | `src/index.ts`, `src/types.ts` | Public exports and data contracts. |
 
 ## Callable extraction
@@ -90,7 +90,7 @@ similarity = (codeSimilarity + descriptionSimilarity + fileDescriptionSimilarity
 
 All component scores and the average are computed in one SQLite query. Name, line-count, and path exclusions plus similarity bounds apply before ranking/limiting. Range upper bounds are exclusive. Combined JSON includes component scores; analysis metadata records mode, weights, and description profiles. Cohesion JSON uses schema version 3 for the three-component scoring contract.
 
-Cross-search selects sources, queries neighbors per source, and deduplicates unordered same-index pairs unless symmetric results are requested. Self-matches are excluded in same-index queries. Same-file exclusion uses canonical roots and file identity to handle aliases. Cluster formatting builds connected components from emitted matches and sorts by member count, then name; transitive connectivity does not imply all-to-all similarity.
+Cross-search selects sources, queries neighbors per source, and deduplicates unordered same-index pairs unless symmetric results are requested. Self-matches are excluded in same-index queries. Same-file exclusion uses canonical roots and file identity to handle aliases. With the `cohesion` option, each selected match receives its physical path distance and matches are re-ranked by descending distance, then similarity. Cluster formatting builds connected components from emitted matches and sorts by member count, then name; transitive connectivity does not imply all-to-all similarity.
 
 ### Cohesion metrics
 
@@ -135,7 +135,7 @@ Exports include `CodeIndex`, `crossSearch`, `analyzeCohesion`, `cohesionLocation
 - Top-level analysis `nameRegex` filters both sources and candidates. Query `SimilaritySearchOptions.nameRegex` filters result names before limiting.
 - Call `await index.useDescriptions()`, then `await index.searchDescription({ query: "maintain the repository index" })`. Select a model via `descriptionProvider: new OpenAIDescriptionProvider({ model: "gpt-5.6-sol" })` in index options. Custom description providers implement both stateless file/callable methods and may add `startFile()` for contextual sessions.
 - Inspect failures through `index.indexErrors()` or exported `readIndexErrors(indexPath)` without a provider. Records use `IndexingError`.
-- Public cohesion reports retain indexed-function data; the CLI presents compact function references and includes source bodies only with `--include-source`.
+- `analyzeCohesion` remains a programmatic report API. The CLI exposes physical-distance review through `cross-search --cohesion` instead of a separate command.
 
 ## Build and development
 
