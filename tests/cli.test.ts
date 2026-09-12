@@ -515,6 +515,7 @@ describe("CLI help", () => {
       "slopdex config model opencode-go/gpt-5.6-luna",
       "slopdex config descriptions enable",
       "slopdex config reranker cohere",
+      "slopdex config reranker openai",
       "slopdex update-files",
       "slopdex reindex-files",
       "slopdex delete-files",
@@ -527,6 +528,7 @@ describe("CLI help", () => {
     ]) expect(result.stdout).toContain(example);
     expect(result.stdout).toContain("--source-path <path>");
     expect(result.stdout).toContain("--description-provider <name>");
+    expect(result.stdout).toContain("--reranker-candidates <number>");
     expect(result.stdout).toContain("--format <json|summary|clusters>");
     expect(result.stdout).toContain("--changed-since <commit>");
     expect(result.stdout).toContain("--uncommitted");
@@ -644,7 +646,7 @@ globalThis.fetch = async (input, options) => {
 });
 
 describe("CLI reranker configuration", () => {
-  it("enables, uses, changes, and disables hosted reranking without opening an index during config", () => {
+  it("enables, uses, changes, and disables reranking without opening an index during config", () => {
     const root = temporaryRoot();
     const configPath = path.join(root, ".slopdex", "config.json");
     write(root, "functions.ts", [
@@ -663,6 +665,13 @@ globalThis.fetch = async (url, options) => {
       {index: 1, relevance_score: 0.95},
       {index: 0, relevance_score: 0.25}
     ].slice(0, body.top_n)});
+  }
+  if (String(url) === 'https://api.openai.com/v1/responses') {
+    return Response.json({status: 'completed', output: [{
+      type: 'message', role: 'assistant', id: 'message-1', content: [{
+        type: 'output_text', text: JSON.stringify({ranking: [{index: 1, score: 0.99}]}), annotations: []
+      }]
+    }]});
   }
   throw new Error('Unexpected API URL: ' + url);
 };
@@ -697,6 +706,23 @@ globalThis.fetch = async (url, options) => {
       rerankerProvider: "jina",
       rerankerModel: "jina-reranker-v3.5",
     });
+    const openai = run("config", "reranker", "openai", "custom-ranker", "--reranker-candidates", "12", "--format", "json");
+    expect(openai.status, openai.stderr).toBe(0);
+    expect(JSON.parse(openai.stdout)).toMatchObject({
+      rerankingEnabled: true,
+      rerankerProvider: "openai",
+      rerankerModel: "custom-ranker",
+      rerankerCandidates: 12,
+    });
+    expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({ rerankerCandidates: 12 });
+    const resized = run("config", "reranker", "openai", "--reranker-candidates", "15", "--format", "json");
+    expect(resized.status, resized.stderr).toBe(0);
+    expect(JSON.parse(resized.stdout)).toMatchObject({ rerankerModel: "custom-ranker", rerankerCandidates: 15 });
+    const llmSearch = run("search", "find two", "--limit", "1", "--format", "json");
+    expect(llmSearch.status, llmSearch.stderr).toBe(0);
+    expect(JSON.parse(llmSearch.stdout)).toMatchObject([
+      { rerankScore: 0.99, function: { name: "two" } },
+    ]);
     const disabled = run("config", "reranker", "disable");
     expect(disabled.status, disabled.stderr).toBe(0);
     expect(JSON.parse(readFileSync(configPath, "utf8")).rerankingEnabled).toBe(false);
@@ -706,8 +732,20 @@ globalThis.fetch = async (url, options) => {
     const root = temporaryRoot();
     const invalid = runCli(root, "config", "reranker", "unknown");
     expect(invalid.status).toBe(2);
-    expect(invalid.stderr).toContain("requires cohere, jina, or disable");
+    expect(invalid.stderr).toContain("requires cohere, jina, openai, or disable");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
+    const misplacedCandidates = runCli(root, "config", "reranker", "cohere", "--reranker-candidates", "10");
+    expect(misplacedCandidates.status).toBe(2);
+    expect(misplacedCandidates.stderr).toContain("only available with config reranker openai");
+
+    const invalidCandidates = runCli(root, "config", "reranker", "openai", "--reranker-candidates", "0");
+    expect(invalidCandidates.status).toBe(2);
+    expect(invalidCandidates.stderr).toContain("reranker candidate count must be a positive integer");
+
+    const excessiveCandidates = runCli(root, "config", "reranker", "openai", "--reranker-candidates", "101");
+    expect(excessiveCandidates.status).toBe(2);
+    expect(excessiveCandidates.stderr).toContain("reranker candidate count must not exceed 100");
 
     write(root, ".slopdex/config.json", JSON.stringify({ rerankingEnabled: true, rerankerProvider: "cohere", rerankerModel: 3 }));
     const malformed = runCli(root, "status");

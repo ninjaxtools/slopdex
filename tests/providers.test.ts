@@ -9,6 +9,7 @@ import { OpenAIEmbeddingProvider } from "../src/embeddings/openai.js";
 import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
 import { parseCallables } from "../src/parser/callable-parser.js";
 import { CohereReranker, JinaReranker } from "../src/rerankers/hosted.js";
+import { OpenAILLMReranker } from "../src/rerankers/openai.js";
 
 const servers: Server[] = [];
 
@@ -230,6 +231,42 @@ describe("embedding providers", () => {
 });
 
 describe("rerankers", () => {
+  it("uses OpenAI structured output with the Luna model and high reasoning", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const paths: string[] = [];
+    const url = await startServer(requests, {
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{
+          type: "output_text",
+          text: JSON.stringify({ ranking: [{ index: 1, score: 0.95 }] }),
+          annotations: [],
+        }],
+      }],
+    }, false, paths);
+    const reranker = new OpenAILLMReranker({ apiKey: "test", baseUrl: url });
+
+    await expect(reranker.rerank("find validation", ["first function", "second function"], { limit: 1 })).resolves.toEqual([
+      { index: 1, score: 0.95 },
+    ]);
+    expect(reranker.profile).toEqual({ provider: "openai", model: "gpt-5.6-luna" });
+    expect(reranker.candidateCount).toBe(10);
+    expect(paths).toEqual(["/v1/responses"]);
+    expect(requests[0]).toMatchObject({
+      model: "gpt-5.6-luna",
+      store: false,
+      reasoning: { effort: "high" },
+      text: { format: { type: "json_schema", name: "function_ranking", strict: true } },
+    });
+    expect(requests[0]!.instructions).toContain("purpose descriptions and source code");
+    expect(requests[0]).not.toHaveProperty("max_output_tokens");
+    expect((requests[0]!.reasoning as Record<string, unknown>)).not.toHaveProperty("summary");
+    expect(JSON.stringify(requests[0]!.input)).toContain("second function");
+  });
+
   it("sends Cohere rerank requests and maps ranked indexes to scores", async () => {
     const requests: Array<Record<string, unknown>> = [];
     const paths: string[] = [];
@@ -272,6 +309,64 @@ describe("rerankers", () => {
     const reranker = new CohereReranker({ apiKey: "test", baseUrl: url });
 
     await expect(reranker.rerank("query", ["document"])).rejects.toThrow(/malformed reranking response/);
+  });
+
+  it("rejects duplicate indexes from the LLM", async () => {
+    const url = await startServer([], {
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{
+          type: "output_text",
+          text: JSON.stringify({ ranking: [{ index: 0, score: 0.9 }, { index: 0, score: 0.8 }] }),
+          annotations: [],
+        }],
+      }],
+    });
+    const reranker = new OpenAILLMReranker({ apiKey: "test", baseUrl: url });
+
+    await expect(reranker.rerank("query", ["one", "two"], { limit: 2 })).rejects.toThrow(/invalid LLM reranking results/);
+  });
+
+  it("rejects the wrong number of LLM results", async () => {
+    const url = await startServer([], {
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{ type: "output_text", text: JSON.stringify({ ranking: [] }), annotations: [] }],
+      }],
+    });
+    const reranker = new OpenAILLMReranker({ apiKey: "test", baseUrl: url });
+
+    await expect(reranker.rerank("query", ["one"], { limit: 1 })).rejects.toThrow(/invalid LLM reranking results/);
+  });
+
+  it("bounds source code sent to the LLM", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, {
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{
+          type: "output_text",
+          text: JSON.stringify({ ranking: [{ index: 0, score: 0.8 }] }),
+          annotations: [],
+        }],
+      }],
+    });
+    const reranker = new OpenAILLMReranker({ apiKey: "test", baseUrl: url });
+
+    await reranker.rerank("query", [`description: important purpose\nsource:\n${"const value = 1;\n".repeat(20_000)}END_MARKER`]);
+
+    const input = JSON.stringify(requests[0]!.input);
+    expect(input).toContain("important purpose");
+    expect(input).not.toContain("END_MARKER");
   });
 });
 

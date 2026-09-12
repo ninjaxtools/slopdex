@@ -85,7 +85,7 @@ export function addNumbers(a: number, b: number) { return a + b; }
     index.close();
   });
 
-  it("reranks description searches using candidate purpose text", async () => {
+  it("reranks description searches using candidate purpose text and code", async () => {
     const root = temporaryRoot();
     write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
     const documents: string[][] = [];
@@ -116,11 +116,82 @@ export function addNumbers(a: number, b: number) { return a + b; }
 
     const results = await index.searchDescription({ query: "second purpose", limit: 1 });
 
-    expect(documents[0]).toEqual([
-      "path: functions.ts\nsymbol: one\ndescription: Purpose of one.",
-      "path: functions.ts\nsymbol: two\ndescription: Purpose of two.",
-    ]);
+    expect(documents[0]).toHaveLength(2);
+    expect(documents[0]![0]).toContain("symbol: one");
+    expect(documents[0]![0]).toContain("source:\nfunction one()");
+    expect(documents[0]![0]).toContain("description:\nPurpose of one.");
+    expect(documents[0]![1]).toContain("symbol: two");
     expect(results).toMatchObject([{ rerankScore: 0.9, function: { name: "two" } }]);
+    index.close();
+  });
+
+  it("uses a reranker's preferred candidate count", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", ["one", "two", "three", "four", "five"]
+      .map((name) => `export function ${name}() { return ${JSON.stringify(name)}; }`)
+      .join("\n"));
+    let candidateCount = 0;
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: {
+        profile: { provider: "controlled", model: "equal", dimensions: 2 },
+        embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+        embedQuery: async () => [1, 0],
+      },
+      reranker: {
+        profile: { provider: "llm", model: "test" },
+        candidateCount: 3,
+        rerank: async (_query, documents) => {
+          candidateCount = documents.length;
+          return [{ index: 2, score: 0.9 }];
+        },
+      },
+    });
+    await index.updateFiles({ upsert: ["functions.ts"] });
+
+    const results = await index.similaritySearch({ query: "three", limit: 1 });
+
+    expect(candidateCount).toBe(3);
+    expect(results[0]!.function.name).toBe("three");
+    index.close();
+  });
+
+  it("rejects an invalid preferred candidate count", () => {
+    const root = temporaryRoot();
+    expect(() => new CodeIndex({
+      rootDir: root,
+      provider: new FakeEmbeddingProvider(),
+      reranker: {
+        profile: { provider: "llm", model: "test" },
+        candidateCount: 0,
+        rerank: async () => [],
+      },
+    })).toThrow(/reranker candidate count must be a positive integer/);
+  });
+
+  it("rejects result limits above a reranker's maximum before embedding the query", async () => {
+    const root = temporaryRoot();
+    let queryEmbedded = false;
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "test", dimensions: 2 },
+      embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+      embedQuery: async () => {
+        queryEmbedded = true;
+        return [1, 0];
+      },
+    };
+    const index = new CodeIndex({
+      rootDir: root,
+      provider,
+      reranker: {
+        profile: { provider: "limited", model: "test" },
+        maximumCandidateCount: 2,
+        rerank: async () => [],
+      },
+    });
+
+    await expect(index.similaritySearch({ query: "anything", limit: 3 })).rejects.toThrow(/supports at most 2 results/);
+    expect(queryEmbedded).toBe(false);
     index.close();
   });
 

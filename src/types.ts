@@ -72,6 +72,10 @@ export interface RerankerProfile {
 
 export interface Reranker {
   readonly profile: RerankerProfile;
+  /** Preferred embedding-ranked candidate pool size for this reranker. */
+  readonly candidateCount?: number;
+  /** Maximum candidate/result count accepted by this reranker. */
+  readonly maximumCandidateCount?: number;
   rerank(
     query: string,
     documents: readonly string[],

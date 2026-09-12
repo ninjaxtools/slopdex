@@ -8,7 +8,8 @@ if (typeof library.openCodeIndex !== "function"
   || typeof library.crossSearch !== "function"
   || typeof library.analyzeCohesion !== "function"
   || typeof library.CohereReranker !== "function"
-  || typeof library.JinaReranker !== "function") {
+  || typeof library.JinaReranker !== "function"
+  || typeof library.OpenAILLMReranker !== "function") {
   throw new Error("Built library exports are incomplete.");
 }
 

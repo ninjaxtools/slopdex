@@ -30,9 +30,10 @@ Optionally enable a hosted second-stage reranker for `search` and `search-descri
 export COHERE_API_KEY="your-api-key"
 slopdex config reranker cohere
 # Or: export JINA_API_KEY="your-api-key" && slopdex config reranker jina
+# Or use an LLM: export OPENAI_API_KEY="your-api-key" && slopdex config reranker openai
 ```
 
-The config command is the only CLI switch for reranking. Use `slopdex config reranker disable` to return to embedding-only ordering. An optional final argument selects a model, for example `slopdex config reranker cohere rerank-v4.0-fast`.
+The config command is the only CLI switch for reranking. Use `slopdex config reranker disable` to return to embedding-only ordering. An optional final argument selects a model, for example `slopdex config reranker cohere rerank-v4.0-fast`. OpenAI LLM reranking defaults to `gpt-5.6-luna` with high reasoning and receives the top 10 embedding results; change the pool with `--reranker-candidates`, for example `slopdex config reranker openai gpt-5.6-luna --reranker-candidates 20`.
 
 To search generated descriptions of each function's role instead:
 
@@ -112,7 +113,7 @@ Usage: `slopdex <command> [arguments] [options]`.
 | `models [opencode\|opencode-go]` | Fetch valid models from the current published Zen and/or Go catalogs. | Qualified `provider/model` lines; optional JSON array |
 | `config model <model\|provider/model>` | Validate a published OpenCode model and persist its provider/model selection without opening an index. Bare IDs auto-resolve only when unambiguous. | Updated setting summary; optional JSON |
 | `config descriptions <enable\|disable>` | Persist whether the next index-using command should enable or disable descriptions. Does not open an index. | Updated setting summary; optional JSON |
-| `config reranker <cohere\|jina\|disable> [model]` | Enable Cohere or Jina query reranking, optionally selecting a model, or disable it. Does not open an index. | Updated setting summary; optional JSON |
+| `config reranker <cohere\|jina\|openai\|disable> [model]` | Enable a hosted or OpenAI LLM query reranker, optionally selecting a model, or disable it. OpenAI accepts `--reranker-candidates <number>` from 1 to 100 and defaults to 10. Does not open an index. | Updated setting summary; optional JSON |
 | `search <query>` | Search function code by meaning. Quote multiword queries. | Summary; optional JSON array |
 | `descriptions <enable\|disable>` | Enable or disable automatic purpose descriptions. Re-enabling with unchanged inputs reuses cached descriptions. | JSON statistics |
 | `search-description <query>` | Search purpose descriptions after enabling them. | Summary including description text; optional JSON array |
@@ -195,7 +196,7 @@ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limi
 
 Similarity is a model-dependent score, not a probability of duplication. Higher scores mean greater semantic resemblance. Query summaries show `score  path :: qualifiedName`; cross-search summaries group those lines beneath each source. Functions without matches are omitted from cross-search output.
 
-With reranking enabled, query summaries show `rerankScore rerank (similarity similarity)`. JSON retains `similarity` and adds `rerankScore`. The similarity threshold first filters embedding candidates; Slopdex retrieves up to five times the requested limit, asks the configured provider to rank those candidates, and returns the requested number. Cross-search and cohesion analysis are not sent to hosted rerankers.
+With reranking enabled, query summaries show `rerankScore rerank (similarity similarity)`. JSON retains `similarity` and adds `rerankScore`. The similarity threshold first filters embedding candidates. Cohere and Jina receive up to five times the requested limit. The OpenAI LLM receives the configured number of top embedding results, 10 by default, or the requested result limit when it is larger. Candidates include function descriptions when available and function metadata/source code. Cross-search and cohesion analysis are not sent to rerankers.
 
 ```text
 Cluster 1 (3 functions, similarity 0.9124-0.9568)
@@ -252,7 +253,7 @@ Use the recovery flag named in the error: `--rebuild-on-divergence` for Git hist
 
 ## Configuration
 
-Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Cohere reranking, and OpenCode Go descriptions (requires `JINA_API_KEY`, `COHERE_API_KEY` for query searches, plus `OPENCODE_API_KEY` when descriptions are enabled):
+Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, OpenAI LLM reranking, and OpenCode Go descriptions (requires `JINA_API_KEY`, `OPENAI_API_KEY` for query searches, plus `OPENCODE_API_KEY` when descriptions are enabled):
 
 ```json
 {
@@ -260,8 +261,9 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Coh
   "model": "jina-embeddings-v4",
   "dimensions": 1024,
   "rerankingEnabled": true,
-  "rerankerProvider": "cohere",
-  "rerankerModel": "rerank-v4.0-pro",
+  "rerankerProvider": "openai",
+  "rerankerModel": "gpt-5.6-luna",
+  "rerankerCandidates": 10,
   "descriptionProvider": "opencode-go",
   "exclude": ["**/fixtures/**"]
 }
@@ -274,8 +276,9 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Coh
 | `descriptionModel` | Description model; provider default unless explicitly set. |
 | `descriptionsEnabled` | When true or false, the next index-using command applies that enabled state during its normal refresh. Unset leaves persisted index state unchanged. |
 | `rerankingEnabled` | Enables second-stage ranking for `search` and `search-description`; disabled/unset by default. Prefer changing it through `config reranker`. |
-| `rerankerProvider` | Hosted reranker: `cohere` or `jina`. |
-| `rerankerModel` | Provider model; defaults to Cohere `rerank-v4.0-pro` or Jina `jina-reranker-v3.5` when enabled by the config command. |
+| `rerankerProvider` | Reranker: `cohere`, `jina`, or `openai`. OpenAI uses an LLM rather than a dedicated reranking endpoint. |
+| `rerankerModel` | Provider model; defaults to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, or OpenAI `gpt-5.6-luna`. |
+| `rerankerCandidates` | Embedding-ranked candidates sent to the OpenAI LLM; integer from `1` to `100`, default `10`. The requested result limit takes precedence when larger, up to 100. |
 | `indexPath` | Index location; `<root>/.slopdex/index.sqlite`. |
 | `include` | Repository-relative glob array; empty/unset includes all supported eligible files. |
 | `exclude` | Additional repository-relative exclusion globs. |

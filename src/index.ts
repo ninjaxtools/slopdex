@@ -10,6 +10,8 @@ export { JinaEmbeddingProvider } from "./embeddings/jina.js";
 export type { JinaEmbeddingProviderOptions } from "./embeddings/jina.js";
 export { CohereReranker, JinaReranker } from "./rerankers/hosted.js";
 export type { CohereRerankerOptions, JinaRerankerOptions } from "./rerankers/hosted.js";
+export { OpenAILLMReranker } from "./rerankers/openai.js";
+export type { OpenAILLMRerankerOptions } from "./rerankers/openai.js";
 export { CodeIndexError, GitDivergenceError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 export type * from "./types.js";
 

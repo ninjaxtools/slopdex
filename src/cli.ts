@@ -11,6 +11,7 @@ import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { CohereReranker, JinaReranker } from "./rerankers/hosted.js";
+import { OpenAILLMReranker } from "./rerankers/openai.js";
 import { crossSearch } from "./search/cross-search.js";
 import {
   descriptionProviderBaseUrl,
@@ -47,8 +48,9 @@ interface FileConfig {
   descriptionProvider?: DescriptionProviderName;
   descriptionModel?: string;
   descriptionsEnabled?: boolean;
-  rerankerProvider?: "cohere" | "jina";
+  rerankerProvider?: "cohere" | "jina" | "openai";
   rerankerModel?: string;
+  rerankerCandidates?: number;
   rerankingEnabled?: boolean;
 }
 
@@ -78,6 +80,7 @@ const parsed = (() => {
         model: { type: "string" },
         "description-provider": { type: "string" },
         "description-model": { type: "string" },
+        "reranker-candidates": { type: "string" },
         dimensions: { type: "string" },
         target: { type: "string" },
         "target-root": { type: "string" },
@@ -504,12 +507,19 @@ function commandLineConfig(config: FileConfig): FileConfig {
     throw new CodeIndexError("rerankingEnabled must be a boolean.");
   }
   if (config.rerankingEnabled === true) {
-    if (config.rerankerProvider !== "cohere" && config.rerankerProvider !== "jina") {
+    if (config.rerankerProvider !== "cohere" && config.rerankerProvider !== "jina" && config.rerankerProvider !== "openai") {
       throw new CodeIndexError(`Unsupported reranker provider: ${String(config.rerankerProvider)}`);
     }
     if (config.rerankerModel !== undefined
       && (typeof config.rerankerModel !== "string" || !config.rerankerModel.trim())) {
       throw new CodeIndexError("rerankerModel must be a non-empty string.");
+    }
+    if (config.rerankerProvider === "openai" && config.rerankerCandidates !== undefined
+      && (typeof config.rerankerCandidates !== "number" || !Number.isInteger(config.rerankerCandidates) || config.rerankerCandidates < 1)) {
+      throw new CodeIndexError("rerankerCandidates must be a positive integer.");
+    }
+    if (config.rerankerProvider === "openai" && typeof config.rerankerCandidates === "number" && config.rerankerCandidates > 100) {
+      throw new CodeIndexError("rerankerCandidates must not exceed 100.");
     }
   }
   return {
@@ -591,16 +601,37 @@ async function runConfig(rootDir: string): Promise<void> {
     config.descriptionModel = selected.model;
     result = { descriptionProvider: selected.provider, descriptionModel: selected.model };
   } else {
-    const provider = positionals[1] as "cohere" | "jina" | "disable";
+    const provider = positionals[1] as "cohere" | "jina" | "openai" | "disable";
     if (provider === "disable") {
       config.rerankingEnabled = false;
       result = { rerankingEnabled: false };
     } else {
-      const model = positionals[2] ?? (provider === "cohere" ? "rerank-v4.0-pro" : "jina-reranker-v3.5");
+      const sameProvider = config.rerankerProvider === provider;
+      const defaultModel = provider === "cohere"
+        ? "rerank-v4.0-pro"
+        : provider === "jina" ? "jina-reranker-v3.5" : "gpt-5.6-luna";
+      const model = positionals[2]
+        ?? (sameProvider && typeof config.rerankerModel === "string" && config.rerankerModel.trim() ? config.rerankerModel : defaultModel);
       config.rerankerProvider = provider;
       config.rerankerModel = model;
+      if (provider === "openai") {
+        const savedCandidates = sameProvider && typeof config.rerankerCandidates === "number"
+          && Number.isInteger(config.rerankerCandidates) && config.rerankerCandidates > 0
+          ? config.rerankerCandidates
+          : 10;
+        config.rerankerCandidates = openAIRerankerCandidateCount(
+          parsed.values["reranker-candidates"], savedCandidates, "reranker candidate count",
+        );
+      } else {
+        delete config.rerankerCandidates;
+      }
       config.rerankingEnabled = true;
-      result = { rerankingEnabled: true, rerankerProvider: provider, rerankerModel: model };
+      result = {
+        rerankingEnabled: true,
+        rerankerProvider: provider,
+        rerankerModel: model,
+        ...(provider === "openai" ? { rerankerCandidates: config.rerankerCandidates } : {}),
+      };
     }
   }
   writeConfigFile(configPath, config);
@@ -713,6 +744,12 @@ function createReranker(config: FileConfig): Reranker | undefined {
   if (config.rerankerProvider === "jina") {
     return new JinaReranker(config.rerankerModel ? { model: config.rerankerModel } : {});
   }
+  if (config.rerankerProvider === "openai") {
+    return new OpenAILLMReranker({
+      ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
+      ...(config.rerankerCandidates ? { candidateCount: config.rerankerCandidates } : {}),
+    });
+  }
   throw new CodeIndexError("rerankerProvider is required when rerankingEnabled is true.");
 }
 
@@ -724,6 +761,10 @@ function numberOption(value: string | undefined, defaultValue: number, name: str
 }
 
 function validateInvocation(): void {
+  if (parsed.values["reranker-candidates"] !== undefined
+    && (command !== "config" || positionals[0] !== "reranker" || positionals[1] !== "openai")) {
+    throw new CodeIndexError("--reranker-candidates is only available with config reranker openai.");
+  }
   if (parsed.values.cohesion && command !== "cross-search") {
     throw new CodeIndexError("--cohesion is only available for cross-search.");
   }
@@ -755,11 +796,12 @@ function validateInvocation(): void {
       }
       if (positionals[0] === "reranker") {
         const provider = positionals[1];
-        if ((provider !== "cohere" && provider !== "jina" && provider !== "disable")
+        if ((provider !== "cohere" && provider !== "jina" && provider !== "openai" && provider !== "disable")
           || positionals.length > (provider === "disable" ? 2 : 3)
           || (positionals[2] !== undefined && !positionals[2].trim())) {
-          throw new CodeIndexError("config reranker requires cohere, jina, or disable, optionally followed by a model ID.");
+          throw new CodeIndexError("config reranker requires cohere, jina, openai, or disable, optionally followed by a model ID.");
         }
+        if (provider === "openai") openAIRerankerCandidateCount(parsed.values["reranker-candidates"], 10, "reranker candidate count");
         return;
       }
       throw new CodeIndexError("config requires descriptions, model, or reranker.");
@@ -820,6 +862,12 @@ function positiveIntegerOption(value: string | undefined, defaultValue: number, 
   const parsedValue = numberOption(value, defaultValue, name);
   if (!Number.isInteger(parsedValue) || parsedValue < 1) throw new CodeIndexError(`${name} must be a positive integer.`);
   return parsedValue;
+}
+
+function openAIRerankerCandidateCount(value: string | undefined, defaultValue: number, name: string): number {
+  const count = positiveIntegerOption(value, defaultValue, name);
+  if (count > 100) throw new CodeIndexError(`${name} must not exceed 100.`);
+  return count;
 }
 
 function similarityThreshold(defaultMin = -1): { min: number; max?: number } {
@@ -891,7 +939,7 @@ Commands:
   models [opencode|opencode-go]        List current published OpenCode models
   config model <model|provider/model>  Validate and save an OpenCode description model
   config descriptions <enable|disable> Save description state without opening an index
-  config reranker <cohere|jina|disable> Save query-search reranking settings
+  config reranker <provider|disable>    Save Cohere, Jina, or OpenAI reranking settings
   status                              Show index metadata
   index-errors                        List persisted file and function indexing failures
   update-files <path...>              Index specific working-tree files
@@ -969,6 +1017,7 @@ Options:
   --model <name>                      Embedding model
   --description-provider <name>       Description provider: openai, opencode, or opencode-go
   --description-model <name>          Description model (provider default: gpt-5.6-sol or gpt-5.6-luna)
+  --reranker-candidates <number>       Candidates sent to the OpenAI LLM reranker (default: 10)
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)
   --rebuild-on-divergence             Rebuild after a rebase or branch change
@@ -1022,6 +1071,9 @@ Other Examples:
 
   Enable hosted reranking for query searches:
     slopdex config reranker cohere
+
+  Use OpenAI LLM reranking with high reasoning over the top 10 candidates:
+    slopdex config reranker openai
 
   Enable purpose descriptions, then search by their meaning:
     slopdex descriptions enable

@@ -82,7 +82,9 @@ Description inputs include contextual and profile information so file-context, p
 
 `search` embeds a query and, when descriptions are complete, scores code, callable-description, and containing-file-description vectors. `search-description` scores callable and file descriptions. Analysis uses code-only cosine similarity unless all indexed callables and files have enabled description embeddings. Cross-index analysis requires completeness on both sides. Description-generator models may differ across indexes even though embedding profiles must match.
 
-An optional `Reranker` performs a hosted second-stage pass for the two natural-language query methods. The vector query retrieves five times the requested result limit after applying name and similarity filters. The reranker receives the query plus candidate code metadata/source, or candidate purpose text for description search, and returns the requested number in relevance order. Results preserve the embedding/fused `similarity` and add `rerankScore`. Cohere defaults to `rerank-v4.0-pro` with `COHERE_API_KEY`; Jina defaults to `jina-reranker-v3.5` with `JINA_API_KEY`. Reranking does not participate in index metadata or cross-search because it creates no persisted artifacts and cross-search is callable-to-callable analysis rather than natural-language retrieval.
+An optional `Reranker` performs a second-stage pass for the two natural-language query methods. After applying name and similarity filters, Cohere and Jina retrieve five times the requested result limit. `OpenAILLMReranker` retrieves its configured candidate count (10 by default), or the result limit when larger. Every reranker receives the query plus candidate path, code metadata/source, and purpose description when available, then returns the requested number in relevance order. Results preserve the embedding/fused `similarity` and add `rerankScore`.
+
+Cohere defaults to `rerank-v4.0-pro` with `COHERE_API_KEY`; Jina defaults to `jina-reranker-v3.5` with `JINA_API_KEY`. The OpenAI LLM path defaults to `gpt-5.6-luna`, sends a strict JSON schema through the Responses API with high reasoning, no reasoning summary, and `store: false`, and validates result cardinality, indexes, uniqueness, and 0-1 scores. Its prompt preserves descriptions before source and caps source-bearing candidate text at 12,000 tokens each and 80,000 tokens in aggregate. Reranking does not participate in index metadata or cross-search because it creates no persisted artifacts and cross-search is callable-to-callable analysis rather than natural-language retrieval.
 
 When descriptions are complete:
 
@@ -111,12 +113,12 @@ Affinity ratios and mean distance are weighted by `semanticWeight`. Cohesion met
 ## Library API
 
 ```ts
-import { CohereReranker, OpenAIEmbeddingProvider, openCodeIndex } from "@ninjaxtools/slopdex";
+import { OpenAIEmbeddingProvider, OpenAILLMReranker, openCodeIndex } from "@ninjaxtools/slopdex";
 
 const index = openCodeIndex({
   rootDir: "/path/to/repository",
   provider: new OpenAIEmbeddingProvider(),
-  reranker: new CohereReranker(),
+  reranker: new OpenAILLMReranker({ candidateCount: 10 }),
 });
 
 try {
@@ -131,7 +133,7 @@ try {
 }
 ```
 
-Exports include `CodeIndex`, `crossSearch`, `analyzeCohesion`, `cohesionLocation`, embedding/description providers, `CohereReranker`, `JinaReranker`, error types, and the contracts in `src/types.ts`. Standalone update/search helpers wrap the corresponding index methods.
+Exports include `CodeIndex`, `crossSearch`, `analyzeCohesion`, `cohesionLocation`, embedding/description providers, `CohereReranker`, `JinaReranker`, `OpenAILLMReranker`, error types, and the contracts in `src/types.ts`. Standalone update/search helpers wrap the corresponding index methods.
 
 - Use `updateFromWorkingTree()` when Git is unavailable. Unlike the CLI, the library does not automatically refresh before queries or fall back from Git.
 - Set `sourceFilter.nameRegex` for source-only cross-search/cohesion filtering; combine it with `path` and a filter type (`all`, `changed-since`, or `uncommitted`). `changed-since` also accepts `uncommitted: true`.

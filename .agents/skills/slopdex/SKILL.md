@@ -21,9 +21,10 @@ Hosted reranking is optional and persists in repository config:
 ```bash
 slopdex config reranker cohere
 # Or: slopdex config reranker jina
+# Or use an LLM: slopdex config reranker openai
 ```
 
-Set `COHERE_API_KEY` or `JINA_API_KEY` respectively. Disable it with `slopdex config reranker disable`. Reranking applies to `search` and `search-description`, not cross-search. It preserves embedding `similarity`, adds `rerankScore`, and orders a wider candidate set by that score.
+Set `COHERE_API_KEY`, `JINA_API_KEY`, or `OPENAI_API_KEY` respectively. The OpenAI LLM reranker defaults to `gpt-5.6-luna`, high reasoning, and the top 10 embedding candidates; configure the pool with `slopdex config reranker openai --reranker-candidates 20`. Disable reranking with `slopdex config reranker disable`. Reranking applies to `search` and `search-description`, not cross-search. It preserves embedding `similarity`, adds `rerankScore`, and orders a wider candidate set by that score.
 
 ### Search function purpose
 
@@ -151,6 +152,7 @@ Usage: `slopdex <command> [arguments] [options]`. Quote queries and regexes. Boo
 | `--dimensions <number>` | Positive dimensions supported by the model; OpenAI `3072`, Jina `1024`. |
 | `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values require `OPENCODE_API_KEY`. |
 | `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go. |
+| `--reranker-candidates <number>` | With `config reranker openai`, embedding-ranked functions sent to the LLM; range `1`-`100`, default `10`. |
 | `--ignore-errors` | Silence saved-diagnostic warnings without deleting records. |
 | `-h`, `--help` | Usage; no refresh. |
 | `--version` | Package version; exits without refresh or saved-diagnostic warnings. |
@@ -201,7 +203,7 @@ Use `--no-reindex` when the task calls for committed-only results or reuse of an
 
 Prefer summary output for compact source review, clusters for duplicate families, and JSON/JSONL for structured processing. Stdout carries results; stderr carries notices and warnings. Cross-search omits sources without emitted matches. Empty output means no findings under the chosen coverage/filters, not proof that no similar code exists.
 
-With hosted reranking enabled, query summaries display both reranker relevance and embedding similarity. Similarity thresholds filter candidates before reranking; limits apply to the reranked output.
+With reranking enabled, query summaries display both reranker relevance and embedding similarity. Similarity thresholds filter candidates before reranking; limits apply to the reranked output. LLM candidate documents include descriptions when available and function metadata/source code.
 
 ### Similarity and clusters
 

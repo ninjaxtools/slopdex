@@ -50,6 +50,15 @@ export class CodeIndex {
     this.indexPath = path.resolve(options.indexPath ?? path.join(this.rootDir, ".slopdex", "index.sqlite"));
     this.provider = options.provider;
     this.reranker = options.reranker;
+    if (this.reranker?.candidateCount !== undefined) {
+      assertPositiveInteger(this.reranker.candidateCount, "reranker candidate count");
+    }
+    if (this.reranker?.maximumCandidateCount !== undefined) {
+      assertPositiveInteger(this.reranker.maximumCandidateCount, "reranker maximum candidate count");
+      if (this.reranker.candidateCount !== undefined && this.reranker.candidateCount > this.reranker.maximumCandidateCount) {
+        throw new CodeIndexError("reranker candidate count must not exceed its maximum candidate count.");
+      }
+    }
     const profile = normalizeProfile(options.provider.profile);
     assertPositiveInteger(profile.dimensions, "embedding dimensions");
     this.#database = new IndexDatabase(this.indexPath, this.rootDir, profile, options.readOnly ?? false);
@@ -845,31 +854,33 @@ export class CodeIndex {
     if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
     const limit = options.limit ?? 10;
     assertPositiveInteger(limit, "limit");
+    const candidateLimit = this.#candidateLimit(limit);
     compileNameRegex(options.nameRegex);
     throwIfAborted(options.signal);
     const vector = await this.#queryEmbedding(options.query, options.signal);
     throwIfAborted(options.signal);
     const includeFileDescriptions = this.#descriptionScoringAvailable();
     const results = this.#database.searchVector(vector, {
-      descriptions: true, limit: this.#candidateLimit(limit), minSimilarity: options.minSimilarity ?? -1,
+      descriptions: true, limit: candidateLimit, minSimilarity: options.minSimilarity ?? -1,
       ...(includeFileDescriptions ? { fileDescriptionVector: vector } : {}),
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
-    return await this.#rerank(options.query, results, limit, options.signal, true);
+    return await this.#rerank(options.query, results, limit, options.signal);
   }
 
   public async similaritySearch(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
     if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
     const limit = options.limit ?? 10;
     assertPositiveInteger(limit, "limit");
+    const candidateLimit = this.#candidateLimit(limit);
     compileNameRegex(options.nameRegex);
     throwIfAborted(options.signal);
     const vector = await this.#queryEmbedding(options.query, options.signal);
     const includeDescriptions = this.#descriptionScoringAvailable();
     const results = this.searchByVector(vector, {
       ...(includeDescriptions ? { descriptionVector: vector, fileDescriptionVector: vector } : {}),
-      limit: this.#candidateLimit(limit),
+      limit: candidateLimit,
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       minSimilarity: options.minSimilarity ?? -1,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -878,7 +889,13 @@ export class CodeIndex {
   }
 
   #candidateLimit(limit: number): number {
-    return this.reranker ? limit * RERANK_CANDIDATE_MULTIPLIER : limit;
+    if (!this.reranker) return limit;
+    if (this.reranker.maximumCandidateCount !== undefined && limit > this.reranker.maximumCandidateCount) {
+      throw new CodeIndexError(`${this.reranker.profile.provider} reranker supports at most ${this.reranker.maximumCandidateCount} results.`);
+    }
+    return this.reranker.candidateCount === undefined
+      ? limit * RERANK_CANDIDATE_MULTIPLIER
+      : Math.max(limit, this.reranker.candidateCount);
   }
 
   async #rerank(
@@ -886,13 +903,13 @@ export class CodeIndex {
     candidates: SimilarityResult[],
     limit: number,
     signal?: AbortSignal,
-    descriptionsOnly = false,
   ): Promise<SimilarityResult[]> {
     if (!this.reranker || candidates.length === 0) return candidates.slice(0, limit);
-    const documents = candidates.map(({ function: callable }) => descriptionsOnly
-      ? [`path: ${callable.path}`, `symbol: ${callable.qualifiedName}`, `description: ${callable.description ?? ""}`].join("\n")
-      : [`path: ${callable.path}`, callable.embeddingInput, callable.description ? `description:\n${callable.description}` : null]
-        .filter((value): value is string => value !== null).join("\n"));
+    const documents = candidates.map(({ function: callable }) => [
+      `path: ${callable.path}`,
+      callable.description ? `description:\n${callable.description}` : null,
+      callable.embeddingInput,
+    ].filter((value): value is string => value !== null).join("\n"));
     const rerankLimit = Math.min(limit, candidates.length);
     const rankings = await this.reranker.rerank(query, documents, signal ? { limit: rerankLimit, signal } : { limit: rerankLimit });
     throwIfAborted(signal);
