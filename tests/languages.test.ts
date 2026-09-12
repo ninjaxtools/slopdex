@@ -221,6 +221,7 @@ describe("multilingual indexing", () => {
       descriptionProvider: {
         profile: { provider: "test", model: "purpose", strategyVersion: "v1" },
         async describe(input) { inputs.push(input); return `Implement ${input.callable.qualifiedName} in ${input.callable.language}`; },
+        async describeFile(input) { return `Implement the callables in ${input.path}`; },
       },
     });
     onTestFinished(() => index.close());
@@ -241,11 +242,11 @@ describe("multilingual indexing", () => {
     expect(await index.searchDescription({ query: "load values", limit: expectedCount })).toHaveLength(expectedCount);
     const report = await analyzeCohesion({ source: index, minLines: 1, minSimilarity: -1 });
     expect(report.metrics.functionsAnalyzed).toBe(expectedCount);
-    expect(report.parameters.similarityMode).toBe("code-description-average");
+    expect(report.parameters.similarityMode).toBe("code-description-file-average");
     let crossLanguage = false;
     for await (const result of crossSearch({ source: index, minLines: 1, limitPerFunction: expectedCount })) {
       crossLanguage ||= result.matches.some((match) => match.function.language !== result.source.language);
-      expect(result.scoring?.similarityMode).toBe("code-description-average");
+      expect(result.scoring?.similarityMode).toBe("code-description-file-average");
     }
     expect(crossLanguage).toBe(true);
 

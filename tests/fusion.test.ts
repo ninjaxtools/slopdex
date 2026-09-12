@@ -1,3 +1,4 @@
+import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it, onTestFinished } from "vitest";
@@ -20,6 +21,10 @@ const vectors: Record<string, { code: number[]; description: number[] }> = {
 const provider: EmbeddingProvider = {
   profile: { provider: "test", model: "fusion", dimensions: 2 },
   embedDocuments: async (inputs) => inputs.map((input) => {
+    if (input.startsWith("file:")) {
+      const name = path.basename(input.slice("file:".length), ".ts");
+      return name === "shared" ? [1, 0] : vectors[name]!.description;
+    }
     const description = input.startsWith("purpose:");
     const name = description ? input.slice("purpose:".length) : /symbol: (\w+)/.exec(input)![1]!;
     return vectors[name]![description ? "description" : "code"];
@@ -32,6 +37,7 @@ async function makeIndex(names: string[], descriptionModel: string | null = "pur
   const descriptionProvider: DescriptionProvider = {
     profile: { provider: "test", model: descriptionModel ?? "unused", strategyVersion: "v1" },
     describe: async ({ callable }) => `purpose:${callable.name}`,
+    describeFile: async ({ path: filePath }) => `file:${filePath}`,
   };
   const paths = names.map((name) => `${name === "balanced" ? "remote" : "src"}/${name}.ts`);
   names.forEach((name, index) => write(root, paths[index]!, `export function ${name}() {\n  return 1;\n}\n`));
@@ -66,17 +72,20 @@ describe("combined code and purpose analysis", () => {
     expect(match.similarity).toBeCloseTo(0.8);
     expect(match.codeSimilarity).toBeCloseTo(0.8);
     expect(match.descriptionSimilarity).toBeCloseTo(0.8);
+    expect(match.fileDescriptionSimilarity).toBeCloseTo(0.8);
     expect(result!.scoring).toMatchObject({
-      similarityMode: "code-description-average", similarityWeights: { code: 0.5, description: 0.5 },
+      similarityMode: "code-description-file-average",
+      similarityWeights: { code: 1 / 3, description: 1 / 3, fileDescription: 1 / 3 },
     });
 
-    const [range] = await collect({ ...options, minSimilarity: 0.5, maxSimilarity: 0.7 });
+    const [range] = await collect({ ...options, minSimilarity: 0.3, maxSimilarity: 0.4 });
     expect(range!.matches[0]).toMatchObject({
-      function: { name: "implementation" }, similarity: 0.5, codeSimilarity: 1, descriptionSimilarity: 0,
+      function: { name: "implementation" }, similarity: 1 / 3, codeSimilarity: 1,
+      descriptionSimilarity: 0, fileDescriptionSimilarity: 0,
     });
     expect(await collect({ ...options, minSimilarity: 0.81 })).toEqual([]);
-    expect(formatSimilaritySummary(result!.matches, result!.source)).toContain("[combined 50/50; code 0.8000, description 0.8000]");
-    expect(formatSimilarityClusters([result!], true)).toContain("combined 50% code + 50% description");
+    expect(formatSimilaritySummary(result!.matches, result!.source)).toContain("[combined thirds; code 0.8000, description 0.8000, file 0.8000]");
+    expect(formatSimilarityClusters([result!], true)).toContain("combined code + callable description + file description");
   });
 
   it("fuses cross-index matches with different description-generator models", async () => {
@@ -86,12 +95,12 @@ describe("combined code and purpose analysis", () => {
     expect(result!.matches[0]!.function.name).toBe("balanced");
     expect(result!.matches[0]!.similarity).toBeCloseTo(0.8);
     expect(result!.scoring).toMatchObject({
-      similarityMode: "code-description-average",
+      similarityMode: "code-description-file-average",
       sourceDescriptionProfile: { model: "source-model" }, targetDescriptionProfile: { model: "target-model" },
     });
-    const [range] = await collect({ source, target, minSimilarity: 0.5, maxSimilarity: 0.7, limitPerFunction: 1 });
+    const [range] = await collect({ source, target, minSimilarity: 0.3, maxSimilarity: 0.4, limitPerFunction: 1 });
     expect(range!.matches[0]!.function.name).toBe("implementation");
-    expect(range!.matches[0]!.similarity).toBe(0.5);
+    expect(range!.matches[0]!.similarity).toBeCloseTo(1 / 3);
   });
 
   it.each([[false, false], [true, false], [false, true]])(
@@ -119,7 +128,8 @@ describe("combined code and purpose analysis", () => {
     const index = await makeIndex(Object.keys(vectors));
     const report = await analyzeCohesion({ source: index, neighbors: 1, minSimilarity: 0.6 });
     expect(report.parameters).toMatchObject({
-      similarityMode: "code-description-average", similarityWeights: { code: 0.5, description: 0.5 },
+      similarityMode: "code-description-file-average",
+      similarityWeights: { code: 1 / 3, description: 1 / 3, fileDescription: 1 / 3 },
     });
     expect(report.repository.descriptionProfile).toEqual(index.descriptionProvider.profile);
     expect(report.metrics).toMatchObject({ semanticEdges: 3, sameFileRatio: 0, sameFolderRatio: 0, remoteRatio: 1 });
@@ -130,6 +140,7 @@ describe("combined code and purpose analysis", () => {
     expect(first.similarity).toBeCloseTo(0.8);
     expect(first.codeSimilarity).toBeCloseTo(0.8);
     expect(first.descriptionSimilarity).toBeCloseTo(0.8);
+    expect(first.fileDescriptionSimilarity).toBeCloseTo(0.8);
     expect(first.semanticWeight).toBeCloseTo(0.5);
     expect(first.cohesionGap).toBeCloseTo(0.5 * (1 - Math.exp(-1.5)));
     expect(report.pairs.slice(1).every((pair) => pair.reciprocal === false)).toBe(true);
@@ -137,15 +148,15 @@ describe("combined code and purpose analysis", () => {
     expect(report.files[0]!.strongestExternalMatch!.descriptionSimilarity).toBeCloseTo(0.8);
     expect(report.groups).toHaveLength(1);
     expect(report.groups[0]!.memberCount).toBe(4);
-    expect(report.groups[0]!.minimumEdgeSimilarity).toBeCloseTo(0.7);
-    expect(formatCohesionSummary(report)).toContain("similarity: combined 50% code + 50% description");
+    expect(report.groups[0]!.minimumEdgeSimilarity).toBeCloseTo(2 / 3);
+    expect(formatCohesionSummary(report)).toContain("similarity: combined 1/3 code + 1/3 callable description + 1/3 file description");
 
     const scoped = await analyzeCohesion({ source: index, neighbors: 1, minSimilarity: 0.6, sourceFilter: { type: "all", path: "src/anchor.ts" } });
     expect(scoped.pairs).toHaveLength(1);
     expect(scoped.pairs[0]!.reciprocal).toBeNull();
-    const range = await analyzeCohesion({ source: index, neighbors: 1, minSimilarity: 0.5, maxSimilarity: 0.6, sourceFilter: { type: "all", path: "src/anchor.ts" } });
+    const range = await analyzeCohesion({ source: index, neighbors: 1, minSimilarity: 0.3, maxSimilarity: 0.4, sourceFilter: { type: "all", path: "src/anchor.ts" } });
     expect(range.pairs).toHaveLength(1);
-    expect(range.pairs[0]!.similarity).toBe(0.5);
+    expect(range.pairs[0]!.similarity).toBeCloseTo(1 / 3);
   });
 
   it.each([false, true])("falls back for same-index cross-search and cohesion (incomplete=%s)", async (incomplete) => {
@@ -179,13 +190,14 @@ describe("combined code and purpose analysis", () => {
     expect(await collect({ source: index, minLines: 4 })).toEqual([]);
   });
 
-  it("keeps text queries code-only and description-only even with a complete description index", async () => {
+  it("includes file descriptions in text-query scoring when descriptions are complete", async () => {
     const index = await makeIndex(Object.keys(vectors));
     const code = await index.similaritySearch({ query: "meaning", minSimilarity: 0.99 });
     const description = await index.searchDescription({ query: "meaning", minSimilarity: 0.99 });
-    expect(code.map((match) => match.function.name)).toEqual(["anchor", "implementation"]);
+    expect(code.map((match) => match.function.name)).toEqual(["anchor"]);
     expect(description.map((match) => match.function.name)).toEqual(["anchor", "purpose"]);
-    expect([...code, ...description].every((match) => match.descriptionSimilarity === undefined)).toBe(true);
+    expect(code[0]).toMatchObject({ codeSimilarity: 1, descriptionSimilarity: 1, fileDescriptionSimilarity: 1 });
+    expect(description[0]).toMatchObject({ descriptionSimilarity: 1, fileDescriptionSimilarity: 1 });
   });
 
   it("excludes same-file fused neighbors before applying the cross-search limit", async () => {
@@ -197,8 +209,8 @@ describe("combined code and purpose analysis", () => {
       crossFileOnly: true, limitPerFunction: 1,
     });
     const anchor = results.find((result) => result.source.name === "anchor")!;
-    expect(anchor.matches[0]!.function.name).toBe("implementation");
-    expect(anchor.matches[0]!.similarity).toBe(0.5);
+    expect(anchor.matches[0]!.function.name).toBe("purpose");
+    expect(anchor.matches[0]!.similarity).toBeCloseTo(2 / 3);
     expect(results.every((result) => result.matches.every((match) => match.function.path !== result.source.path))).toBe(true);
   });
 });

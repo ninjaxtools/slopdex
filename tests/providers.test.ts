@@ -35,9 +35,43 @@ describe("OpenAI description provider", () => {
     const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
     await expect(provider.describe(input)).resolves.toBe("Delivers application messages.");
     expect(requests[0]).toMatchObject({ model: "gpt-5.6-sol", store: false });
-    expect(requests[0]!.instructions).toContain("purpose of the specified callable within its codebase");
+    expect(requests[0]!.instructions).toContain("requested file or callable within its codebase");
     const requestInput = requests[0]!.input as Array<{ content: Array<{ text: string }> }>;
     expect(JSON.parse(requestInput[0]!.content[0]!.text)).toMatchObject({ repository: "example", path: "client.ts", fileContext: fileSource });
+  });
+
+  it("reuses one growing conversation for callables in the same file", async () => {
+    const source = "export function one() { return 1; }\nexport function two() { return one() + 1; }\n";
+    const callables = parseCallables("functions.ts", source);
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, {
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{ type: "output_text", text: "Supports the application workflow.", annotations: [] }],
+      }],
+    });
+    const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
+    const session = provider.startFile({ repository: "example", path: "functions.ts", fileSource: source });
+
+    await session.describeFile();
+    await session.describe(callables[0]!);
+    await session.describe(callables[1]!);
+
+    const firstInput = requests[0]!.input as unknown[];
+    const secondInput = requests[1]!.input as unknown[];
+    const thirdInput = requests[2]!.input as unknown[];
+    expect(secondInput.slice(0, firstInput.length)).toEqual(firstInput);
+    expect(thirdInput.slice(0, secondInput.length)).toEqual(secondInput);
+    expect(JSON.stringify(thirdInput)).toContain("Supports the application workflow.");
+    expect(JSON.stringify(thirdInput).match(/export function one/g)).toHaveLength(1);
+    expect(requests.map((request) => request.instructions)).toEqual([
+      requests[0]!.instructions,
+      requests[0]!.instructions,
+      requests[0]!.instructions,
+    ]);
   });
 
   it.each([

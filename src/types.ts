@@ -77,13 +77,29 @@ export interface DescriptionInput {
   fileSource: string;
 }
 
+export interface DescriptionFileInput {
+  repository: string;
+  path: string;
+  fileSource: string;
+}
+
+export interface DescriptionFileSession {
+  describeFile(options?: { signal?: AbortSignal }): Promise<string>;
+  replayFile(description: string): void;
+  describe(callable: ParsedCallable, options?: { signal?: AbortSignal }): Promise<string>;
+  replay(callable: ParsedCallable, description: string): void;
+}
+
 export interface DescriptionProvider {
   readonly profile: DescriptionProfile;
   describe(input: DescriptionInput, options?: { signal?: AbortSignal }): Promise<string>;
+  describeFile(input: DescriptionFileInput, options?: { signal?: AbortSignal }): Promise<string>;
+  startFile?(input: DescriptionFileInput): DescriptionFileSession;
 }
 
 export interface DescriptionStats {
   descriptionsCreated: number;
+  fileDescriptionsCreated: number;
   descriptionsEnabled: boolean;
 }
 
@@ -128,6 +144,17 @@ export interface UpdateStats {
   checkpoint: string | null;
 }
 
+export interface ReindexFilesOptions {
+  includeCallables?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface ReindexFilesStats {
+  filesReindexed: number;
+  fileDescriptionsCreated: number;
+  descriptionsCreated: number;
+}
+
 export interface SimilaritySearchOptions {
   query: string;
   /** Restrict result qualified names before ranking and limiting. */
@@ -142,11 +169,12 @@ export interface SimilarityScores {
   similarity: number;
   codeSimilarity?: number;
   descriptionSimilarity?: number;
+  fileDescriptionSimilarity?: number;
 }
 
 export interface AnalysisSimilarity {
-  similarityMode: "code" | "code-description-average";
-  similarityWeights: { code: number; description: number };
+  similarityMode: "code" | "code-description-file-average";
+  similarityWeights: { code: number; description: number; fileDescription: number };
 }
 
 export interface SimilarityResult extends SimilarityScores {
@@ -269,7 +297,7 @@ export interface CohesionAnalysisOptions {
 }
 
 export interface CohesionReport<FunctionValue = IndexedFunction> {
-  schemaVersion: 2;
+  schemaVersion: 3;
   repository: {
     generation: number;
     gitCheckpoint: string | null;
@@ -303,6 +331,9 @@ export interface IndexStatus {
   embeddingProfile: Required<EmbeddingProfile>;
   descriptionsEnabled: boolean;
   descriptionCount: number;
+  fileDescriptionCount: number;
+  describableFileCount: number;
+  staleFileDescriptionCount: number;
   descriptionProfile: DescriptionProfile | null;
   indexingErrorCount: number;
   failedFileCount: number;

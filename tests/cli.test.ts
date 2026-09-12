@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 
 import { describe, expect, it } from "vitest";
@@ -521,6 +522,7 @@ describe("CLI help", () => {
       "slopdex config model opencode-go/gpt-5.6-luna",
       "slopdex config descriptions enable",
       "slopdex update-files",
+      "slopdex reindex-files",
       "slopdex delete-files",
       "slopdex update-git",
       "slopdex search",
@@ -662,7 +664,8 @@ describe("CLI descriptions", () => {
 globalThis.fetch = async (url, options) => {
   const body = JSON.parse(options.body);
   if (url === 'https://api.openai.com/v1/responses' || url === 'https://opencode.ai/zen/v1/responses' || url === 'https://opencode.ai/zen/go/v1/responses') {
-    const input = JSON.parse(body.input[0].content[0].text);
+    const message = body.input[body.input.length - 1];
+    const input = JSON.parse(message.content[0].text);
     return Response.json({status: 'completed', output: [{type: 'message', role: 'assistant', id: 'message-1', content: [{
       type: 'output_text', text: 'Purpose of ' + input.qualifiedName + ' using ' + body.model, annotations: []
     }]}]});
@@ -681,19 +684,29 @@ globalThis.fetch = async (url, options) => {
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
     const initialized = run("descriptions", "enable");
     expect(initialized.status, initialized.stderr).toBe(0);
-    expect(JSON.parse(initialized.stdout)).toEqual({ descriptionsCreated: 1, descriptionsEnabled: true });
+    expect(JSON.parse(initialized.stdout)).toEqual({ descriptionsCreated: 1, fileDescriptionsCreated: 1, descriptionsEnabled: true });
     expect(JSON.parse(run("status").stdout).descriptionProfile).toMatchObject({
       provider: "opencode-go",
       model: "gpt-5.6-luna",
     });
+    const old = new DatabaseSync(path.join(root, ".slopdex/index.sqlite"));
+    old.prepare("UPDATE metadata SET value = ? WHERE key = 'description_profile'").run(JSON.stringify({
+      provider: "opencode-go", model: "gpt-5.6-luna", strategyVersion: "callable-purpose-v1",
+    }));
+    old.exec("DELETE FROM description_cache;");
+    old.close();
+    const migrated = run("descriptions", "enable");
+    expect(migrated.status, migrated.stderr).toBe(0);
+    expect(JSON.parse(migrated.stdout).descriptionsCreated).toBe(1);
+    expect(JSON.parse(run("status").stdout).descriptionProfile.strategyVersion).toBe("callable-purpose-v2");
     expect(JSON.parse(run("descriptions", "enable").stdout).descriptionsCreated).toBe(0);
 
     const disabled = run("descriptions", "disable");
     expect(disabled.status, disabled.stderr).toBe(0);
-    expect(JSON.parse(disabled.stdout)).toEqual({ descriptionsCreated: 0, descriptionsEnabled: false });
+    expect(JSON.parse(disabled.stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: false });
     expect(JSON.parse(run("status").stdout)).toMatchObject({ descriptionCount: 0, descriptionsEnabled: false });
     expect(run("search-description", "workflow").stderr).toContain("run descriptions enable first");
-    expect(JSON.parse(run("descriptions", "enable").stdout)).toEqual({ descriptionsCreated: 0, descriptionsEnabled: true });
+    expect(JSON.parse(run("descriptions", "enable").stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
 
     const search = run("search-description", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
     expect(search.status, search.stderr).toBe(0);
@@ -733,15 +746,19 @@ globalThis.fetch = async (url, options) => {
     const crossRow = JSON.parse(cross.stdout.trim());
     expect(crossRow.matches[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, descriptionSimilarity: 1 });
     expect(crossRow.scoring).toMatchObject({
-      similarityMode: "code-description-average", similarityWeights: { code: 0.5, description: 0.5 },
+      similarityMode: "code-description-file-average",
+      similarityWeights: { code: 1 / 3, description: 1 / 3, fileDescription: 1 / 3 },
       sourceDescriptionProfile: { model: "custom-description-model" }, targetDescriptionProfile: { model: "custom-description-model" },
     });
-    expect(run("cross-search", "--min-lines", "1").stdout).toContain("combined 50% code + 50% description");
+    expect(run("cross-search", "--min-lines", "1").stdout).toContain("combined code + callable description + file description");
     const cohesion = run("cohesion", "--min-lines", "1", "--format", "json");
     expect(cohesion.status, cohesion.stderr).toBe(0);
     const report = JSON.parse(cohesion.stdout);
     expect(report.pairs[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, descriptionSimilarity: 1 });
-    expect(report.parameters).toMatchObject({ similarityMode: "code-description-average", similarityWeights: { code: 0.5, description: 0.5 } });
+    expect(report.parameters).toMatchObject({
+      similarityMode: "code-description-file-average",
+      similarityWeights: { code: 1 / 3, description: 1 / 3, fileDescription: 1 / 3 },
+    });
     expect(report.repository.descriptionProfile.model).toBe("custom-description-model");
 
     const rebuilt = run("status", "--model", "text-embedding-3-small", "--force-reindex");
@@ -749,6 +766,49 @@ globalThis.fetch = async (url, options) => {
     expect(JSON.parse(rebuilt.stdout)).toMatchObject({
       functionCount: 2, descriptionCount: 2, descriptionsEnabled: true,
       descriptionProfile: { provider: "opencode", model: "custom-description-model" },
+    });
+  }, 30_000);
+
+  it("reindexes stale file descriptions and optionally callable descriptions", () => {
+    const root = temporaryRoot();
+    write(root, "src/a.ts", "export function one() { return 1; }\n");
+    write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2 }));
+    write(root, ".slopdex/mock-api.mjs", `
+globalThis.fetch = async (url, options) => {
+  const body = JSON.parse(options.body);
+  if (url === 'https://api.openai.com/v1/responses') {
+    const input = JSON.parse(body.input[body.input.length - 1].content[0].text);
+    const text = input.request === 'Describe this file overall.' ? 'File purpose' : 'Callable purpose';
+    return Response.json({status: 'completed', output: [{type: 'message', role: 'assistant', id: 'message-1', content: [{
+      type: 'output_text', text, annotations: []
+    }]}]});
+  }
+  if (url === 'https://api.openai.com/v1/embeddings') {
+    return Response.json({data: body.input.map((_, index) => ({index, embedding: [1, 0]}))});
+  }
+  throw new Error('Unexpected API URL: ' + url);
+};
+`);
+    const env = {
+      ...process.env,
+      NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}`,
+      OPENAI_API_KEY: "test",
+    };
+    const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
+    expect(run("descriptions", "enable").status).toBe(0);
+
+    write(root, "src/a.ts", "export function one() { return 2; }\n");
+    const filesOnly = run("reindex-files");
+    expect(filesOnly.status, filesOnly.stderr).toBe(0);
+    expect(JSON.parse(filesOnly.stdout)).toEqual({
+      filesReindexed: 1, fileDescriptionsCreated: 1, descriptionsCreated: 0,
+    });
+
+    write(root, "src/a.ts", "export function one() { return 3; }\n");
+    const withCallables = run("reindex-files", "--callables");
+    expect(withCallables.status, withCallables.stderr).toBe(0);
+    expect(JSON.parse(withCallables.stdout)).toEqual({
+      filesReindexed: 1, fileDescriptionsCreated: 1, descriptionsCreated: 1,
     });
   });
 
@@ -767,5 +827,8 @@ globalThis.fetch = async (url, options) => {
       expect(invalid.status).toBe(2);
       expect(invalid.stderr).toContain("descriptions requires enable or disable");
     }
+    const invalidReindex = runCli(root, "reindex-files", "extra");
+    expect(invalidReindex.status).toBe(2);
+    expect(invalidReindex.stderr).toContain("does not accept positional arguments");
   });
 });

@@ -18,6 +18,7 @@ function openIndex(root: string, embeddingProvider = provider): CodeIndex {
     descriptionProvider: {
       profile: { provider: "test", model: "purpose", strategyVersion: "v1" },
       describe: async ({ callable }) => `Purpose of ${callable.qualifiedName}`,
+      describeFile: async ({ path }) => `Purpose of ${path}`,
     },
   });
   onTestFinished(() => index.close());
@@ -65,7 +66,7 @@ describe("source symbol filtering", () => {
     expect(results).toHaveLength(1);
     expect(results[0]!.source.qualifiedName).toBe("Source.keep");
     expect(results[0]!.matches.map((match) => match.function.qualifiedName)).toEqual(["other"]);
-    expect(results[0]!.scoring?.similarityMode).toBe(descriptions ? "code-description-average" : "code");
+    expect(results[0]!.scoring?.similarityMode).toBe(descriptions ? "code-description-file-average" : "code");
     expect(await collect({ ...options, sourceFilter: { type: "all", nameRegex: "^missing$" } })).toEqual([]);
     await expect(collect({ ...options, sourceFilter: { type: "all", nameRegex: "[" } })).rejects.toThrow("Invalid name regex");
   });

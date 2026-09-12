@@ -14,6 +14,7 @@ function openIndex(root: string, provider = new FakeEmbeddingProvider()): CodeIn
     descriptionProvider: {
       profile: { provider: "test", model: "purpose", strategyVersion: "v1" },
       describe: async ({ callable }) => `Purpose of ${callable.name}`,
+      describeFile: async ({ path }) => `Purpose of ${path}`,
     },
   });
   onTestFinished(() => index.close());

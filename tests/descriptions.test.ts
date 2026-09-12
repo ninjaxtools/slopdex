@@ -5,13 +5,20 @@ import { describe, expect, it } from "vitest";
 import { CodeIndex } from "../src/code-index.js";
 import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
 import { resetIndexState } from "../src/storage/database.js";
-import type { DescriptionInput, DescriptionProvider, EmbeddingProvider } from "../src/types.js";
+import type { DescriptionFileInput, DescriptionInput, DescriptionProvider, EmbeddingProvider } from "../src/types.js";
 import { FakeEmbeddingProvider, commitAll, git, initGit, temporaryRoot, write } from "./helpers.js";
 
 class FakeDescriptionProvider implements DescriptionProvider {
   public readonly profile = { provider: "fake", model: "purpose", strategyVersion: "v1" };
   public inputs: DescriptionInput[] = [];
+  public fileInputs: DescriptionFileInput[] = [];
   public fail = false;
+
+  public async describeFile(input: DescriptionFileInput): Promise<string> {
+    this.fileInputs.push(input);
+    if (this.fail) throw new Error("Description service unavailable");
+    return `Purpose of ${input.path}: support the application workflow.`;
+  }
 
   public async describe(input: DescriptionInput): Promise<string> {
     this.inputs.push(input);
@@ -39,16 +46,17 @@ export class Client { constructor() {} send() { deliver(); } }
 
     const functionsBefore = index.allFunctions();
     const vectorsBefore = functionsBefore.map((value) => index.vectorForFunction(value.id));
-    await expect(index.useDescriptions()).resolves.toEqual({ descriptionsCreated: 3, descriptionsEnabled: true });
-    expect(index.status()).toMatchObject({ descriptionCount: 3, descriptionProfile: descriptions.profile });
+    await expect(index.useDescriptions()).resolves.toEqual({ descriptionsCreated: 3, fileDescriptionsCreated: 1, descriptionsEnabled: true });
+    expect(index.status()).toMatchObject({ descriptionCount: 3, fileDescriptionCount: 1, descriptionProfile: descriptions.profile });
+    expect(descriptions.fileInputs).toHaveLength(1);
     expect(descriptions.inputs.every((input) => input.fileSource === source && input.repository === path.basename(root))).toBe(true);
     expect(index.allFunctions().map((value) => value.id)).toEqual(functionsBefore.map((value) => value.id));
     expect(index.allFunctions().map((value) => index.vectorForFunction(value.id))).toEqual(vectorsBefore);
-    await expect(index.useDescriptions()).resolves.toEqual({ descriptionsCreated: 0, descriptionsEnabled: true });
-    expect(index.disableDescriptions()).toEqual({ descriptionsCreated: 0, descriptionsEnabled: false });
+    await expect(index.useDescriptions()).resolves.toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
+    expect(index.disableDescriptions()).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: false });
     expect(index.status()).toMatchObject({ descriptionsEnabled: false, descriptionCount: 3 });
     await expect(index.searchDescription({ query: "workflow" })).rejects.toThrow(/descriptions enable/);
-    await expect(index.useDescriptions()).resolves.toEqual({ descriptionsCreated: 0, descriptionsEnabled: true });
+    await expect(index.useDescriptions()).resolves.toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
     index.close();
 
     const reopened = new CodeIndex({ rootDir: root, provider, descriptionProvider: descriptions });
@@ -94,6 +102,79 @@ export class Client { constructor() {} send() { deliver(); } }
     index.close();
   });
 
+  it("keeps changed file descriptions stale until explicitly reindexed", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    const descriptions = new FakeDescriptionProvider();
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider(), descriptionProvider: descriptions });
+    await index.updateFiles({ upsert: ["functions.ts"] });
+    await index.useDescriptions();
+    expect(descriptions.fileInputs).toHaveLength(1);
+    expect(descriptions.inputs).toHaveLength(2);
+
+    write(root, "functions.ts", "export function one() { return 3; }\nexport function two() { return 4; }\n");
+    await index.updateFiles({ upsert: ["functions.ts"] });
+    expect(index.status()).toMatchObject({ staleFileDescriptionCount: 1, fileDescriptionCount: 1 });
+    expect(descriptions.fileInputs).toHaveLength(1);
+    expect(descriptions.inputs).toHaveLength(4);
+
+    await expect(index.reindexFiles()).resolves.toEqual({
+      filesReindexed: 1, fileDescriptionsCreated: 1, descriptionsCreated: 0,
+    });
+    expect(index.status().staleFileDescriptionCount).toBe(0);
+    expect(descriptions.fileInputs).toHaveLength(2);
+    expect(descriptions.inputs).toHaveLength(4);
+    await expect(index.reindexFiles()).resolves.toEqual({
+      filesReindexed: 0, fileDescriptionsCreated: 0, descriptionsCreated: 0,
+    });
+
+    write(root, "functions.ts", "export function one() { return 5; }\nexport function two() { return 6; }\n");
+    await index.updateFiles({ upsert: ["functions.ts"] });
+    await expect(index.reindexFiles({ includeCallables: true })).resolves.toEqual({
+      filesReindexed: 1, fileDescriptionsCreated: 1, descriptionsCreated: 2,
+    });
+    expect(descriptions.fileInputs).toHaveLength(3);
+    expect(descriptions.inputs).toHaveLength(8);
+    index.close();
+  });
+
+  it("resumes a file-description reindex from its durable generation cache", async () => {
+    const root = temporaryRoot();
+    write(root, "function.ts", "export function one() { return 1; }\n");
+    class VersionedDescriptions extends FakeDescriptionProvider {
+      public override async describeFile(input: DescriptionFileInput): Promise<string> {
+        this.fileInputs.push(input);
+        return `File description ${this.fileInputs.length}`;
+      }
+    }
+    class FailingEmbeddingProvider extends FakeEmbeddingProvider {
+      public fail = true;
+
+      public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+        if (this.fail && inputs.includes("File description 2")) throw new Error("file description embedding failed");
+        return super.embedDocuments(inputs);
+      }
+    }
+    const descriptions = new VersionedDescriptions();
+    const provider = new FailingEmbeddingProvider();
+    const index = new CodeIndex({ rootDir: root, provider, descriptionProvider: descriptions });
+    await index.updateFiles({ upsert: ["function.ts"] });
+    await index.useDescriptions();
+    write(root, "function.ts", "export function one() { return 2; }\n");
+    await index.updateFiles({ upsert: ["function.ts"] });
+
+    await expect(index.reindexFiles()).rejects.toThrow(/file description embedding failed/);
+    expect(descriptions.fileInputs).toHaveLength(2);
+    expect(index.status().staleFileDescriptionCount).toBe(1);
+    provider.fail = false;
+    await expect(index.reindexFiles()).resolves.toEqual({
+      filesReindexed: 1, fileDescriptionsCreated: 0, descriptionsCreated: 0,
+    });
+    expect(descriptions.fileInputs).toHaveLength(2);
+    expect(index.status().staleFileDescriptionCount).toBe(0);
+    index.close();
+  });
+
   it("searches the description vectors independently of the code vectors and applies thresholds", async () => {
     const root = temporaryRoot();
     write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
@@ -114,6 +195,32 @@ export class Client { constructor() {} send() { deliver(); } }
     expect(await index.searchDescription({ query: "purpose", minSimilarity: 1.1 })).toEqual([]);
     await expect(index.searchDescription({ query: " " })).rejects.toThrow(/empty/);
     await expect(index.searchDescription({ query: "purpose", limit: 0 })).rejects.toThrow(/positive integer/);
+    index.close();
+  });
+
+  it("skips unavailable files when measuring file-description coverage", async () => {
+    const root = temporaryRoot();
+    write(root, "healthy.ts", "export function one() { return 1; }\n");
+    write(root, "large.ts", "export function oversized() { return 'too large'; }\n");
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: new FakeEmbeddingProvider(),
+      descriptionProvider: new FakeDescriptionProvider(),
+      maxFileSize: 45,
+    });
+    await index.updateFiles({ upsert: ["healthy.ts", "large.ts"] });
+    await expect(index.useDescriptions()).resolves.toMatchObject({
+      descriptionsCreated: 1, fileDescriptionsCreated: 1, descriptionsEnabled: true,
+    });
+    expect(index.status()).toMatchObject({
+      fileCount: 2, describableFileCount: 1, fileDescriptionCount: 1, staleFileDescriptionCount: 0,
+    });
+
+    write(root, "healthy.ts", "export function one() { return 'now too large for this index'; }\n");
+    await index.updateFiles({ upsert: ["healthy.ts"] });
+    expect(index.status()).toMatchObject({
+      fileCount: 2, describableFileCount: 0, fileDescriptionCount: 0, staleFileDescriptionCount: 0,
+    });
     index.close();
   });
 
@@ -169,9 +276,60 @@ export class Client { constructor() {} send() { deliver(); } }
 
     descriptions.shouldFail = false;
     const resumed = new CodeIndex({ rootDir: root, provider, descriptionProvider: descriptions, embeddingBatchSize: 1 });
-    await expect(resumed.useDescriptions()).resolves.toEqual({ descriptionsCreated: 1, descriptionsEnabled: true });
+    await expect(resumed.useDescriptions()).resolves.toEqual({ descriptionsCreated: 1, fileDescriptionsCreated: 0, descriptionsEnabled: true });
     expect(descriptions.inputs.filter((input) => input.callable.name === "one")).toHaveLength(1);
     expect(descriptions.inputs.filter((input) => input.callable.name === "two")).toHaveLength(2);
+    resumed.close();
+  });
+
+  it("replays cached descriptions when a file conversation resumes", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    class SessionDescriptionProvider extends FakeDescriptionProvider {
+      public events: string[] = [];
+      public failOnTwo = true;
+
+      public startFile(input: { path: string }) {
+        this.events.push(`start:${input.path}`);
+        return {
+          describeFile: async () => {
+            this.events.push("describe-file");
+            return "Purpose of functions.ts";
+          },
+          replayFile: (description: string) => {
+            this.events.push(`replay-file:${description}`);
+          },
+          describe: async (callable: DescriptionInput["callable"]) => {
+            this.events.push(`describe:${callable.name}`);
+            if (this.failOnTwo && callable.name === "two") throw new Error("description failed");
+            return `Purpose of ${callable.name}`;
+          },
+          replay: (callable: DescriptionInput["callable"], description: string) => {
+            this.events.push(`replay:${callable.name}:${description}`);
+          },
+        };
+      }
+    }
+    const descriptions = new SessionDescriptionProvider();
+    const provider = new FakeEmbeddingProvider();
+    const first = new CodeIndex({ rootDir: root, provider, descriptionProvider: descriptions });
+    await first.updateFiles({ upsert: ["functions.ts"] });
+    await expect(first.useDescriptions()).rejects.toThrow(/description failed/);
+    first.close();
+
+    descriptions.failOnTwo = false;
+    const resumed = new CodeIndex({ rootDir: root, provider, descriptionProvider: descriptions });
+    await expect(resumed.useDescriptions()).resolves.toEqual({ descriptionsCreated: 1, fileDescriptionsCreated: 0, descriptionsEnabled: true });
+    expect(descriptions.events).toEqual([
+      "start:functions.ts",
+      "describe-file",
+      "describe:one",
+      "describe:two",
+      "start:functions.ts",
+      "replay-file:Purpose of functions.ts",
+      "replay:one:Purpose of one",
+      "describe:two",
+    ]);
     resumed.close();
   });
 
@@ -185,7 +343,7 @@ export class Client { constructor() {} send() { deliver(); } }
       public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
         if (inputs.every((input) => input.startsWith("Purpose of"))) {
           this.descriptionInputs.push(...inputs);
-          if (this.shouldFail && this.descriptionInputs.length === 2) throw new Error("description embedding failed");
+          if (this.shouldFail && this.descriptionInputs.length === 3) throw new Error("description embedding failed");
         }
         return await super.embedDocuments(inputs);
       }
@@ -199,10 +357,10 @@ export class Client { constructor() {} send() { deliver(); } }
 
     provider.shouldFail = false;
     const resumed = new CodeIndex({ rootDir: root, provider, descriptionProvider: descriptions, embeddingBatchSize: 1 });
-    await expect(resumed.useDescriptions()).resolves.toEqual({ descriptionsCreated: 0, descriptionsEnabled: true });
+    await expect(resumed.useDescriptions()).resolves.toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
     expect(descriptions.inputs).toHaveLength(2);
-    expect(provider.descriptionInputs.filter((input) => input.includes("one"))).toHaveLength(1);
-    expect(provider.descriptionInputs.filter((input) => input.includes("two"))).toHaveLength(2);
+    expect(provider.descriptionInputs.filter((input) => input.startsWith("Purpose of one in"))).toHaveLength(1);
+    expect(provider.descriptionInputs.filter((input) => input.startsWith("Purpose of two in"))).toHaveLength(2);
     resumed.close();
   });
 
@@ -261,6 +419,37 @@ export class Client { constructor() {} send() { deliver(); } }
     db.exec("UPDATE metadata SET value = '5' WHERE key = 'schema_version';");
     db.close();
     expect(() => new CodeIndex({ rootDir: root, provider })).toThrow(/Unsupported index schema version 5/);
+  });
+
+  it("migrates schema 6 indexes to file-description storage", () => {
+    const root = temporaryRoot();
+    const indexPath = path.join(root, ".slopdex/index.sqlite");
+    const provider = new FakeEmbeddingProvider();
+    write(root, ".slopdex/.keep", "");
+    const db = new DatabaseSync(indexPath);
+    db.exec(`
+      CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE files (
+        path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, blob_oid TEXT,
+        source_mode TEXT NOT NULL, indexed_commit TEXT, previous_path TEXT,
+        language TEXT NOT NULL, byte_size INTEGER NOT NULL
+      );
+    `);
+    const metadata = db.prepare("INSERT INTO metadata(key, value) VALUES (?, ?)");
+    metadata.run("schema_version", "6");
+    metadata.run("root_dir", root);
+    metadata.run("embedding_profile", JSON.stringify(provider.profile));
+    metadata.run("generation", "0");
+    db.close();
+
+    const index = new CodeIndex({ rootDir: root, provider });
+    expect(index.status()).toMatchObject({ fileDescriptionCount: 0, staleFileDescriptionCount: 0 });
+    index.close();
+    const migrated = new DatabaseSync(indexPath, { readOnly: true });
+    expect(migrated.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "7" });
+    expect((migrated.prepare("PRAGMA table_info(files)").all() as Array<{ name: string }>).map((column) => column.name))
+      .toContain("file_description_embedding_id");
+    migrated.close();
   });
 
   it("persists the OpenAI model choice and enables descriptions on empty indexes", async () => {

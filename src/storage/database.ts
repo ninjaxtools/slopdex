@@ -18,7 +18,7 @@ import type {
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "6";
+const SCHEMA_VERSION = "7";
 
 export interface PreparedDescription {
   key: string;
@@ -26,9 +26,17 @@ export interface PreparedDescription {
   vector?: readonly number[];
 }
 
+export interface PreparedFileDescription {
+  path: string;
+  contentHash: string;
+  descriptionKey: string;
+  value: PreparedDescription;
+}
+
 export interface PreparedCallable extends ParsedCallable {
   embeddingKey: string;
   vector?: readonly number[];
+  descriptionKey?: string;
   description?: PreparedDescription;
 }
 
@@ -44,6 +52,7 @@ export interface PreparedFile {
   previousPath?: string;
   replacePath?: string;
   callables: PreparedCallable[];
+  fileDescription?: PreparedFileDescription;
   errors: IndexingIssue[];
   unavailable?: boolean;
 }
@@ -59,6 +68,11 @@ export interface IndexedFileState {
   blobOid: string | null;
   sourceMode: SourceMode;
   previousPath: string | null;
+  language: string;
+  describable: boolean;
+  fileDescription: string | null;
+  fileDescriptionPath: string | null;
+  fileDescriptionContentHash: string | null;
 }
 
 interface FunctionRow {
@@ -132,7 +146,7 @@ export class IndexDatabase {
 
   #initializeSchema(): void {
     const existingVersion = this.#metadataTableExists() ? this.#metadata("schema_version") : null;
-    if (existingVersion && existingVersion !== SCHEMA_VERSION) {
+    if (existingVersion && existingVersion !== "6" && existingVersion !== SCHEMA_VERSION) {
       throw new IncompatibleIndexError(`Unsupported index schema version ${existingVersion}.`);
     }
     this.#db.exec(`
@@ -148,7 +162,11 @@ export class IndexDatabase {
         indexed_commit TEXT,
         previous_path TEXT,
         language TEXT NOT NULL,
-        byte_size INTEGER NOT NULL
+        byte_size INTEGER NOT NULL,
+        file_description_path TEXT,
+        file_description_content_hash TEXT,
+        file_description TEXT,
+        file_description_embedding_id INTEGER REFERENCES embeddings(id)
       );
       CREATE TABLE IF NOT EXISTS embeddings (
         id INTEGER PRIMARY KEY,
@@ -205,6 +223,23 @@ export class IndexDatabase {
       INSERT OR IGNORE INTO callable_provenance(identity_key, source_hash, first_seen_commit)
         SELECT identity_key, source_hash, first_seen_commit FROM functions WHERE first_seen_commit IS NOT NULL;
     `);
+    if (existingVersion === "6") {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(`
+          ALTER TABLE files ADD COLUMN file_description_path TEXT;
+          ALTER TABLE files ADD COLUMN file_description_content_hash TEXT;
+          ALTER TABLE files ADD COLUMN file_description TEXT;
+          ALTER TABLE files ADD COLUMN file_description_embedding_id INTEGER REFERENCES embeddings(id);
+        `);
+        this.#setMetadata("schema_version", SCHEMA_VERSION);
+        this.#db.exec("COMMIT");
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    this.#db.exec("CREATE INDEX IF NOT EXISTS files_description_embedding ON files(file_description_embedding_id);");
   }
 
   #metadataTableExists(): boolean {
@@ -326,9 +361,15 @@ export class IndexDatabase {
     return row.id;
   }
 
-  public enableDescriptions(values: readonly { id: number; description: PreparedDescription }[], profile: DescriptionProfile, expectedGeneration: number): void {
+  public enableDescriptions(
+    values: readonly { id: number; description: PreparedDescription }[],
+    files: readonly PreparedFile[],
+    profile: DescriptionProfile,
+    expectedGeneration: number,
+  ): void {
     this.#transaction(() => {
       if (this.getGeneration() !== expectedGeneration) throw new CodeIndexError("Index changed while descriptions were being prepared; retry the update.");
+      for (const file of files) this.#updateFileDescription(file);
       for (const { id, description } of values) {
         this.#db.prepare("UPDATE functions SET description = ?, description_embedding_id = ? WHERE id = ?")
           .run(description.description, this.#embeddingId(description.key, description.vector), id);
@@ -337,6 +378,57 @@ export class IndexDatabase {
       this.#setMetadata("description_profile", JSON.stringify(profile));
       this.#setMetadata("generation", String(expectedGeneration + 1));
     });
+  }
+
+  public updateDescriptions(
+    files: readonly PreparedFile[],
+    includeCallables: boolean,
+    expectedGeneration: number,
+  ): void {
+    this.#transaction(() => {
+      if (this.getGeneration() !== expectedGeneration) throw new CodeIndexError("Index changed while descriptions were being prepared; retry the update.");
+      if (files.length === 0) return;
+      for (const file of files) {
+        this.#updateFileDescription(file);
+        this.#replaceCachedDescription(file.fileDescription!.descriptionKey, file.fileDescription!.value.description);
+        if (!includeCallables) continue;
+        for (const callable of file.callables) {
+          if (!callable.description) throw new CodeIndexError(`Missing description for ${callable.qualifiedName}.`);
+          if (!callable.descriptionKey) throw new CodeIndexError(`Missing description cache key for ${callable.qualifiedName}.`);
+          this.#db.prepare("UPDATE functions SET description = ?, description_embedding_id = ? WHERE identity_key = ?")
+            .run(
+              callable.description.description,
+              this.#embeddingId(callable.description.key, callable.description.vector),
+              callable.identityKey,
+            );
+          this.#replaceCachedDescription(callable.descriptionKey, callable.description.description);
+        }
+      }
+      this.#setMetadata("generation", String(expectedGeneration + 1));
+    });
+  }
+
+  #updateFileDescription(file: PreparedFile): void {
+    if (!file.fileDescription) throw new CodeIndexError(`Missing file description for ${file.path}.`);
+    this.#db.prepare(`
+      UPDATE files
+      SET file_description_path = ?, file_description_content_hash = ?,
+        file_description = ?, file_description_embedding_id = ?
+      WHERE path = ?
+    `).run(
+      file.fileDescription.path,
+      file.fileDescription.contentHash,
+      file.fileDescription.value.description,
+      this.#embeddingId(file.fileDescription.value.key, file.fileDescription.value.vector),
+      file.path,
+    );
+  }
+
+  #replaceCachedDescription(key: string, description: string): void {
+    this.#db.prepare(`
+      INSERT INTO description_cache(description_key, description) VALUES (?, ?)
+      ON CONFLICT(description_key) DO UPDATE SET description = excluded.description
+    `).run(key, description);
   }
 
   public disableDescriptions(): void {
@@ -357,9 +449,32 @@ export class IndexDatabase {
   public getFileStates(): IndexedFileState[] {
     return this.#db.prepare(`
       SELECT path, content_hash AS contentHash, blob_oid AS blobOid,
-        source_mode AS sourceMode, previous_path AS previousPath
+        source_mode AS sourceMode, previous_path AS previousPath, language,
+        NOT EXISTS (
+          SELECT 1 FROM indexing_errors ie
+          WHERE ie.path = files.path
+            AND json_extract(ie.diagnostic, '$.code') IN ('read-error', 'file-too-large')
+        ) AS describable,
+        file_description AS fileDescription,
+        file_description_path AS fileDescriptionPath,
+        file_description_content_hash AS fileDescriptionContentHash
       FROM files ORDER BY path
     `).all() as unknown as IndexedFileState[];
+  }
+
+  public fileDescription(filePath: string): { description: string; path: string; contentHash: string } | undefined {
+    const row = this.#db.prepare(`
+      SELECT file_description AS description, file_description_path AS path,
+        file_description_content_hash AS contentHash
+      FROM files WHERE path = ? AND file_description IS NOT NULL
+    `).get(filePath) as { description: string; path: string; contentHash: string } | undefined;
+    return row;
+  }
+
+  public functionDescription(identityKey: string): string | undefined {
+    const row = this.#db.prepare("SELECT description FROM functions WHERE identity_key = ?")
+      .get(identityKey) as { description: string | null } | undefined;
+    return row?.description ?? undefined;
   }
 
   public applyUpdate(options: {
@@ -430,8 +545,18 @@ export class IndexDatabase {
   #replaceFile(file: PreparedFile, stats: UpdateStats): void {
     const sourcePath = file.replacePath ?? file.previousPath ?? file.path;
     const oldRows = this.#rowsForPath(sourcePath);
-    const existingFile = this.#db.prepare("SELECT previous_path FROM files WHERE path = ?").get(sourcePath) as
-      | { previous_path: string | null }
+    const existingFile = this.#db.prepare(`
+      SELECT previous_path, file_description_path, file_description_content_hash,
+        file_description, file_description_embedding_id
+      FROM files WHERE path = ?
+    `).get(sourcePath) as
+      | {
+        previous_path: string | null;
+        file_description_path: string | null;
+        file_description_content_hash: string | null;
+        file_description: string | null;
+        file_description_embedding_id: number | null;
+      }
       | undefined;
     const oldMatches = reconcileFunctions(file.callables, oldRows);
 
@@ -447,8 +572,10 @@ export class IndexDatabase {
       this.#db.prepare("DELETE FROM files WHERE path = ?").run(file.path);
     }
     this.#db.prepare(`
-      INSERT INTO files(path, content_hash, blob_oid, source_mode, indexed_commit, previous_path, language, byte_size)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO files(
+        path, content_hash, blob_oid, source_mode, indexed_commit, previous_path, language, byte_size,
+        file_description_path, file_description_content_hash, file_description, file_description_embedding_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       file.path,
       file.contentHash,
@@ -458,6 +585,12 @@ export class IndexDatabase {
       file.sourceMode === "working-tree" ? file.previousPath ?? existingFile?.previous_path ?? null : null,
       file.language,
       file.byteSize,
+      file.fileDescription?.path ?? (file.unavailable ? null : existingFile?.file_description_path) ?? null,
+      file.fileDescription?.contentHash ?? (file.unavailable ? null : existingFile?.file_description_content_hash) ?? null,
+      file.fileDescription?.value.description ?? (file.unavailable ? null : existingFile?.file_description) ?? null,
+      file.fileDescription
+        ? this.#embeddingId(file.fileDescription.value.key, file.fileDescription.value.vector)
+        : file.unavailable ? null : existingFile?.file_description_embedding_id ?? null,
     );
     const insertError = this.#db.prepare("INSERT INTO indexing_errors(path, diagnostic) VALUES (?, ?)");
     for (const error of file.errors) insertError.run(file.path, JSON.stringify(error));
@@ -552,6 +685,7 @@ export class IndexDatabase {
   public searchVector(vector: readonly number[], options: {
     descriptions?: boolean;
     descriptionVector?: readonly number[];
+    fileDescriptionVector?: readonly number[];
     limit: number;
     minSimilarity: number;
     maxSimilarity?: number;
@@ -560,8 +694,15 @@ export class IndexDatabase {
     minLines?: number;
     nameRegex?: string;
   }): SimilarityResult[] {
-    const fused = options.descriptionVector !== undefined;
-    if (fused && options.descriptions) throw new CodeIndexError("Description-only search cannot also use score fusion.");
+    const functionDescription = options.descriptionVector !== undefined;
+    const fileDescription = options.fileDescriptionVector !== undefined;
+    const fused = functionDescription || fileDescription;
+    if (functionDescription && options.descriptions) throw new CodeIndexError("Description-only search cannot also supply a separate function-description vector.");
+    const scoreCount = 1 + Number(functionDescription) + Number(fileDescription);
+    const scoreExpression = ["base_similarity"]
+      .concat(functionDescription ? ["description_similarity"] : [])
+      .concat(fileDescription ? ["file_description_similarity"] : [])
+      .join(" + ");
     const excludePaths = options.excludePaths ?? [];
     const pathFilter = excludePaths.length > 0
       ? `AND f.path NOT IN (${excludePaths.map(() => "?").join(", ")})`
@@ -569,16 +710,18 @@ export class IndexDatabase {
     const rows = this.#db.prepare(`
       WITH scores AS (
         SELECT f.*, 1.0 - vec_distance_cosine(e.vector, ?) AS base_similarity
-          ${fused ? ", 1.0 - vec_distance_cosine(d.vector, ?) AS description_similarity" : ""}
+          ${functionDescription ? ", 1.0 - vec_distance_cosine(d.vector, ?) AS description_similarity" : ""}
+          ${fileDescription ? ", 1.0 - vec_distance_cosine(fd.vector, ?) AS file_description_similarity" : ""}
         FROM functions f
         JOIN embeddings e ON e.id = f.${options.descriptions ? "description_embedding_id" : "embedding_id"}
-        ${fused ? "JOIN embeddings d ON d.id = f.description_embedding_id" : ""}
+        ${functionDescription ? "JOIN embeddings d ON d.id = f.description_embedding_id" : ""}
+        ${fileDescription ? "JOIN files described_file ON described_file.path = f.path JOIN embeddings fd ON fd.id = described_file.file_description_embedding_id" : ""}
         WHERE (? IS NULL OR f.id != ?)
           ${pathFilter}
           AND f.line_count >= ?
           AND (? IS NULL OR slopdex_regexp(?, f.qualified_name))
       ), ranked AS (
-        SELECT *, ${fused ? "0.5 * base_similarity + 0.5 * description_similarity" : "base_similarity"} AS similarity
+         SELECT *, ${fused ? `(${scoreExpression}) / ${scoreCount}.0` : "base_similarity"} AS similarity
         FROM scores
       )
       SELECT * FROM ranked
@@ -588,6 +731,7 @@ export class IndexDatabase {
     `).all(
       vectorBuffer(vector),
       ...(options.descriptionVector ? [vectorBuffer(options.descriptionVector)] : []),
+      ...(options.fileDescriptionVector ? [vectorBuffer(options.fileDescriptionVector)] : []),
       options.excludeId ?? null,
       options.excludeId ?? null,
       ...excludePaths,
@@ -598,11 +742,18 @@ export class IndexDatabase {
       options.maxSimilarity ?? null,
       options.maxSimilarity ?? null,
       options.limit,
-    ) as unknown as Array<FunctionRow & { similarity: number; base_similarity: number; description_similarity: number }>;
+    ) as unknown as Array<FunctionRow & {
+      similarity: number;
+      base_similarity: number;
+      description_similarity?: number;
+      file_description_similarity?: number;
+    }>;
     return rows.map((row) => ({
       function: toIndexedFunction(row),
       similarity: row.similarity,
-      ...(fused ? { codeSimilarity: row.base_similarity, descriptionSimilarity: row.description_similarity } : {}),
+      ...(fused && !options.descriptions ? { codeSimilarity: row.base_similarity } : {}),
+      ...(fused ? { descriptionSimilarity: options.descriptions ? row.base_similarity : row.description_similarity } : {}),
+      ...(fileDescription ? { fileDescriptionSimilarity: row.file_description_similarity } : {}),
     }));
   }
 
@@ -615,9 +766,37 @@ export class IndexDatabase {
     return bufferVector(row.vector);
   }
 
+  public vectorForFile(filePath: string): number[] {
+    const row = this.#db.prepare(`
+      SELECT e.vector FROM files f
+      JOIN embeddings e ON e.id = f.file_description_embedding_id WHERE f.path = ?
+    `).get(filePath) as { vector: Uint8Array } | undefined;
+    if (!row) throw new CodeIndexError(`File ${filePath} does not exist or has no description embedding.`);
+    return bufferVector(row.vector);
+  }
+
+  public fileVectorForFunction(id: number): number[] {
+    const row = this.#db.prepare(`
+      SELECT e.vector FROM functions fn
+      JOIN files f ON f.path = fn.path
+      JOIN embeddings e ON e.id = f.file_description_embedding_id
+      WHERE fn.id = ?
+    `).get(id) as { vector: Uint8Array } | undefined;
+    if (!row) throw new CodeIndexError(`Function ${id} does not exist or its file has no description embedding.`);
+    return bufferVector(row.vector);
+  }
+
   public status(): IndexStatus {
     const functionCount = Number((this.#db.prepare("SELECT COUNT(*) AS count FROM functions").get() as { count: number }).count);
     const fileCount = Number((this.#db.prepare("SELECT COUNT(*) AS count FROM files").get() as { count: number }).count);
+    const describableFileCount = Number((this.#db.prepare(`
+      SELECT COUNT(*) AS count FROM files f
+      WHERE NOT EXISTS (
+        SELECT 1 FROM indexing_errors ie
+        WHERE ie.path = f.path
+          AND json_extract(ie.diagnostic, '$.code') IN ('read-error', 'file-too-large')
+      )
+    `).get() as { count: number }).count);
     return {
       rootDir: this.#rootDir,
       indexPath: this.#indexPath,
@@ -628,6 +807,18 @@ export class IndexDatabase {
       embeddingProfile: this.#profile,
       descriptionsEnabled: this.descriptionsEnabled(),
       descriptionCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM functions WHERE description_embedding_id IS NOT NULL").get() as { count: number }).count),
+      fileDescriptionCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM files WHERE file_description_embedding_id IS NOT NULL").get() as { count: number }).count),
+      describableFileCount,
+      staleFileDescriptionCount: Number((this.#db.prepare(`
+        SELECT COUNT(*) AS count FROM files f
+        WHERE (file_description_path IS NULL OR file_description_path != path
+          OR file_description_content_hash IS NULL OR file_description_content_hash != content_hash)
+          AND NOT EXISTS (
+            SELECT 1 FROM indexing_errors ie
+            WHERE ie.path = f.path
+              AND json_extract(ie.diagnostic, '$.code') IN ('read-error', 'file-too-large')
+          )
+      `).get() as { count: number }).count),
       descriptionProfile: this.descriptionProfile(),
       indexingErrorCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM indexing_errors").get() as { count: number }).count),
       failedFileCount: this.filesWithErrors().length,

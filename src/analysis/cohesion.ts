@@ -49,7 +49,7 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
   const neighborsFor = (callable: IndexedFunction): SimilarityResult[] => {
     throwIfAborted(options.signal);
     const matches = options.source.similarToFunction(callable.id, {
-      includeDescriptions: scoring.similarityMode === "code-description-average",
+      includeDescriptions: scoring.similarityMode === "code-description-file-average",
       limit: neighbors,
       minSimilarity,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -100,7 +100,7 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
     .slice(0, limit);
   const groups = buildGroups(reportedPairs);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     repository: {
       generation: status.generation,
       gitCheckpoint: status.gitCheckpoint,
@@ -161,6 +161,7 @@ function scorePair(edge: CandidateEdge, reciprocal: boolean | null, minSimilarit
     similarity: edge.similarity,
     ...(edge.codeSimilarity !== undefined ? { codeSimilarity: edge.codeSimilarity } : {}),
     ...(edge.descriptionSimilarity !== undefined ? { descriptionSimilarity: edge.descriptionSimilarity } : {}),
+    ...(edge.fileDescriptionSimilarity !== undefined ? { fileDescriptionSimilarity: edge.fileDescriptionSimilarity } : {}),
     reciprocal,
     semanticWeight,
     separationWeight,
@@ -256,6 +257,7 @@ function updateStrongestExternal(
       similarity: pair.similarity,
       ...(pair.codeSimilarity !== undefined ? { codeSimilarity: pair.codeSimilarity } : {}),
       ...(pair.descriptionSimilarity !== undefined ? { descriptionSimilarity: pair.descriptionSimilarity } : {}),
+      ...(pair.fileDescriptionSimilarity !== undefined ? { fileDescriptionSimilarity: pair.fileDescriptionSimilarity } : {}),
       cohesionGap: pair.cohesionGap,
     };
   }

@@ -112,6 +112,8 @@ slopdex status
 slopdex index-errors --format summary
 slopdex update-git
 slopdex update-files src/service.ts src/model.ts
+slopdex reindex-files
+slopdex reindex-files --callables
 slopdex delete-files src/removed.ts
 slopdex --version
 ```
@@ -120,6 +122,7 @@ slopdex --version
 - `index-errors` reads saved failures without refreshing or needing API credentials.
 - `update-git` explicitly refreshes HEAD and working-tree changes.
 - `update-files` reparses specified working-tree files after automatic refresh, even when their contents are unchanged.
+- `reindex-files` regenerates stale file descriptions and embeddings. Add `--callables` to also replace callable descriptions in those files.
 - `delete-files` removes index entries after automatic refresh, not source files. Eligible files can return on later refresh.
 - `--version` prints the built package version. `--help` describes available commands/options.
 
@@ -173,6 +176,7 @@ Explicit relative config/index paths resolve from the current directory. Source 
 | `--rebuild-on-divergence` | Permit reconciliation after non-descendant history changes, such as a rebase/branch switch. |
 | `--force-reindex` | Recreate an incompatible index. Compatible indexes still use normal refresh; this is not an unconditional reparse flag. |
 | `--no-reindex` | With Git, reconcile the committed snapshot but omit working-tree overlays. Without Git, reuse a non-empty index; missing/empty indexes still populate. Not an offline mode. |
+| `--callables` | With `reindex-files`, continue after the file description and regenerate every callable description in each stale file. |
 
 Use `--no-reindex` when the task calls for committed-only results or reuse of an existing non-Git index, rather than silently weakening freshness.
 
@@ -208,7 +212,7 @@ When reporting candidates, identify paths/symbols, summarize the shared behavior
 
 ### Purpose-aware scoring
 
-`search` uses code only; `search-description` uses purpose descriptions only. Cross-search and cohesion automatically use **50% code + 50% description similarity** when descriptions are enabled and complete. Cross-repository analysis needs completeness on both sides; otherwise all scores are code-only. Description-generator models may differ even though embedding profiles must match.
+When descriptions are complete, `search`, cross-search, and cohesion average code, callable-description, and file-description similarity with equal one-third weights. `search-description` averages callable and file descriptions. Cross-repository analysis needs completeness on both sides; otherwise all scores are code-only. Stale file descriptions remain in scoring until `reindex-files` refreshes them. Description-generator models may differ even though embedding profiles must match.
 
 Thresholds and limits apply to the selected score. Text labels combined scoring; JSON includes component scores and mode/weights (`scoring` in cross-search, `parameters` in cohesion). Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, neighbor count, and source/candidate filters.
 

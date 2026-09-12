@@ -73,7 +73,7 @@ export function beta() { return 2; }
       minLines: 1,
     });
 
-    expect(report.schemaVersion).toBe(2);
+    expect(report.schemaVersion).toBe(3);
     expect(report.metrics).toMatchObject({
       functionsAnalyzed: 4,
       candidateFunctions: 4,

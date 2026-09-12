@@ -70,7 +70,7 @@ export function formatSimilarityClusters(results: readonly CrossSearchResult[], 
       ? cluster.min.toFixed(4)
       : `${cluster.min.toFixed(4)}-${cluster.max.toFixed(4)}`;
     return [
-      `Cluster ${index + 1} (${cluster.members.length} functions, similarity ${similarity}${combined ? ", combined 50% code + 50% description" : ""})`,
+      `Cluster ${index + 1} (${cluster.members.length} functions, similarity ${similarity}${combined ? ", combined code + callable description + file description" : ""})`,
       ...cluster.members.map((member) => `  ${clusterFunctionName(member, sameIndex)}`),
     ].join("\n");
   }).join("\n\n");
@@ -83,8 +83,8 @@ export function formatCohesionSummary(report: CohesionReport): string {
     `Cohesion: ${metrics.functionsAnalyzed} functions analyzed, ${metrics.semanticEdges} semantic ${edgeLabel}`,
     `  same file ${(metrics.sameFileRatio * 100).toFixed(1)}%  same folder ${(metrics.sameFolderRatio * 100).toFixed(1)}%  remote ${(metrics.remoteRatio * 100).toFixed(1)}%  mean distance ${metrics.weightedMeanDistance.toFixed(2)}`,
   ];
-  if (report.parameters.similarityMode === "code-description-average") {
-    lines.push("  similarity: combined 50% code + 50% description");
+  if (report.parameters.similarityMode === "code-description-file-average") {
+    lines.push("  similarity: combined 1/3 code + 1/3 callable description + 1/3 file description");
   }
   if (report.pairs.length === 0) return [...lines, "No cohesion gaps."].join("\n");
   lines.push("");
@@ -99,9 +99,11 @@ export function formatCohesionSummary(report: CohesionReport): string {
 }
 
 function scoreDetails(scores: SimilarityScores): string {
-  return scores.codeSimilarity !== undefined && scores.descriptionSimilarity !== undefined
-    ? `  [combined 50/50; code ${scores.codeSimilarity.toFixed(4)}, description ${scores.descriptionSimilarity.toFixed(4)}]`
-    : "";
+  if (scores.descriptionSimilarity === undefined || scores.fileDescriptionSimilarity === undefined) return "";
+  if (scores.codeSimilarity === undefined) {
+    return `  [combined 50/50; description ${scores.descriptionSimilarity.toFixed(4)}, file ${scores.fileDescriptionSimilarity.toFixed(4)}]`;
+  }
+  return `  [combined thirds; code ${scores.codeSimilarity.toFixed(4)}, description ${scores.descriptionSimilarity.toFixed(4)}, file ${scores.fileDescriptionSimilarity.toFixed(4)}]`;
 }
 
 function clusterFunctionName(

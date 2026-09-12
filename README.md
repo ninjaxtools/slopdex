@@ -111,6 +111,7 @@ Usage: `slopdex <command> [arguments] [options]`.
 | `index-errors` | Read saved file/function indexing failures. | Summary; optional JSON array |
 | `update-git` | Explicitly refresh a Git snapshot, with current working-tree changes when targeting HEAD. | JSON update statistics |
 | `update-files <path...>` | After automatic refresh, explicitly reparse selected working-tree files. Paths are repository-relative or absolute within the root. | JSON update statistics |
+| `reindex-files [--callables]` | Regenerate descriptions for files changed since their stored file description. By default stops after each file description; `--callables` also regenerates its callable descriptions. | JSON description statistics |
 | `delete-files <path...>` | After automatic refresh, remove paths from the index; source files are not deleted. A later refresh can restore eligible files. | JSON update statistics |
 
 Manual maintenance examples:
@@ -118,6 +119,8 @@ Manual maintenance examples:
 ```bash
 slopdex update-git
 slopdex update-files src/service.ts src/model.ts
+slopdex reindex-files
+slopdex reindex-files --callables
 slopdex delete-files src/removed.ts
 slopdex update-git --target HEAD --rebuild-on-divergence
 slopdex update-git --force-reindex
@@ -134,7 +137,7 @@ slopdex update-git --force-reindex
 | `--model <name>` | Embedding model; `text-embedding-3-large` for OpenAI, `jina-embeddings-v4` for Jina. |
 | `--dimensions <number>` | Positive embedding dimension count; OpenAI `3072`, Jina `1024`. Must be supported by the model. |
 | `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use Zen or Go with `OPENCODE_API_KEY`. |
-| `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go, then the persisted model unless overridden. OpenCode custom models must support its Responses endpoint. |
+| `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go, then the persisted model unless overridden. Published OpenCode models use their documented protocol. |
 | `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
 | `-h`, `--help` | Show CLI usage without refreshing. |
 | `--version` | Print the package version and exit. |
@@ -223,13 +226,17 @@ For automation, pass `--format json`: query searches and diagnostics return JSON
 
 ### Descriptions and scoring
 
-Descriptions are optional and disabled initially. `descriptions enable` persists the selected provider and model and keeps descriptions current on later updates, including file-context and path changes. Use `slopdex descriptions enable --description-provider opencode-go` for OpenCode Go, or combine `--description-provider` and `--description-model` to change both. `slopdex descriptions disable` stops automatic updates and description-based searching/scoring while retaining cached descriptions. `status` exposes `descriptionsEnabled`, `descriptionCount`, and `descriptionProfile`.
+Descriptions are optional and disabled initially. `descriptions enable` persists the selected provider and model and keeps callable descriptions current on later updates. Use `slopdex descriptions enable --description-provider opencode-go` for OpenCode Go, or combine `--description-provider` and `--description-model` to change both. `slopdex descriptions disable` stops automatic updates and description-based searching/scoring while retaining cached descriptions. `status` exposes callable/file description counts, stale file-description count, enabled state, and profile.
+
+Descriptions are generated in source order through one conversation per file. Instructions and complete file source form a stable prefix; Slopdex asks for the overall file description first, then each callable request and answer extends that conversation. This allows supported providers to reuse their prompt cache instead of receiving a separate duplicated file context for every callable.
+
+Ordinary updates preserve an existing file description even when its source changes, while still refreshing callable descriptions. `slopdex reindex-files` explicitly regenerates stale file descriptions and their embeddings; add `--callables` to continue through and replace every callable description in those files.
 
 Tree-sitter extraction, generated descriptions, and document/query vectors are content-addressed in the same SQLite database. Each validated result is committed immediately, independently of the final logical index update. If indexing is interrupted or a later provider call fails, rerunning reuses every completed result whose profile, operation, input, and source context hash still match.
 
-`search` always searches code; `search-description` always searches purpose descriptions. When all callables have enabled descriptions, cross-search and cohesion automatically use **50% code similarity + 50% description similarity**. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Thresholds and neighbor limits apply to the selected score.
+With complete descriptions, `search`, cross-search, and cohesion average **one-third code similarity + one-third callable-description similarity + one-third file-description similarity**. `search-description` averages callable and file descriptions without code. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Stale file descriptions remain searchable until explicitly reindexed. Thresholds and neighbor limits apply to the selected score.
 
-Text output labels combined scores. JSON exposes `codeSimilarity`, `descriptionSimilarity`, and scoring mode/weights (`scoring` for cross-search, `parameters` for cohesion). Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, neighbor count, and source/candidate filters.
+Text output labels combined scores. JSON exposes `codeSimilarity`, `descriptionSimilarity`, `fileDescriptionSimilarity`, and scoring mode/weights (`scoring` for cross-search, `parameters` for cohesion). Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, neighbor count, and source/candidate filters.
 
 ### Exclusions
 

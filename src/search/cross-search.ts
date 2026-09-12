@@ -20,7 +20,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
     sourceDescriptionProfile: sourceStatus.descriptionProfile,
     targetDescriptionProfile: targetStatus.descriptionProfile,
   };
-  const includeDescriptions = scoring.similarityMode === "code-description-average";
+  const includeDescriptions = scoring.similarityMode === "code-description-file-average";
 
   const limit = options.limitPerFunction ?? 5;
   assertPositiveInteger(limit, "limitPerFunction");
@@ -74,7 +74,10 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         ...excludePaths,
       })
       : target.searchByVector(vector, {
-        ...(includeDescriptions ? { descriptionVector: options.source.vectorForFunction(source.id, "description") } : {}),
+        ...(includeDescriptions ? {
+          descriptionVector: options.source.vectorForFunction(source.id, "description"),
+          fileDescriptionVector: options.source.vectorForFile(source.path),
+        } : {}),
         limit,
         minSimilarity: options.minSimilarity ?? -1,
         ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),

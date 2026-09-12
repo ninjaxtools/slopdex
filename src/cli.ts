@@ -58,6 +58,11 @@ interface PublishedModel {
   model: string;
 }
 
+interface DescriptionRefreshHooks {
+  beforeRefresh?: (index: CodeIndex) => void | Promise<void>;
+  afterRefresh?: (index: CodeIndex) => void | Promise<void>;
+}
+
 const parsed = (() => {
   try {
     return parseArgs({
@@ -93,6 +98,7 @@ const parsed = (() => {
         "rebuild-on-divergence": { type: "boolean", default: false },
         "force-reindex": { type: "boolean", default: false },
         "no-reindex": { type: "boolean", default: false },
+        callables: { type: "boolean", default: false },
         "ignore-errors": { type: "boolean", default: false },
         version: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
@@ -187,9 +193,8 @@ async function main(): Promise<void> {
     ...(config.embeddingBatchSize ? { embeddingBatchSize: config.embeddingBatchSize } : {}),
   };
   const updateTarget = command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD";
-  const { descriptionProvider: _descriptionProvider, ...refreshOptions } = indexOptions;
   const updateStats = await ensureIndexUpdated(
-    command === "descriptions" && descriptionsAction === "enable" ? refreshOptions : indexOptions,
+    indexOptions,
     "index",
     updateTarget,
     parsed.values["rebuild-on-divergence"],
@@ -215,6 +220,9 @@ async function main(): Promise<void> {
         printJson(updateStats);
         break;
       }
+      case "reindex-files":
+        printJson(await index.reindexFiles({ includeCallables: parsed.values.callables }));
+        break;
       case "descriptions":
         printJson(descriptionsAction === "enable" ? await index.useDescriptions() : index.disableDescriptions());
         break;
@@ -351,16 +359,18 @@ async function ensureIndexUpdated(
   rebuildOnDivergence: boolean,
   forceRebuild: boolean,
   noReindex: boolean,
-  beforeRefresh?: (index: CodeIndex) => void | Promise<void>,
+  hooks?: DescriptionRefreshHooks,
 ): Promise<UpdateStats> {
   diagnosticIndexes.add(resolveIndexPath(options));
-  const initialized = await initializeMissingIndex(options, label, target, noReindex, beforeRefresh);
+  const initialized = await initializeMissingIndex(options, label, target, noReindex, hooks);
   if (initialized) return initialized;
   try {
     const index = new CodeIndex(options);
     try {
-      await beforeRefresh?.(index);
-      return await refreshIndex(index, label, target, rebuildOnDivergence, noReindex);
+      await hooks?.beforeRefresh?.(index);
+      const stats = await refreshIndex(index, label, target, rebuildOnDivergence, noReindex);
+      await hooks?.afterRefresh?.(index);
+      return stats;
     } finally {
       index.close();
     }
@@ -377,7 +387,7 @@ async function ensureIndexUpdated(
       if (!(resetError instanceof IncompatibleIndexError)) throw resetError;
       removeIndexArtifacts(indexPath);
     }
-    return initializeIndex(options, indexPath, label, target, noReindex, descriptionProfile, beforeRefresh);
+    return initializeIndex(options, indexPath, label, target, noReindex, descriptionProfile, hooks);
   }
 }
 
@@ -386,7 +396,7 @@ async function initializeMissingIndex(
   label: string,
   target: string,
   noReindex: boolean,
-  beforeRefresh?: (index: CodeIndex) => void | Promise<void>,
+  hooks?: DescriptionRefreshHooks,
 ): Promise<UpdateStats | null> {
   const indexPath = resolveIndexPath(options);
   if (existsSync(indexPath)) return null;
@@ -394,7 +404,7 @@ async function initializeMissingIndex(
   process.stderr.write(
     `slopdex: ${label} not found at ${indexPath}; initializing automatically from ${target}${noReindex ? "" : " and the working tree"}.\n`,
   );
-  return initializeIndex(options, indexPath, label, target, noReindex, null, beforeRefresh);
+  return initializeIndex(options, indexPath, label, target, noReindex, null, hooks);
 }
 
 async function initializeIndex(
@@ -404,7 +414,7 @@ async function initializeIndex(
   target: string,
   noReindex: boolean,
   descriptionProfile: DescriptionProfile | null = null,
-  beforeRefresh?: (index: CodeIndex) => void | Promise<void>,
+  hooks?: DescriptionRefreshHooks,
 ): Promise<UpdateStats> {
   const index = new CodeIndex({
     ...options, indexPath,
@@ -416,8 +426,10 @@ async function initializeIndex(
   });
   try {
     if (descriptionProfile) await index.useDescriptions();
-    await beforeRefresh?.(index);
-    return await refreshIndex(index, label, target, false, noReindex);
+    await hooks?.beforeRefresh?.(index);
+    const stats = await refreshIndex(index, label, target, false, noReindex);
+    await hooks?.afterRefresh?.(index);
+    return stats;
   } finally {
     index.close();
   }
@@ -520,13 +532,33 @@ function createDescriptionProvider(config: FileConfig): OpenAIDescriptionProvide
   });
 }
 
-function descriptionRefresh(config: FileConfig): ((index: CodeIndex) => void | Promise<void>) | undefined {
+function descriptionRefresh(config: FileConfig): DescriptionRefreshHooks | undefined {
   if (command === "descriptions") {
-    return descriptionsAction === "disable" ? (index) => { index.disableDescriptions(); } : undefined;
+    return descriptionsAction === "disable"
+      ? { beforeRefresh: (index) => { index.disableDescriptions(); } }
+      : enableDescriptionRefresh(false);
   }
-  if (config.descriptionsEnabled === true) return async (index) => { await index.useDescriptions(); };
-  if (config.descriptionsEnabled === false) return (index) => { index.disableDescriptions(); };
+  if (config.descriptionsEnabled === true) return enableDescriptionRefresh();
+  if (config.descriptionsEnabled === false) return { beforeRefresh: (index) => { index.disableDescriptions(); } };
   return undefined;
+}
+
+function enableDescriptionRefresh(afterRefresh = true): DescriptionRefreshHooks {
+  return {
+    beforeRefresh: (index) => {
+      const status = index.status();
+      if (status.descriptionsEnabled && !sameDescriptionProfile(status.descriptionProfile, index.descriptionProvider.profile)) {
+        index.disableDescriptions();
+      }
+    },
+    ...(afterRefresh ? { afterRefresh: async (index: CodeIndex) => { await index.useDescriptions(); } } : {}),
+  };
+}
+
+function sameDescriptionProfile(left: DescriptionProfile | null, right: DescriptionProfile): boolean {
+  return left?.provider === right.provider
+    && left.model === right.model
+    && left.strategyVersion === right.strategyVersion;
 }
 
 async function runModels(): Promise<void> {
@@ -704,6 +736,9 @@ function validateInvocation(): void {
     case "status":
     case "update-git":
       return;
+    case "reindex-files":
+      if (positionals.length > 0) throw new CodeIndexError("reindex-files does not accept positional arguments.");
+      return;
     case "descriptions":
       if (positionals.length !== 1 || (descriptionsAction !== "enable" && descriptionsAction !== "disable")) {
         throw new CodeIndexError("descriptions requires enable or disable.");
@@ -875,6 +910,7 @@ Commands:
   status                              Show index metadata
   index-errors                        List persisted file and function indexing failures
   update-files <path...>              Index specific working-tree files
+  reindex-files                       Regenerate stale file descriptions
   delete-files <path...>              Remove specific files from the index
   update-git                          Index a Git snapshot plus working-tree changes
   search <query>                      Search functions by semantic similarity
@@ -924,8 +960,8 @@ Analysis Examples:
     threshold, and allow for intentionally separate architectural responsibilities.
 
 Reading Analysis Output:
-  With complete description indexes, cross-search and cohesion use combined 50% code + 50%
-  description similarity. Cross-repository search requires complete descriptions on both sides;
+  With complete description indexes, search, cross-search, and cohesion combine code, callable
+  description, and file description similarity equally. Cross-repository search requires complete descriptions on both sides;
   otherwise the analysis uses code-only similarity. Thresholds and limits apply after fusion.
   JSON includes component scores and description-generator profiles for reproducibility.
   Compare results only when similarity mode and weights match.
@@ -979,6 +1015,7 @@ Options:
   --rebuild-on-divergence             Rebuild after a rebase or branch change
   --force-reindex                     Rebuild an incompatible existing index
   --no-reindex                        Skip worktree overlays or reuse a non-Git index
+  --callables                         With reindex-files, also regenerate callable descriptions
   --ignore-errors                     Silence warnings about persisted indexing errors
   --limit <number>                    Search result limit
   --neighbors <number>                Semantic neighbors per function for cohesion (default: 20)
@@ -1011,6 +1048,10 @@ Other Examples:
 
   Index specific working-tree files:
     slopdex update-files src/service.ts src/model.ts
+
+  Regenerate stale file descriptions, optionally continuing through callable descriptions:
+    slopdex reindex-files
+    slopdex reindex-files --callables
 
   Remove deleted files from the index:
     slopdex delete-files src/removed.ts

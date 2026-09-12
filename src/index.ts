@@ -18,6 +18,7 @@ import type {
   CodeIndexOptions,
   CohesionAnalysisOptions,
   CrossSearchOptions,
+  ReindexFilesOptions,
   SimilaritySearchOptions,
   UpdateFilesOptions,
   UpdateFromGitOptions,
@@ -38,6 +39,10 @@ export function updateFromGit(index: CodeIndex, options?: UpdateFromGitOptions) 
 
 export function updateFromWorkingTree(index: CodeIndex, options?: UpdateFromWorkingTreeOptions) {
   return index.updateFromWorkingTree(options);
+}
+
+export function reindexFiles(index: CodeIndex, options?: ReindexFilesOptions) {
+  return index.reindexFiles(options);
 }
 
 export function similaritySearch(index: CodeIndex, options: SimilaritySearchOptions) {

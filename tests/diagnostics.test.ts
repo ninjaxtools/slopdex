@@ -25,6 +25,7 @@ function openIndex(root: string, maxFileSize?: number): CodeIndex {
     descriptionProvider: {
       profile: { provider: "test", model: "purpose", strategyVersion: "v1" },
       describe: async ({ callable }) => `Purpose of ${callable.name}`,
+      describeFile: async ({ path }) => `Purpose of ${path}`,
     },
   });
   onTestFinished(() => index.close());
