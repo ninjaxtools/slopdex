@@ -489,6 +489,11 @@ export function two(value: string) {
     expect(invalidNeighbors.stderr).toContain("neighbors must be a positive integer");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
+    const invalidDescriptionProvider = runCli(root, "status", "--description-provider", "unknown");
+    expect(invalidDescriptionProvider.status).toBe(2);
+    expect(invalidDescriptionProvider.stderr).toContain("Unsupported description provider: unknown");
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
     const invalidCohesionThreshold = runCli(root, "cohesion", "--threshold", "1");
     expect(invalidCohesionThreshold.status).toBe(2);
     expect(invalidCohesionThreshold.stderr).toContain("cohesion threshold must be at least -1 and less than 1");
@@ -522,6 +527,7 @@ describe("CLI help", () => {
       "slopdex cohesion --threshold 0.8 --neighbors 20 --limit 50 --format summary",
     ]) expect(result.stdout).toContain(example);
     expect(result.stdout).toContain("--source-path <path>");
+    expect(result.stdout).toContain("--description-provider <name>");
     expect(result.stdout).toContain("--format <json|summary|clusters>");
     expect(result.stdout).toContain("--changed-since <commit>");
     expect(result.stdout).toContain("--uncommitted");
@@ -560,14 +566,14 @@ describe("CLI descriptions", () => {
   it("initializes, searches, updates, changes models, and preserves description mode through a rebuild", () => {
     const root = temporaryRoot();
     write(root, "src/a.ts", "export function one() { return 1; }\n");
-    write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2 }));
+    write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2, descriptionProvider: "opencode-go" }));
     write(root, ".slopdex/mock-api.mjs", `
 globalThis.fetch = async (url, options) => {
   const body = JSON.parse(options.body);
-  if (url === 'https://api.openai.com/v1/responses') {
-    const input = JSON.parse(body.input);
-    return Response.json({status: 'completed', output: [{type: 'message', content: [{
-      type: 'output_text', text: 'Purpose of ' + input.qualifiedName + ' using ' + body.model
+  if (url === 'https://api.openai.com/v1/responses' || url === 'https://opencode.ai/zen/v1/responses' || url === 'https://opencode.ai/zen/go/v1/responses') {
+    const input = JSON.parse(body.input[0].content[0].text);
+    return Response.json({status: 'completed', output: [{type: 'message', role: 'assistant', id: 'message-1', content: [{
+      type: 'output_text', text: 'Purpose of ' + input.qualifiedName + ' using ' + body.model, annotations: []
     }]}]});
   }
   if (url === 'https://api.openai.com/v1/embeddings') {
@@ -576,11 +582,19 @@ globalThis.fetch = async (url, options) => {
   throw new Error('Unexpected API URL: ' + url);
 };
 `);
-    const env = { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}` };
+    const env = {
+      ...process.env,
+      NODE_OPTIONS: `--import=${pathToFileURL(path.join(root, ".slopdex/mock-api.mjs")).href}`,
+      OPENCODE_API_KEY: "test",
+    };
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
     const initialized = run("descriptions", "enable");
     expect(initialized.status, initialized.stderr).toBe(0);
     expect(JSON.parse(initialized.stdout)).toEqual({ descriptionsCreated: 1, descriptionsEnabled: true });
+    expect(JSON.parse(run("status").stdout).descriptionProfile).toMatchObject({
+      provider: "opencode-go",
+      model: "gpt-5.6-luna",
+    });
     expect(JSON.parse(run("descriptions", "enable").stdout).descriptionsCreated).toBe(0);
 
     const disabled = run("descriptions", "disable");
@@ -592,10 +606,10 @@ globalThis.fetch = async (url, options) => {
 
     const search = run("search-description", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
     expect(search.status, search.stderr).toBe(0);
-    expect(JSON.parse(search.stdout)[0].function.description).toBe("Purpose of one using gpt-5.6-sol");
+    expect(JSON.parse(search.stdout)[0].function.description).toBe("Purpose of one using gpt-5.6-luna");
     expect(JSON.parse(search.stdout)[0].function).not.toHaveProperty("descriptionEmbeddingId");
     const text = run("search-description", "workflow");
-    expect(text.stdout).toContain("Purpose of one using gpt-5.6-sol");
+    expect(text.stdout).toContain("Purpose of one using gpt-5.6-luna");
 
     write(root, "src/b.ts", "export function two() { return 2; }\n");
     const updated = run("status");
@@ -606,10 +620,22 @@ globalThis.fetch = async (url, options) => {
       expect(filtered.status, filtered.stderr).toBe(0);
       expect(JSON.parse(filtered.stdout).map((match: { function: { name: string } }) => match.function.name)).toEqual(["two"]);
     }
-    const changedModel = run("descriptions", "enable", "--description-model", "custom-description-model");
+    const changedModel = run(
+      "descriptions", "enable",
+      "--description-provider", "opencode",
+      "--description-model", "custom-description-model",
+    );
     expect(changedModel.status, changedModel.stderr).toBe(0);
     expect(JSON.parse(changedModel.stdout).descriptionsCreated).toBe(2);
-    expect(JSON.parse(run("status").stdout).descriptionProfile.model).toBe("custom-description-model");
+    write(root, ".slopdex/config.json", JSON.stringify({
+      dimensions: 2,
+      descriptionProvider: "opencode",
+      descriptionModel: "custom-description-model",
+    }));
+    expect(JSON.parse(run("status").stdout).descriptionProfile).toMatchObject({
+      provider: "opencode",
+      model: "custom-description-model",
+    });
 
     const cross = run("cross-search", "--min-lines", "1", "--format", "json");
     expect(cross.status, cross.stderr).toBe(0);
@@ -631,7 +657,7 @@ globalThis.fetch = async (url, options) => {
     expect(rebuilt.status, rebuilt.stderr).toBe(0);
     expect(JSON.parse(rebuilt.stdout)).toMatchObject({
       functionCount: 2, descriptionCount: 2, descriptionsEnabled: true,
-      descriptionProfile: { model: "custom-description-model" },
+      descriptionProfile: { provider: "opencode", model: "custom-description-model" },
     });
   });
 

@@ -43,6 +43,8 @@
     "check:parser-parity": "node --import tsx scripts/check-parser-parity.mjs"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^4.0.66",
+    "ai": "^7.0.99",
     "ignore": "^7.0.9",
     "install": "^0.13.0",
     "js-tiktoken": "^1.0.21",

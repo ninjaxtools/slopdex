@@ -1,5 +1,8 @@
+import { createOpenAI } from "@ai-sdk/openai";
+import { embed, embedMany } from "ai";
+
 import type { EmbeddingProvider } from "../types.js";
-import { requestEmbeddings } from "./http.js";
+import { requestEmbeddings } from "./ai-sdk.js";
 
 export interface JinaEmbeddingProviderOptions {
   apiKey?: string;
@@ -11,7 +14,7 @@ export interface JinaEmbeddingProviderOptions {
 export class JinaEmbeddingProvider implements EmbeddingProvider {
   public readonly profile;
   readonly #apiKey: string;
-  readonly #url: string;
+  readonly #baseUrl: string;
 
   public constructor(options: JinaEmbeddingProviderOptions = {}) {
     this.#apiKey = options.apiKey ?? process.env.JINA_API_KEY ?? "";
@@ -25,33 +28,51 @@ export class JinaEmbeddingProvider implements EmbeddingProvider {
       dimensions,
       strategyVersion: "callable-v2:code-query-passage",
     } as const;
-    this.#url = options.baseUrl ?? "https://api.jina.ai/v1/embeddings";
+    const url = (options.baseUrl ?? "https://api.jina.ai/v1/embeddings").replace(/\/$/, "");
+    this.#baseUrl = url.endsWith("/embeddings") ? url.slice(0, -"/embeddings".length) : url;
   }
 
-  public embedDocuments(inputs: readonly string[], options?: { signal?: AbortSignal }): Promise<number[][]> {
-    if (inputs.length === 0) return Promise.resolve([]);
-    return this.#embed(inputs, "code.passage", options?.signal);
+  public async embedDocuments(inputs: readonly string[], options?: { signal?: AbortSignal }): Promise<number[][]> {
+    if (inputs.length === 0) return [];
+    return requestEmbeddings(
+      embedMany({
+        model: this.#model("code.passage"),
+        values: [...inputs],
+        providerOptions: { openai: { dimensions: this.profile.dimensions } },
+        ...(options?.signal ? { abortSignal: options.signal } : {}),
+      }).then(({ embeddings }) => embeddings),
+      this.profile.dimensions,
+      options?.signal,
+    );
   }
 
   public async embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]> {
-    return (await this.#embed([input], "code.query", options?.signal))[0]!;
+    return (await requestEmbeddings(
+      embed({
+        model: this.#model("code.query"),
+        value: input,
+        providerOptions: { openai: { dimensions: this.profile.dimensions } },
+        ...(options?.signal ? { abortSignal: options.signal } : {}),
+      }).then(({ embedding }) => [embedding]),
+      this.profile.dimensions,
+      options?.signal,
+    ))[0]!;
   }
 
-  #embed(inputs: readonly string[], task: "code.passage" | "code.query", signal?: AbortSignal): Promise<number[][]> {
-    return requestEmbeddings({
-      url: this.#url,
+  #model(task: "code.passage" | "code.query") {
+    const request: typeof fetch = (input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      delete body.encoding_format;
+      return fetch(input, {
+        ...init,
+        body: JSON.stringify({ ...body, embedding_type: "float", truncate: true, task }),
+      });
+    };
+    return createOpenAI({
       apiKey: this.#apiKey,
-      body: {
-        model: this.profile.model,
-        dimensions: this.profile.dimensions,
-        embedding_type: "float",
-        truncate: true,
-        task,
-        input: inputs,
-      },
-      expectedCount: inputs.length,
-      dimensions: this.profile.dimensions,
-      ...(signal ? { signal } : {}),
-    });
+      baseURL: this.#baseUrl,
+      name: "jina",
+      fetch: request,
+    }).embeddingModel(this.profile.model);
   }
 }

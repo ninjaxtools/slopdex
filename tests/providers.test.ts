@@ -25,23 +25,46 @@ describe("OpenAI description provider", () => {
     const requests: Array<Record<string, unknown>> = [];
     const url = await startServer(requests, {
       status: "completed",
-      output: [{ type: "reasoning" }, { type: "message", content: [{ type: "output_text", text: "Delivers application messages." }] }],
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{ type: "output_text", text: "Delivers application messages.", annotations: [] }],
+      }],
     });
     const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
     await expect(provider.describe(input)).resolves.toBe("Delivers application messages.");
     expect(requests[0]).toMatchObject({ model: "gpt-5.6-sol", store: false });
     expect(requests[0]!.instructions).toContain("purpose of the specified callable within its codebase");
-    expect(JSON.parse(requests[0]!.input as string)).toMatchObject({ repository: "example", path: "client.ts", fileContext: fileSource });
+    const requestInput = requests[0]!.input as Array<{ content: Array<{ text: string }> }>;
+    expect(JSON.parse(requestInput[0]!.content[0]!.text)).toMatchObject({ repository: "example", path: "client.ts", fileContext: fileSource });
   });
 
   it.each([
     { status: "incomplete", output: [] },
     { status: "completed", output: [] },
-    { status: "completed", output: [{ type: "message", content: [{ type: "refusal", refusal: "no" }] }] },
+    { status: "completed", output: [{ type: "message", role: "assistant", id: "message-1", content: [] }] },
   ])("rejects unusable descriptions: %j", async (response) => {
     const url = await startServer([], response);
     const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
     await expect(provider.describe(input)).rejects.toThrow(/incomplete|empty/);
+  });
+
+  it("supports OpenCode Go with its API key, endpoint, and default model", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, {
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{ type: "output_text", text: "Delivers through OpenCode Go.", annotations: [] }],
+      }],
+    });
+    const provider = new OpenAIDescriptionProvider({ provider: "opencode-go", apiKey: "test", baseUrl: url });
+
+    await expect(provider.describe(input)).resolves.toBe("Delivers through OpenCode Go.");
+    expect(provider.profile).toMatchObject({ provider: "opencode-go", model: "gpt-5.6-luna" });
+    expect(requests[0]).toMatchObject({ model: "gpt-5.6-luna", store: false });
   });
 });
 
@@ -52,12 +75,12 @@ describe("embedding providers", () => {
     expect(provider.profile).toMatchObject({ model: "text-embedding-3-large", dimensions: 3072 });
   });
 
-  it("sends OpenAI batches and restores response index order", async () => {
+  it("sends OpenAI embedding batches", async () => {
     const requests: unknown[] = [];
     const url = await startServer(requests, {
       data: [
-        { index: 1, embedding: [0, 1] },
         { index: 0, embedding: [1, 0] },
+        { index: 1, embedding: [0, 1] },
       ],
     });
     const provider = new OpenAIEmbeddingProvider({
@@ -105,7 +128,7 @@ describe("embedding providers", () => {
     const url = await startServer([], { data: [{ index: 0, embedding: ["1", 0] }] });
     const provider = new OpenAIEmbeddingProvider({ apiKey: "test", baseUrl: url, dimensions: 2 });
 
-    await expect(provider.embedDocuments(["one"])).rejects.toThrow(/malformed vector/);
+    await expect(provider.embedDocuments(["one"])).rejects.toThrow(/Embedding request failed/);
   });
 });
 

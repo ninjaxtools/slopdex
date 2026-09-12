@@ -1,8 +1,10 @@
+import { createOpenAI } from "@ai-sdk/openai";
+import { embed, embedMany } from "ai";
 import { Tiktoken } from "js-tiktoken/lite";
 import cl100kBase from "js-tiktoken/ranks/cl100k_base";
 
 import type { EmbeddingProvider } from "../types.js";
-import { requestEmbeddings } from "./http.js";
+import { requestEmbeddings } from "./ai-sdk.js";
 
 const MAX_INPUT_TOKENS = 8192;
 let tokenizer: Tiktoken | undefined;
@@ -22,41 +24,45 @@ export interface OpenAIEmbeddingProviderOptions {
 
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   public readonly profile;
-  readonly #apiKey: string;
-  readonly #url: string;
+  readonly #model;
 
   public constructor(options: OpenAIEmbeddingProviderOptions = {}) {
-    this.#apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? "";
-    if (!this.#apiKey) throw new Error("OPENAI_API_KEY is required.");
+    const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? "";
+    if (!apiKey) throw new Error("OPENAI_API_KEY is required.");
     const model = options.model ?? "text-embedding-3-large";
     const dimensions = options.dimensions ?? 3072;
     if (!Number.isInteger(dimensions) || dimensions < 1) throw new Error("dimensions must be a positive integer.");
     this.profile = { provider: "openai", model, dimensions, strategyVersion: "callable-v2" } as const;
-    this.#url = `${(options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "")}/embeddings`;
+    this.#model = createOpenAI({
+      apiKey,
+      baseURL: (options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, ""),
+    }).embeddingModel(model);
   }
 
-  public embedDocuments(inputs: readonly string[], options?: { signal?: AbortSignal }): Promise<number[][]> {
-    if (inputs.length === 0) return Promise.resolve([]);
-    return this.#embed(inputs, options?.signal);
+  public async embedDocuments(inputs: readonly string[], options?: { signal?: AbortSignal }): Promise<number[][]> {
+    if (inputs.length === 0) return [];
+    return requestEmbeddings(
+      embedMany({
+        model: this.#model,
+        values: inputs.map(truncateInput),
+        providerOptions: { openai: { dimensions: this.profile.dimensions } },
+        ...(options?.signal ? { abortSignal: options.signal } : {}),
+      }).then(({ embeddings }) => embeddings),
+      this.profile.dimensions,
+      options?.signal,
+    );
   }
 
   public async embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]> {
-    return (await this.#embed([input], options?.signal))[0]!;
-  }
-
-  #embed(inputs: readonly string[], signal?: AbortSignal): Promise<number[][]> {
-    return requestEmbeddings({
-      url: this.#url,
-      apiKey: this.#apiKey,
-      body: {
-        model: this.profile.model,
-        dimensions: this.profile.dimensions,
-        encoding_format: "float",
-        input: inputs.map(truncateInput),
-      },
-      expectedCount: inputs.length,
-      dimensions: this.profile.dimensions,
-      ...(signal ? { signal } : {}),
-    });
+    return (await requestEmbeddings(
+      embed({
+        model: this.#model,
+        value: truncateInput(input),
+        providerOptions: { openai: { dimensions: this.profile.dimensions } },
+        ...(options?.signal ? { abortSignal: options.signal } : {}),
+      }).then(({ embedding }) => [embedding]),
+      this.profile.dimensions,
+      options?.signal,
+    ))[0]!;
   }
 }

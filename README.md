@@ -119,7 +119,8 @@ slopdex update-git --force-reindex
 | `--provider <openai\|jina>` | Embedding provider; `openai` by default. |
 | `--model <name>` | Embedding model; `text-embedding-3-large` for OpenAI, `jina-embeddings-v4` for Jina. |
 | `--dimensions <number>` | Positive embedding dimension count; OpenAI `3072`, Jina `1024`. Must be supported by the model. |
-| `--description-model <name>` | OpenAI description model; `gpt-5.6-sol` initially, then the persisted model unless overridden. |
+| `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use Zen or Go with `OPENCODE_API_KEY`. |
+| `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go, then the persisted model unless overridden. OpenCode custom models must support its Responses endpoint. |
 | `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
 | `-h`, `--help` | Show CLI usage without refreshing. |
 | `--version` | Print the package version and exit. |
@@ -208,7 +209,7 @@ For automation, pass `--format json`: query searches and diagnostics return JSON
 
 ### Descriptions and scoring
 
-Descriptions are optional and disabled initially. `descriptions enable` persists the selected description model and keeps descriptions current on later updates, including file-context and path changes. Use `slopdex descriptions enable --description-model <model-id>` to change it, or `slopdex descriptions disable` to stop automatic updates and description-based searching/scoring while retaining cached descriptions. `status` exposes `descriptionsEnabled`, `descriptionCount`, and `descriptionProfile`.
+Descriptions are optional and disabled initially. `descriptions enable` persists the selected provider and model and keeps descriptions current on later updates, including file-context and path changes. Use `slopdex descriptions enable --description-provider opencode-go` for OpenCode Go, or combine `--description-provider` and `--description-model` to change both. `slopdex descriptions disable` stops automatic updates and description-based searching/scoring while retaining cached descriptions. `status` exposes `descriptionsEnabled`, `descriptionCount`, and `descriptionProfile`.
 
 Tree-sitter extraction, generated descriptions, and document/query vectors are content-addressed in the same SQLite database. Each validated result is committed immediately, independently of the final logical index update. If indexing is interrupted or a later provider call fails, rerunning reuses every completed result whose profile, operation, input, and source context hash still match.
 
@@ -232,13 +233,14 @@ Use the recovery flag named in the error: `--rebuild-on-divergence` for Git hist
 
 ## Configuration
 
-Optional file: `<root>/.slopdex/config.json`. Example using Jina (requires `JINA_API_KEY`):
+Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings and OpenCode Go descriptions (requires `JINA_API_KEY`, plus `OPENCODE_API_KEY` when descriptions are enabled):
 
 ```json
 {
   "provider": "jina",
   "model": "jina-embeddings-v4",
   "dimensions": 1024,
+  "descriptionProvider": "opencode-go",
   "exclude": ["**/fixtures/**"]
 }
 ```
@@ -246,14 +248,15 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina (requires `JINA
 | Property | Purpose / default |
 | --- | --- |
 | `provider`, `model`, `dimensions` | Embedding settings; defaults are listed in the CLI table. |
-| `descriptionModel` | Description model; initially `gpt-5.6-sol`. |
+| `descriptionProvider` | Description provider: `openai`, `opencode` (Zen), or `opencode-go`; defaults to `openai`. |
+| `descriptionModel` | Description model; provider default unless explicitly set. |
 | `indexPath` | Index location; `<root>/.slopdex/index.sqlite`. |
 | `include` | Repository-relative glob array; empty/unset includes all supported eligible files. |
 | `exclude` | Additional repository-relative exclusion globs. |
 | `maxFileSize` | Maximum source-file size in bytes; positive integer, default `1048576`. |
 | `embeddingBatchSize` | Embedding inputs per batch; positive integer, default `32`. |
 
-Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`). Changing the embedding profile requires rebuilding with `--force-reindex`.
+Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`, `OPENCODE_API_KEY`). Changing the embedding profile requires rebuilding with `--force-reindex`.
 
 ## Development
 

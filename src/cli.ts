@@ -12,7 +12,7 @@ import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
-import { OpenAIDescriptionProvider } from "./descriptions/openai.js";
+import { isDescriptionProviderName, OpenAIDescriptionProvider, type DescriptionProviderName } from "./descriptions/openai.js";
 import { readIndexErrorCounts, readIndexErrors, resetIndexState } from "./storage/database.js";
 import { compileNameRegex } from "./utils.js";
 import type {
@@ -41,6 +41,7 @@ interface FileConfig {
   exclude?: string[];
   maxFileSize?: number;
   embeddingBatchSize?: number;
+  descriptionProvider?: DescriptionProviderName;
   descriptionModel?: string;
 }
 
@@ -56,6 +57,7 @@ const parsed = (() => {
         index: { type: "string" },
         provider: { type: "string" },
         model: { type: "string" },
+        "description-provider": { type: "string" },
         "description-model": { type: "string" },
         dimensions: { type: "string" },
         target: { type: "string" },
@@ -151,10 +153,11 @@ async function main(): Promise<void> {
     return;
   }
   const provider = createProvider(config);
+  const descriptionProvider = createDescriptionProvider(config);
   const indexOptions: CodeIndexOptions = {
     rootDir,
     provider,
-    ...(config.descriptionModel ? { descriptionProvider: new OpenAIDescriptionProvider({ model: config.descriptionModel }) } : {}),
+    ...(descriptionProvider ? { descriptionProvider } : {}),
     onWarning: () => {}, // Persisted diagnostics are reported once per index at exit.
     ...(parsed.values.index || config.indexPath ? { indexPath: parsed.values.index ?? config.indexPath } : {}),
     ...(config.include ? { include: config.include } : {}),
@@ -262,6 +265,7 @@ async function runCrossSearch(
   const targetConfig = targetRootDir && !usesSourceAsTarget
     ? loadConfig(targetRootDir, parsed.values["target-config"])
     : undefined;
+  const targetDescriptionProvider = targetConfig ? createDescriptionProvider(targetConfig) : undefined;
   const targetOptions: CodeIndexOptions | undefined = targetRootDir && resolvedTargetPath && !usesSourceAsTarget ? {
     rootDir: targetRootDir,
     indexPath: resolvedTargetPath,
@@ -271,7 +275,7 @@ async function runCrossSearch(
     ...(targetConfig?.exclude ? { exclude: targetConfig.exclude } : {}),
     ...(targetConfig?.maxFileSize ? { maxFileSize: targetConfig.maxFileSize } : {}),
     ...(targetConfig?.embeddingBatchSize ? { embeddingBatchSize: targetConfig.embeddingBatchSize } : {}),
-    ...(targetConfig?.descriptionModel ? { descriptionProvider: new OpenAIDescriptionProvider({ model: targetConfig.descriptionModel }) } : {}),
+    ...(targetDescriptionProvider ? { descriptionProvider: targetDescriptionProvider } : {}),
   } : undefined;
   if (targetOptions) {
     await ensureIndexUpdated(
@@ -383,7 +387,10 @@ async function initializeIndex(
   const index = new CodeIndex({
     ...options, indexPath,
     ...(descriptionProfile && !options.descriptionProvider
-      ? { descriptionProvider: new OpenAIDescriptionProvider({ model: descriptionProfile.model }) } : {}),
+      ? { descriptionProvider: new OpenAIDescriptionProvider({
+        provider: descriptionProfile.provider as DescriptionProviderName,
+        model: descriptionProfile.model,
+      }) } : {}),
   });
   try {
     if (descriptionProfile) await index.useDescriptions();
@@ -400,7 +407,9 @@ function descriptionProfileForRebuild(indexPath: string, rootDir: string): Descr
       .map((row) => [row.key, row.value]));
     if (metadata.get("root_dir") !== path.resolve(rootDir) || metadata.get("descriptions_enabled") !== "true") return null;
     const profile = JSON.parse(metadata.get("description_profile")!) as DescriptionProfile;
-    if (profile.provider !== "openai") throw new CodeIndexError("Rebuilding this description index requires its custom description provider through the library API.");
+    if (!isDescriptionProviderName(profile.provider)) {
+      throw new CodeIndexError("Rebuilding this description index requires its custom description provider through the library API.");
+    }
     return profile;
   } finally {
     db.close();
@@ -466,13 +475,26 @@ function commandLineConfig(config: FileConfig): FileConfig {
   const provider: FileConfig["provider"] = providerValue === "openai" || providerValue === "jina"
     ? providerValue
     : undefined;
+  const descriptionProviderValue = parsed.values["description-provider"] ?? config.descriptionProvider;
+  if (descriptionProviderValue !== undefined && !isDescriptionProviderName(descriptionProviderValue)) {
+    throw new CodeIndexError(`Unsupported description provider: ${descriptionProviderValue}`);
+  }
   return {
     ...config,
     ...(provider ? { provider } : {}),
     ...(parsed.values.model ? { model: parsed.values.model } : {}),
+    ...(descriptionProviderValue ? { descriptionProvider: descriptionProviderValue } : {}),
     ...(parsed.values["description-model"] ? { descriptionModel: parsed.values["description-model"] } : {}),
     ...(dimensions ? { dimensions } : {}),
   };
+}
+
+function createDescriptionProvider(config: FileConfig): OpenAIDescriptionProvider | undefined {
+  if (!config.descriptionProvider && !config.descriptionModel) return undefined;
+  return new OpenAIDescriptionProvider({
+    ...(config.descriptionProvider ? { provider: config.descriptionProvider } : {}),
+    ...(config.descriptionModel ? { model: config.descriptionModel } : {}),
+  });
 }
 
 function createProvider(config: FileConfig): EmbeddingProvider {
@@ -775,7 +797,8 @@ Options:
   --index <path>                      SQLite index path
   --provider <openai|jina>            Embedding provider
   --model <name>                      Embedding model
-  --description-model <name>          OpenAI description model (default: gpt-5.6-sol)
+  --description-provider <name>       Description provider: openai, opencode, or opencode-go
+  --description-model <name>          Description model (provider default: gpt-5.6-sol or gpt-5.6-luna)
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)
   --rebuild-on-divergence             Rebuild after a rebase or branch change

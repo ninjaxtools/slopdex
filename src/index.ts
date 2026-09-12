@@ -4,7 +4,7 @@ export { analyzeCohesion, cohesionLocation } from "./analysis/cohesion.js";
 export { crossSearch } from "./search/cross-search.js";
 export { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 export { OpenAIDescriptionProvider } from "./descriptions/openai.js";
-export type { OpenAIDescriptionProviderOptions } from "./descriptions/openai.js";
+export type { DescriptionProviderName, OpenAIDescriptionProviderOptions } from "./descriptions/openai.js";
 export type { OpenAIEmbeddingProviderOptions } from "./embeddings/openai.js";
 export { JinaEmbeddingProvider } from "./embeddings/jina.js";
 export type { JinaEmbeddingProviderOptions } from "./embeddings/jina.js";

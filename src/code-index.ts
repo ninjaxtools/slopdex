@@ -7,7 +7,7 @@ import { GitignoreRules } from "./gitignore.js";
 import { CALLABLE_PARSER_CACHE_VERSION, languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
 import { SourcePolicy } from "./source-policy.js";
 import { IndexDatabase, type PreparedCallable, type PreparedDescription, type PreparedFile } from "./storage/database.js";
-import { OpenAIDescriptionProvider } from "./descriptions/openai.js";
+import { isDescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
 import type {
   CodeIndexOptions,
   CrossSearchSourceFilter,
@@ -48,8 +48,11 @@ export class CodeIndex {
     const profile = normalizeProfile(options.provider.profile);
     assertPositiveInteger(profile.dimensions, "embedding dimensions");
     this.#database = new IndexDatabase(this.indexPath, this.rootDir, profile, options.readOnly ?? false);
+    const storedDescriptionProfile = this.#database.descriptionProfile();
     this.descriptionProvider = options.descriptionProvider ?? new OpenAIDescriptionProvider({
-      ...(this.#database.descriptionProfile()?.provider === "openai" ? { model: this.#database.descriptionProfile()!.model } : {}),
+      ...(storedDescriptionProfile && isDescriptionProviderName(storedDescriptionProfile.provider)
+        ? { provider: storedDescriptionProfile.provider, model: storedDescriptionProfile.model }
+        : {}),
     });
     this.#policy = new SourcePolicy(options.include, options.exclude);
     this.#maxFileSize = options.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;

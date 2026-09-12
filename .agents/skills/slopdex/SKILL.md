@@ -30,7 +30,8 @@ Then purpose descriptions can be searched:
 slopdex search-description "keep the repository index synchronized" --format summary --limit 10
 ```
 
-Enabling needs `OPENAI_API_KEY` in the environment.
+Enabling needs `OPENAI_API_KEY` by default. Select OpenCode Zen or Go with
+`--description-provider opencode` or `--description-provider opencode-go` and set `OPENCODE_API_KEY`.
 
 To select another model:
 
@@ -125,7 +126,8 @@ Usage: `slopdex <command> [arguments] [options]`. Quote queries and regexes. Boo
 | `--provider <openai\|jina>` | Embedding provider; `openai`. |
 | `--model <name>` | Embedding model; OpenAI `text-embedding-3-large`, Jina `jina-embeddings-v4`. |
 | `--dimensions <number>` | Positive dimensions supported by the model; OpenAI `3072`, Jina `1024`. |
-| `--description-model <name>` | OpenAI description model; initially `gpt-5.6-sol`, then the persisted selection. |
+| `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values require `OPENCODE_API_KEY`. |
+| `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go. |
 | `--ignore-errors` | Silence saved-diagnostic warnings without deleting records. |
 | `-h`, `--help` | Usage; no refresh. |
 | `--version` | Package version; exits without refresh or saved-diagnostic warnings. |
