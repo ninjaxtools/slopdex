@@ -11,7 +11,7 @@ let tokenizer: Tiktoken | undefined;
 
 function truncateInput(input: string): string {
   tokenizer ??= new Tiktoken(cl100kBase);
-  const tokens = tokenizer.encode(input);
+  const tokens = tokenizer.encode(input, [], []);
   return tokens.length <= MAX_INPUT_TOKENS ? input : tokenizer.decode(tokens.slice(0, MAX_INPUT_TOKENS));
 }
 

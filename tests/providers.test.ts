@@ -228,6 +228,20 @@ describe("embedding providers", () => {
 
     await expect(provider.embedDocuments(["one"])).rejects.toThrow(/Embedding request failed/);
   });
+
+  it("treats tokenizer special tokens as ordinary embedding input", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, { data: [{ index: 0, embedding: [1, 0] }] });
+    const provider = new OpenAIEmbeddingProvider({ apiKey: "test", baseUrl: url, dimensions: 2 });
+
+    await provider.embedDocuments([`function marker() { return "<|endoftext|>"; }`]);
+    await provider.embedQuery("find <|endoftext|>");
+
+    expect(requests.map((request) => request.input)).toEqual([
+      [`function marker() { return "<|endoftext|>"; }`],
+      ["find <|endoftext|>"],
+    ]);
+  });
 });
 
 describe("rerankers", () => {
@@ -367,6 +381,29 @@ describe("rerankers", () => {
     const input = JSON.stringify(requests[0]!.input);
     expect(input).toContain("important purpose");
     expect(input).not.toContain("END_MARKER");
+  });
+
+  it("treats tokenizer special tokens as ordinary reranker input", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, {
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{
+          type: "output_text",
+          text: JSON.stringify({ ranking: [{ index: 0, score: 1 }] }),
+          annotations: [],
+        }],
+      }],
+    });
+    const reranker = new OpenAILLMReranker({ apiKey: "test", baseUrl: url });
+
+    await expect(reranker.rerank("find marker", ["return '<|endoftext|>'"])).resolves.toEqual([
+      { index: 0, score: 1 },
+    ]);
+    expect(JSON.stringify(requests[0]!.input)).toContain("<|endoftext|>");
   });
 });
 

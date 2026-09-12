@@ -52,12 +52,13 @@ Storage uses Node's `node:sqlite` and `sqlite-vec`. Writable connections enable 
 - `files`: paths, content hashes, blob IDs, source mode, previous paths, language, and size.
 - `functions`: identity, names, signatures, locations, source, provenance, and embedding/description references.
 - `embeddings`: code, description, and query vectors keyed by embedding profile, operation, and exact input.
+- `function_vectors`: synchronized `vec0` storage for filtered code-vector nearest-neighbor queries.
 - `description_cache`: generated description text keyed independently by description profile and complete source context.
 - `parse_cache`: successful Tree-sitter extraction results keyed by parser strategy, path, and file-content hash.
 - `callable_provenance`: first-seen committed source identity.
 - `indexing_errors`: diagnostics associated with files.
 
-Current schema version is `7`. Schema 6 is migrated in place by adding file-description state; earlier schemas require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. Forced rebuilds clear logical index state while retaining content-addressed caches when possible; incompatible older databases are recreated. Enabled OpenAI description settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`.
+Current schema version is `8`. Schemas 6 and 7 are migrated in place by adding file-description state when necessary and building the nearest-neighbor vector table; earlier schemas require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. Forced rebuilds clear logical index state while retaining content-addressed caches when possible; incompatible older databases are recreated. Enabled OpenAI description settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`.
 
 ### Diagnostics
 
@@ -80,7 +81,7 @@ Description inputs include contextual and profile information so file-context, p
 
 ## Similarity and analysis
 
-`search` embeds a query and, when descriptions are complete, scores code, callable-description, and containing-file-description vectors. `search-description` scores callable and file descriptions. Analysis uses code-only cosine similarity unless all indexed callables and files have enabled description embeddings. Cross-index analysis requires completeness on both sides. Description-generator models may differ across indexes even though embedding profiles must match.
+`search` embeds a query and, when descriptions are complete, scores code, callable-description, and containing-file-description vectors. `search-description` scores callable and file descriptions. Filter-compatible code-only searches up to sqlite-vec's 8,192-dimension limit use the synchronized `vec0` nearest-neighbor table; larger custom profiles plus fused, regex, upper-bound, and multi-path searches retain the exact scalar scoring path. Analysis uses code-only cosine similarity unless all indexed callables and files have enabled description embeddings. Cross-index analysis requires completeness on both sides. Description-generator models may differ across indexes even though embedding profiles must match.
 
 An optional `Reranker` performs a second-stage pass for the two natural-language query methods. After applying name and similarity filters, Cohere and Jina retrieve five times the requested result limit. `OpenAILLMReranker` retrieves its configured candidate count (10 by default), or the result limit when larger. Every reranker receives the query plus candidate path, code metadata/source, and purpose description when available, then returns the requested number in relevance order. Results preserve the embedding/fused `similarity` and add `rerankScore`.
 

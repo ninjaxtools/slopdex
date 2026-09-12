@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -11,27 +11,54 @@ import { OpenAIEmbeddingProvider } from "../src/embeddings/openai.js";
 import { commitAll, initGit, temporaryRoot, write } from "./helpers.js";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
+const cliTimeoutMs = 10_000;
+const testTimeoutMs = 120_000;
 
 function runCli(root: string, ...args: string[]) {
   return runCliWithEnv(root, process.env, ...args);
 }
 
 function runCliWithEnv(root: string, env: NodeJS.ProcessEnv, ...args: string[]) {
-  return spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args, "--root", root], {
-    cwd: projectRoot,
-    encoding: "utf8",
-    env: { ...env, OPENAI_API_KEY: "test" },
+  return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", "src/cli.ts", ...args, "--root", root], {
+      cwd: projectRoot,
+      env: { ...env, OPENAI_API_KEY: "test" },
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, cliTimeoutMs);
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once("close", (status) => {
+      clearTimeout(timeout);
+      if (timedOut) {
+        reject(new Error(`CLI timed out after ${cliTimeoutMs}ms${stderr ? `:\n${stderr}` : ""}`));
+        return;
+      }
+      resolve({ status, stdout, stderr });
+    });
   });
 }
 
-describe("CLI index initialization", () => {
-  it("initializes a missing index from HEAD and prints a notice", () => {
+describe("CLI index initialization", { timeout: testTimeoutMs }, () => {
+  it("initializes a missing index from HEAD and prints a notice", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "README.md", "# Example\n");
     const head = commitAll(root, "initial");
 
-    const result = runCli(root, "status");
+    const result = await runCli(root, "status");
 
     expect(result.status).toBe(0);
     expect(result.stderr).toContain("index not found");
@@ -40,7 +67,7 @@ describe("CLI index initialization", () => {
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(true);
   });
 
-  it("initializes a missing index with uncommitted non-source changes", () => {
+  it("initializes a missing index with uncommitted non-source changes", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "README.md", "# Example\n");
@@ -48,7 +75,7 @@ describe("CLI index initialization", () => {
     write(root, "README.md", "# Changed locally\n");
     write(root, "notes.md", "Untracked notes\n");
 
-    const result = runCli(root, "status");
+    const result = await runCli(root, "status");
 
     expect(result.status).toBe(0);
     expect(result.stderr).toContain("index not found");
@@ -56,7 +83,7 @@ describe("CLI index initialization", () => {
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(true);
   });
 
-  it("retains a partial initialization cache and resumes without repeating completed API calls", () => {
+  it("retains a partial initialization cache and resumes without repeating completed API calls", async () => {
     const root = temporaryRoot();
     const statePath = path.join(root, ".slopdex", "api-state.json");
     write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
@@ -79,19 +106,19 @@ globalThis.fetch = async (_url, options) => {
       SLOPDEX_STATE_PATH: statePath,
     };
 
-    const failed = runCliWithEnv(root, env, "status");
+    const failed = await runCliWithEnv(root, env, "status");
     expect(failed.status).not.toBe(0);
     expect(failed.stderr).toContain("intentional failure");
     expect(existsSync(path.join(root, ".slopdex/index.sqlite"))).toBe(true);
 
-    const resumed = runCliWithEnv(root, env, "status");
+    const resumed = await runCliWithEnv(root, env, "status");
     expect(resumed.status, resumed.stderr).toBe(0);
     const calls = JSON.parse(readFileSync(statePath, "utf8")) as string[];
     expect(calls.filter((input) => input.includes("symbol: one"))).toHaveLength(1);
     expect(calls.filter((input) => input.includes("symbol: two"))).toHaveLength(2);
   });
 
-  it("initializes a missing cross-search target index", () => {
+  it("initializes a missing cross-search target index", async () => {
     const sourceRoot = temporaryRoot();
     const targetRoot = temporaryRoot();
     for (const root of [sourceRoot, targetRoot]) {
@@ -101,7 +128,7 @@ globalThis.fetch = async (_url, options) => {
     }
     const targetIndex = path.join(targetRoot, ".slopdex", "target.sqlite");
 
-    const result = runCli(
+    const result = await runCli(
       sourceRoot,
       "cross-search",
       "--target-root",
@@ -115,7 +142,7 @@ globalThis.fetch = async (_url, options) => {
     expect(existsSync(targetIndex)).toBe(true);
   });
 
-  it("refreshes a cross-search target with the target repository policy", () => {
+  it("refreshes a cross-search target with the target repository policy", async () => {
     const sourceRoot = temporaryRoot();
     const targetRoot = temporaryRoot();
     initGit(sourceRoot);
@@ -130,7 +157,7 @@ globalThis.fetch = async (_url, options) => {
     commitAll(targetRoot, "target");
     const targetIndex = path.join(targetRoot, ".slopdex", "target.sqlite");
 
-    const result = runCli(
+    const result = await runCli(
       sourceRoot,
       "cross-search",
       "--target-root",
@@ -152,147 +179,147 @@ globalThis.fetch = async (_url, options) => {
     target.close();
   });
 
-  it("accepts a recursive source path and threshold range", () => {
+  it("accepts a recursive source path and threshold range", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "README.md", "# Example\n");
     commitAll(root, "initial");
 
-    const result = runCli(root, "cross-search", "--source-path", "src", "--threshold", "0.85-0.95");
+    const result = await runCli(root, "cross-search", "--source-path", "src", "--threshold", "0.85-0.95");
 
     expect(result.status).toBe(0);
     expect(result.stderr).not.toContain("must be a number");
   });
 
-  it("refreshes an existing index before reporting status", () => {
+  it("refreshes an existing index before reporting status", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "README.md", "# Initial\n");
     commitAll(root, "initial");
-    expect(runCli(root, "status").status).toBe(0);
+    expect((await runCli(root, "status")).status).toBe(0);
 
     write(root, "README.md", "# Updated\n");
     const target = commitAll(root, "updated");
     write(root, "notes.md", "Uncommitted\n");
-    const result = runCli(root, "status");
+    const result = await runCli(root, "status");
 
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ gitCheckpoint: target });
   });
 
-  it("indexes the full working tree when the root is not a Git repository", () => {
+  it("indexes the full working tree when the root is not a Git repository", async () => {
     const root = temporaryRoot();
     write(root, "src/types.ts", "export interface First {}\n");
 
-    const first = runCli(root, "status");
+    const first = await runCli(root, "status");
     expect(first.status).toBe(0);
     expect(first.stderr).toContain("warning: no Git repository is available for index; re-indexing all source files");
     expect(JSON.parse(first.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: null });
 
     write(root, "src/more.ts", "export interface Second {}\n");
-    const second = runCli(root, "status");
+    const second = await runCli(root, "status");
     expect(second.status).toBe(0);
     expect(second.stderr).toContain("re-indexing all source files");
     expect(JSON.parse(second.stdout)).toMatchObject({ fileCount: 2, gitCheckpoint: null });
   });
 
-  it("uses a non-empty filesystem index with --no-reindex", () => {
+  it("uses a non-empty filesystem index with --no-reindex", async () => {
     const root = temporaryRoot();
     write(root, "src/types.ts", "export interface First {}\n");
 
-    const initial = runCli(root, "status", "--no-reindex");
+    const initial = await runCli(root, "status", "--no-reindex");
     expect(initial.status).toBe(0);
     expect(initial.stderr).toContain("re-indexing all source files");
     expect(JSON.parse(initial.stdout)).toMatchObject({ fileCount: 1 });
 
     write(root, "src/more.ts", "export interface Second {}\n");
-    const cached = runCli(root, "status", "--no-reindex");
+    const cached = await runCli(root, "status", "--no-reindex");
     expect(cached.status).toBe(0);
     expect(cached.stderr).toContain("full working-tree re-index skipped because --no-reindex was specified");
     expect(JSON.parse(cached.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: null });
   });
 
-  it("populates an empty filesystem index despite --no-reindex", () => {
+  it("populates an empty filesystem index despite --no-reindex", async () => {
     const root = temporaryRoot();
-    expect(runCli(root, "status").status).toBe(0);
+    expect((await runCli(root, "status")).status).toBe(0);
 
     write(root, "src/types.ts", "export interface First {}\n");
-    const result = runCli(root, "status", "--no-reindex");
+    const result = await runCli(root, "status", "--no-reindex");
 
     expect(result.status).toBe(0);
     expect(result.stderr).toContain("re-indexing all source files");
     expect(JSON.parse(result.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: null });
   });
 
-  it("uses only committed files with --no-reindex in a Git repository", () => {
+  it("uses only committed files with --no-reindex in a Git repository", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "tracked.ts", "export interface Tracked {}\n");
     const head = commitAll(root, "base");
     write(root, "untracked.ts", "export interface Untracked {}\n");
 
-    const committedOnly = runCli(root, "status", "--no-reindex");
+    const committedOnly = await runCli(root, "status", "--no-reindex");
     expect(committedOnly.status).toBe(0);
     expect(committedOnly.stderr).not.toContain("no Git repository");
     expect(JSON.parse(committedOnly.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: head });
 
-    expect(runCli(root, "status").status).toBe(0);
-    const restored = runCli(root, "status", "--no-reindex");
+    expect((await runCli(root, "status")).status).toBe(0);
+    const restored = await runCli(root, "status", "--no-reindex");
     expect(restored.status).toBe(0);
     expect(JSON.parse(restored.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: head });
   });
 
-  it("falls back when the Git executable is unavailable", () => {
+  it("falls back when the Git executable is unavailable", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "src/types.ts", "export interface Value {}\n");
     commitAll(root, "base");
 
-    const result = runCliWithEnv(root, { ...process.env, PATH: "" }, "status");
+    const result = await runCliWithEnv(root, { ...process.env, PATH: "" }, "status");
 
     expect(result.status).toBe(0);
     expect(result.stderr).toContain("warning: no Git repository is available for index; re-indexing all source files");
     expect(JSON.parse(result.stdout)).toMatchObject({ fileCount: 1, gitCheckpoint: null });
   });
 
-  it("does not treat an invalid Git target as an unavailable repository", () => {
+  it("does not treat an invalid Git target as an unavailable repository", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "src/types.ts", "export interface Value {}\n");
     commitAll(root, "base");
 
-    const result = runCli(root, "update-git", "--target", "missing-ref");
+    const result = await runCli(root, "update-git", "--target", "missing-ref");
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("Git command failed");
     expect(result.stderr).not.toContain("no Git repository is available");
   });
 
-  it("does not hide Git configuration failures behind filesystem fallback", () => {
+  it("does not hide Git configuration failures behind filesystem fallback", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "src/types.ts", "export interface Value {}\n");
     commitAll(root, "base");
 
-    const result = runCliWithEnv(root, { ...process.env, GIT_DIR: path.join(root, "missing-git-dir") }, "status");
+    const result = await runCliWithEnv(root, { ...process.env, GIT_DIR: path.join(root, "missing-git-dir") }, "status");
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("Git command failed");
     expect(result.stderr).not.toContain("no Git repository is available");
   });
 
-  it("force rebuilds an incompatible index and prints a warning", () => {
+  it("force rebuilds an incompatible index and prints a warning", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "README.md", "# Example\n");
     commitAll(root, "initial");
-    expect(runCli(root, "status", "--model", "text-embedding-3-small").status).toBe(0);
+    expect((await runCli(root, "status", "--model", "text-embedding-3-small")).status).toBe(0);
 
-    const incompatible = runCli(root, "status");
+    const incompatible = await runCli(root, "status");
     expect(incompatible.status).toBe(2);
     expect(incompatible.stderr).toContain("Embedding provider, model, dimensions, or strategy differs");
 
-    const rebuilt = runCli(root, "status", "--force-reindex");
+    const rebuilt = await runCli(root, "status", "--force-reindex");
     expect(rebuilt.status).toBe(0);
     expect(rebuilt.stderr).toContain("warning: index is incompatible");
     expect(rebuilt.stderr).toContain("rebuilding automatically because --force-reindex was specified");
@@ -301,17 +328,17 @@ globalThis.fetch = async (_url, options) => {
     });
   });
 
-  it("supports clusters, changed-since, and uncommitted filters", () => {
+  it("supports clusters, changed-since, and uncommitted filters", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "README.md", "# Initial\n");
     const base = commitAll(root, "initial");
 
-    const clusters = runCli(root, "cross-search", "--format", "clusters", "--changed-since", base, "--cross-file-only");
+    const clusters = await runCli(root, "cross-search", "--format", "clusters", "--changed-since", base, "--cross-file-only");
     expect(clusters.status).toBe(0);
     expect(clusters.stdout).toBe("No clusters.\n");
 
-    const uncommitted = runCli(root, "cross-search", "--cohesion", "--uncommitted", "--changed-since", base, "--source-path", "src", "-e", "keep$", "--format", "json");
+    const uncommitted = await runCli(root, "cross-search", "--cohesion", "--uncommitted", "--changed-since", base, "--source-path", "src", "-e", "keep$", "--format", "json");
     expect(uncommitted.status).toBe(0);
     expect(uncommitted.stdout).toBe("");
   });
@@ -344,7 +371,7 @@ export function two(value: string) {
     await index.updateFromGit();
     index.close();
 
-    const result = runCli(
+    const result = await runCli(
       root,
       "cross-search",
       "--cross-file-only",
@@ -362,15 +389,15 @@ export function two(value: string) {
     expect(rows.every((row) => row.source.path !== row.matches[0].function.path)).toBe(true);
     expect(rows.every((row) => row.source.lineCount === 3 && row.matches[0].function.lineCount === 3)).toBe(true);
 
-    const defaultFormat = runCli(root, "cross-search");
+    const defaultFormat = await runCli(root, "cross-search");
     expect(defaultFormat.status).toBe(0);
     expect(defaultFormat.stdout).toMatch(/^Cluster 1 /);
 
-    const minimum = runCli(root, "cross-search", "--min-lines", "4");
+    const minimum = await runCli(root, "cross-search", "--min-lines", "4");
     expect(minimum.status).toBe(0);
     expect(minimum.stdout).toBe("No clusters.\n");
 
-    const regex = runCli(
+    const regex = await runCli(
       root,
       "cross-search",
       "--regex",
@@ -390,15 +417,15 @@ export function two(value: string) {
     expect(regexRow.source.qualifiedName).toBe("one");
     expect(regexRow.matches.map((match: { function: { qualifiedName: string } }) => match.function.qualifiedName)).toEqual(["external"]);
 
-    const sourceRegex = runCli(root, "cross-search", "-e", "^one$", "--source-path", "same.ts",
+    const sourceRegex = await runCli(root, "cross-search", "-e", "^one$", "--source-path", "same.ts",
       "--cross-file-only", "--min-lines", "3", "--limit", "1", "--threshold", "0.8-1.1", "--format", "json");
     expect(sourceRegex.status).toBe(0);
     const selected = JSON.parse(sourceRegex.stdout);
     expect(selected.source.qualifiedName).toBe("one");
     expect(selected.matches.map((match: { function: { qualifiedName: string } }) => match.function.qualifiedName)).toEqual(["external"]);
-    expect(runCli(root, "cross-search", "--regex", "^one$", "--source-path", "same.ts",
-      "--cross-file-only", "--min-lines", "3", "--limit", "1", "--threshold", "0.8-1.1", "--format", "json").stdout).toBe(sourceRegex.stdout);
-    const empty = runCli(root, "cross-search", "--regexp", "^missing$", "--format", "json");
+    expect((await runCli(root, "cross-search", "--regex", "^one$", "--source-path", "same.ts",
+      "--cross-file-only", "--min-lines", "3", "--limit", "1", "--threshold", "0.8-1.1", "--format", "json")).stdout).toBe(sourceRegex.stdout);
+    const empty = await runCli(root, "cross-search", "--regexp", "^missing$", "--format", "json");
     expect(empty.status).toBe(0);
     expect(empty.stdout).toBe("");
   });
@@ -429,65 +456,65 @@ export function two(value: string) {
     await index.updateFromGit();
     index.close();
 
-    const summary = runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--limit", "2");
+    const summary = await runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--limit", "2");
     expect(summary.status).toBe(0);
     expect(summary.stdout).toContain("[distance 4]");
     expect(summary.stdout.indexOf("packages/feature/three.ts")).toBeLessThan(summary.stdout.indexOf("src/two.ts"));
 
-    const json = runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--limit", "2", "--format", "json");
+    const json = await runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--limit", "2", "--format", "json");
     expect(json.status).toBe(0);
     const rows = json.stdout.trim().split("\n").map((line) => JSON.parse(line));
     const one = rows.find((row) => row.source.qualifiedName === "one");
     expect(one.matches.map((match: { function: { qualifiedName: string } }) => match.function.qualifiedName)).toEqual(["three", "two"]);
     expect(one.matches.map((match: { physicalDistance: number }) => match.physicalDistance)).toEqual([4, 1]);
 
-    const clusters = runCli(root, "cross-search", "--cohesion", "--format", "clusters");
+    const clusters = await runCli(root, "cross-search", "--cohesion", "--format", "clusters");
     expect(clusters.status).toBe(2);
     expect(clusters.stderr).toContain("does not preserve cohesion match order");
 
-    const removed = runCli(root, "cohesion");
+    const removed = await runCli(root, "cohesion");
     expect(removed.status).toBe(2);
     expect(removed.stderr).toContain("Unknown command: cohesion");
   });
 
-  it.each(["--min-similarity", "--added-since"])("rejects removed option %s cleanly", (option) => {
-    const result = runCli("/", "cross-search", option, "0.8");
+  it.each(["--min-similarity", "--added-since"])("rejects removed option %s cleanly", async (option) => {
+    const result = await runCli("/", "cross-search", option, "0.8");
     expect(result.status).toBe(2);
     expect(result.stderr).toMatch(/^slopdex: Unknown option/);
     expect(result.stderr).not.toContain("node:internal");
   });
 
-  it("validates options before creating or refreshing an index", () => {
+  it("validates options before creating or refreshing an index", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "README.md", "# Initial\n");
     commitAll(root, "initial");
 
-    const invalidRegex = runCli(root, "cross-search", "--regex", "[");
+    const invalidRegex = await runCli(root, "cross-search", "--regex", "[");
     expect(invalidRegex.status).toBe(2);
     expect(invalidRegex.stderr).toContain("Invalid --regex value");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    const conflictingAliases = runCli(root, "search", "query", "-e", "one", "--regex", "two");
+    const conflictingAliases = await runCli(root, "search", "query", "-e", "one", "--regex", "two");
     expect(conflictingAliases.status).toBe(2);
     expect(conflictingAliases.stderr).toContain("are aliases and cannot use different values");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    const emptyRange = runCli(root, "cross-search", "--threshold", "0.9-0.9");
+    const emptyRange = await runCli(root, "cross-search", "--threshold", "0.9-0.9");
     expect(emptyRange.status).toBe(2);
     expect(emptyRange.stderr).toContain("minimum must be less than its maximum");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
     for (const command of ["cross-search", "search", "search-description"]) {
       for (const option of ["-e", "--regex"]) {
-        const invalidSourceRegex = runCli(root, command, ...(command.startsWith("search") ? ["query"] : []), option, "[");
+        const invalidSourceRegex = await runCli(root, command, ...(command.startsWith("search") ? ["query"] : []), option, "[");
         expect(invalidSourceRegex.status).toBe(2);
         expect(invalidSourceRegex.stderr).toContain(option === "--regex" ? "Invalid --regex value" : "Invalid -e/--regexp value");
         expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
       }
     }
 
-    const invalidDescriptionProvider = runCli(root, "status", "--description-provider", "unknown");
+    const invalidDescriptionProvider = await runCli(root, "status", "--description-provider", "unknown");
     expect(invalidDescriptionProvider.status).toBe(2);
     expect(invalidDescriptionProvider.stderr).toContain("Unsupported description provider: unknown");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
@@ -495,18 +522,18 @@ export function two(value: string) {
   });
 });
 
-describe("CLI help", () => {
-  it("prints the package version", () => {
+describe("CLI help", { timeout: testTimeoutMs }, () => {
+  it("prints the package version", async () => {
     const { version } = JSON.parse(readFileSync(path.join(projectRoot, "package.json"), "utf8")) as { version: string };
-    const result = runCli("/", "--version");
+    const result = await runCli("/", "--version");
 
     expect(result.status).toBe(0);
     expect(result.stdout).toBe(`${version}\n`);
     expect(result.stderr).toBe("");
   });
 
-  it("includes an example for every command", () => {
-    const result = runCli("/", "--help");
+  it("includes an example for every command", async () => {
+    const result = await runCli("/", "--help");
 
     expect(result.status).toBe(0);
     for (const example of [
@@ -557,8 +584,8 @@ describe("CLI help", () => {
   });
 });
 
-describe("CLI model configuration", () => {
-  it("lists published models and validates index-free config changes", () => {
+describe("CLI model configuration", { timeout: testTimeoutMs }, () => {
+  it("lists published models and validates index-free config changes", async () => {
     const root = temporaryRoot();
     const configPath = path.join(root, ".slopdex", "config.json");
     write(root, "src/a.ts", "export function one() { return 1; }\n");
@@ -591,7 +618,7 @@ globalThis.fetch = async (input, options) => {
     };
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
 
-    const listed = run("models", "opencode", "--format", "json");
+    const listed = await run("models", "opencode", "--format", "json");
     expect(listed.status, listed.stderr).toBe(0);
     expect(JSON.parse(listed.stdout)).toEqual([
       { provider: "opencode", model: "gpt-5.6-sol" },
@@ -599,12 +626,12 @@ globalThis.fetch = async (input, options) => {
     ]);
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    const ambiguous = run("config", "model", "shared-model");
+    const ambiguous = await run("config", "model", "shared-model");
     expect(ambiguous.status).toBe(2);
     expect(ambiguous.stderr).toContain("available from multiple providers");
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ dimensions: 2, exclude: ["fixtures/**"] });
 
-    const automatic = run("config", "model", "gpt-5.6-sol");
+    const automatic = await run("config", "model", "gpt-5.6-sol");
     expect(automatic.status, automatic.stderr).toBe(0);
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({
       descriptionProvider: "opencode",
@@ -612,7 +639,7 @@ globalThis.fetch = async (input, options) => {
       exclude: ["fixtures/**"],
     });
 
-    const qualified = run("config", "model", "opencode-go/gpt-5.6-luna", "--format", "json");
+    const qualified = await run("config", "model", "opencode-go/gpt-5.6-luna", "--format", "json");
     expect(qualified.status, qualified.stderr).toBe(0);
     expect(JSON.parse(qualified.stdout)).toMatchObject({
       configPath,
@@ -620,17 +647,17 @@ globalThis.fetch = async (input, options) => {
       descriptionModel: "gpt-5.6-luna",
     });
 
-    const invalid = run("config", "model", "opencode-go/not-published");
+    const invalid = await run("config", "model", "opencode-go/not-published");
     expect(invalid.status).toBe(2);
     expect(invalid.stderr).toContain("Unknown opencode-go model");
     expect(JSON.parse(readFileSync(configPath, "utf8")).descriptionModel).toBe("gpt-5.6-luna");
 
-    const enabled = run("config", "descriptions", "enable");
+    const enabled = await run("config", "descriptions", "enable");
     expect(enabled.status, enabled.stderr).toBe(0);
     expect(JSON.parse(readFileSync(configPath, "utf8")).descriptionsEnabled).toBe(true);
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    const status = run("status");
+    const status = await run("status");
     expect(status.status, status.stderr).toBe(0);
     expect(JSON.parse(status.stdout)).toMatchObject({
       descriptionsEnabled: true,
@@ -638,15 +665,15 @@ globalThis.fetch = async (input, options) => {
       descriptionProfile: { provider: "opencode-go", model: "gpt-5.6-luna" },
     });
 
-    expect(run("config", "descriptions", "disable").status).toBe(0);
-    const disabled = run("status");
+    expect((await run("config", "descriptions", "disable")).status).toBe(0);
+    const disabled = await run("status");
     expect(disabled.status, disabled.stderr).toBe(0);
     expect(JSON.parse(disabled.stdout).descriptionsEnabled).toBe(false);
   });
 });
 
-describe("CLI reranker configuration", () => {
-  it("enables, uses, changes, and disables reranking without opening an index during config", () => {
+describe("CLI reranker configuration", { timeout: testTimeoutMs }, () => {
+  it("enables, uses, changes, and disables reranking without opening an index during config", async () => {
     const root = temporaryRoot();
     const configPath = path.join(root, ".slopdex", "config.json");
     write(root, "functions.ts", [
@@ -683,7 +710,7 @@ globalThis.fetch = async (url, options) => {
     };
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
 
-    const enabled = run("config", "reranker", "cohere", "rerank-v4.0-fast", "--format", "json");
+    const enabled = await run("config", "reranker", "cohere", "rerank-v4.0-fast", "--format", "json");
     expect(enabled.status, enabled.stderr).toBe(0);
     expect(JSON.parse(enabled.stdout)).toMatchObject({
       configPath,
@@ -693,20 +720,20 @@ globalThis.fetch = async (url, options) => {
     });
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    const search = run("search", "find two", "--limit", "1", "--format", "json");
+    const search = await run("search", "find two", "--limit", "1", "--format", "json");
     expect(search.status, search.stderr).toBe(0);
     expect(JSON.parse(search.stdout)).toMatchObject([
       { similarity: 1, rerankScore: 0.95, function: { name: "two" } },
     ]);
 
-    const jina = run("config", "reranker", "jina");
+    const jina = await run("config", "reranker", "jina");
     expect(jina.status, jina.stderr).toBe(0);
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({
       rerankingEnabled: true,
       rerankerProvider: "jina",
       rerankerModel: "jina-reranker-v3.5",
     });
-    const openai = run("config", "reranker", "openai", "custom-ranker", "--reranker-candidates", "12", "--format", "json");
+    const openai = await run("config", "reranker", "openai", "custom-ranker", "--reranker-candidates", "12", "--format", "json");
     expect(openai.status, openai.stderr).toBe(0);
     expect(JSON.parse(openai.stdout)).toMatchObject({
       rerankingEnabled: true,
@@ -715,51 +742,51 @@ globalThis.fetch = async (url, options) => {
       rerankerCandidates: 12,
     });
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({ rerankerCandidates: 12 });
-    const resized = run("config", "reranker", "openai", "--reranker-candidates", "15", "--format", "json");
+    const resized = await run("config", "reranker", "openai", "--reranker-candidates", "15", "--format", "json");
     expect(resized.status, resized.stderr).toBe(0);
     expect(JSON.parse(resized.stdout)).toMatchObject({ rerankerModel: "custom-ranker", rerankerCandidates: 15 });
-    const llmSearch = run("search", "find two", "--limit", "1", "--format", "json");
+    const llmSearch = await run("search", "find two", "--limit", "1", "--format", "json");
     expect(llmSearch.status, llmSearch.stderr).toBe(0);
     expect(JSON.parse(llmSearch.stdout)).toMatchObject([
       { rerankScore: 0.99, function: { name: "two" } },
     ]);
-    const disabled = run("config", "reranker", "disable");
+    const disabled = await run("config", "reranker", "disable");
     expect(disabled.status, disabled.stderr).toBe(0);
     expect(JSON.parse(readFileSync(configPath, "utf8")).rerankingEnabled).toBe(false);
   });
 
-  it("rejects invalid reranker configuration before creating an index", () => {
+  it("rejects invalid reranker configuration before creating an index", async () => {
     const root = temporaryRoot();
-    const invalid = runCli(root, "config", "reranker", "unknown");
+    const invalid = await runCli(root, "config", "reranker", "unknown");
     expect(invalid.status).toBe(2);
     expect(invalid.stderr).toContain("requires cohere, jina, openai, or disable");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    const misplacedCandidates = runCli(root, "config", "reranker", "cohere", "--reranker-candidates", "10");
+    const misplacedCandidates = await runCli(root, "config", "reranker", "cohere", "--reranker-candidates", "10");
     expect(misplacedCandidates.status).toBe(2);
     expect(misplacedCandidates.stderr).toContain("only available with config reranker openai");
 
-    const invalidCandidates = runCli(root, "config", "reranker", "openai", "--reranker-candidates", "0");
+    const invalidCandidates = await runCli(root, "config", "reranker", "openai", "--reranker-candidates", "0");
     expect(invalidCandidates.status).toBe(2);
     expect(invalidCandidates.stderr).toContain("reranker candidate count must be a positive integer");
 
-    const excessiveCandidates = runCli(root, "config", "reranker", "openai", "--reranker-candidates", "101");
+    const excessiveCandidates = await runCli(root, "config", "reranker", "openai", "--reranker-candidates", "101");
     expect(excessiveCandidates.status).toBe(2);
     expect(excessiveCandidates.stderr).toContain("reranker candidate count must not exceed 100");
 
     write(root, ".slopdex/config.json", JSON.stringify({ rerankingEnabled: true, rerankerProvider: "cohere", rerankerModel: 3 }));
-    const malformed = runCli(root, "status");
+    const malformed = await runCli(root, "status");
     expect(malformed.status).toBe(2);
     expect(malformed.stderr).toContain("rerankerModel must be a non-empty string");
 
-    const disabled = runCli(root, "config", "reranker", "disable");
+    const disabled = await runCli(root, "config", "reranker", "disable");
     expect(disabled.status, disabled.stderr).toBe(0);
-    expect(runCli(root, "status").status).toBe(0);
+    expect((await runCli(root, "status")).status).toBe(0);
   });
 });
 
-describe("CLI descriptions", () => {
-  it("initializes, searches, updates, changes models, and preserves description mode through a rebuild", () => {
+describe("CLI descriptions", { timeout: testTimeoutMs }, () => {
+  it("initializes, searches, updates, changes models, and preserves description mode through a rebuild", async () => {
     const root = temporaryRoot();
     write(root, "src/a.ts", "export function one() { return 1; }\n");
     write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2, descriptionProvider: "opencode-go" }));
@@ -785,10 +812,10 @@ globalThis.fetch = async (url, options) => {
       OPENCODE_API_KEY: "test",
     };
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
-    const initialized = run("descriptions", "enable");
+    const initialized = await run("descriptions", "enable");
     expect(initialized.status, initialized.stderr).toBe(0);
     expect(JSON.parse(initialized.stdout)).toEqual({ descriptionsCreated: 1, fileDescriptionsCreated: 1, descriptionsEnabled: true });
-    expect(JSON.parse(run("status").stdout).descriptionProfile).toMatchObject({
+    expect(JSON.parse((await run("status")).stdout).descriptionProfile).toMatchObject({
       provider: "opencode-go",
       model: "gpt-5.6-luna",
     });
@@ -798,36 +825,36 @@ globalThis.fetch = async (url, options) => {
     }));
     old.exec("DELETE FROM description_cache;");
     old.close();
-    const migrated = run("descriptions", "enable");
+    const migrated = await run("descriptions", "enable");
     expect(migrated.status, migrated.stderr).toBe(0);
     expect(JSON.parse(migrated.stdout).descriptionsCreated).toBe(1);
-    expect(JSON.parse(run("status").stdout).descriptionProfile.strategyVersion).toBe("callable-purpose-v2");
-    expect(JSON.parse(run("descriptions", "enable").stdout).descriptionsCreated).toBe(0);
+    expect(JSON.parse((await run("status")).stdout).descriptionProfile.strategyVersion).toBe("callable-purpose-v2");
+    expect(JSON.parse((await run("descriptions", "enable")).stdout).descriptionsCreated).toBe(0);
 
-    const disabled = run("descriptions", "disable");
+    const disabled = await run("descriptions", "disable");
     expect(disabled.status, disabled.stderr).toBe(0);
     expect(JSON.parse(disabled.stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: false });
-    expect(JSON.parse(run("status").stdout)).toMatchObject({ descriptionCount: 0, descriptionsEnabled: false });
-    expect(run("search-description", "workflow").stderr).toContain("run descriptions enable first");
-    expect(JSON.parse(run("descriptions", "enable").stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
+    expect(JSON.parse((await run("status")).stdout)).toMatchObject({ descriptionCount: 0, descriptionsEnabled: false });
+    expect((await run("search-description", "workflow")).stderr).toContain("run descriptions enable first");
+    expect(JSON.parse((await run("descriptions", "enable")).stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
 
-    const search = run("search-description", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
+    const search = await run("search-description", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
     expect(search.status, search.stderr).toBe(0);
     expect(JSON.parse(search.stdout)[0].function.description).toBe("Purpose of one using gpt-5.6-luna");
     expect(JSON.parse(search.stdout)[0].function).not.toHaveProperty("descriptionEmbeddingId");
-    const text = run("search-description", "workflow");
+    const text = await run("search-description", "workflow");
     expect(text.stdout).toContain("Purpose of one using gpt-5.6-luna");
 
     write(root, "src/b.ts", "export function two() { return 2; }\n");
-    const updated = run("status");
+    const updated = await run("status");
     expect(updated.status, updated.stderr).toBe(0);
     expect(JSON.parse(updated.stdout)).toMatchObject({ functionCount: 2, descriptionCount: 2, descriptionsEnabled: true });
     for (const command of ["search", "search-description"]) {
-      const filtered = run(command, "workflow", "-e", "^two$", "--limit", "1", "--format", "json");
+      const filtered = await run(command, "workflow", "-e", "^two$", "--limit", "1", "--format", "json");
       expect(filtered.status, filtered.stderr).toBe(0);
       expect(JSON.parse(filtered.stdout).map((match: { function: { name: string } }) => match.function.name)).toEqual(["two"]);
     }
-    const changedModel = run(
+    const changedModel = await run(
       "descriptions", "enable",
       "--description-provider", "opencode",
       "--description-model", "custom-description-model",
@@ -839,12 +866,12 @@ globalThis.fetch = async (url, options) => {
       descriptionProvider: "opencode",
       descriptionModel: "custom-description-model",
     }));
-    expect(JSON.parse(run("status").stdout).descriptionProfile).toMatchObject({
+    expect(JSON.parse((await run("status")).stdout).descriptionProfile).toMatchObject({
       provider: "opencode",
       model: "custom-description-model",
     });
 
-    const cross = run("cross-search", "--min-lines", "1", "--format", "json");
+    const cross = await run("cross-search", "--min-lines", "1", "--format", "json");
     expect(cross.status, cross.stderr).toBe(0);
     const crossRow = JSON.parse(cross.stdout.trim());
     expect(crossRow.matches[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, descriptionSimilarity: 1 });
@@ -853,8 +880,8 @@ globalThis.fetch = async (url, options) => {
       similarityWeights: { code: 1 / 3, description: 1 / 3, fileDescription: 1 / 3 },
       sourceDescriptionProfile: { model: "custom-description-model" }, targetDescriptionProfile: { model: "custom-description-model" },
     });
-    expect(run("cross-search", "--min-lines", "1").stdout).toContain("combined code + callable description + file description");
-    const cohesion = run("cross-search", "--cohesion", "--min-lines", "1", "--format", "json");
+    expect((await run("cross-search", "--min-lines", "1")).stdout).toContain("combined code + callable description + file description");
+    const cohesion = await run("cross-search", "--cohesion", "--min-lines", "1", "--format", "json");
     expect(cohesion.status, cohesion.stderr).toBe(0);
     const report = JSON.parse(cohesion.stdout.trim());
     expect(report.matches[0]).toMatchObject({ similarity: 1, codeSimilarity: 1, descriptionSimilarity: 1, physicalDistance: 1 });
@@ -863,15 +890,15 @@ globalThis.fetch = async (url, options) => {
       similarityWeights: { code: 1 / 3, description: 1 / 3, fileDescription: 1 / 3 },
     });
 
-    const rebuilt = run("status", "--model", "text-embedding-3-small", "--force-reindex");
+    const rebuilt = await run("status", "--model", "text-embedding-3-small", "--force-reindex");
     expect(rebuilt.status, rebuilt.stderr).toBe(0);
     expect(JSON.parse(rebuilt.stdout)).toMatchObject({
       functionCount: 2, descriptionCount: 2, descriptionsEnabled: true,
       descriptionProfile: { provider: "opencode", model: "custom-description-model" },
     });
-  }, 30_000);
+  });
 
-  it("reindexes stale file descriptions and optionally callable descriptions", () => {
+  it("reindexes stale file descriptions and optionally callable descriptions", async () => {
     const root = temporaryRoot();
     write(root, "src/a.ts", "export function one() { return 1; }\n");
     write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2 }));
@@ -897,39 +924,39 @@ globalThis.fetch = async (url, options) => {
       OPENAI_API_KEY: "test",
     };
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
-    expect(run("descriptions", "enable").status).toBe(0);
+    expect((await run("descriptions", "enable")).status).toBe(0);
 
     write(root, "src/a.ts", "export function one() { return 2; }\n");
-    const filesOnly = run("reindex-files");
+    const filesOnly = await run("reindex-files");
     expect(filesOnly.status, filesOnly.stderr).toBe(0);
     expect(JSON.parse(filesOnly.stdout)).toEqual({
       filesReindexed: 1, fileDescriptionsCreated: 1, descriptionsCreated: 0,
     });
 
     write(root, "src/a.ts", "export function one() { return 3; }\n");
-    const withCallables = run("reindex-files", "--callables");
+    const withCallables = await run("reindex-files", "--callables");
     expect(withCallables.status, withCallables.stderr).toBe(0);
     expect(JSON.parse(withCallables.stdout)).toEqual({
       filesReindexed: 1, fileDescriptionsCreated: 1, descriptionsCreated: 1,
     });
   });
 
-  it("validates description search arguments and explains how to enable descriptions", () => {
+  it("validates description search arguments and explains how to enable descriptions", async () => {
     const root = temporaryRoot();
-    const missingQuery = runCli(root, "search-description");
+    const missingQuery = await runCli(root, "search-description");
     expect(missingQuery.status).toBe(2);
     expect(missingQuery.stderr).toContain("search-description requires a query");
     expect(existsSync(path.join(root, ".slopdex/index.sqlite"))).toBe(false);
-    const disabled = runCli(root, "search-description", "workflow");
+    const disabled = await runCli(root, "search-description", "workflow");
     expect(disabled.status).toBe(2);
     expect(disabled.stderr).toContain("run descriptions enable first");
 
     for (const args of [["descriptions"], ["descriptions", "maybe"], ["descriptions", "enable", "extra"]]) {
-      const invalid = runCli(root, ...args);
+      const invalid = await runCli(root, ...args);
       expect(invalid.status).toBe(2);
       expect(invalid.stderr).toContain("descriptions requires enable or disable");
     }
-    const invalidReindex = runCli(root, "reindex-files", "extra");
+    const invalidReindex = await runCli(root, "reindex-files", "extra");
     expect(invalidReindex.status).toBe(2);
     expect(invalidReindex.stderr).toContain("does not accept positional arguments");
   });

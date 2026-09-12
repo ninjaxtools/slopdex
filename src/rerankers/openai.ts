@@ -88,7 +88,7 @@ export class OpenAILLMReranker implements Reranker {
       const candidateTokenLimit = Math.min(MAX_CANDIDATE_TOKENS, Math.max(1, Math.floor(MAX_TOTAL_CANDIDATE_TOKENS / documents.length)));
       tokenizer ??= new Tiktoken(cl100kBase);
       const candidates = documents.map((document, index) => {
-        const tokens = tokenizer!.encode(document);
+        const tokens = tokenizer!.encode(document, [], []);
         return {
           index,
           document: tokens.length <= candidateTokenLimit ? document : tokenizer!.decode(tokens.slice(0, candidateTokenLimit)),

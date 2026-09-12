@@ -249,7 +249,7 @@ Parse, extraction, read, and file-size failures are saved while healthy callable
 
 Saved failures trigger stderr warnings, including on cached runs, help, and cross-search targets. `--ignore-errors` silences warnings without clearing records. Updates retry failed files; successful indexing, deletion, or exclusion clears their diagnostics. Version output bypasses diagnostics.
 
-Use the recovery flag named in the error: `--rebuild-on-divergence` for Git history changes, `--force-reindex` for incompatible indexes. Schema versions before 5 require `--force-reindex`; schema-5 rebuilds preserve reusable artifact caches. For provider/authentication failures, fix the reported configuration and rerun. For source-change-during-indexing errors, rerun after edits settle. Exit status is `0` on success, `2` for argument/domain errors, and `1` for other failures (or invocation without a command).
+Use the recovery flag named in the error: `--rebuild-on-divergence` for Git history changes, `--force-reindex` for incompatible indexes. Schema versions 6 and 7 migrate in place; earlier schemas require `--force-reindex`, with compatible rebuilds preserving reusable artifact caches. For provider/authentication failures, fix the reported configuration and rerun. For source-change-during-indexing errors, rerun after edits settle. Exit status is `0` on success, `2` for argument/domain errors, and `1` for other failures (or invocation without a command).
 
 ## Configuration
 

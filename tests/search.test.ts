@@ -2,6 +2,7 @@ import { linkSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import * as sqliteVec from "sqlite-vec";
 import { describe, expect, it } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
@@ -24,6 +25,71 @@ export function addNumbers(a: number, b: number) { return a + b; }
     expect(results).toHaveLength(3);
     expect(results[0]!.similarity).toBeGreaterThanOrEqual(results[1]!.similarity);
     expect(results[1]!.similarity).toBeGreaterThanOrEqual(results[2]!.similarity);
+    index.close();
+  });
+
+  it("returns exact code-only nearest neighbors after thresholding", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", `
+export function closest() { return 1; }
+export function included() { return 2; }
+export function belowThreshold() { return 3; }
+`);
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "neighbors", dimensions: 2, strategyVersion: "callable-v1" },
+      embedDocuments: async (inputs) => inputs.map((input) => {
+        if (input.includes("included")) return [0.8, 0.6];
+        if (input.includes("belowThreshold")) return [0, 1];
+        return [1, 0];
+      }),
+      embedQuery: async () => [1, 0],
+    };
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFiles({ upsert: ["functions.ts"] });
+
+    const results = await index.similaritySearch({ query: "nearest", limit: 3, minSimilarity: 0.5 });
+
+    expect(results.map((result) => [result.function.name, result.similarity])).toEqual([
+      ["closest", 1],
+      ["included", expect.closeTo(0.8)],
+    ]);
+    index.close();
+  });
+
+  it("preserves deterministic ID ordering across a large nearest-neighbor tie", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", Array.from({ length: 40 }, (_, index) =>
+      `export function f${String(index).padStart(2, "0")}() { return ${index}; }`).join("\n"));
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "ties", dimensions: 2 },
+      embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFiles({ upsert: ["functions.ts"] });
+
+    const results = await index.similaritySearch({ query: "anything", limit: 3 });
+
+    expect(results.map((result) => result.function.name)).toEqual(["f00", "f01", "f02"]);
+    index.close();
+  });
+
+  it("retains scalar search support above sqlite-vec's dimension limit", async () => {
+    const root = temporaryRoot();
+    write(root, "function.ts", "export function largeVector() { return 1; }\n");
+    const dimensions = 8193;
+    const vector = [1, ...new Array<number>(dimensions - 1).fill(0)];
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "large-vector", dimensions },
+      embedDocuments: async (inputs) => inputs.map(() => vector),
+      embedQuery: async () => vector,
+    };
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFiles({ upsert: ["function.ts"] });
+
+    const results = await index.similaritySearch({ query: "large vector" });
+
+    expect(results[0]).toMatchObject({ similarity: 1, function: { name: "largeVector" } });
     index.close();
   });
 
@@ -195,6 +261,36 @@ export function addNumbers(a: number, b: number) { return a + b; }
     index.close();
   });
 
+  it("does not send more candidates than a reranker's maximum", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", ["one", "two", "three", "four", "five"]
+      .map((name) => `export function ${name}() { return ${JSON.stringify(name)}; }`)
+      .join("\n"));
+    let candidateCount = 0;
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: {
+        profile: { provider: "controlled", model: "equal", dimensions: 2 },
+        embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+        embedQuery: async () => [1, 0],
+      },
+      reranker: {
+        profile: { provider: "limited", model: "test" },
+        maximumCandidateCount: 2,
+        rerank: async (_query, documents) => {
+          candidateCount = documents.length;
+          return [{ index: 0, score: 1 }];
+        },
+      },
+    });
+    await index.updateFiles({ upsert: ["functions.ts"] });
+
+    await index.similaritySearch({ query: "function", limit: 1 });
+
+    expect(candidateCount).toBe(2);
+    index.close();
+  });
+
   it("rejects invalid output from custom rerankers", async () => {
     const root = temporaryRoot();
     write(root, "function.ts", "export function one() { return 1; }\n");
@@ -229,6 +325,44 @@ describe("cross search", () => {
     database.close();
 
     expect(() => new CodeIndex({ rootDir: root, provider })).toThrow(/Unsupported index schema version 4/);
+  });
+
+  it("migrates schema 7 indexes and synchronizes the nearest-neighbor index", async () => {
+    const root = temporaryRoot();
+    write(root, "function.ts", "export function existing() { return 1; }\n");
+    const provider = new FakeEmbeddingProvider();
+    const original = new CodeIndex({ rootDir: root, provider });
+    await original.updateFiles({ upsert: ["function.ts"] });
+    const indexPath = original.indexPath;
+    original.close();
+
+    const oldDatabase = new DatabaseSync(indexPath, { allowExtension: true });
+    sqliteVec.load(oldDatabase);
+    oldDatabase.enableLoadExtension(false);
+    oldDatabase.exec(`
+      DROP TRIGGER functions_vector_insert;
+      DROP TRIGGER functions_vector_delete;
+      DROP TRIGGER functions_vector_update;
+      DROP TABLE function_vectors;
+      UPDATE metadata SET value = '7' WHERE key = 'schema_version';
+    `);
+    oldDatabase.close();
+
+    const migrated = new CodeIndex({ rootDir: root, provider });
+    expect((await migrated.similaritySearch({ query: "existing" }))[0]!.function.name).toBe("existing");
+    write(root, "function.ts", `
+export function existing() { return 1; }
+export function added() { return 2; }
+`);
+    await migrated.updateFiles({ upsert: ["function.ts"] });
+    migrated.close();
+
+    const database = new DatabaseSync(indexPath, { allowExtension: true });
+    sqliteVec.load(database);
+    database.enableLoadExtension(false);
+    expect(database.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "8" });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM function_vectors").get()).toEqual({ count: 2 });
+    database.close();
   });
 
   it("can include symmetric matches for every source function while excluding itself", async () => {
@@ -414,6 +548,44 @@ export function two(value: string) { return value.trim(); }
     index.close();
   });
 
+  it("prefilters short, self, and one same-file candidate before the vec0 limit", async () => {
+    const root = temporaryRoot();
+    write(root, "same.ts", `
+export function source() {
+  return 1;
+}
+export function sameFile() {
+  return 2;
+}
+`);
+    write(root, "short.ts", "export function shortExternal() { return 3; }\n");
+    write(root, "eligible.ts", `export function eligible() {
+  return 4;
+}\n`);
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "filtered-neighbors", dimensions: 2, strategyVersion: "callable-v1" },
+      embedDocuments: async (inputs) => inputs.map((input) => input.includes("eligible") ? [0.8, 0.6] : [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFiles({ upsert: ["same.ts", "short.ts", "eligible.ts"] });
+
+    const results = [];
+    for await (const result of crossSearch({
+      source: index,
+      sourceFilter: { type: "all", path: "same.ts", nameRegex: "^source$" },
+      crossFileOnly: true,
+      includeSymmetricDuplicates: true,
+      minLines: 2,
+      limitPerFunction: 1,
+    })) results.push(result);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.source.name).toBe("source");
+    expect(results[0]!.matches.map((match) => match.function.name)).toEqual(["eligible"]);
+    index.close();
+  });
+
   it("allows matching paths when cross-searching different repository roots", async () => {
     const sourceRoot = temporaryRoot();
     const targetRoot = temporaryRoot();
@@ -426,9 +598,10 @@ export function two(value: string) { return value.trim(); }
     await target.updateFiles({ upsert: ["same.ts"] });
 
     const results = [];
-    for await (const result of crossSearch({ source, target, crossFileOnly: true, minLines: 1 })) results.push(result);
+    for await (const result of crossSearch({ source, target, crossFileOnly: true, cohesion: true, minLines: 1 })) results.push(result);
 
     expect(results[0]!.matches[0]!.function.path).toBe("same.ts");
+    expect(results[0]!.matches[0]!.physicalDistance).toBe(1);
     source.close();
     target.close();
   });

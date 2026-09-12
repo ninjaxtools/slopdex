@@ -446,7 +446,7 @@ export class Client { constructor() {} send() { deliver(); } }
     expect(index.status()).toMatchObject({ fileDescriptionCount: 0, staleFileDescriptionCount: 0 });
     index.close();
     const migrated = new DatabaseSync(indexPath, { readOnly: true });
-    expect(migrated.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "7" });
+    expect(migrated.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "8" });
     expect((migrated.prepare("PRAGMA table_info(files)").all() as Array<{ name: string }>).map((column) => column.name))
       .toContain("file_description_embedding_id");
     migrated.close();

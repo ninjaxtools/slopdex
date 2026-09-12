@@ -1,4 +1,5 @@
 import { lstat, readFile, readdir } from "node:fs/promises";
+import { lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import { CodeIndexError, GitDivergenceError } from "./errors.js";
@@ -128,8 +129,28 @@ export class CodeIndex {
       }, true);
       if (file) prepared.push(file);
     }
-    const embeddingsCreated = await this.#attachEmbeddings(prepared, options.signal);
-    await gitignore.assertUnchanged(options.signal);
+    let embeddingsCreated = await this.#attachEmbeddings(prepared, options.signal);
+    for (let attempt = 0; ; attempt += 1) {
+      await gitignore.assertUnchanged(options.signal);
+      const changed: PreparedFile[] = [];
+      for (let index = 0; index < prepared.length; index += 1) {
+        const file = prepared[index]!;
+        if (!this.#workingFileChangedSynchronously(file)) continue;
+        if (attempt >= 2) throw new CodeIndexError(`Source changed repeatedly while indexing: ${file.path}; retry the update.`);
+        const refreshed = await this.#prepareWorkingFile(file.path, {
+          blobOid: null,
+          sourceMode: "working-tree",
+          indexedCommit: null,
+          ...(file.previousPath ? { previousPath: file.previousPath } : {}),
+          ...(file.replacePath ? { replacePath: file.replacePath } : {}),
+        }, true);
+        if (!refreshed) throw new CodeIndexError(`Source changed while indexing: ${file.path}; retry the update.`);
+        prepared[index] = refreshed;
+        changed.push(refreshed);
+      }
+      if (changed.length === 0) break;
+      embeddingsCreated += await this.#attachEmbeddings(changed, options.signal);
+    }
     return this.#database.applyUpdate({
       files: prepared,
       deletePaths: [...deletePaths, ...renameMap.values()],
@@ -242,7 +263,8 @@ export class CodeIndex {
       const claimedRenameSources = new Set<string>();
       for (const entry of eligibleEntries) {
         const indexed = indexedByPath.get(entry.path);
-        if (indexed?.sourceMode === "git" && indexed.blobOid === entry.oid && !diagnosticsScan && !retryPaths.has(entry.path)) continue;
+        if (indexed?.sourceMode === "git" && indexed.blobOid === entry.oid && entry.size <= this.#maxFileSize
+          && !diagnosticsScan && !retryPaths.has(entry.path)) continue;
         const matches = renameCandidates.filter((candidate) => (
           candidate.blobOid === entry.oid && !claimedRenameSources.has(candidate.path)
         ));
@@ -260,7 +282,8 @@ export class CodeIndex {
         const indexed = indexedByPath.get(targetPath);
         const entry = tree.get(targetPath)!;
         if (
-          (diagnosticsScan || retryPaths.has(targetPath) || !indexed || (indexed.sourceMode === "git" && indexed.blobOid !== entry.oid))
+          (diagnosticsScan || retryPaths.has(targetPath) || entry.size > this.#maxFileSize
+            || !indexed || (indexed.sourceMode === "git" && indexed.blobOid !== entry.oid))
           && !upserts.has(targetPath)
         ) {
           upserts.set(targetPath, { entry });
@@ -304,7 +327,8 @@ export class CodeIndex {
     }
     for (const [filePath, { entry, previousPath }] of upserts) {
       const indexed = indexedByPath.get(filePath);
-      if (!previousPath && indexed?.sourceMode === "git" && indexed.blobOid === entry.oid && !diagnosticsScan && !retryPaths.has(filePath)) upserts.delete(filePath);
+      if (!previousPath && indexed?.sourceMode === "git" && indexed.blobOid === entry.oid && entry.size <= this.#maxFileSize
+        && !diagnosticsScan && !retryPaths.has(filePath)) upserts.delete(filePath);
     }
 
     const workingPrepared: PreparedFile[] = [];
@@ -553,6 +577,19 @@ export class CodeIndex {
       if (info.size > this.#maxFileSize) return !file.errors.some((error) => error.code === "file-too-large");
       const content = await readFile(path.join(this.rootDir, file.path));
       return file.unavailable === true || sha256(content.toString("utf8")) !== file.contentHash;
+    } catch {
+      return file.unavailable !== true;
+    }
+  }
+
+  #workingFileChangedSynchronously(file: PreparedFile): boolean {
+    try {
+      const absolutePath = path.join(this.rootDir, file.path);
+      const info = lstatSync(absolutePath);
+      if (!info.isFile() || info.isSymbolicLink() || info.size !== file.byteSize) return true;
+      if (info.size > this.#maxFileSize) return !file.errors.some((error) => error.code === "file-too-large");
+      const contentHash = sha256(readFileSync(absolutePath, "utf8"));
+      return file.unavailable === true || contentHash !== file.contentHash;
     } catch {
       return file.unavailable !== true;
     }
@@ -893,9 +930,12 @@ export class CodeIndex {
     if (this.reranker.maximumCandidateCount !== undefined && limit > this.reranker.maximumCandidateCount) {
       throw new CodeIndexError(`${this.reranker.profile.provider} reranker supports at most ${this.reranker.maximumCandidateCount} results.`);
     }
-    return this.reranker.candidateCount === undefined
+    const preferred = this.reranker.candidateCount === undefined
       ? limit * RERANK_CANDIDATE_MULTIPLIER
       : Math.max(limit, this.reranker.candidateCount);
+    return this.reranker.maximumCandidateCount === undefined
+      ? preferred
+      : Math.min(preferred, this.reranker.maximumCandidateCount);
   }
 
   async #rerank(

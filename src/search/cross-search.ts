@@ -36,6 +36,9 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
   const targetRoot = options.crossFileOnly
     ? sameIndex ? sourceRoot! : await canonicalRoot(target.rootDir)
     : undefined;
+  const rootsDiffer = options.cohesion && !sameIndex
+    ? await canonicalRoot(options.source.rootDir) !== await canonicalRoot(target.rootDir)
+    : false;
   const canonicalFiles = new Map<string, Promise<string>>();
   const canonicalFile = (root: string, filePath: string): Promise<string> => {
     const absolutePath = path.resolve(root, filePath);
@@ -89,7 +92,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
     const rankedCandidates = options.cohesion
       ? candidates.map((match) => ({
         ...match,
-        physicalDistance: cohesionLocation(source.path, match.function.path).physicalDistance,
+        physicalDistance: cohesionLocation(source.path, match.function.path).physicalDistance + Number(rootsDiffer),
       })).sort((left, right) => right.physicalDistance - left.physicalDistance
         || right.similarity - left.similarity
         || left.function.path.localeCompare(right.function.path)

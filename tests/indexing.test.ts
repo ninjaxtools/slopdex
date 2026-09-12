@@ -85,6 +85,69 @@ export function multiply(a: number, b: number) { return a * b; }
     parse.mockRestore();
     resumed.close();
   });
+
+  it("re-reads explicitly updated source that changes during embedding", async () => {
+    const root = temporaryRoot();
+    write(root, "value.ts", "export function value() { return 1; }\n");
+    let changed = false;
+    class ChangingProvider extends FakeEmbeddingProvider {
+      public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+        if (!changed) {
+          changed = true;
+          write(root, "value.ts", "export function value() { return 2; }\n");
+        }
+        return await super.embedDocuments(inputs);
+      }
+    }
+    const index = new CodeIndex({ rootDir: root, provider: new ChangingProvider() });
+
+    await index.updateFiles({ upsert: ["value.ts"] });
+
+    expect(index.allFunctions()[0]!.source).toContain("return 2");
+    index.close();
+  });
+
+  it("takes one stable snapshot across a multi-file explicit update", async () => {
+    const root = temporaryRoot();
+    write(root, ".gitignore", "");
+    write(root, "first.ts", "export function first() { return 1; }\n");
+    write(root, "second.ts", "export function second() { return 2; }\n");
+    let scheduled = false;
+    class DelayedChangeProvider extends FakeEmbeddingProvider {
+      public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+        if (!scheduled) {
+          scheduled = true;
+          setTimeout(() => write(root, "first.ts", "export function first() { return 3; }\n"), 0);
+        }
+        return await super.embedDocuments(inputs);
+      }
+    }
+    const index = new CodeIndex({ rootDir: root, provider: new DelayedChangeProvider() });
+
+    await index.updateFiles({ upsert: ["first.ts", "second.ts"] });
+
+    expect(index.allFunctions().find((callable) => callable.name === "first")!.source).toContain("return 3");
+    index.close();
+  });
+
+  it.skipIf(process.getuid?.() === 0)("persists explicit read errors without aborting healthy files", async () => {
+    const root = temporaryRoot();
+    write(root, "locked.ts", "export function locked() { return 1; }\n");
+    write(root, "healthy.ts", "export function healthy() { return 2; }\n");
+    const lockedPath = `${root}/locked.ts`;
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    chmodSync(lockedPath, 0);
+
+    try {
+      await index.updateFiles({ upsert: ["locked.ts", "healthy.ts"] });
+
+      expect(index.allFunctions().map((callable) => callable.name)).toEqual(["healthy"]);
+      expect(index.indexErrors()[0]).toMatchObject({ path: "locked.ts", code: "read-error" });
+    } finally {
+      chmodSync(lockedPath, 0o644);
+      index.close();
+    }
+  });
 });
 
 describe("filesystem indexing", () => {
@@ -155,6 +218,23 @@ describe("filesystem indexing", () => {
 });
 
 describe("Git indexing", () => {
+  it("reconciles unchanged committed files against a lower maxFileSize", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "large.ts", `export function large() { return 1; }\n//${"x".repeat(256)}\n`);
+    commitAll(root, "base");
+    const initial = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider(), maxFileSize: 1024 });
+    await initial.updateFromGit();
+    initial.close();
+
+    const restricted = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider(), maxFileSize: 64 });
+    await restricted.updateFromGit();
+
+    expect(restricted.status()).toMatchObject({ functionCount: 0, indexingErrorCount: 1 });
+    expect(restricted.indexErrors()[0]).toMatchObject({ path: "large.ts", code: "file-too-large" });
+    restricted.close();
+  });
+
   it("can update committed files without indexing working-tree changes", async () => {
     const root = temporaryRoot();
     initGit(root);

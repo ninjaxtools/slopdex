@@ -18,7 +18,10 @@ import type {
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "7";
+const SCHEMA_VERSION = "8";
+const KNN_TIE_OVERFETCH = 32;
+const VEC0_MAX_K = 4096;
+const VEC0_MAX_DIMENSIONS = 8192;
 
 export interface PreparedDescription {
   key: string;
@@ -146,7 +149,7 @@ export class IndexDatabase {
 
   #initializeSchema(): void {
     const existingVersion = this.#metadataTableExists() ? this.#metadata("schema_version") : null;
-    if (existingVersion && existingVersion !== "6" && existingVersion !== SCHEMA_VERSION) {
+    if (existingVersion && existingVersion !== "6" && existingVersion !== "7" && existingVersion !== SCHEMA_VERSION) {
       throw new IncompatibleIndexError(`Unsupported index schema version ${existingVersion}.`);
     }
     this.#db.exec(`
@@ -223,15 +226,23 @@ export class IndexDatabase {
       INSERT OR IGNORE INTO callable_provenance(identity_key, source_hash, first_seen_commit)
         SELECT identity_key, source_hash, first_seen_commit FROM functions WHERE first_seen_commit IS NOT NULL;
     `);
-    if (existingVersion === "6") {
+    if (existingVersion === "6" || existingVersion === "7" || existingVersion === null) {
       this.#db.exec("BEGIN IMMEDIATE");
       try {
-        this.#db.exec(`
-          ALTER TABLE files ADD COLUMN file_description_path TEXT;
-          ALTER TABLE files ADD COLUMN file_description_content_hash TEXT;
-          ALTER TABLE files ADD COLUMN file_description TEXT;
-          ALTER TABLE files ADD COLUMN file_description_embedding_id INTEGER REFERENCES embeddings(id);
-        `);
+        if (existingVersion === "6") {
+          this.#db.exec(`
+            ALTER TABLE files ADD COLUMN file_description_path TEXT;
+            ALTER TABLE files ADD COLUMN file_description_content_hash TEXT;
+            ALTER TABLE files ADD COLUMN file_description TEXT;
+            ALTER TABLE files ADD COLUMN file_description_embedding_id INTEGER REFERENCES embeddings(id);
+          `);
+        }
+        const storedProfile = this.#metadata("embedding_profile");
+        const dimensions = storedProfile
+          ? Number((JSON.parse(storedProfile) as EmbeddingProfile).dimensions)
+          : this.#profile.dimensions;
+        if (!Number.isInteger(dimensions) || dimensions <= 0) throw new IncompatibleIndexError("Index has an invalid embedding profile.");
+        if (dimensions <= VEC0_MAX_DIMENSIONS) this.#db.exec(functionVectorsSchema(dimensions));
         this.#setMetadata("schema_version", SCHEMA_VERSION);
         this.#db.exec("COMMIT");
       } catch (error) {
@@ -704,12 +715,48 @@ export class IndexDatabase {
       .concat(fileDescription ? ["file_description_similarity"] : [])
       .join(" + ");
     const excludePaths = options.excludePaths ?? [];
+    if (!options.descriptions && !fused && options.maxSimilarity === undefined
+      && options.nameRegex === undefined && excludePaths.length <= 1 && options.limit <= VEC0_MAX_K
+      && this.#profile.dimensions <= VEC0_MAX_DIMENSIONS) {
+      const excludeIdFilter = options.excludeId === undefined ? "" : "AND function_id_filter != ?";
+      const excludePathFilter = excludePaths.length === 0 ? "" : "AND path != ?";
+      const candidateLimit = Math.min(options.limit + KNN_TIE_OVERFETCH, VEC0_MAX_K);
+      const rows = this.#db.prepare(`
+        WITH nearest AS MATERIALIZED (
+          SELECT function_id, distance
+          FROM function_vectors
+          WHERE embedding MATCH ? AND k = ?
+            AND line_count >= ?
+            ${excludeIdFilter}
+            ${excludePathFilter}
+        )
+        SELECT f.*, 1.0 - nearest.distance AS similarity, 1.0 - nearest.distance AS base_similarity
+        FROM nearest JOIN functions f ON f.id = nearest.function_id
+        WHERE 1.0 - nearest.distance >= ?
+        ORDER BY similarity DESC, f.id ASC
+      `).all(
+        vectorBuffer(vector),
+        candidateLimit,
+        options.minLines ?? 1,
+        ...(options.excludeId === undefined ? [] : [options.excludeId]),
+        ...excludePaths,
+        options.minSimilarity,
+      ) as unknown as Array<FunctionRow & { similarity: number; base_similarity: number }>;
+      const boundary = rows[options.limit - 1];
+      const last = rows.at(-1);
+      const ambiguousTie = rows.length === candidateLimit && boundary && last
+        && Math.abs(boundary.similarity - last.similarity) <= Number.EPSILON;
+      if (!ambiguousTie) {
+        return rows.slice(0, options.limit)
+          .map((row) => ({ function: toIndexedFunction(row), similarity: row.similarity }));
+      }
+    }
     const pathFilter = excludePaths.length > 0
       ? `AND f.path NOT IN (${excludePaths.map(() => "?").join(", ")})`
       : "";
     const rows = this.#db.prepare(`
       WITH scores AS (
-        SELECT f.*, 1.0 - vec_distance_cosine(e.vector, ?) AS base_similarity
+        SELECT f.id AS function_id, 1.0 - vec_distance_cosine(e.vector, ?) AS base_similarity
           ${functionDescription ? ", 1.0 - vec_distance_cosine(d.vector, ?) AS description_similarity" : ""}
           ${fileDescription ? ", 1.0 - vec_distance_cosine(fd.vector, ?) AS file_description_similarity" : ""}
         FROM functions f
@@ -721,13 +768,19 @@ export class IndexDatabase {
           AND f.line_count >= ?
           AND (? IS NULL OR slopdex_regexp(?, f.qualified_name))
       ), ranked AS (
-         SELECT *, ${fused ? `(${scoreExpression}) / ${scoreCount}.0` : "base_similarity"} AS similarity
+        SELECT *, ${fused ? `(${scoreExpression}) / ${scoreCount}.0` : "base_similarity"} AS similarity
         FROM scores
+      ), selected AS (
+        SELECT * FROM ranked
+        WHERE similarity >= ? AND (? IS NULL OR similarity < ?)
+        ORDER BY similarity DESC, function_id ASC
+        LIMIT ?
       )
-      SELECT * FROM ranked
-      WHERE similarity >= ? AND (? IS NULL OR similarity < ?)
-      ORDER BY similarity DESC, id ASC
-      LIMIT ?
+      SELECT f.*, selected.similarity, selected.base_similarity
+        ${functionDescription ? ", selected.description_similarity" : ""}
+        ${fileDescription ? ", selected.file_description_similarity" : ""}
+      FROM selected JOIN functions f ON f.id = selected.function_id
+      ORDER BY selected.similarity DESC, f.id ASC
     `).all(
       vectorBuffer(vector),
       ...(options.descriptionVector ? [vectorBuffer(options.descriptionVector)] : []),
@@ -853,8 +906,10 @@ export function resetIndexState(
   rootDir: string,
   profile: EmbeddingProfile,
 ): void {
-  const database = new DatabaseSync(indexPath);
+  const database = new DatabaseSync(indexPath, { allowExtension: true });
   try {
+    sqliteVec.load(database);
+    database.enableLoadExtension(false);
     database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
     const metadata = new Map((database.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>)
       .map((row) => [row.key, row.value]));
@@ -864,9 +919,21 @@ export function resetIndexState(
     if (path.resolve(metadata.get("root_dir") ?? "") !== path.resolve(rootDir)) {
       throw new IncompatibleIndexError("Index belongs to a different repository.");
     }
+    if (!Number.isInteger(profile.dimensions) || profile.dimensions <= 0) {
+      throw new CodeIndexError("Embedding dimensions must be a positive integer.");
+    }
     database.exec("BEGIN IMMEDIATE");
     try {
-      database.exec("DELETE FROM files; DELETE FROM callable_provenance; DELETE FROM metadata;");
+      database.exec(`
+        DELETE FROM files;
+        DROP TRIGGER IF EXISTS functions_vector_insert;
+        DROP TRIGGER IF EXISTS functions_vector_delete;
+        DROP TRIGGER IF EXISTS functions_vector_update;
+        DROP TABLE IF EXISTS function_vectors;
+        DELETE FROM callable_provenance;
+        DELETE FROM metadata;
+      `);
+      if (profile.dimensions <= VEC0_MAX_DIMENSIONS) database.exec(functionVectorsSchema(profile.dimensions));
       const setMetadata = database.prepare("INSERT INTO metadata(key, value) VALUES (?, ?)");
       setMetadata.run("schema_version", SCHEMA_VERSION);
       setMetadata.run("root_dir", path.resolve(rootDir));
@@ -910,6 +977,33 @@ function errorsFromDatabase(database: DatabaseSync): IndexingError[] {
     ...JSON.parse(row.diagnostic) as IndexingIssue,
     id: row.id, sourceMode: row.source_mode, indexedCommit: row.indexed_commit,
   }));
+}
+
+function functionVectorsSchema(dimensions: number): string {
+  return `
+    CREATE VIRTUAL TABLE function_vectors USING vec0(
+      function_id INTEGER PRIMARY KEY,
+      embedding FLOAT[${dimensions}] distance_metric=cosine,
+      line_count INTEGER,
+      path TEXT,
+      function_id_filter INTEGER
+    );
+    INSERT INTO function_vectors(function_id, embedding, line_count, path, function_id_filter)
+      SELECT f.id, e.vector, f.line_count, f.path, f.id
+      FROM functions f JOIN embeddings e ON e.id = f.embedding_id;
+    CREATE TRIGGER functions_vector_insert AFTER INSERT ON functions BEGIN
+      INSERT INTO function_vectors(function_id, embedding, line_count, path, function_id_filter)
+        SELECT new.id, e.vector, new.line_count, new.path, new.id FROM embeddings e WHERE e.id = new.embedding_id;
+    END;
+    CREATE TRIGGER functions_vector_delete AFTER DELETE ON functions BEGIN
+      DELETE FROM function_vectors WHERE function_id = old.id;
+    END;
+    CREATE TRIGGER functions_vector_update AFTER UPDATE OF embedding_id, line_count, path ON functions BEGIN
+      DELETE FROM function_vectors WHERE function_id = old.id;
+      INSERT INTO function_vectors(function_id, embedding, line_count, path, function_id_filter)
+        SELECT new.id, e.vector, new.line_count, new.path, new.id FROM embeddings e WHERE e.id = new.embedding_id;
+    END;
+  `;
 }
 
 function vectorBuffer(vector: readonly number[]): Uint8Array {
