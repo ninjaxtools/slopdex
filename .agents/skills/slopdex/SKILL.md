@@ -39,6 +39,17 @@ To select another model:
 slopdex descriptions enable --description-model <model-id>
 ```
 
+List and persist a published OpenCode model without creating an index:
+
+```bash
+slopdex models opencode-go
+slopdex config model opencode-go/gpt-5.6-luna
+slopdex config descriptions enable
+```
+
+The next index-using command applies the configured description state. A bare model ID passed to
+`config model` resolves automatically only when it belongs to one of Zen or Go; qualify shared IDs.
+
 ### Find duplicate candidates
 
 ```bash

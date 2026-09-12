@@ -31,9 +31,20 @@ slopdex descriptions enable
 slopdex search-description "keep the repository index synchronized" --format summary --limit 10
 ```
 
-This requires `OPENAI_API_KEY` even when Jina supplies embeddings, and adds generation costs. See [descriptions and scoring](#descriptions-and-scoring).
+The default description provider requires `OPENAI_API_KEY` even when Jina supplies embeddings. OpenCode Zen and Go use `OPENCODE_API_KEY`. Description generation can add provider costs; see [descriptions and scoring](#descriptions-and-scoring).
 
 `descriptions disable` turns off description generation while retaining cached data.
+
+To choose from OpenCode's current published models and persist description settings without creating an index:
+
+```bash
+slopdex models opencode-go
+slopdex config model opencode-go/gpt-5.6-luna
+slopdex config descriptions enable
+```
+
+The next index-using command creates or refreshes the index and applies the configured description state.
+You can also pass the selection separately as `slopdex config model --description-provider opencode-go --description-model gpt-5.6-luna`.
 
 ### Find duplicate-code candidates
 
@@ -88,6 +99,9 @@ Usage: `slopdex <command> [arguments] [options]`.
 
 | Command | Purpose | Output |
 | --- | --- | --- |
+| `models [opencode\|opencode-go]` | Fetch valid models from the current published Zen and/or Go catalogs. | Qualified `provider/model` lines; optional JSON array |
+| `config model <model\|provider/model>` | Validate a published OpenCode model and persist its provider/model selection without opening an index. Bare IDs auto-resolve only when unambiguous. | Updated setting summary; optional JSON |
+| `config descriptions <enable\|disable>` | Persist whether the next index-using command should enable or disable descriptions. Does not open an index. | Updated setting summary; optional JSON |
 | `search <query>` | Search function code by meaning. Quote multiword queries. | Summary; optional JSON array |
 | `descriptions <enable\|disable>` | Enable or disable automatic purpose descriptions. Re-enabling with unchanged inputs reuses cached descriptions. | JSON statistics |
 | `search-description <query>` | Search purpose descriptions after enabling them. | Summary including description text; optional JSON array |
@@ -250,6 +264,7 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings and 
 | `provider`, `model`, `dimensions` | Embedding settings; defaults are listed in the CLI table. |
 | `descriptionProvider` | Description provider: `openai`, `opencode` (Zen), or `opencode-go`; defaults to `openai`. |
 | `descriptionModel` | Description model; provider default unless explicitly set. |
+| `descriptionsEnabled` | When true or false, the next index-using command applies that enabled state during its normal refresh. Unset leaves persisted index state unchanged. |
 | `indexPath` | Index location; `<root>/.slopdex/index.sqlite`. |
 | `include` | Repository-relative glob array; empty/unset includes all supported eligible files. |
 | `exclude` | Additional repository-relative exclusion globs. |

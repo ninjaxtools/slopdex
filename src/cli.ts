@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
@@ -12,7 +12,12 @@ import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { crossSearch } from "./search/cross-search.js";
-import { isDescriptionProviderName, OpenAIDescriptionProvider, type DescriptionProviderName } from "./descriptions/openai.js";
+import {
+  descriptionProviderBaseUrl,
+  isDescriptionProviderName,
+  OpenAIDescriptionProvider,
+  type DescriptionProviderName,
+} from "./descriptions/openai.js";
 import { readIndexErrorCounts, readIndexErrors, resetIndexState } from "./storage/database.js";
 import { compileNameRegex } from "./utils.js";
 import type {
@@ -43,6 +48,14 @@ interface FileConfig {
   embeddingBatchSize?: number;
   descriptionProvider?: DescriptionProviderName;
   descriptionModel?: string;
+  descriptionsEnabled?: boolean;
+}
+
+type OpenCodeDescriptionProvider = Exclude<DescriptionProviderName, "openai">;
+
+interface PublishedModel {
+  provider: OpenCodeDescriptionProvider;
+  model: string;
 }
 
 const parsed = (() => {
@@ -141,6 +154,14 @@ void main().catch((error: unknown) => {
 async function main(): Promise<void> {
   validateInvocation();
   const rootDir = path.resolve(parsed.values.root!);
+  if (command === "models") {
+    await runModels();
+    return;
+  }
+  if (command === "config") {
+    await runConfig(rootDir);
+    return;
+  }
   const config = loadConfig(rootDir, parsed.values.config);
   if (command === "index-errors") {
     const indexPath = path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex/index.sqlite"));
@@ -174,9 +195,7 @@ async function main(): Promise<void> {
     parsed.values["rebuild-on-divergence"],
     parsed.values["force-reindex"],
     parsed.values["no-reindex"],
-    command === "descriptions" && descriptionsAction === "disable"
-      ? (refreshIndex) => { refreshIndex.disableDescriptions(); }
-      : undefined,
+    descriptionRefresh(config),
   );
   const index = new CodeIndex(indexOptions);
   try {
@@ -285,6 +304,7 @@ async function runCrossSearch(
       parsed.values["rebuild-on-divergence"],
       parsed.values["force-reindex"],
       parsed.values["no-reindex"],
+      descriptionRefresh(targetConfig!),
     );
   }
   const target = targetOptions ? new CodeIndex({ ...targetOptions, readOnly: true }) : undefined;
@@ -331,15 +351,15 @@ async function ensureIndexUpdated(
   rebuildOnDivergence: boolean,
   forceRebuild: boolean,
   noReindex: boolean,
-  beforeRefresh?: (index: CodeIndex) => void,
+  beforeRefresh?: (index: CodeIndex) => void | Promise<void>,
 ): Promise<UpdateStats> {
   diagnosticIndexes.add(resolveIndexPath(options));
-  const initialized = await initializeMissingIndex(options, label, target, noReindex);
+  const initialized = await initializeMissingIndex(options, label, target, noReindex, beforeRefresh);
   if (initialized) return initialized;
   try {
     const index = new CodeIndex(options);
     try {
-      beforeRefresh?.(index);
+      await beforeRefresh?.(index);
       return await refreshIndex(index, label, target, rebuildOnDivergence, noReindex);
     } finally {
       index.close();
@@ -357,7 +377,7 @@ async function ensureIndexUpdated(
       if (!(resetError instanceof IncompatibleIndexError)) throw resetError;
       removeIndexArtifacts(indexPath);
     }
-    return initializeIndex(options, indexPath, label, target, noReindex, descriptionProfile);
+    return initializeIndex(options, indexPath, label, target, noReindex, descriptionProfile, beforeRefresh);
   }
 }
 
@@ -366,6 +386,7 @@ async function initializeMissingIndex(
   label: string,
   target: string,
   noReindex: boolean,
+  beforeRefresh?: (index: CodeIndex) => void | Promise<void>,
 ): Promise<UpdateStats | null> {
   const indexPath = resolveIndexPath(options);
   if (existsSync(indexPath)) return null;
@@ -373,7 +394,7 @@ async function initializeMissingIndex(
   process.stderr.write(
     `slopdex: ${label} not found at ${indexPath}; initializing automatically from ${target}${noReindex ? "" : " and the working tree"}.\n`,
   );
-  return initializeIndex(options, indexPath, label, target, noReindex);
+  return initializeIndex(options, indexPath, label, target, noReindex, null, beforeRefresh);
 }
 
 async function initializeIndex(
@@ -383,6 +404,7 @@ async function initializeIndex(
   target: string,
   noReindex: boolean,
   descriptionProfile: DescriptionProfile | null = null,
+  beforeRefresh?: (index: CodeIndex) => void | Promise<void>,
 ): Promise<UpdateStats> {
   const index = new CodeIndex({
     ...options, indexPath,
@@ -394,6 +416,7 @@ async function initializeIndex(
   });
   try {
     if (descriptionProfile) await index.useDescriptions();
+    await beforeRefresh?.(index);
     return await refreshIndex(index, label, target, false, noReindex);
   } finally {
     index.close();
@@ -497,6 +520,136 @@ function createDescriptionProvider(config: FileConfig): OpenAIDescriptionProvide
   });
 }
 
+function descriptionRefresh(config: FileConfig): ((index: CodeIndex) => void | Promise<void>) | undefined {
+  if (command === "descriptions") {
+    return descriptionsAction === "disable" ? (index) => { index.disableDescriptions(); } : undefined;
+  }
+  if (config.descriptionsEnabled === true) return async (index) => { await index.useDescriptions(); };
+  if (config.descriptionsEnabled === false) return (index) => { index.disableDescriptions(); };
+  return undefined;
+}
+
+async function runModels(): Promise<void> {
+  const positionalProvider = positionals[0];
+  const optionProvider = parsed.values["description-provider"];
+  if (positionalProvider && optionProvider && positionalProvider !== optionProvider) {
+    throw new CodeIndexError("models provider and --description-provider must match when both are supplied.");
+  }
+  const requested = positionalProvider ?? optionProvider;
+  if (requested !== undefined && !isOpenCodeDescriptionProvider(requested)) {
+    throw new CodeIndexError("models provider must be opencode or opencode-go.");
+  }
+  const providers: OpenCodeDescriptionProvider[] = requested ? [requested] : ["opencode", "opencode-go"];
+  const models = (await Promise.all(providers.map(fetchPublishedModels))).flat();
+  const format = outputFormat("summary");
+  if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+  if (format === "json") printJson(models);
+  else process.stdout.write(`${models.map(({ provider, model }) => `${provider}/${model}`).join("\n")}\n`);
+}
+
+async function runConfig(rootDir: string): Promise<void> {
+  const configPath = path.resolve(parsed.values.config ?? path.join(rootDir, ".slopdex", "config.json"));
+  const config = readConfigFile(configPath);
+  const action = positionals[0];
+  let result: Record<string, unknown>;
+  if (action === "descriptions") {
+    config.descriptionsEnabled = positionals[1] === "enable";
+    result = { descriptionsEnabled: config.descriptionsEnabled };
+  } else {
+    const selected = await resolveConfiguredModel(positionals[1]);
+    config.descriptionProvider = selected.provider;
+    config.descriptionModel = selected.model;
+    result = { descriptionProvider: selected.provider, descriptionModel: selected.model };
+  }
+  writeConfigFile(configPath, config);
+  const format = outputFormat("summary");
+  if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+  if (format === "json") printJson({ configPath, ...result });
+  else process.stdout.write(`Updated ${configPath}: ${Object.entries(result).map(([key, value]) => `${key}=${value}`).join(" ")}\n`);
+}
+
+async function resolveConfiguredModel(positionalModel: string | undefined): Promise<PublishedModel> {
+  const optionModel = parsed.values["description-model"];
+  if (positionalModel && optionModel && positionalModel !== optionModel) {
+    throw new CodeIndexError("config model argument and --description-model must match when both are supplied.");
+  }
+  let reference = positionalModel ?? optionModel;
+  if (!reference) throw new CodeIndexError("config model requires a model ID or provider/model reference.");
+  let provider = parsed.values["description-provider"];
+  const separator = reference.indexOf("/");
+  if (separator !== -1) {
+    const qualifiedProvider = reference.slice(0, separator);
+    reference = reference.slice(separator + 1);
+    if (provider && provider !== qualifiedProvider) {
+      throw new CodeIndexError("Model reference and --description-provider must select the same provider.");
+    }
+    provider = qualifiedProvider;
+  }
+  if (!reference) throw new CodeIndexError("config model requires a non-empty model ID.");
+  if (provider !== undefined) {
+    if (!isOpenCodeDescriptionProvider(provider)) {
+      throw new CodeIndexError("config model provider must be opencode or opencode-go.");
+    }
+    const models = await fetchPublishedModels(provider);
+    if (!models.some(({ model }) => model === reference)) {
+      throw new CodeIndexError(`Unknown ${provider} model: ${reference}`);
+    }
+    return { provider, model: reference };
+  }
+  const matches = (await Promise.all([
+    fetchPublishedModels("opencode"),
+    fetchPublishedModels("opencode-go"),
+  ])).flat().filter(({ model }) => model === reference);
+  if (matches.length === 0) throw new CodeIndexError(`Unknown OpenCode model: ${reference}`);
+  if (matches.length > 1) {
+    throw new CodeIndexError(`Model ${reference} is available from multiple providers; use provider/model.`);
+  }
+  return matches[0]!;
+}
+
+async function fetchPublishedModels(provider: OpenCodeDescriptionProvider): Promise<PublishedModel[]> {
+  const url = `${descriptionProviderBaseUrl(provider)}/models`;
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (error) {
+    throw new CodeIndexError(`Could not fetch ${provider} models: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+  if (!response.ok) {
+    throw new CodeIndexError(`Could not fetch ${provider} models (${response.status}): ${(await response.text()).slice(0, 500)}`);
+  }
+  let body: { data?: Array<{ id?: unknown }> };
+  try {
+    body = await response.json() as { data?: Array<{ id?: unknown }> };
+  } catch (error) {
+    throw new CodeIndexError(`${provider} returned a malformed model list.`, { cause: error });
+  }
+  if (!Array.isArray(body.data) || body.data.some((item) => typeof item.id !== "string" || item.id.length === 0)) {
+    throw new CodeIndexError(`${provider} returned a malformed model list.`);
+  }
+  return [...new Set(body.data.map((item) => item.id as string))].map((model) => ({ provider, model }));
+}
+
+function isOpenCodeDescriptionProvider(value: string): value is OpenCodeDescriptionProvider {
+  return value === "opencode" || value === "opencode-go";
+}
+
+function readConfigFile(configPath: string): FileConfig {
+  if (!existsSync(configPath)) return {};
+  const value = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CodeIndexError(`Config must contain a JSON object: ${configPath}`);
+  }
+  return value as FileConfig;
+}
+
+function writeConfigFile(configPath: string, config: FileConfig): void {
+  mkdirSync(path.dirname(configPath), { recursive: true });
+  const temporaryPath = `${configPath}.tmp-${process.pid}`;
+  writeFileSync(temporaryPath, `${JSON.stringify(config, null, 2)}\n`);
+  renameSync(temporaryPath, configPath);
+}
+
 function createProvider(config: FileConfig): EmbeddingProvider {
   if ((config.provider ?? "openai") === "jina") {
     return new JinaEmbeddingProvider({
@@ -526,6 +679,25 @@ function validateInvocation(): void {
     compileNameRegex(nameRegex, parsed.values.regex !== undefined ? "--regex value" : "-e/--regexp value");
   }
   switch (command) {
+    case "models":
+      if (positionals.length > 1) throw new CodeIndexError("models accepts at most one provider.");
+      if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      return;
+    case "config":
+      if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      if (positionals[0] === "descriptions") {
+        if (positionals.length !== 2 || (positionals[1] !== "enable" && positionals[1] !== "disable")) {
+          throw new CodeIndexError("config descriptions requires enable or disable.");
+        }
+        return;
+      }
+      if (positionals[0] === "model") {
+        if (positionals.length > 2 || (!positionals[1] && !parsed.values["description-model"])) {
+          throw new CodeIndexError("config model requires a model ID or provider/model reference.");
+        }
+        return;
+      }
+      throw new CodeIndexError("config requires descriptions or model.");
     case "index-errors":
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
@@ -697,6 +869,9 @@ function printHelp(): void {
   process.stdout.write(`Usage: slopdex <command> [arguments] [options]
 
 Commands:
+  models [opencode|opencode-go]        List current published OpenCode models
+  config model <model|provider/model>  Validate and save an OpenCode description model
+  config descriptions <enable|disable> Save description state without opening an index
   status                              Show index metadata
   index-errors                        List persisted file and function indexing failures
   update-files <path...>              Index specific working-tree files
@@ -823,6 +998,11 @@ Options:
   --target-config <path>              Config file for a second indexed codebase
 
 Other Examples:
+  List published OpenCode Go models and save one for future index commands:
+    slopdex models opencode-go
+    slopdex config model opencode-go/gpt-5.6-luna
+    slopdex config descriptions enable
+
   Show metadata for the current index:
     slopdex status
 

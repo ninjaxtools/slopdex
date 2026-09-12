@@ -20,6 +20,10 @@ export function isDescriptionProviderName(value: string): value is DescriptionPr
   return DESCRIPTION_PROVIDER_NAMES.includes(value as DescriptionProviderName);
 }
 
+export function descriptionProviderBaseUrl(provider: DescriptionProviderName): string {
+  return PROVIDERS[provider].baseUrl;
+}
+
 const PROVIDERS: Record<DescriptionProviderName, { apiKey: string; baseUrl: string; model: string }> = {
   openai: { apiKey: "OPENAI_API_KEY", baseUrl: "https://api.openai.com/v1", model: "gpt-5.6-sol" },
   opencode: { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/v1", model: "gpt-5.6-sol" },
@@ -59,11 +63,12 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
   public async describe(input: DescriptionInput, options?: { signal?: AbortSignal }): Promise<string> {
     throwIfAborted(options?.signal);
     if (!this.#apiKey) throw new CodeIndexError(`${this.#apiKeyName} is required to generate descriptions.`);
-    const provider = createOpenAI({ apiKey: this.#apiKey, baseURL: this.#baseUrl });
+    const { model, responses } = await this.#languageModel();
     let text: string;
     try {
       ({ text } = await generateText({
-        model: provider.responses(this.profile.model),
+        model,
+        ...(responses ? {} : { system: INSTRUCTIONS }),
         prompt: JSON.stringify({
           repository: input.repository,
           path: input.callable.path,
@@ -73,7 +78,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
           fileContext: input.fileSource,
         }),
         maxOutputTokens: 4096,
-        providerOptions: { openai: { instructions: INSTRUCTIONS, store: false } },
+        ...(responses ? { providerOptions: { openai: { instructions: INSTRUCTIONS, store: false } } } : {}),
         ...(this.#headers ? { headers: this.#headers } : {}),
         ...(options?.signal ? { abortSignal: options.signal } : {}),
       }));
@@ -87,5 +92,59 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     const description = text.trim();
     if (!description) throw new CodeIndexError("Description provider returned an empty description.");
     return description;
+  }
+
+  async #languageModel() {
+    const model = this.profile.model;
+    if (this.profile.provider === "openai" || /^(gpt-|grok-|muse-spark-)/.test(model)) {
+      return {
+        model: createOpenAI({ apiKey: this.#apiKey, baseURL: this.#baseUrl }).responses(model),
+        responses: true,
+      } as const;
+    }
+    if (model.startsWith("gemini-")) {
+      const { createGoogle } = await import("@ai-sdk/google");
+      return {
+        model: createGoogle({
+          apiKey: this.#apiKey,
+          baseURL: this.#baseUrl,
+          name: this.profile.provider,
+          ...(this.#headers ? { headers: this.#headers } : {}),
+        })(model),
+        responses: false,
+      } as const;
+    }
+    const usesMessages = model.startsWith("claude-")
+      || model.startsWith("qwen")
+      || (this.profile.provider === "opencode-go" && model.startsWith("minimax-"));
+    if (usesMessages) {
+      const { createAnthropic } = await import("@ai-sdk/anthropic");
+      return {
+        model: createAnthropic({
+          apiKey: this.#apiKey,
+          baseURL: this.#baseUrl,
+          name: this.profile.provider,
+          ...(this.#headers ? { headers: this.#headers } : {}),
+        })(model),
+        responses: false,
+      } as const;
+    }
+    const usesChatCompletions = /^(big-pickle|deepseek-|glm-|hy\d|minimax-|kimi-|ling-|longcat-|mimo-|nemotron-|omen-)/.test(model);
+    if (!usesChatCompletions) {
+      return {
+        model: createOpenAI({ apiKey: this.#apiKey, baseURL: this.#baseUrl }).responses(model),
+        responses: true,
+      } as const;
+    }
+    const { createOpenAICompatible } = await import("@ai-sdk/openai-compatible");
+    return {
+      model: createOpenAICompatible({
+        apiKey: this.#apiKey,
+        baseURL: this.#baseUrl,
+        name: this.profile.provider,
+        ...(this.#headers ? { headers: this.#headers } : {}),
+      })(model),
+      responses: false,
+    } as const;
   }
 }

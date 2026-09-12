@@ -66,6 +66,68 @@ describe("OpenAI description provider", () => {
     expect(provider.profile).toMatchObject({ provider: "opencode-go", model: "gpt-5.6-luna" });
     expect(requests[0]).toMatchObject({ model: "gpt-5.6-luna", store: false });
   });
+
+  it("routes OpenCode chat-completions models through the compatible AI SDK provider", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, {
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "Handles Kimi requests." } }],
+    });
+    const provider = new OpenAIDescriptionProvider({
+      provider: "opencode-go",
+      model: "kimi-k3",
+      apiKey: "test",
+      baseUrl: url,
+    });
+
+    await expect(provider.describe(input)).resolves.toBe("Handles Kimi requests.");
+    expect(requests[0]).toMatchObject({ model: "kimi-k3" });
+  });
+
+  it("routes OpenCode Messages models through the Anthropic AI SDK provider", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const paths: string[] = [];
+    const url = await startServer(requests, {
+      id: "message-1",
+      type: "message",
+      role: "assistant",
+      model: "qwen3.8-max",
+      content: [{ type: "text", text: "Handles Qwen requests." }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 4 },
+    }, false, paths);
+    const provider = new OpenAIDescriptionProvider({
+      provider: "opencode-go",
+      model: "qwen3.8-max",
+      apiKey: "test",
+      baseUrl: url,
+    });
+
+    await expect(provider.describe(input)).resolves.toBe("Handles Qwen requests.");
+    expect(paths[0]).toBe("/v1/messages");
+    expect(requests[0]).toMatchObject({ model: "qwen3.8-max" });
+  });
+
+  it("routes OpenCode Gemini models through the Google AI SDK provider", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const paths: string[] = [];
+    const url = await startServer(requests, {
+      candidates: [{
+        content: { role: "model", parts: [{ text: "Handles Gemini requests." }] },
+        finishReason: "STOP",
+      }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 4, totalTokenCount: 14 },
+    }, false, paths);
+    const provider = new OpenAIDescriptionProvider({
+      provider: "opencode",
+      model: "gemini-3.8-flash",
+      apiKey: "test",
+      baseUrl: url,
+    });
+
+    await expect(provider.describe(input)).resolves.toBe("Handles Gemini requests.");
+    expect(paths[0]).toContain("/v1/models/gemini-3.8-flash:generateContent");
+  });
 });
 
 describe("embedding providers", () => {
@@ -136,11 +198,13 @@ async function startServer(
   requests: unknown[],
   response: unknown,
   exactUrl = false,
+  paths?: string[],
 ): Promise<string> {
   const server = createServer((request, serverResponse) => {
     const body: Buffer[] = [];
     request.on("data", (value: Buffer) => body.push(value));
     request.on("end", () => {
+      paths?.push(request.url ?? "");
       requests.push(JSON.parse(Buffer.concat(body).toString("utf8")));
       serverResponse.setHeader("content-type", "application/json");
       serverResponse.end(JSON.stringify(response));

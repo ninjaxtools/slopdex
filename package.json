@@ -43,7 +43,10 @@
     "check:parser-parity": "node --import tsx scripts/check-parser-parity.mjs"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.53",
+    "@ai-sdk/google": "^4.0.69",
     "@ai-sdk/openai": "^4.0.66",
+    "@ai-sdk/openai-compatible": "^3.0.48",
     "ai": "^7.0.99",
     "ignore": "^7.0.9",
     "install": "^0.13.0",
