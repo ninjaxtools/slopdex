@@ -4,6 +4,7 @@ import Parser from "tree-sitter";
 import { describe, expect, it, vi } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
+import type { IndexProgress } from "../src/types.js";
 import { FakeEmbeddingProvider, commitAll, git, initGit, temporaryRoot, write } from "./helpers.js";
 
 class CountingEmbeddingProvider extends FakeEmbeddingProvider {
@@ -51,6 +52,47 @@ export function multiply(a: number, b: number) { return a * b; }
     expect(stats).toMatchObject({ functionsAdded: 2, embeddingsCreated: 1 });
     expect(index.status().functionCount).toBe(2);
     index.close();
+  });
+
+  it("embeds vector batches concurrently up to the configured parallelism", async () => {
+    const root = temporaryRoot();
+    const paths: string[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      paths.push(`file${index}.ts`);
+      write(root, `file${index}.ts`, `export function fn${index}() { return ${index}; }\n`);
+    }
+    let active = 0;
+    let maximum = 0;
+    class TrackingProvider extends FakeEmbeddingProvider {
+      public override async embedDocuments(inputs: readonly string[]): Promise<number[][]> {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+        return await super.embedDocuments(inputs);
+      }
+    }
+    const progress: IndexProgress[] = [];
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: new TrackingProvider(),
+      embeddingBatchSize: 1,
+      parallelism: 3,
+      onProgress: (value) => progress.push(value),
+    });
+
+    await index.updateFiles({ upsert: paths });
+
+    expect(maximum).toBe(3);
+    expect(progress[0]).toEqual({ phase: "vectors", completed: 0, total: 6 });
+    expect(progress.at(-1)).toEqual({ phase: "vectors", completed: 6, total: 6 });
+    index.close();
+  });
+
+  it("rejects invalid parallelism", () => {
+    const root = temporaryRoot();
+    expect(() => new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider(), parallelism: 0 }))
+      .toThrow(/parallelism must be a positive integer/);
   });
 
   it("durably caches parsing and each completed embedding before a failed initial update", async () => {

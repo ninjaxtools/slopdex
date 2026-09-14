@@ -15,7 +15,7 @@ import type {
   DescriptionProvider,
   ParsedCallable,
 } from "../types.js";
-import { throwIfAborted } from "../utils.js";
+import { DEFAULT_PARALLELISM, throwIfAborted } from "../utils.js";
 
 export interface OpenAIDescriptionProviderOptions {
   apiKey?: string;
@@ -24,6 +24,7 @@ export interface OpenAIDescriptionProviderOptions {
   provider?: DescriptionProviderName;
   verbose?: boolean;
   retryDelayMs?: number;
+  parallelism?: number;
 }
 
 export const DESCRIPTION_PROVIDER_NAMES = ["openai", "opencode", "opencode-go"] as const;
@@ -87,6 +88,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
   readonly #openCode: boolean;
   readonly #verbose: boolean;
   readonly #retryDelayMs: number;
+  readonly #parallelism: number;
 
   public constructor(options: OpenAIDescriptionProviderOptions = {}) {
     const provider = options.provider ?? "openai";
@@ -103,6 +105,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     this.#openCode = provider !== "openai";
     this.#verbose = options.verbose ?? false;
     this.#retryDelayMs = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
+    this.#parallelism = options.parallelism ?? DEFAULT_PARALLELISM;
     this.profile = {
       provider,
       model: options.model ?? defaults.model,
@@ -160,7 +163,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     throwIfAborted(options?.signal);
     if (!this.#apiKey) throw new CodeIndexError(`${this.#apiKeyHint} is required to generate descriptions.`);
     const { model, responses } = await this.#languageModel(headers);
-    reportModelCall("descriptions", this.profile, this.#verbose);
+    reportModelCall("descriptions", this.profile, this.#verbose, this.#parallelism);
     let retryDelayMs = this.#retryDelayMs;
     for (let attempt = 0; ; attempt += 1) {
       throwIfAborted(options?.signal);

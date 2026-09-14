@@ -3,6 +3,7 @@ import { embed, embedMany } from "ai";
 
 import type { EmbeddingProvider } from "../types.js";
 import { reportModelCall } from "../model-call-notice.js";
+import { DEFAULT_PARALLELISM } from "../utils.js";
 import { requestEmbeddings } from "./ai-sdk.js";
 
 export interface JinaEmbeddingProviderOptions {
@@ -11,6 +12,7 @@ export interface JinaEmbeddingProviderOptions {
   dimensions?: number;
   baseUrl?: string;
   verbose?: boolean;
+  parallelism?: number;
 }
 
 export class JinaEmbeddingProvider implements EmbeddingProvider {
@@ -18,6 +20,7 @@ export class JinaEmbeddingProvider implements EmbeddingProvider {
   readonly #apiKey: string;
   readonly #baseUrl: string;
   readonly #verbose: boolean;
+  readonly #parallelism: number;
 
   public constructor(options: JinaEmbeddingProviderOptions = {}) {
     this.#apiKey = options.apiKey ?? process.env.JINA_API_KEY ?? "";
@@ -32,13 +35,14 @@ export class JinaEmbeddingProvider implements EmbeddingProvider {
       strategyVersion: "callable-v2:code-query-passage",
     } as const;
     this.#verbose = options.verbose ?? false;
+    this.#parallelism = options.parallelism ?? DEFAULT_PARALLELISM;
     const url = (options.baseUrl ?? "https://api.jina.ai/v1/embeddings").replace(/\/$/, "");
     this.#baseUrl = url.endsWith("/embeddings") ? url.slice(0, -"/embeddings".length) : url;
   }
 
   public async embedDocuments(inputs: readonly string[], options?: { signal?: AbortSignal }): Promise<number[][]> {
     if (inputs.length === 0) return [];
-    reportModelCall("vectors", this.profile, this.#verbose);
+    reportModelCall("vectors", this.profile, this.#verbose, this.#parallelism);
     return requestEmbeddings(
       embedMany({
         model: this.#model("code.passage"),
@@ -52,7 +56,7 @@ export class JinaEmbeddingProvider implements EmbeddingProvider {
   }
 
   public async embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]> {
-    reportModelCall("vectors", this.profile, this.#verbose);
+    reportModelCall("vectors", this.profile, this.#verbose, 1);
     return (await requestEmbeddings(
       embed({
         model: this.#model("code.query"),

@@ -521,7 +521,7 @@ describe("external model call notices", () => {
         apiKey: "test", baseUrl: embeddingUrl, model: "notice-vectors-default", dimensions: 2,
       });
       const verboseEmbedding = new OpenAIEmbeddingProvider({
-        apiKey: "test", baseUrl: embeddingUrl, model: "notice-vectors-verbose", dimensions: 2, verbose: true,
+        apiKey: "test", baseUrl: embeddingUrl, model: "notice-vectors-verbose", dimensions: 2, verbose: true, parallelism: 3,
       });
       const defaultDescriptions = new OpenAIDescriptionProvider({
         apiKey: "test", baseUrl: descriptionUrl, model: "notice-descriptions-default",
@@ -550,6 +550,9 @@ describe("external model call notices", () => {
         expect(notices.filter((line) => line.includes(`kind=${kind}`) && line.includes(`notice-${kind}-default`))).toHaveLength(1);
         expect(notices.filter((line) => line.includes(`kind=${kind}`) && line.includes(`notice-${kind}-verbose`))).toHaveLength(2);
       }
+      expect(notices.filter((line) => line.includes("notice-vectors-verbose")).every((line) => line.includes("parallelism=3"))).toBe(true);
+      expect(notices.filter((line) => line.includes("notice-vectors-default")).every((line) => line.includes("parallelism=10"))).toBe(true);
+      expect(notices.filter((line) => line.includes("notice-reranking-default")).every((line) => line.includes("parallelism=1"))).toBe(true);
       expect(notices.every((line) => line.startsWith("slopdex: notice: external model call:") && line.endsWith("\n"))).toBe(true);
     } finally {
       stderr.mockRestore();

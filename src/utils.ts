@@ -3,6 +3,8 @@ import path from "node:path";
 
 import { CodeIndexError } from "./errors.js";
 
+export const DEFAULT_PARALLELISM = 10;
+
 export function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -29,6 +31,37 @@ export function chunk<T>(values: readonly T[], size: number): T[][] {
     batches.push(values.slice(index, index + size));
   }
   return batches;
+}
+
+export async function forEachConcurrent<T>(
+  values: readonly T[],
+  limit: number,
+  worker: (value: T, index: number, signal: AbortSignal) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  assertPositiveInteger(limit, "parallelism");
+  if (values.length === 0) return;
+  const controller = new AbortController();
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  let nextIndex = 0;
+  let failure: { error: unknown } | undefined;
+  const run = async (): Promise<void> => {
+    while (failure === undefined) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) return;
+      try {
+        await worker(values[index]!, index, combined);
+      } catch (error) {
+        failure ??= { error };
+        controller.abort();
+        throw error;
+      }
+    }
+  };
+  const runners = Array.from({ length: Math.min(limit, values.length) }, () => run());
+  await Promise.allSettled(runners);
+  if (failure !== undefined) throw failure.error;
 }
 
 export function assertPositiveInteger(value: number, name: string): void {

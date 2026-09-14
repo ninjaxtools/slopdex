@@ -92,6 +92,7 @@ describe("CLI index initialization", { timeout: testTimeoutMs }, () => {
     write(root, ".slopdex/config.json", JSON.stringify({
       dimensions: 2,
       embeddingBatchSize: 1,
+      parallelism: 3,
       verbose: configVerbose,
     }));
     write(root, ".slopdex/mock-api.mjs", `
@@ -107,7 +108,7 @@ globalThis.fetch = async (_url, options) => {
 
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr.match(/external model call: kind=vectors/g)).toHaveLength(2);
-    expect(result.stderr).toContain('provider="openai" model="text-embedding-3-large"');
+    expect(result.stderr).toContain('provider="openai" model="text-embedding-3-large" parallelism=3');
   });
 
   it("retains a partial initialization cache and resumes without repeating completed API calls", async () => {
@@ -568,6 +569,7 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
       "slopdex models opencode-go",
       "slopdex config model opencode-go/gpt-5.6-luna",
       "slopdex config descriptions enable",
+      "slopdex config parallelism 10",
       "slopdex config reranker cohere",
       "slopdex config reranker openai",
       "slopdex update-files",
@@ -678,6 +680,17 @@ globalThis.fetch = async (input, options) => {
     expect(invalid.status).toBe(2);
     expect(invalid.stderr).toContain("Unknown opencode-go model");
     expect(JSON.parse(readFileSync(configPath, "utf8")).descriptionModel).toBe("gpt-5.6-luna");
+
+    const parallelism = await run("config", "parallelism", "4", "--format", "json");
+    expect(parallelism.status, parallelism.stderr).toBe(0);
+    expect(JSON.parse(parallelism.stdout)).toMatchObject({ configPath, parallelism: 4 });
+    expect(JSON.parse(readFileSync(configPath, "utf8")).parallelism).toBe(4);
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
+    const invalidParallelism = await run("config", "parallelism", "zero");
+    expect(invalidParallelism.status).toBe(2);
+    expect(invalidParallelism.stderr).toContain("config parallelism requires a positive integer");
+    expect(JSON.parse(readFileSync(configPath, "utf8")).parallelism).toBe(4);
 
     const enabled = await run("config", "descriptions", "enable");
     expect(enabled.status, enabled.stderr).toBe(0);
@@ -841,6 +854,8 @@ globalThis.fetch = async (url, options) => {
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
     const initialized = await run("descriptions", "enable");
     expect(initialized.status, initialized.stderr).toBe(0);
+    expect(initialized.stderr).toContain('kind=descriptions provider="opencode-go" model="gpt-5.6-luna" parallelism=10');
+    expect(initialized.stderr).toContain('kind=vectors provider="openai" model="text-embedding-3-large" parallelism=10');
     expect(JSON.parse(initialized.stdout)).toEqual({ descriptionsCreated: 1, fileDescriptionsCreated: 1, descriptionsEnabled: true });
     expect(JSON.parse((await run("status")).stdout).descriptionProfile).toMatchObject({
       provider: "opencode-go",

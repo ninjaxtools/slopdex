@@ -121,6 +121,14 @@ export interface DescriptionStats {
   descriptionsEnabled: boolean;
 }
 
+export type IndexProgressPhase = "vectors" | "descriptions" | "description-vectors";
+
+export interface IndexProgress {
+  phase: IndexProgressPhase;
+  completed: number;
+  total: number;
+}
+
 export interface CodeIndexOptions {
   rootDir: string;
   indexPath?: string;
@@ -129,6 +137,10 @@ export interface CodeIndexOptions {
   reranker?: Reranker;
   descriptionProvider?: DescriptionProvider;
   onWarning?: (message: string) => void;
+  /** Maximum number of concurrent provider requests for vectors and descriptions. */
+  parallelism?: number;
+  /** Receives vector and description generation progress updates. */
+  onProgress?: (progress: IndexProgress) => void;
   include?: readonly string[];
   exclude?: readonly string[];
   maxFileSize?: number;

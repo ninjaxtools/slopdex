@@ -5,6 +5,7 @@ import cl100kBase from "js-tiktoken/ranks/cl100k_base";
 
 import type { EmbeddingProvider } from "../types.js";
 import { reportModelCall } from "../model-call-notice.js";
+import { DEFAULT_PARALLELISM } from "../utils.js";
 import { requestEmbeddings } from "./ai-sdk.js";
 
 const MAX_INPUT_TOKENS = 8192;
@@ -22,12 +23,14 @@ export interface OpenAIEmbeddingProviderOptions {
   dimensions?: number;
   baseUrl?: string;
   verbose?: boolean;
+  parallelism?: number;
 }
 
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   public readonly profile;
   readonly #model;
   readonly #verbose: boolean;
+  readonly #parallelism: number;
 
   public constructor(options: OpenAIEmbeddingProviderOptions = {}) {
     const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? "";
@@ -37,6 +40,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     if (!Number.isInteger(dimensions) || dimensions < 1) throw new Error("dimensions must be a positive integer.");
     this.profile = { provider: "openai", model, dimensions, strategyVersion: "callable-v2" } as const;
     this.#verbose = options.verbose ?? false;
+    this.#parallelism = options.parallelism ?? DEFAULT_PARALLELISM;
     this.#model = createOpenAI({
       apiKey,
       baseURL: (options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, ""),
@@ -45,7 +49,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
   public async embedDocuments(inputs: readonly string[], options?: { signal?: AbortSignal }): Promise<number[][]> {
     if (inputs.length === 0) return [];
-    reportModelCall("vectors", this.profile, this.#verbose);
+    reportModelCall("vectors", this.profile, this.#verbose, this.#parallelism);
     return requestEmbeddings(
       embedMany({
         model: this.#model,
@@ -59,7 +63,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   public async embedQuery(input: string, options?: { signal?: AbortSignal }): Promise<number[]> {
-    reportModelCall("vectors", this.profile, this.#verbose);
+    reportModelCall("vectors", this.profile, this.#verbose, 1);
     return (await requestEmbeddings(
       embed({
         model: this.#model,

@@ -10,6 +10,7 @@ import { JinaEmbeddingProvider } from "./embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
+import { clearProgress, TerminalProgress } from "./progress.js";
 import { CohereReranker, JinaReranker } from "./rerankers/hosted.js";
 import { OpenAILLMReranker } from "./rerankers/openai.js";
 import { crossSearch } from "./search/cross-search.js";
@@ -20,7 +21,7 @@ import {
   type DescriptionProviderName,
 } from "./descriptions/openai.js";
 import { readIndexErrorCounts, readIndexErrors, resetIndexState } from "./storage/database.js";
-import { compileNameRegex } from "./utils.js";
+import { compileNameRegex, DEFAULT_PARALLELISM } from "./utils.js";
 import type {
   CodeIndexOptions,
   CrossSearchOptions,
@@ -45,6 +46,7 @@ interface FileConfig {
   exclude?: string[];
   maxFileSize?: number;
   embeddingBatchSize?: number;
+  parallelism?: number;
   descriptionProvider?: DescriptionProviderName;
   descriptionModel?: string;
   descriptionsEnabled?: boolean;
@@ -157,6 +159,7 @@ if (parsed.values.help || !command) {
 }
 
 void main().catch((error: unknown) => {
+  clearProgress();
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`slopdex: ${message}\n`);
   process.exitCode = error instanceof CodeIndexError ? 2 : 1;
@@ -187,9 +190,12 @@ async function main(): Promise<void> {
   const provider = createProvider(config);
   const reranker = command === "search" || command === "search-description" ? createReranker(config) : undefined;
   const descriptionProvider = createDescriptionProvider(config);
+  const progress = new TerminalProgress();
   const indexOptions: CodeIndexOptions = {
     rootDir,
     provider,
+    parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
+    onProgress: (value) => progress.update(value),
     ...(reranker ? { reranker } : {}),
     ...(descriptionProvider ? { descriptionProvider } : {}),
     onWarning: () => {}, // Persisted diagnostics are reported once per index at exit.
@@ -288,6 +294,8 @@ async function runCrossSearch(
     rootDir: targetRootDir,
     indexPath: resolvedTargetPath,
     provider,
+    ...(sourceOptions.parallelism !== undefined ? { parallelism: sourceOptions.parallelism } : {}),
+    ...(sourceOptions.onProgress ? { onProgress: sourceOptions.onProgress } : {}),
     ...(sourceOptions.onWarning ? { onWarning: sourceOptions.onWarning } : {}),
     ...(targetConfig?.include ? { include: targetConfig.include } : {}),
     ...(targetConfig?.exclude ? { exclude: targetConfig.exclude } : {}),
@@ -415,6 +423,7 @@ async function initializeIndex(
       ? { descriptionProvider: new OpenAIDescriptionProvider({
         provider: descriptionProfile.provider as DescriptionProviderName,
         model: descriptionProfile.model,
+        parallelism: options.parallelism ?? DEFAULT_PARALLELISM,
         ...(options.verbose ? { verbose: true } : {}),
       }) } : {}),
   });
@@ -511,6 +520,9 @@ function commandLineConfig(config: FileConfig): FileConfig {
   if (config.rerankingEnabled !== undefined && typeof config.rerankingEnabled !== "boolean") {
     throw new CodeIndexError("rerankingEnabled must be a boolean.");
   }
+  if (config.parallelism !== undefined && (!Number.isInteger(config.parallelism) || config.parallelism < 1)) {
+    throw new CodeIndexError("parallelism must be a positive integer.");
+  }
   if (config.verbose !== undefined && typeof config.verbose !== "boolean") {
     throw new CodeIndexError("verbose must be a boolean.");
   }
@@ -546,6 +558,7 @@ function createDescriptionProvider(config: FileConfig): OpenAIDescriptionProvide
   return new OpenAIDescriptionProvider({
     ...(config.descriptionProvider ? { provider: config.descriptionProvider } : {}),
     ...(config.descriptionModel ? { model: config.descriptionModel } : {}),
+    parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
     ...(config.verbose ? { verbose: true } : {}),
   });
 }
@@ -610,6 +623,10 @@ async function runConfig(rootDir: string): Promise<void> {
     config.descriptionProvider = selected.provider;
     config.descriptionModel = selected.model;
     result = { descriptionProvider: selected.provider, descriptionModel: selected.model };
+  } else if (action === "parallelism") {
+    const parallelism = Number(positionals[1]);
+    config.parallelism = parallelism;
+    result = { parallelism };
   } else {
     const provider = positionals[1] as "cohere" | "jina" | "openai" | "disable";
     if (provider === "disable") {
@@ -738,12 +755,14 @@ function createProvider(config: FileConfig): EmbeddingProvider {
     return new JinaEmbeddingProvider({
       ...(config.model ? { model: config.model } : {}),
       ...(config.dimensions ? { dimensions: config.dimensions } : {}),
+      parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
       ...(config.verbose ? { verbose: true } : {}),
     });
   }
   return new OpenAIEmbeddingProvider({
     ...(config.model ? { model: config.model } : {}),
     ...(config.dimensions ? { dimensions: config.dimensions } : {}),
+    parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
     ...(config.verbose ? { verbose: true } : {}),
   });
 }
@@ -813,6 +832,13 @@ function validateInvocation(): void {
         }
         return;
       }
+      if (positionals[0] === "parallelism") {
+        const value = Number(positionals[1]);
+        if (positionals.length !== 2 || !Number.isInteger(value) || value < 1) {
+          throw new CodeIndexError("config parallelism requires a positive integer.");
+        }
+        return;
+      }
       if (positionals[0] === "reranker") {
         const provider = positionals[1];
         if ((provider !== "cohere" && provider !== "jina" && provider !== "openai" && provider !== "disable")
@@ -823,7 +849,7 @@ function validateInvocation(): void {
         if (provider === "openai") openAIRerankerCandidateCount(parsed.values["reranker-candidates"], 10, "reranker candidate count");
         return;
       }
-      throw new CodeIndexError("config requires descriptions, model, or reranker.");
+      throw new CodeIndexError("config requires descriptions, model, parallelism, or reranker.");
     case "index-errors":
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
@@ -958,6 +984,7 @@ Commands:
   models [opencode|opencode-go]        List current published OpenCode models
   config model <model|provider/model>  Validate and save an OpenCode description model
   config descriptions <enable|disable> Save description state without opening an index
+  config parallelism <count>           Save the concurrent provider request limit (default: 10)
   config reranker <provider|disable>    Save Cohere, Jina, or OpenAI reranking settings
   status                              Show index metadata
   index-errors                        List persisted file and function indexing failures
@@ -1066,6 +1093,7 @@ Other Examples:
     slopdex models opencode-go
     slopdex config model opencode-go/gpt-5.6-luna
     slopdex config descriptions enable
+    slopdex config parallelism 10
 
   Show metadata for the current index:
     slopdex status

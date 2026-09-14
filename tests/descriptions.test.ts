@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { CodeIndex } from "../src/code-index.js";
 import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
 import { resetIndexState } from "../src/storage/database.js";
-import type { DescriptionFileInput, DescriptionInput, DescriptionProvider, EmbeddingProvider } from "../src/types.js";
+import type { DescriptionFileInput, DescriptionInput, DescriptionProvider, EmbeddingProvider, IndexProgress } from "../src/types.js";
 import { FakeEmbeddingProvider, commitAll, git, initGit, temporaryRoot, write } from "./helpers.js";
 
 class FakeDescriptionProvider implements DescriptionProvider {
@@ -195,6 +195,44 @@ export class Client { constructor() {} send() { deliver(); } }
     expect(await index.searchDescription({ query: "purpose", minSimilarity: 1.1 })).toEqual([]);
     await expect(index.searchDescription({ query: " " })).rejects.toThrow(/empty/);
     await expect(index.searchDescription({ query: "purpose", limit: 0 })).rejects.toThrow(/positive integer/);
+    index.close();
+  });
+
+  it("generates descriptions across files concurrently up to the configured parallelism", async () => {
+    const root = temporaryRoot();
+    const paths = ["a.ts", "b.ts", "c.ts", "d.ts"];
+    for (const [index, file] of paths.entries()) {
+      write(root, file, `export function fn${index}() { return ${index}; }\n`);
+    }
+    let active = 0;
+    let maximum = 0;
+    class TrackingDescriptionProvider extends FakeDescriptionProvider {
+      public override async describeFile(input: DescriptionFileInput): Promise<string> {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+        return await super.describeFile(input);
+      }
+    }
+    const progress: IndexProgress[] = [];
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: new FakeEmbeddingProvider(),
+      descriptionProvider: new TrackingDescriptionProvider(),
+      parallelism: 2,
+      onProgress: (value) => progress.push(value),
+    });
+    await index.updateFiles({ upsert: paths });
+    await index.useDescriptions();
+
+    expect(maximum).toBe(2);
+    const descriptionProgress = progress.filter((value) => value.phase === "descriptions");
+    expect(descriptionProgress[0]).toEqual({ phase: "descriptions", completed: 0, total: 8 });
+    expect(descriptionProgress.at(-1)).toEqual({ phase: "descriptions", completed: 8, total: 8 });
+    const vectorProgress = progress.filter((value) => value.phase === "description-vectors");
+    expect(vectorProgress[0]).toEqual({ phase: "description-vectors", completed: 0, total: 8 });
+    expect(vectorProgress.at(-1)).toEqual({ phase: "description-vectors", completed: 8, total: 8 });
     index.close();
   });
 

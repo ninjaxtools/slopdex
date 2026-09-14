@@ -13,6 +13,8 @@ import type {
   CodeIndexOptions,
   CrossSearchSourceFilter,
   EmbeddingProfile,
+  IndexProgress,
+  IndexProgressPhase,
   IndexStatus,
   IndexedFunction,
   IndexingError,
@@ -27,7 +29,17 @@ import type {
   UpdateFromWorkingTreeOptions,
   UpdateStats,
 } from "./types.js";
-import { assertPositiveInteger, chunk, compileNameRegex, normalizeEmbeddingVector, normalizeRelativePath, sha256, throwIfAborted } from "./utils.js";
+import {
+  assertPositiveInteger,
+  chunk,
+  compileNameRegex,
+  DEFAULT_PARALLELISM,
+  forEachConcurrent,
+  normalizeEmbeddingVector,
+  normalizeRelativePath,
+  sha256,
+  throwIfAborted,
+} from "./utils.js";
 
 const DEFAULT_MAX_FILE_SIZE = 1024 * 1024;
 const DEFAULT_BATCH_SIZE = 32;
@@ -43,6 +55,8 @@ export class CodeIndex {
   readonly #policy: SourcePolicy;
   readonly #maxFileSize: number;
   readonly #embeddingBatchSize: number;
+  readonly #parallelism: number;
+  readonly #onProgress: ((progress: IndexProgress) => void) | undefined;
   readonly #git: GitRepository;
   readonly #onWarning: (message: string) => void;
 
@@ -63,11 +77,15 @@ export class CodeIndex {
     const profile = normalizeProfile(options.provider.profile);
     assertPositiveInteger(profile.dimensions, "embedding dimensions");
     this.#database = new IndexDatabase(this.indexPath, this.rootDir, profile, options.readOnly ?? false);
+    this.#parallelism = options.parallelism ?? DEFAULT_PARALLELISM;
+    assertPositiveInteger(this.#parallelism, "parallelism");
+    this.#onProgress = options.onProgress;
     const storedDescriptionProfile = this.#database.descriptionProfile();
     this.descriptionProvider = options.descriptionProvider ?? new OpenAIDescriptionProvider({
       ...(storedDescriptionProfile && isDescriptionProviderName(storedDescriptionProfile.provider)
         ? { provider: storedDescriptionProfile.provider, model: storedDescriptionProfile.model }
         : {}),
+      parallelism: this.#parallelism,
       ...(options.verbose ? { verbose: true } : {}),
     });
     this.#policy = new SourcePolicy(options.include, options.exclude);
@@ -77,6 +95,10 @@ export class CodeIndex {
     assertPositiveInteger(this.#maxFileSize, "maxFileSize");
     assertPositiveInteger(this.#embeddingBatchSize, "embeddingBatchSize");
     this.#git = new GitRepository(this.rootDir);
+  }
+
+  #progress(phase: IndexProgressPhase, completed: number, total: number): void {
+    this.#onProgress?.({ phase, completed, total });
   }
 
   public close(): void {
@@ -677,6 +699,7 @@ export class CodeIndex {
       }
       await this.#attachDescriptions(files.filter((file) => !file.unavailable), signal);
     }
+    throwIfAborted(signal);
     const profile = JSON.stringify(normalizeProfile(this.provider.profile));
     const unique = new Map<string, PreparedCallable[]>();
     for (const file of files) {
@@ -696,16 +719,23 @@ export class CodeIndex {
         missing.push([key, callables]);
       }
     }
-    for (const batch of chunk(missing, this.#embeddingBatchSize)) {
-      throwIfAborted(signal);
-      const vectors = await this.provider.embedDocuments(batch.map(([, callables]) => callables[0]!.embeddingInput), signal ? { signal } : undefined);
+    if (missing.length === 0) return 0;
+    let completed = 0;
+    this.#progress("vectors", 0, missing.length);
+    await forEachConcurrent(chunk(missing, this.#embeddingBatchSize), this.#parallelism, async (batch, _index, workerSignal) => {
+      const vectors = await this.provider.embedDocuments(
+        batch.map(([, callables]) => callables[0]!.embeddingInput),
+        { signal: workerSignal },
+      );
       if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of vectors.");
       vectors.forEach((vector, index) => {
         const converted = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
         this.#database.storeEmbedding(batch[index]![0], converted);
         for (const callable of batch[index]![1]) callable.vector = converted;
       });
-    }
+      completed += batch.length;
+      this.#progress("vectors", completed, missing.length);
+    }, signal);
     throwIfAborted(signal);
     return missing.length;
   }
@@ -718,9 +748,11 @@ export class CodeIndex {
     const profile = descriptionProfileJson(this.descriptionProvider.profile);
     const embeddingProfile = JSON.stringify(normalizeProfile(this.provider.profile));
     const prepared = new Map<string, PreparedDescription>();
+    const repository = path.basename(this.rootDir);
     let descriptionsCreated = 0;
     let fileDescriptionsCreated = 0;
-    const repository = path.basename(this.rootDir);
+    let pending = 0;
+    const tasks: DescriptionTask[] = [];
     for (const file of files) {
       const storedFileDescription = this.#database.fileDescription(file.replacePath ?? file.previousPath ?? file.path);
       const fileDescriptionKey = sha256(`${profile}\0${repository}\0${file.path}\0${file.contentHash}\0file`);
@@ -728,79 +760,107 @@ export class CodeIndex {
         ? sha256(`${fileDescriptionKey}\0reindex\0${storedFileDescription?.description ?? ""}`)
         : fileDescriptionKey;
       const refreshFileDescription = options.refreshFileDescriptions || !storedFileDescription;
-      let fileDescription = refreshFileDescription
+      const fileDescription = refreshFileDescription
         ? this.#database.cachedDescription(fileCacheKey)
         : storedFileDescription.description;
-      let fileDescriptionAddedToSession = false;
       const descriptions = (options.skipCallables ? [] : file.callables).map((callable) => {
         const descriptionKey = sha256(`${profile}\0${repository}\0${file.path}\0${file.contentHash}\0${callable.identityKey}\0${callable.sourceHash}`);
         const cacheKey = options.reindexCache
           ? sha256(`${descriptionKey}\0reindex\0${this.#database.functionDescription(callable.identityKey) ?? ""}`)
           : descriptionKey;
+        const description = options.forceCallableDescriptions
+          ? this.#database.cachedDescription(cacheKey)
+          : this.#database.cachedDescription(descriptionKey);
         return {
           callable,
           descriptionKey,
           cacheKey,
-          description: options.forceCallableDescriptions
-            ? this.#database.cachedDescription(cacheKey)
-            : this.#database.cachedDescription(descriptionKey),
+          ...(description ? { description } : {}),
         };
       });
-      const session = refreshFileDescription || descriptions.some(({ description }) => !description)
+      pending += (refreshFileDescription && !fileDescription ? 1 : 0)
+        + descriptions.filter(({ description }) => !description).length;
+      tasks.push({
+        file,
+        fileCacheKey,
+        fileDescriptionKey,
+        refreshFileDescription,
+        ...(fileDescription ? { fileDescription } : {}),
+        fileDescriptionPath: refreshFileDescription ? file.path : storedFileDescription.path,
+        fileDescriptionContentHash: refreshFileDescription ? file.contentHash : storedFileDescription.contentHash,
+        descriptions,
+      });
+    }
+    let completed = 0;
+    if (pending > 0) this.#progress("descriptions", 0, pending);
+    await forEachConcurrent(tasks, this.#parallelism, async (task, _index, workerSignal) => {
+      const { file } = task;
+      const session = task.refreshFileDescription || task.descriptions.some(({ description }) => !description)
         ? this.descriptionProvider.startFile?.({ repository, path: file.path, fileSource: file.source })
         : undefined;
-      if (refreshFileDescription && !fileDescription) {
+      let fileDescription = task.fileDescription;
+      let fileDescriptionAddedToSession = false;
+      if (task.refreshFileDescription && !fileDescription) {
         const generated = session
-          ? await session.describeFile(signal ? { signal } : undefined)
+          ? await session.describeFile({ signal: workerSignal })
           : await this.descriptionProvider.describeFile(
             { repository, path: file.path, fileSource: file.source },
-            signal ? { signal } : undefined,
+            { signal: workerSignal },
           );
         if (typeof generated !== "string" || !generated.trim()) {
           throw new CodeIndexError("Description provider does not support file descriptions or returned an empty description.");
         }
-        fileDescription = this.#database.storeDescription(fileCacheKey, generated.trim());
+        fileDescription = this.#database.storeDescription(task.fileCacheKey, generated.trim());
         fileDescriptionsCreated += 1;
         fileDescriptionAddedToSession = session !== undefined;
+        completed += 1;
+        this.#progress("descriptions", completed, pending);
       }
       if (session && fileDescription && !fileDescriptionAddedToSession) session.replayFile(fileDescription);
       if (fileDescription) {
         const value = prepareDescription(prepared, embeddingProfile, fileDescription, this.#database);
         file.fileDescription = {
-          path: refreshFileDescription ? file.path : storedFileDescription.path,
-          contentHash: refreshFileDescription ? file.contentHash : storedFileDescription.contentHash,
-          descriptionKey: fileDescriptionKey,
+          path: task.fileDescriptionPath,
+          contentHash: task.fileDescriptionContentHash,
+          descriptionKey: task.fileDescriptionKey,
           value,
         };
       }
-      for (const entry of descriptions) {
-        throwIfAborted(signal);
+      for (const entry of task.descriptions) {
+        throwIfAborted(workerSignal);
         const { callable, descriptionKey, cacheKey } = entry;
         let { description } = entry;
         if (!description) {
           const generated = session
-            ? await session.describe(callable, signal ? { signal } : undefined)
-            : await this.descriptionProvider.describe({ repository, callable, fileSource: file.source }, signal ? { signal } : undefined);
+            ? await session.describe(callable, { signal: workerSignal })
+            : await this.descriptionProvider.describe({ repository, callable, fileSource: file.source }, { signal: workerSignal });
           if (typeof generated !== "string" || !generated.trim()) throw new CodeIndexError("Description provider returned an empty description.");
           description = this.#database.storeDescription(cacheKey, generated.trim());
           descriptionsCreated += 1;
+          completed += 1;
+          this.#progress("descriptions", completed, pending);
         } else {
           session?.replay(callable, description);
         }
         callable.descriptionKey = descriptionKey;
         callable.description = prepareDescription(prepared, embeddingProfile, description, this.#database);
       }
-    }
+    }, signal);
     const missing = [...prepared.values()].filter((description) => !description.vector);
-    for (const batch of chunk(missing, this.#embeddingBatchSize)) {
-      throwIfAborted(signal);
-      const vectors = await this.provider.embedDocuments(batch.map((value) => value.description), signal ? { signal } : undefined);
-      if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of description vectors.");
-      vectors.forEach((vector, index) => {
-        const converted = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
-        this.#database.storeEmbedding(batch[index]!.key, converted);
-        batch[index]!.vector = converted;
-      });
+    if (missing.length > 0) {
+      let embedded = 0;
+      this.#progress("description-vectors", 0, missing.length);
+      await forEachConcurrent(chunk(missing, this.#embeddingBatchSize), this.#parallelism, async (batch, _index, workerSignal) => {
+        const vectors = await this.provider.embedDocuments(batch.map((value) => value.description), { signal: workerSignal });
+        if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of description vectors.");
+        vectors.forEach((vector, index) => {
+          const converted = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
+          this.#database.storeEmbedding(batch[index]!.key, converted);
+          batch[index]!.vector = converted;
+        });
+        embedded += batch.length;
+        this.#progress("description-vectors", embedded, missing.length);
+      }, signal);
     }
     throwIfAborted(signal);
     return { descriptionsCreated, fileDescriptionsCreated };
@@ -1103,6 +1163,24 @@ export class CodeIndex {
     }
     return current.filter((callable) => changedIds.has(callable.id));
   }
+}
+
+interface DescriptionTaskEntry {
+  callable: PreparedCallable;
+  descriptionKey: string;
+  cacheKey: string;
+  description?: string;
+}
+
+interface DescriptionTask {
+  file: PreparedFile;
+  fileCacheKey: string;
+  fileDescriptionKey: string;
+  refreshFileDescription: boolean;
+  fileDescription?: string;
+  fileDescriptionPath: string;
+  fileDescriptionContentHash: string;
+  descriptions: DescriptionTaskEntry[];
 }
 
 function changedFunctionIds(
