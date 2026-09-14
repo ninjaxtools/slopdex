@@ -1,6 +1,9 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError, generateText, type ModelMessage } from "ai";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 
 import { CodeIndexError } from "../errors.js";
 import { reportModelCall } from "../model-call-notice.js";
@@ -38,6 +41,30 @@ const PROVIDERS: Record<DescriptionProviderName, { apiKey: string; baseUrl: stri
   "opencode-go": { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/go/v1", model: "gpt-5.6-luna" },
 };
 
+export function openCodeAuthPath(): string {
+  const dataHome = process.env.XDG_DATA_HOME?.trim() || path.join(homedir(), ".local", "share");
+  return path.join(dataHome, "opencode", "auth.json");
+}
+
+export function openCodeAuthKey(provider: DescriptionProviderName): string | undefined {
+  let auth: unknown;
+  try {
+    auth = JSON.parse(readFileSync(openCodeAuthPath(), "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!auth || typeof auth !== "object" || Array.isArray(auth)) return undefined;
+  const entry = (auth as Record<string, unknown>)[provider];
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+  const key = (entry as Record<string, unknown>).key;
+  return typeof key === "string" && key.length > 0 ? key : undefined;
+}
+
+function displayPath(value: string): string {
+  const home = homedir();
+  return value.startsWith(`${home}${path.sep}`) ? `~${value.slice(home.length)}` : value;
+}
+
 const INSTRUCTIONS = `Describe the requested file or callable within its codebase in one to three concise sentences.
 For a file, explain its overall responsibility, the feature or workflow it supports, and its visible relationships.
 For a callable, explain why it exists and what it accomplishes rather than giving a step-by-step account of its implementation.
@@ -49,6 +76,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
   public readonly profile;
   readonly #apiKey: string;
   readonly #apiKeyName: string;
+  readonly #apiKeyHint: string;
   readonly #baseUrl: string;
   readonly #openCode: boolean;
   readonly #verbose: boolean;
@@ -57,7 +85,13 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     const provider = options.provider ?? "openai";
     const defaults = PROVIDERS[provider];
     this.#apiKeyName = defaults.apiKey;
-    this.#apiKey = options.apiKey ?? process.env[this.#apiKeyName] ?? "";
+    this.#apiKey = options.apiKey
+      || process.env[this.#apiKeyName]
+      || (provider === "openai" ? undefined : openCodeAuthKey(provider))
+      || "";
+    this.#apiKeyHint = provider === "openai"
+      ? this.#apiKeyName
+      : `${this.#apiKeyName} or ${displayPath(openCodeAuthPath())}`;
     this.#baseUrl = (options.baseUrl ?? defaults.baseUrl).replace(/\/$/, "");
     this.#openCode = provider !== "openai";
     this.#verbose = options.verbose ?? false;
@@ -116,7 +150,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     options?: { signal?: AbortSignal },
   ): Promise<string> {
     throwIfAborted(options?.signal);
-    if (!this.#apiKey) throw new CodeIndexError(`${this.#apiKeyName} is required to generate descriptions.`);
+    if (!this.#apiKey) throw new CodeIndexError(`${this.#apiKeyHint} is required to generate descriptions.`);
     const { model, responses } = await this.#languageModel(headers);
     reportModelCall("descriptions", this.profile, this.#verbose);
     let text: string;

@@ -10,10 +10,12 @@ import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
 import { parseCallables } from "../src/parser/callable-parser.js";
 import { CohereReranker, JinaReranker } from "../src/rerankers/hosted.js";
 import { OpenAILLMReranker } from "../src/rerankers/openai.js";
+import { temporaryRoot, write } from "./helpers.js";
 
 const servers: Server[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   })));
@@ -101,6 +103,63 @@ describe("OpenAI description provider", () => {
     await expect(provider.describe(input)).resolves.toBe("Delivers through OpenCode Go.");
     expect(provider.profile).toMatchObject({ provider: "opencode-go", model: "gpt-5.6-luna" });
     expect(requests[0]).toMatchObject({ model: "gpt-5.6-luna", store: false });
+  });
+
+  it.each(["opencode", "opencode-go"] as const)(
+    "reads the %s API key from opencode's auth.json when the environment has none",
+    async (provider) => {
+      const dataHome = temporaryRoot("slopdex-auth-");
+      write(dataHome, "opencode/auth.json", JSON.stringify({
+        [provider]: { type: "api", key: `auth-key-${provider}` },
+      }));
+      vi.stubEnv("XDG_DATA_HOME", dataHome);
+      vi.stubEnv("OPENCODE_API_KEY", "");
+      const requests: Array<Record<string, unknown>> = [];
+      const authorizations: Array<string | undefined> = [];
+      const url = await startServer(requests, {
+        output: [{
+          type: "message",
+          role: "assistant",
+          id: "message-1",
+          content: [{ type: "output_text", text: "Delivers through OpenCode.", annotations: [] }],
+        }],
+      }, false, undefined, authorizations);
+      const descriptionProvider = new OpenAIDescriptionProvider({ provider, baseUrl: url });
+
+      await expect(descriptionProvider.describe(input)).resolves.toBe("Delivers through OpenCode.");
+      expect(authorizations).toEqual([`Bearer auth-key-${provider}`]);
+    },
+  );
+
+  it("prefers OPENCODE_API_KEY over opencode's auth.json", async () => {
+    const dataHome = temporaryRoot("slopdex-auth-");
+    write(dataHome, "opencode/auth.json", JSON.stringify({
+      "opencode-go": { type: "api", key: "auth-key" },
+    }));
+    vi.stubEnv("XDG_DATA_HOME", dataHome);
+    vi.stubEnv("OPENCODE_API_KEY", "env-key");
+    const requests: Array<Record<string, unknown>> = [];
+    const authorizations: Array<string | undefined> = [];
+    const url = await startServer(requests, {
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{ type: "output_text", text: "Delivers through OpenCode.", annotations: [] }],
+      }],
+    }, false, undefined, authorizations);
+    const descriptionProvider = new OpenAIDescriptionProvider({ provider: "opencode-go", baseUrl: url });
+
+    await expect(descriptionProvider.describe(input)).resolves.toBe("Delivers through OpenCode.");
+    expect(authorizations).toEqual(["Bearer env-key"]);
+  });
+
+  it("mentions the auth file when no OpenCode API key is available", async () => {
+    vi.stubEnv("XDG_DATA_HOME", temporaryRoot("slopdex-auth-"));
+    vi.stubEnv("OPENCODE_API_KEY", "");
+    const descriptionProvider = new OpenAIDescriptionProvider({ provider: "opencode-go" });
+
+    await expect(descriptionProvider.describe(input)).rejects.toThrow(/OPENCODE_API_KEY or .*auth\.json is required/);
   });
 
   it("routes OpenCode chat-completions models through the compatible AI SDK provider", async () => {
@@ -474,12 +533,14 @@ async function startServer(
   response: unknown,
   exactUrl = false,
   paths?: string[],
+  authorizations?: Array<string | undefined>,
 ): Promise<string> {
   const server = createServer((request, serverResponse) => {
     const body: Buffer[] = [];
     request.on("data", (value: Buffer) => body.push(value));
     request.on("end", () => {
       paths?.push(request.url ?? "");
+      authorizations?.push(request.headers.authorization);
       requests.push(JSON.parse(Buffer.concat(body).toString("utf8")));
       serverResponse.setHeader("content-type", "application/json");
       serverResponse.end(JSON.stringify(response));

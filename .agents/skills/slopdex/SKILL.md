@@ -41,7 +41,8 @@ slopdex search-description "keep the repository index synchronized" --format sum
 ```
 
 Enabling needs `OPENAI_API_KEY` by default. Select OpenCode Zen or Go with
-`--description-provider opencode` or `--description-provider opencode-go` and set `OPENCODE_API_KEY`.
+`--description-provider opencode` or `--description-provider opencode-go` and set `OPENCODE_API_KEY`
+or sign in with `opencode auth login`, which stores the key in `~/.local/share/opencode/auth.json`.
 
 To select another model:
 
@@ -150,7 +151,7 @@ Usage: `slopdex <command> [arguments] [options]`. Quote queries and regexes. Boo
 | `--provider <openai\|jina>` | Embedding provider; `openai`. |
 | `--model <name>` | Embedding model; OpenAI `text-embedding-3-large`, Jina `jina-embeddings-v4`. |
 | `--dimensions <number>` | Positive dimensions supported by the model; OpenAI `3072`, Jina `1024`. |
-| `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values require `OPENCODE_API_KEY`. |
+| `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json`. |
 | `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go. |
 | `--reranker-candidates <number>` | With `config reranker openai`, embedding-ranked functions sent to the LLM; range `1`-`100`, default `10`. |
 | `--ignore-errors` | Silence saved-diagnostic warnings without deleting records. |

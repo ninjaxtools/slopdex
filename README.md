@@ -42,7 +42,7 @@ slopdex descriptions enable
 slopdex search-description "keep the repository index synchronized" --format summary --limit 10
 ```
 
-The default description provider requires `OPENAI_API_KEY` even when Jina supplies embeddings. OpenCode Zen and Go use `OPENCODE_API_KEY`. Description generation can add provider costs; see [descriptions and scoring](#descriptions-and-scoring).
+The default description provider requires `OPENAI_API_KEY` even when Jina supplies embeddings. OpenCode Zen and Go use `OPENCODE_API_KEY`, falling back to the key stored by `opencode auth login` in `~/.local/share/opencode/auth.json`. Description generation can add provider costs; see [descriptions and scoring](#descriptions-and-scoring).
 
 `descriptions disable` turns off description generation while retaining cached data.
 
@@ -147,7 +147,7 @@ slopdex update-git --force-reindex
 | `--provider <openai\|jina>` | Embedding provider; `openai` by default. |
 | `--model <name>` | Embedding model; `text-embedding-3-large` for OpenAI, `jina-embeddings-v4` for Jina. |
 | `--dimensions <number>` | Positive embedding dimension count; OpenAI `3072`, Jina `1024`. Must be supported by the model. |
-| `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use Zen or Go with `OPENCODE_API_KEY`. |
+| `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use Zen or Go with `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json`. |
 | `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go, then the persisted model unless overridden. Published OpenCode models use their documented protocol. |
 | `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
 | `--verbose` | Write one stderr notice for every external model call instead of one per call kind/provider/model. |
@@ -256,7 +256,7 @@ Use the recovery flag named in the error: `--rebuild-on-divergence` for Git hist
 
 ## Configuration
 
-Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, OpenAI LLM reranking, and OpenCode Go descriptions (requires `JINA_API_KEY`, `OPENAI_API_KEY` for query searches, plus `OPENCODE_API_KEY` when descriptions are enabled):
+Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, OpenAI LLM reranking, and OpenCode Go descriptions (requires `JINA_API_KEY`, `OPENAI_API_KEY` for query searches, plus `OPENCODE_API_KEY` or the `opencode-go` entry in `~/.local/share/opencode/auth.json` when descriptions are enabled):
 
 ```json
 {
@@ -290,7 +290,7 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Ope
 | `embeddingBatchSize` | Embedding inputs per batch; positive integer, default `32`. |
 | `verbose` | When true, report every external model request on stderr; false/unset reports each call kind/provider/model once per process. |
 
-Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`). Reranker settings do not change the stored index and do not require a rebuild. Changing the embedding profile requires rebuilding with `--force-reindex`.
+Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`); OpenCode providers also fall back to `~/.local/share/opencode/auth.json`. Reranker settings do not change the stored index and do not require a rebuild. Changing the embedding profile requires rebuilding with `--force-reindex`.
 
 ## Development
 
