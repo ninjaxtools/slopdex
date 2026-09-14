@@ -175,6 +175,44 @@ export class Client { constructor() {} send() { deliver(); } }
     index.close();
   });
 
+  it("reuses generated and assigned descriptions across description model changes", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");
+    class ModelNamedDescriptionProvider implements DescriptionProvider {
+      public readonly profile;
+      public constructor(model: string) {
+        this.profile = { provider: "fake", model, strategyVersion: "v1" };
+      }
+
+      public async describeFile(): Promise<string> {
+        return `File purpose via ${this.profile.model}`;
+      }
+
+      public async describe(input: DescriptionInput): Promise<string> {
+        if (input.callable.name === "two" && this.profile.model === "model-a") throw new Error("description failed");
+        return `Purpose of ${input.callable.name} via ${this.profile.model}`;
+      }
+    }
+    const provider = new FakeEmbeddingProvider();
+    const first = new CodeIndex({ rootDir: root, provider, descriptionProvider: new ModelNamedDescriptionProvider("model-a") });
+    await first.updateFiles({ upsert: ["functions.ts"] });
+    await expect(first.useDescriptions()).rejects.toThrow(/description failed/);
+    first.close();
+
+    const modelB = new ModelNamedDescriptionProvider("model-b");
+    const resumed = new CodeIndex({ rootDir: root, provider, descriptionProvider: modelB });
+    await expect(resumed.useDescriptions()).resolves.toEqual({ descriptionsCreated: 1, fileDescriptionsCreated: 0, descriptionsEnabled: true });
+    const functions = resumed.allFunctions();
+    expect(functions.find((value) => value.name === "one")!.description).toContain("via model-a");
+    expect(functions.find((value) => value.name === "two")!.description).toContain("via model-b");
+    expect(resumed.status()).toMatchObject({ descriptionProfile: modelB.profile });
+    resumed.close();
+
+    const sameModel = new CodeIndex({ rootDir: root, provider, descriptionProvider: new ModelNamedDescriptionProvider("model-b") });
+    await expect(sameModel.useDescriptions()).resolves.toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
+    sameModel.close();
+  });
+
   it("searches the description vectors independently of the code vectors and applies thresholds", async () => {
     const root = temporaryRoot();
     write(root, "functions.ts", "export function one() { return 1; }\nexport function two() { return 2; }\n");

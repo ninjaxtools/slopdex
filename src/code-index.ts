@@ -694,9 +694,6 @@ export class CodeIndex {
 
   async #attachEmbeddings(files: PreparedFile[], signal?: AbortSignal): Promise<number> {
     if (this.#database.descriptionsEnabled()) {
-      if (descriptionProfileJson(this.#database.descriptionProfile()!) !== descriptionProfileJson(this.descriptionProvider.profile)) {
-        throw new CodeIndexError("Description provider or model differs from this index; run descriptions enable (useDescriptions() in the library) with the new provider first.");
-      }
       await this.#attachDescriptions(files.filter((file) => !file.unavailable), signal);
     }
     throwIfAborted(signal);
@@ -743,7 +740,7 @@ export class CodeIndex {
   async #attachDescriptions(
     files: PreparedFile[],
     signal?: AbortSignal,
-    options: { refreshFileDescriptions?: boolean; forceCallableDescriptions?: boolean; reindexCache?: boolean; skipCallables?: boolean } = {},
+    options: { refreshFileDescriptions?: boolean; forceCallableDescriptions?: boolean; reindexCache?: boolean; skipCallables?: boolean; ignoreLiveDescriptions?: boolean } = {},
   ): Promise<{ descriptionsCreated: number; fileDescriptionsCreated: number }> {
     const profile = descriptionProfileJson(this.descriptionProvider.profile);
     const embeddingProfile = JSON.stringify(normalizeProfile(this.provider.profile));
@@ -753,28 +750,55 @@ export class CodeIndex {
     let fileDescriptionsCreated = 0;
     let pending = 0;
     const tasks: DescriptionTask[] = [];
+    const strategy = this.descriptionProvider.profile.strategyVersion;
+    const useLiveReuse = !options.skipCallables && !options.reindexCache && !options.forceCallableDescriptions && !options.ignoreLiveDescriptions;
+    const liveCallableDescriptions = useLiveReuse
+      ? this.#database.liveFunctionDescriptions(files.flatMap((file) => file.callables.map((callable) => callable.identityKey)))
+      : new Map<string, { description: string | null; sourceHash: string }>();
+    const liveFileHashes = useLiveReuse && files.length > 0
+      ? this.#database.liveFileContentHashes(files.map((file) => file.replacePath ?? file.previousPath ?? file.path))
+      : new Map<string, string>();
     for (const file of files) {
-      const storedFileDescription = this.#database.fileDescription(file.replacePath ?? file.previousPath ?? file.path);
+      const lookupPath = file.replacePath ?? file.previousPath ?? file.path;
+      const storedFileDescription = this.#database.fileDescription(lookupPath);
       const fileDescriptionKey = sha256(`${profile}\0${repository}\0${file.path}\0${file.contentHash}\0file`);
+      const fileAgnosticKey = sha256(`${strategy}\0${repository}\0${file.path}\0${file.contentHash}\0file`);
       const fileCacheKey = options.reindexCache
         ? sha256(`${fileDescriptionKey}\0reindex\0${storedFileDescription?.description ?? ""}`)
         : fileDescriptionKey;
       const refreshFileDescription = options.refreshFileDescriptions || !storedFileDescription;
       const fileDescription = refreshFileDescription
         ? this.#database.cachedDescription(fileCacheKey)
+          ?? (!options.reindexCache ? this.#database.cachedDescription(fileAgnosticKey) : undefined)
         : storedFileDescription.description;
+      const fileUnchanged = liveFileHashes.get(lookupPath) === file.contentHash;
       const descriptions = (options.skipCallables ? [] : file.callables).map((callable) => {
         const descriptionKey = sha256(`${profile}\0${repository}\0${file.path}\0${file.contentHash}\0${callable.identityKey}\0${callable.sourceHash}`);
+        const agnosticKey = sha256(`${strategy}\0${repository}\0${file.path}\0${file.contentHash}\0${callable.identityKey}\0${callable.sourceHash}`);
         const cacheKey = options.reindexCache
           ? sha256(`${descriptionKey}\0reindex\0${this.#database.functionDescription(callable.identityKey) ?? ""}`)
           : descriptionKey;
-        const description = options.forceCallableDescriptions
+        if (useLiveReuse && fileUnchanged) {
+          const live = liveCallableDescriptions.get(callable.identityKey);
+          if (live?.description && live.sourceHash === callable.sourceHash) {
+            return {
+              callable,
+              descriptionKey,
+              cacheKey,
+              agnosticKey,
+              description: live.description,
+            };
+          }
+        }
+        const description = options.forceCallableDescriptions || options.reindexCache
           ? this.#database.cachedDescription(cacheKey)
-          : this.#database.cachedDescription(descriptionKey);
+          : this.#database.cachedDescription(descriptionKey)
+            ?? this.#database.cachedDescription(agnosticKey);
         return {
           callable,
           descriptionKey,
           cacheKey,
+          agnosticKey,
           ...(description ? { description } : {}),
         };
       });
@@ -783,6 +807,7 @@ export class CodeIndex {
       tasks.push({
         file,
         fileCacheKey,
+        fileAgnosticKey,
         fileDescriptionKey,
         refreshFileDescription,
         ...(fileDescription ? { fileDescription } : {}),
@@ -811,6 +836,7 @@ export class CodeIndex {
           throw new CodeIndexError("Description provider does not support file descriptions or returned an empty description.");
         }
         fileDescription = this.#database.storeDescription(task.fileCacheKey, generated.trim());
+        this.#database.storeDescription(task.fileAgnosticKey, fileDescription);
         fileDescriptionsCreated += 1;
         fileDescriptionAddedToSession = session !== undefined;
         completed += 1;
@@ -828,7 +854,7 @@ export class CodeIndex {
       }
       for (const entry of task.descriptions) {
         throwIfAborted(workerSignal);
-        const { callable, descriptionKey, cacheKey } = entry;
+        const { callable, descriptionKey, cacheKey, agnosticKey } = entry;
         let { description } = entry;
         if (!description) {
           const generated = session
@@ -836,6 +862,7 @@ export class CodeIndex {
             : await this.descriptionProvider.describe({ repository, callable, fileSource: file.source }, { signal: workerSignal });
           if (typeof generated !== "string" || !generated.trim()) throw new CodeIndexError("Description provider returned an empty description.");
           description = this.#database.storeDescription(cacheKey, generated.trim());
+          this.#database.storeDescription(agnosticKey, description);
           descriptionsCreated += 1;
           completed += 1;
           this.#progress("descriptions", completed, pending);
@@ -871,17 +898,22 @@ export class CodeIndex {
     const generation = this.#database.getGeneration();
     const functions = this.allFunctions();
     const status = this.status();
-    const profileChanged = descriptionProfileJson(this.#database.descriptionProfile() ?? this.descriptionProvider.profile)
+    const storedProfile = this.#database.descriptionProfile();
+    const strategyChanged = (storedProfile?.strategyVersion ?? this.descriptionProvider.profile.strategyVersion)
+      !== this.descriptionProvider.profile.strategyVersion;
+    const profileChanged = descriptionProfileJson(storedProfile ?? this.descriptionProvider.profile)
       !== descriptionProfileJson(this.descriptionProvider.profile);
     if (this.#database.descriptionsEnabled()
-      && !profileChanged
+      && !strategyChanged
       && functions.every((callable) => callable.descriptionEmbeddingId !== null)
       && status.fileDescriptionCount === status.describableFileCount) {
+      if (profileChanged) this.#database.updateDescriptionProfile(this.descriptionProvider.profile, generation);
       return { descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true };
     }
     const files = await this.#descriptionFiles(this.#database.getFileStates().filter((file) => file.describable), functions, options.signal);
     const { descriptionsCreated, fileDescriptionsCreated } = await this.#attachDescriptions(files, options.signal, {
-      refreshFileDescriptions: profileChanged,
+      refreshFileDescriptions: strategyChanged,
+      ...(strategyChanged ? { ignoreLiveDescriptions: true } : {}),
     });
     const ids = new Map(functions.map((callable) => [callable.identityKey, callable.id]));
     this.#database.enableDescriptions(files.flatMap((file) => file.callables.map((callable) => ({
@@ -893,9 +925,6 @@ export class CodeIndex {
   public async reindexFiles(options: ReindexFilesOptions = {}): Promise<ReindexFilesStats> {
     throwIfAborted(options.signal);
     if (!this.#database.descriptionsEnabled()) throw new CodeIndexError("Descriptions are not enabled; run descriptions enable first.");
-    if (descriptionProfileJson(this.#database.descriptionProfile()!) !== descriptionProfileJson(this.descriptionProvider.profile)) {
-      throw new CodeIndexError("Description provider or model differs from this index; run descriptions enable first.");
-    }
     const generation = this.#database.getGeneration();
     const states = this.#database.getFileStates()
       .filter((file) => file.describable
@@ -907,7 +936,7 @@ export class CodeIndex {
       reindexCache: true,
       skipCallables: !options.includeCallables,
     });
-    this.#database.updateDescriptions(files, options.includeCallables ?? false, generation);
+    this.#database.updateDescriptions(files, options.includeCallables ?? false, generation, this.descriptionProvider.profile);
     return { filesReindexed: files.length, ...created };
   }
 
@@ -1169,12 +1198,14 @@ interface DescriptionTaskEntry {
   callable: PreparedCallable;
   descriptionKey: string;
   cacheKey: string;
+  agnosticKey: string;
   description?: string;
 }
 
 interface DescriptionTask {
   file: PreparedFile;
   fileCacheKey: string;
+  fileAgnosticKey: string;
   fileDescriptionKey: string;
   refreshFileDescription: boolean;
   fileDescription?: string;

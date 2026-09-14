@@ -347,6 +347,41 @@ export class IndexDatabase {
     return row?.description;
   }
 
+  public liveFunctionDescriptions(identityKeys: readonly string[]): Map<string, { description: string | null; sourceHash: string }> {
+    const result = new Map<string, { description: string | null; sourceHash: string }>();
+    for (let index = 0; index < identityKeys.length; index += 500) {
+      const batch = identityKeys.slice(index, index + 500);
+      if (batch.length === 0) continue;
+      const rows = this.#db.prepare(`
+        SELECT identity_key AS identityKey, description, source_hash AS sourceHash
+        FROM functions WHERE identity_key IN (${batch.map(() => "?").join(", ")})
+      `).all(...batch) as Array<{ identityKey: string; description: string | null; sourceHash: string }>;
+      for (const row of rows) result.set(row.identityKey, { description: row.description, sourceHash: row.sourceHash });
+    }
+    return result;
+  }
+
+  public liveFileContentHashes(filePaths: readonly string[]): Map<string, string> {
+    const result = new Map<string, string>();
+    for (let index = 0; index < filePaths.length; index += 500) {
+      const batch = filePaths.slice(index, index + 500);
+      if (batch.length === 0) continue;
+      const rows = this.#db.prepare(`
+        SELECT path, content_hash AS contentHash FROM files WHERE path IN (${batch.map(() => "?").join(", ")})
+      `).all(...batch) as Array<{ path: string; contentHash: string }>;
+      for (const row of rows) result.set(row.path, row.contentHash);
+    }
+    return result;
+  }
+
+  public updateDescriptionProfile(profile: DescriptionProfile, expectedGeneration: number): void {
+    this.#transaction(() => {
+      if (this.getGeneration() !== expectedGeneration) throw new CodeIndexError("Index changed while descriptions were being prepared; retry the update.");
+      this.#setMetadata("description_profile", JSON.stringify(profile));
+      this.#setMetadata("generation", String(expectedGeneration + 1));
+    });
+  }
+
   public storeDescription(key: string, description: string): string {
     if (this.#readOnly) return description;
     this.#db.prepare("INSERT OR IGNORE INTO description_cache(description_key, description) VALUES (?, ?)").run(key, description);
@@ -395,9 +430,11 @@ export class IndexDatabase {
     files: readonly PreparedFile[],
     includeCallables: boolean,
     expectedGeneration: number,
+    profile?: DescriptionProfile,
   ): void {
     this.#transaction(() => {
       if (this.getGeneration() !== expectedGeneration) throw new CodeIndexError("Index changed while descriptions were being prepared; retry the update.");
+      if (profile) this.#setMetadata("description_profile", JSON.stringify(profile));
       if (files.length === 0) return;
       for (const file of files) {
         this.#updateFileDescription(file);

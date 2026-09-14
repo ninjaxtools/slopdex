@@ -902,7 +902,11 @@ globalThis.fetch = async (url, options) => {
       "--description-model", "custom-description-model",
     );
     expect(changedModel.status, changedModel.stderr).toBe(0);
-    expect(JSON.parse(changedModel.stdout).descriptionsCreated).toBe(2);
+    expect(JSON.parse(changedModel.stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
+    const reused = await run("search-description", "workflow", "--threshold", "0.9", "--limit", "2", "--format", "json");
+    expect(reused.status, reused.stderr).toBe(0);
+    expect(JSON.parse(reused.stdout).map((match: { function: { description: string } }) => match.function.description).sort())
+      .toEqual(["Purpose of one using gpt-5.6-luna", "Purpose of two using gpt-5.6-luna"]);
     write(root, ".slopdex/config.json", JSON.stringify({
       dimensions: 2,
       descriptionProvider: "opencode",

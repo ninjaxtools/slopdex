@@ -576,20 +576,8 @@ function descriptionRefresh(config: FileConfig): DescriptionRefreshHooks | undef
 
 function enableDescriptionRefresh(afterRefresh = true): DescriptionRefreshHooks {
   return {
-    beforeRefresh: (index) => {
-      const status = index.status();
-      if (status.descriptionsEnabled && !sameDescriptionProfile(status.descriptionProfile, index.descriptionProvider.profile)) {
-        index.disableDescriptions();
-      }
-    },
     ...(afterRefresh ? { afterRefresh: async (index: CodeIndex) => { await index.useDescriptions(); } } : {}),
   };
-}
-
-function sameDescriptionProfile(left: DescriptionProfile | null, right: DescriptionProfile): boolean {
-  return left?.provider === right.provider
-    && left.model === right.model
-    && left.strategyVersion === right.strategyVersion;
 }
 
 async function runModels(): Promise<void> {
