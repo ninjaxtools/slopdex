@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { setTimeout as wait } from "node:timers/promises";
 
 import { CodeIndexError } from "../errors.js";
 import { reportModelCall } from "../model-call-notice.js";
@@ -22,6 +23,7 @@ export interface OpenAIDescriptionProviderOptions {
   baseUrl?: string;
   provider?: DescriptionProviderName;
   verbose?: boolean;
+  retryDelayMs?: number;
 }
 
 export const DESCRIPTION_PROVIDER_NAMES = ["openai", "opencode", "opencode-go"] as const;
@@ -40,6 +42,10 @@ const PROVIDERS: Record<DescriptionProviderName, { apiKey: string; baseUrl: stri
   opencode: { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/v1", model: "gpt-5.6-sol" },
   "opencode-go": { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/go/v1", model: "gpt-5.6-luna" },
 };
+
+const EMPTY_DESCRIPTION_MESSAGE = "Description provider returned an empty description.";
+const EMPTY_DESCRIPTION_RETRIES = 5;
+const DEFAULT_RETRY_DELAY_MS = 1_000;
 
 export function openCodeAuthPath(): string {
   const dataHome = process.env.XDG_DATA_HOME?.trim() || path.join(homedir(), ".local", "share");
@@ -80,6 +86,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
   readonly #baseUrl: string;
   readonly #openCode: boolean;
   readonly #verbose: boolean;
+  readonly #retryDelayMs: number;
 
   public constructor(options: OpenAIDescriptionProviderOptions = {}) {
     const provider = options.provider ?? "openai";
@@ -95,6 +102,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     this.#baseUrl = (options.baseUrl ?? defaults.baseUrl).replace(/\/$/, "");
     this.#openCode = provider !== "openai";
     this.#verbose = options.verbose ?? false;
+    this.#retryDelayMs = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
     this.profile = {
       provider,
       model: options.model ?? defaults.model,
@@ -153,27 +161,34 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
     if (!this.#apiKey) throw new CodeIndexError(`${this.#apiKeyHint} is required to generate descriptions.`);
     const { model, responses } = await this.#languageModel(headers);
     reportModelCall("descriptions", this.profile, this.#verbose);
-    let text: string;
-    try {
-      ({ text } = await generateText({
-        model,
-        ...(responses ? {} : { system: INSTRUCTIONS }),
-        messages,
-        maxOutputTokens: 4096,
-        ...(responses ? { providerOptions: { openai: { instructions: INSTRUCTIONS, store: false } } } : {}),
-        ...(headers ? { headers } : {}),
-        ...(options?.signal ? { abortSignal: options.signal } : {}),
-      }));
-    } catch (error) {
-      if (options?.signal?.aborted) throw error;
-      const detail = APICallError.isInstance(error) && error.responseBody
-        ? error.responseBody.slice(0, 1000)
-        : error instanceof Error ? error.message : String(error);
-      throw new CodeIndexError(`Description request failed: ${detail}`, { cause: error });
+    let retryDelayMs = this.#retryDelayMs;
+    for (let attempt = 0; ; attempt += 1) {
+      throwIfAborted(options?.signal);
+      let text: string;
+      try {
+        ({ text } = await generateText({
+          model,
+          ...(responses ? {} : { system: INSTRUCTIONS }),
+          messages,
+          maxOutputTokens: 4096,
+          ...(responses ? { providerOptions: { openai: { instructions: INSTRUCTIONS, store: false } } } : {}),
+          ...(headers ? { headers } : {}),
+          ...(options?.signal ? { abortSignal: options.signal } : {}),
+        }));
+      } catch (error) {
+        if (options?.signal?.aborted) throw error;
+        const detail = APICallError.isInstance(error) && error.responseBody
+          ? error.responseBody.slice(0, 1000)
+          : error instanceof Error ? error.message : String(error);
+        throw new CodeIndexError(`Description request failed: ${detail}`, { cause: error });
+      }
+      const description = text.trim();
+      if (description) return description;
+      if (attempt >= EMPTY_DESCRIPTION_RETRIES) throw new CodeIndexError(EMPTY_DESCRIPTION_MESSAGE);
+      process.stderr.write(`slopdex: ${EMPTY_DESCRIPTION_MESSAGE}\n`);
+      await wait(retryDelayMs, undefined, options?.signal ? { signal: options.signal } : undefined);
+      retryDelayMs *= 2;
     }
-    const description = text.trim();
-    if (!description) throw new CodeIndexError("Description provider returned an empty description.");
-    return description;
   }
 
   async #languageModel(headers: Record<string, string> | undefined) {

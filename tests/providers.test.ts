@@ -82,10 +82,39 @@ describe("OpenAI description provider", () => {
     { status: "incomplete", output: [] },
     { status: "completed", output: [] },
     { status: "completed", output: [{ type: "message", role: "assistant", id: "message-1", content: [] }] },
-  ])("rejects unusable descriptions: %j", async (response) => {
-    const url = await startServer([], response);
-    const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
+  ])("retries unusable descriptions before rejecting: %j", async (response) => {
+    const requests: unknown[] = [];
+    const url = await startServer(requests, response);
+    const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url, retryDelayMs: 1 });
     await expect(provider.describe(input)).rejects.toThrow(/incomplete|empty/);
+    expect(requests).toHaveLength(6);
+  });
+
+  it("retries empty descriptions and reports each failure to stderr", async () => {
+    const requests: unknown[] = [];
+    const url = await startServer(requests, () => requests.length <= 1
+      ? { status: "completed", output: [] }
+      : {
+        status: "completed",
+        output: [{
+          type: "message",
+          role: "assistant",
+          id: "message-1",
+          content: [{ type: "output_text", text: "Recovered from an empty description.", annotations: [] }],
+        }],
+      });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const lines: string[] = [];
+    try {
+      const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url, retryDelayMs: 1 });
+      await expect(provider.describe(input)).resolves.toBe("Recovered from an empty description.");
+      for (const [value] of stderr.mock.calls) lines.push(String(value));
+    } finally {
+      stderr.mockRestore();
+    }
+    expect(requests).toHaveLength(2);
+    expect(lines.filter((line) => line.includes("empty description")))
+      .toEqual(["slopdex: Description provider returned an empty description.\n"]);
   });
 
   it("supports OpenCode Go with its API key, endpoint, and default model", async () => {
@@ -530,7 +559,7 @@ describe("external model call notices", () => {
 
 async function startServer(
   requests: unknown[],
-  response: unknown,
+  response: unknown | (() => unknown),
   exactUrl = false,
   paths?: string[],
   authorizations?: Array<string | undefined>,
@@ -543,7 +572,7 @@ async function startServer(
       authorizations?.push(request.headers.authorization);
       requests.push(JSON.parse(Buffer.concat(body).toString("utf8")));
       serverResponse.setHeader("content-type", "application/json");
-      serverResponse.end(JSON.stringify(response));
+      serverResponse.end(JSON.stringify(typeof response === "function" ? response() : response));
     });
   });
   servers.push(server);
