@@ -64,6 +64,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
   if (useCache) {
     await options.source.refreshSimilarityCache({
       width: Math.min(200, Math.max(50, limit * 5)),
+      minSimilarity: options.minSimilarity ?? -1,
       ...(options.signal ? { signal: options.signal } : {}),
       ...(options.onCacheProgress ? { onProgress: options.onCacheProgress } : {}),
     });

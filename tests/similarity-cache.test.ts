@@ -174,7 +174,7 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     expect(indexedNames(await crossSearchSnapshot(migrated)).length).toBeGreaterThan(0);
     const migratedDb = new DatabaseSync(indexPath, { readOnly: true });
     expect(migratedDb.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get())
-      .toEqual({ value: "9" });
+      .toEqual({ value: "10" });
     migratedDb.close();
     migrated.close();
   });
@@ -238,5 +238,189 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     expect(events[0]).toMatchObject({ phase: "similarity-cache", completed: 0 });
     expect(events.at(-1)!.completed).toBe(events.at(-1)!.total);
     index.close();
+  });
+
+  it("stores only pairs at or above the refresh floor", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    const indexPath = index.indexPath;
+    const readSimilarities = (): number[] => {
+      const db = new DatabaseSync(indexPath, { readOnly: true });
+      try {
+        return (db.prepare("SELECT similarity FROM similarity_cache").all() as Array<{ similarity: number }>)
+          .map((row) => row.similarity);
+      } finally {
+        db.close();
+      }
+    };
+    const readFloors = (): number[] => {
+      const db = new DatabaseSync(indexPath, { readOnly: true });
+      try {
+        return (db.prepare("SELECT DISTINCT floor FROM similarity_cache_state").all() as Array<{ floor: number }>)
+          .map((row) => row.floor);
+      } finally {
+        db.close();
+      }
+    };
+
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: -1 });
+    const allPairs = readSimilarities();
+    expect(Math.min(...allPairs)).toBeLessThan(0.7);
+
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.7 });
+    const floored = readSimilarities();
+    expect(floored.length).toBeGreaterThan(0);
+    expect(floored.length).toBeLessThan(allPairs.length);
+    expect(Math.min(...floored)).toBeGreaterThanOrEqual(0.7 - 1e-9);
+    expect(readFloors()).toEqual([0.7]);
+    index.close();
+  });
+
+  it("stays exact above the floor and falls back below it", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.7 });
+
+    for (const callable of index.allFunctions()) {
+      for (const minSimilarity of [0.9, 0.7, 0.3, 0.1, -1]) {
+        for (const limit of [1, 3, 10]) {
+          expect(index.cachedSimilarToFunction(callable.id, { limit, minSimilarity }))
+            .toEqual(index.similarToFunction(callable.id, { limit, minSimilarity }));
+        }
+      }
+      expect(index.cachedSimilarToFunction(callable.id, { limit: 3, minSimilarity: 0.7, excludePaths: ["beta.ts"] }))
+        .toEqual(index.similarToFunction(callable.id, { limit: 3, minSimilarity: 0.7, excludePaths: ["beta.ts"] }));
+      expect(index.cachedSimilarToFunction(callable.id, { limit: 3, minSimilarity: 0.1, maxSimilarity: 0.8 }))
+        .toEqual(index.similarToFunction(callable.id, { limit: 3, minSimilarity: 0.1, maxSimilarity: 0.8 }));
+    }
+    index.close();
+  });
+
+  it("reuses the cache when narrowing and recomputes when expanding", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    const indexPath = index.indexPath;
+    const floors = (): number[] => {
+      const db = new DatabaseSync(indexPath, { readOnly: true });
+      try {
+        return (db.prepare("SELECT DISTINCT floor FROM similarity_cache_state").all() as Array<{ floor: number }>)
+          .map((row) => row.floor);
+      } finally {
+        db.close();
+      }
+    };
+
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.1 });
+    const narrow = await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.8 });
+    expect(narrow.sourcesRefreshed).toBe(0);
+    expect(floors()).toEqual([0.1]);
+
+    const expand = await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.05 });
+    expect(expand.sourcesRefreshed).toBe(index.status().functionCount);
+    expect(floors()).toEqual([0.05]);
+    for (const callable of index.allFunctions()) {
+      for (const minSimilarity of [0.8, 0.3, -1]) {
+        expect(index.cachedSimilarToFunction(callable.id, { limit: 4, minSimilarity }))
+          .toEqual(index.similarToFunction(callable.id, { limit: 4, minSimilarity }));
+      }
+    }
+    index.close();
+  });
+
+  it("keeps a floored cache exact across edits and deletions", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.7 });
+
+    write(root, "beta.ts", `
+export function authenticateUser(user: string) { return Boolean(user); }
+export function subtractNumbers(a: number, b: number) { return a - b; }
+`);
+    await index.updateFiles({ upsert: ["beta.ts"] });
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.7 });
+    await index.updateFiles({ delete: ["beta.ts"] });
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.7 });
+
+    const remaining = new Set(index.allFunctions().map((callable) => callable.id));
+    for (const callable of index.allFunctions()) {
+      for (const minSimilarity of [0.7, 0.1, -1]) {
+        const cached = index.cachedSimilarToFunction(callable.id, { limit: 10, minSimilarity });
+        expect(cached.every((match) => remaining.has(match.function.id))).toBe(true);
+        expect(cached).toEqual(index.similarToFunction(callable.id, { limit: 10, minSimilarity }));
+      }
+    }
+    index.close();
+  });
+
+  it("runs thresholded cross-search identically from cache and live", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+
+    const snapshot = async (): Promise<unknown> => {
+      const results = [];
+      for await (const result of crossSearch({
+        source: index,
+        limitPerFunction: 3,
+        includeSymmetricDuplicates: true,
+        minSimilarity: 0.7,
+        minLines: 1,
+      })) results.push(result);
+      return results.map((result) => ({
+        source: result.source.id,
+        matches: result.matches.map((match) => [match.function.id, match.similarity] as const),
+      }));
+    };
+    const floored = await snapshot();
+    expect(index.similarityCacheInfo().cachedPairs).toBeGreaterThan(0);
+    await index.refreshSimilarityCache({ minSimilarity: -1 });
+    expect(await snapshot()).toEqual(floored);
+    index.close();
+  });
+
+  it("migrates schema 9 indexes by backfilling cache state", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const provider = new FakeEmbeddingProvider();
+    const original = new CodeIndex({ rootDir: root, provider });
+    await original.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await original.refreshSimilarityCache({ width: 10 });
+    const indexPath = original.indexPath;
+    original.close();
+
+    const downgrade = new DatabaseSync(indexPath);
+    downgrade.exec(`
+      ALTER TABLE similarity_cache_state DROP COLUMN floor;
+      ALTER TABLE similarity_cache_state DROP COLUMN stored_count;
+      ALTER TABLE similarity_cache_state DROP COLUMN complete;
+      UPDATE metadata SET value = '9' WHERE key = 'schema_version';
+    `);
+    downgrade.close();
+
+    const migrated = new CodeIndex({ rootDir: root, provider });
+    const migratedDb = new DatabaseSync(indexPath, { readOnly: true });
+    expect(migratedDb.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get())
+      .toEqual({ value: "10" });
+    const states = migratedDb.prepare("SELECT floor, stored_count, complete FROM similarity_cache_state").all() as
+      Array<{ floor: number; stored_count: number; complete: number }>;
+    expect(states.length).toBeGreaterThan(0);
+    expect(states.every((row) => row.floor === -1 && row.stored_count > 0)).toBe(true);
+    migratedDb.close();
+    for (const callable of migrated.allFunctions()) {
+      for (const minSimilarity of [0.5, -1]) {
+        expect(migrated.cachedSimilarToFunction(callable.id, { limit: 4, minSimilarity }))
+          .toEqual(migrated.similarToFunction(callable.id, { limit: 4, minSimilarity }));
+      }
+    }
+    migrated.close();
   });
 });

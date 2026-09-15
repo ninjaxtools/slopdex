@@ -18,7 +18,7 @@ import type {
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "9";
+const SCHEMA_VERSION = "10";
 const KNN_TIE_OVERFETCH = 32;
 const VEC0_MAX_K = 4096;
 const VEC0_MAX_DIMENSIONS = 8192;
@@ -153,7 +153,7 @@ export class IndexDatabase {
 
   #initializeSchema(): void {
     const existingVersion = this.#metadataTableExists() ? this.#metadata("schema_version") : null;
-    if (existingVersion && existingVersion !== "6" && existingVersion !== "7" && existingVersion !== "8" && existingVersion !== SCHEMA_VERSION) {
+    if (existingVersion && existingVersion !== "6" && existingVersion !== "7" && existingVersion !== "8" && existingVersion !== "9" && existingVersion !== SCHEMA_VERSION) {
       throw new IncompatibleIndexError(`Unsupported index schema version ${existingVersion}.`);
     }
     this.#db.exec(`
@@ -257,6 +257,26 @@ export class IndexDatabase {
       this.#db.exec("BEGIN IMMEDIATE");
       try {
         this.#db.exec(similarityCacheSchema());
+        this.#setMetadata("schema_version", SCHEMA_VERSION);
+        this.#db.exec("COMMIT");
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    } else if (existingVersion === "9") {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(`
+          ALTER TABLE similarity_cache_state ADD COLUMN floor REAL NOT NULL DEFAULT -1;
+          ALTER TABLE similarity_cache_state ADD COLUMN stored_count INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE similarity_cache_state ADD COLUMN complete INTEGER NOT NULL DEFAULT 0;
+          UPDATE similarity_cache_state SET stored_count = (
+            SELECT COUNT(*) FROM similarity_cache c
+            WHERE c.source_id = similarity_cache_state.function_id
+              AND c.similarity_mode = similarity_cache_state.similarity_mode
+          );
+          UPDATE similarity_cache_state SET complete = (stored_count < cached_width);
+        `);
         this.#setMetadata("schema_version", SCHEMA_VERSION);
         this.#db.exec("COMMIT");
       } catch (error) {
@@ -917,12 +937,16 @@ export class IndexDatabase {
     fileDescriptionEmbeddingId: number | null;
     cachedWidth: number;
     generation: number;
+    floor: number;
+    storedCount: number;
+    complete: boolean;
   }> {
     const rows = this.#db.prepare(`
       SELECT function_id AS functionId, code_embedding_id AS codeEmbeddingId,
         description_embedding_id AS descriptionEmbeddingId,
         file_description_embedding_id AS fileDescriptionEmbeddingId,
-        cached_width AS cachedWidth, generation
+        cached_width AS cachedWidth, generation, floor,
+        stored_count AS storedCount, complete
       FROM similarity_cache_state WHERE similarity_mode = ?
     `).all(mode) as Array<{
       functionId: number;
@@ -931,6 +955,9 @@ export class IndexDatabase {
       fileDescriptionEmbeddingId: number | null;
       cachedWidth: number;
       generation: number;
+      floor: number;
+      storedCount: number;
+      complete: number;
     }>;
     return new Map(rows.map((row) => [row.functionId, {
       codeEmbeddingId: row.codeEmbeddingId,
@@ -938,6 +965,9 @@ export class IndexDatabase {
       fileDescriptionEmbeddingId: row.fileDescriptionEmbeddingId,
       cachedWidth: row.cachedWidth,
       generation: row.generation,
+      floor: row.floor,
+      storedCount: Number(row.storedCount),
+      complete: row.complete !== 0,
     }]));
   }
 
@@ -977,6 +1007,8 @@ export class IndexDatabase {
       fileDescriptionEmbeddingId: number | null;
       cachedWidth: number;
       generation: number;
+      floor: number;
+      complete: boolean;
     },
   ): void {
     if (this.#readOnly) return;
@@ -1002,14 +1034,18 @@ export class IndexDatabase {
       this.#db.prepare(`
         INSERT INTO similarity_cache_state(
           function_id, code_embedding_id, description_embedding_id,
-          file_description_embedding_id, similarity_mode, cached_width, generation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          file_description_embedding_id, similarity_mode, cached_width, generation,
+          floor, stored_count, complete
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(function_id, similarity_mode) DO UPDATE SET
           code_embedding_id = excluded.code_embedding_id,
           description_embedding_id = excluded.description_embedding_id,
           file_description_embedding_id = excluded.file_description_embedding_id,
           cached_width = excluded.cached_width,
-          generation = excluded.generation
+          generation = excluded.generation,
+          floor = excluded.floor,
+          stored_count = excluded.stored_count,
+          complete = excluded.complete
       `).run(
         sourceId,
         state.codeEmbeddingId,
@@ -1018,6 +1054,9 @@ export class IndexDatabase {
         mode,
         state.cachedWidth,
         state.generation,
+        state.floor,
+        neighbors.length,
+        state.complete ? 1 : 0,
       );
     });
   }
@@ -1045,20 +1084,27 @@ export class IndexDatabase {
       fileDescriptionEmbeddingId: number | null;
       cachedWidth: number;
       generation: number;
+      floor: number;
+      storedCount: number;
+      complete: boolean;
     },
   ): void {
     if (this.#readOnly) return;
     this.#db.prepare(`
       INSERT INTO similarity_cache_state(
         function_id, code_embedding_id, description_embedding_id,
-        file_description_embedding_id, similarity_mode, cached_width, generation
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        file_description_embedding_id, similarity_mode, cached_width, generation,
+        floor, stored_count, complete
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(function_id, similarity_mode) DO UPDATE SET
         code_embedding_id = excluded.code_embedding_id,
         description_embedding_id = excluded.description_embedding_id,
         file_description_embedding_id = excluded.file_description_embedding_id,
         cached_width = excluded.cached_width,
-        generation = excluded.generation
+        generation = excluded.generation,
+        floor = excluded.floor,
+        stored_count = excluded.stored_count,
+        complete = excluded.complete
     `).run(
       functionId,
       state.codeEmbeddingId,
@@ -1067,6 +1113,9 @@ export class IndexDatabase {
       mode,
       state.cachedWidth,
       state.generation,
+      state.floor,
+      state.storedCount,
+      state.complete ? 1 : 0,
     );
   }
 
@@ -1232,6 +1281,9 @@ function similarityCacheSchema(): string {
       file_description_embedding_id INTEGER,
       cached_width INTEGER NOT NULL,
       generation INTEGER NOT NULL,
+      floor REAL NOT NULL DEFAULT -1,
+      stored_count INTEGER NOT NULL DEFAULT 0,
+      complete INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (function_id, similarity_mode)
     );
   `;

@@ -2,9 +2,16 @@
 
 <img src="sloppy-dexter.png" width="280" alt="Dexter, the sloppy slime" />
 
-This is Dexter.
+This is Dexter the sloppy slime.
 
-He is a sloppy slime and could benefit from some vector search to clean up after himself.
+Slopdex is intended to help doing analysis on codebases that contain a lot of AI generated code.
+
+The main functions supported at the moment are
+
+- `slopdex search` which does plain semantic search
+- `slopdex cross-search` which finds clusters of similar code
+
+Finding clusters of similar code with `cross-search` helps eliminating code duplication, and withe the addition of the `--cohesion` argument, which ranks similar code by file-tree distance, it also helps with identifying similar code that is not necessarily duplicated but spread across the codebase, which could indicate that they could be refactored with the help of an abstraction.
 
 ## Getting started
 

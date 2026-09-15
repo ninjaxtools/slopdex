@@ -1110,20 +1110,30 @@ export class CodeIndex {
 
   /**
    * Incrementally refresh the persisted pairwise-similarity cache for same-index
-   * analysis. Only functions whose embeddings changed (plus a merge pass over the
-   * remaining functions when the changed set is small) are re-queried; unchanged
-   * pairs are reused. Call before cross-search/cohesion, then read through
+   * analysis. Only pairs scoring at or above `minSimilarity` (the caller's
+   * effective threshold) are stored; queries below the cached floor fall back to
+   * live vector search. Only functions whose embeddings changed (plus a merge
+   * pass over the remaining functions when the changed set is small) are
+   * re-queried; unchanged pairs are reused. Lowering the floor below what is
+   * cached re-queries every function, since the missing band cannot be rebuilt
+   * incrementally; raising it reuses the cache for free. A per-function state
+   * row records the embedding triple, floor, row count, and a completeness flag,
+   * so a sparse row set is never mistaken for an unfinished computation. Call
+   * before cross-search/cohesion, then read through
    * {@link cachedSimilarToFunction}. Best-effort under concurrent writers: a
    * later refresh repairs any rows raced by an overlapping update.
    */
   public async refreshSimilarityCache(options: {
     width?: number;
+    /** Minimum similarity stored; pairs below it are never cached. Defaults to -1 (cache everything). */
+    minSimilarity?: number;
     signal?: AbortSignal;
     /** Overrides the index-level onProgress for the cache-fill bar. */
     onProgress?: (progress: IndexProgress) => void;
   } = {}): Promise<{
     similarityMode: string;
     width: number;
+    minSimilarity: number;
     sourcesRefreshed: number;
     pairsStored: number;
     skipped: boolean;
@@ -1132,20 +1142,22 @@ export class CodeIndex {
       MAX_SIMILARITY_CACHE_WIDTH,
       Math.max(1, Math.floor(options.width ?? DEFAULT_SIMILARITY_CACHE_WIDTH)),
     );
+    const floor = options.minSimilarity ?? -1;
     const mode = analysisSimilarity(this.status()).similarityMode;
     const includeDescriptions = mode !== "code";
     if (this.#database.isReadOnly) {
-      return { similarityMode: mode, width, sourcesRefreshed: 0, pairsStored: 0, skipped: true };
+      return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed: 0, pairsStored: 0, skipped: true };
     }
     throwIfAborted(options.signal);
     const generation = this.#database.getGeneration();
     const triples = this.#database.similarityCacheTriples();
     if (triples.length <= 1) {
-      return { similarityMode: mode, width, sourcesRefreshed: 0, pairsStored: 0, skipped: false };
+      return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed: 0, pairsStored: 0, skipped: false };
     }
     const states = this.#database.similarityCacheStates(mode);
     const tripleById = new Map(triples.map((triple) => [triple.functionId, triple]));
     const dirty = new Set<number>();
+    let expanding = false;
     for (const triple of triples) {
       throwIfAborted(options.signal);
       const state = states.get(triple.functionId);
@@ -1153,15 +1165,17 @@ export class CodeIndex {
         || state.codeEmbeddingId !== triple.codeEmbeddingId
         || state.descriptionEmbeddingId !== triple.descriptionEmbeddingId
         || state.fileDescriptionEmbeddingId !== triple.fileDescriptionEmbeddingId
-        || state.cachedWidth < width) {
+        || (state.cachedWidth < width && !state.complete)) {
+        dirty.add(triple.functionId);
+      } else if (state.floor > floor) {
+        expanding = true;
         dirty.add(triple.functionId);
       }
     }
-    if (dirty.size === 0) {
+    if (dirty.size === 0 && !expanding) {
       const counts = this.#database.similarityCacheCounts(mode);
-      const complete = triples.length - 1;
       for (const triple of triples) {
-        if ((counts.get(triple.functionId) ?? 0) < Math.min(width, complete)) {
+        if ((counts.get(triple.functionId) ?? 0) < (states.get(triple.functionId)?.storedCount ?? 0)) {
           dirty.add(triple.functionId);
         }
       }
@@ -1169,34 +1183,37 @@ export class CodeIndex {
     let sourcesRefreshed = 0;
     let pairsStored = 0;
     if (dirty.size === 0) {
-      return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
+      return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed, pairsStored, skipped: false };
     }
     const report = options.onProgress ?? this.#onProgress;
     const total = triples.length;
     let completed = 0;
     report?.({ phase: "similarity-cache", completed, total });
-    const fullRefresh = states.size === 0 || dirty.size > Math.max(8, Math.ceil(triples.length * 0.25));
+    const fullRefresh = states.size === 0 || expanding || dirty.size > Math.max(8, Math.ceil(triples.length * 0.25));
     if (fullRefresh) {
       for (const triple of triples) {
         throwIfAborted(options.signal);
-        const neighbors = this.similarToFunction(triple.functionId, {
+        const scanned = this.similarToFunction(triple.functionId, {
           ...(includeDescriptions ? { includeDescriptions: true } : {}),
-          limit: Math.min(width, triples.length - 1),
-          minSimilarity: -1,
-        }).slice(0, width);
+          limit: Math.min(width + 1, triples.length - 1),
+          minSimilarity: floor,
+        });
+        const neighbors = scanned.slice(0, width);
         this.#database.storeSimilarityNeighbors(triple.functionId, mode, neighbors, {
           codeEmbeddingId: triple.codeEmbeddingId,
           descriptionEmbeddingId: triple.descriptionEmbeddingId,
           fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
           cachedWidth: width,
           generation,
+          floor,
+          complete: scanned.length <= width,
         });
         sourcesRefreshed += 1;
         pairsStored += neighbors.length;
         completed += 1;
         report?.({ phase: "similarity-cache", completed, total });
       }
-      return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
+      return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed, pairsStored, skipped: false };
     }
     const functionsById = new Map(this.allFunctions().map((callable) => [callable.id, callable]));
     const lean = new Map<number, Map<number, SimilarityResult>>();
@@ -1205,7 +1222,7 @@ export class CodeIndex {
       const full = this.similarToFunction(dirtyId, {
         ...(includeDescriptions ? { includeDescriptions: true } : {}),
         limit: triples.length - 1,
-        minSimilarity: -1,
+        minSimilarity: floor,
       });
       const byTarget = new Map<number, SimilarityResult>();
       for (const match of full) byTarget.set(match.function.id, match);
@@ -1218,6 +1235,8 @@ export class CodeIndex {
         fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
         cachedWidth: width,
         generation,
+        floor,
+        complete: full.length <= width,
       });
       sourcesRefreshed += 1;
       pairsStored += top.length;
@@ -1228,7 +1247,8 @@ export class CodeIndex {
       throwIfAborted(options.signal);
       if (dirty.has(triple.functionId)) continue;
       const cached = this.#database.cachedSimilarityNeighbors(triple.functionId, mode);
-      const kept = cached.filter((match) => !dirty.has(match.function.id) && functionsById.has(match.function.id));
+      const kept = cached.filter((match) => match.similarity >= floor
+        && !dirty.has(match.function.id) && functionsById.has(match.function.id));
       const added: SimilarityResult[] = [];
       for (const [dirtyId, byTarget] of lean) {
         if (dirtyId === triple.functionId) continue;
@@ -1239,19 +1259,30 @@ export class CodeIndex {
           added.push({ ...scores, function: dirtyFunction });
         }
       }
-      const merged = [...kept, ...added]
+      const plusOne = [...kept, ...added]
         .sort((left, right) => right.similarity - left.similarity || left.function.id - right.function.id)
-        .slice(0, width);
+        .slice(0, width + 1);
+      const merged = plusOne.slice(0, width);
+      const contributorsComplete = triples.every((candidate) =>
+        dirty.has(candidate.functionId) || states.get(candidate.functionId)?.complete === true);
+      const complete = plusOne.length <= width && contributorsComplete;
       const unchanged = merged.length === cached.length
         && merged.every((match, index) => match.function.id === cached[index]!.function.id
           && match.similarity === cached[index]!.similarity);
       if (unchanged) {
+        // Rows are untouched, but the merge already applied the new floor and
+        // width: record them without rewriting the neighbor rows. When narrowing
+        // dropped no rows, the previous (lower) floor still holds.
+        const narrowed = cached.some((match) => match.similarity < floor);
         this.#database.touchSimilarityCacheState(triple.functionId, mode, {
           codeEmbeddingId: triple.codeEmbeddingId,
           descriptionEmbeddingId: triple.descriptionEmbeddingId,
           fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
           cachedWidth: width,
           generation,
+          floor: narrowed ? floor : (states.get(triple.functionId)?.floor ?? floor),
+          storedCount: merged.length,
+          complete,
         });
       } else {
         this.#database.storeSimilarityNeighbors(triple.functionId, mode, merged, {
@@ -1260,6 +1291,8 @@ export class CodeIndex {
           fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
           cachedWidth: width,
           generation,
+          floor,
+          complete,
         });
         pairsStored += merged.length;
       }
@@ -1267,14 +1300,16 @@ export class CodeIndex {
       completed += 1;
       report?.({ phase: "similarity-cache", completed, total });
     }
-    return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
+    return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed, pairsStored, skipped: false };
   }
 
   /**
    * Same-index neighbor lookup backed by {@link refreshSimilarityCache}.
    * Returns cache rows filtered exactly like {@link similarToFunction} and falls
    * back to a live vector query whenever the cache entry is missing, stale,
-   * narrower than requested, or too truncated to satisfy the filters.
+   * computed at a higher floor than requested, or too truncated to satisfy the
+   * filters. A cache entry flagged complete holds every pair above its floor,
+   * so short results from it are exact and need no live query.
    */
   public cachedSimilarToFunction(functionId: number, options: {
     includeDescriptions?: boolean;
@@ -1289,7 +1324,7 @@ export class CodeIndex {
     const live = (): SimilarityResult[] => this.similarToFunction(functionId, options);
     const states = this.#database.similarityCacheStates(mode);
     const state = states.get(functionId);
-    if (!state || state.cachedWidth < options.limit || state.generation !== this.#database.getGeneration()) {
+    if (!state || state.generation !== this.#database.getGeneration()) {
       return live();
     }
     const triples = this.#database.similarityCacheTriples();
@@ -1300,12 +1335,14 @@ export class CodeIndex {
       || triple.fileDescriptionEmbeddingId !== state.fileDescriptionEmbeddingId) {
       return live();
     }
+    if (state.floor > options.minSimilarity) {
+      return live();
+    }
     const cached = this.#database.cachedSimilarityNeighbors(functionId, mode);
     const filtered = filterSimilarityResults(cached, options);
     if (filtered.length >= options.limit) return filtered.slice(0, options.limit);
-    const totalOthers = triples.length - 1;
-    if (cached.length < totalOthers) return live();
-    return filtered;
+    if (state.complete) return filtered;
+    return live();
   }
 
   public vectorForFile(filePath: string): number[] {
