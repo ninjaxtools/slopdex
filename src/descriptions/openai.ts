@@ -39,9 +39,9 @@ export function descriptionProviderBaseUrl(provider: DescriptionProviderName): s
 }
 
 const PROVIDERS: Record<DescriptionProviderName, { apiKey: string; baseUrl: string; model: string }> = {
-  openai: { apiKey: "OPENAI_API_KEY", baseUrl: "https://api.openai.com/v1", model: "gpt-5.6-sol" },
-  opencode: { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/v1", model: "gpt-5.6-sol" },
-  "opencode-go": { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/go/v1", model: "gpt-5.6-luna" },
+  openai: { apiKey: "OPENAI_API_KEY", baseUrl: "https://api.openai.com/v1", model: "gpt-5.6-luna" },
+  opencode: { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/v1", model: "muse-spark-1.3-contributor" },
+  "opencode-go": { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/go/v1", model: "muse-spark-1.3-contributor" },
 };
 
 const EMPTY_DESCRIPTION_MESSAGE = "Description provider returned an empty description.";

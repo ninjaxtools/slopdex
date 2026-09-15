@@ -25,7 +25,7 @@ describe("OpenAI description provider", () => {
   const fileSource = "export function deliver() { send(); }";
   const input = { repository: "example", callable: parseCallables("client.ts", fileSource)[0]!, fileSource };
 
-  it("uses gpt-5.6-sol and sends purpose-oriented context to the Responses API", async () => {
+  it("uses gpt-5.6-luna and sends purpose-oriented context to the Responses API", async () => {
     const requests: Array<Record<string, unknown>> = [];
     const url = await startServer(requests, {
       status: "completed",
@@ -38,7 +38,7 @@ describe("OpenAI description provider", () => {
     });
     const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
     await expect(provider.describe(input)).resolves.toBe("Delivers application messages.");
-    expect(requests[0]).toMatchObject({ model: "gpt-5.6-sol", store: false });
+    expect(requests[0]).toMatchObject({ model: "gpt-5.6-luna", store: false });
     expect(requests[0]!.instructions).toContain("requested file or callable within its codebase");
     const requestInput = requests[0]!.input as Array<{ content: Array<{ text: string }> }>;
     expect(JSON.parse(requestInput[0]!.content[0]!.text)).toMatchObject({ repository: "example", path: "client.ts", fileContext: fileSource });
@@ -130,8 +130,8 @@ describe("OpenAI description provider", () => {
     const provider = new OpenAIDescriptionProvider({ provider: "opencode-go", apiKey: "test", baseUrl: url });
 
     await expect(provider.describe(input)).resolves.toBe("Delivers through OpenCode Go.");
-    expect(provider.profile).toMatchObject({ provider: "opencode-go", model: "gpt-5.6-luna" });
-    expect(requests[0]).toMatchObject({ model: "gpt-5.6-luna", store: false });
+    expect(provider.profile).toMatchObject({ provider: "opencode-go", model: "muse-spark-1.3-contributor" });
+    expect(requests[0]).toMatchObject({ model: "muse-spark-1.3-contributor", store: false });
   });
 
   it.each(["opencode", "opencode-go"] as const)(

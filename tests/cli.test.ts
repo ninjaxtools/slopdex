@@ -854,16 +854,16 @@ globalThis.fetch = async (url, options) => {
     const run = (...args: string[]) => runCliWithEnv(root, env, ...args);
     const initialized = await run("descriptions", "enable");
     expect(initialized.status, initialized.stderr).toBe(0);
-    expect(initialized.stderr).toContain('kind=descriptions provider="opencode-go" model="gpt-5.6-luna" parallelism=10');
+    expect(initialized.stderr).toContain('kind=descriptions provider="opencode-go" model="muse-spark-1.3-contributor" parallelism=10');
     expect(initialized.stderr).toContain('kind=vectors provider="openai" model="text-embedding-3-large" parallelism=10');
     expect(JSON.parse(initialized.stdout)).toEqual({ descriptionsCreated: 1, fileDescriptionsCreated: 1, descriptionsEnabled: true });
     expect(JSON.parse((await run("status")).stdout).descriptionProfile).toMatchObject({
       provider: "opencode-go",
-      model: "gpt-5.6-luna",
+      model: "muse-spark-1.3-contributor",
     });
     const old = new DatabaseSync(path.join(root, ".slopdex/index.sqlite"));
     old.prepare("UPDATE metadata SET value = ? WHERE key = 'description_profile'").run(JSON.stringify({
-      provider: "opencode-go", model: "gpt-5.6-luna", strategyVersion: "callable-purpose-v1",
+      provider: "opencode-go", model: "muse-spark-1.3-contributor", strategyVersion: "callable-purpose-v1",
     }));
     old.exec("DELETE FROM description_cache;");
     old.close();
@@ -882,10 +882,10 @@ globalThis.fetch = async (url, options) => {
 
     const search = await run("search-description", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
     expect(search.status, search.stderr).toBe(0);
-    expect(JSON.parse(search.stdout)[0].function.description).toBe("Purpose of one using gpt-5.6-luna");
+    expect(JSON.parse(search.stdout)[0].function.description).toBe("Purpose of one using muse-spark-1.3-contributor");
     expect(JSON.parse(search.stdout)[0].function).not.toHaveProperty("descriptionEmbeddingId");
     const text = await run("search-description", "workflow");
-    expect(text.stdout).toContain("Purpose of one using gpt-5.6-luna");
+    expect(text.stdout).toContain("Purpose of one using muse-spark-1.3-contributor");
 
     write(root, "src/b.ts", "export function two() { return 2; }\n");
     const updated = await run("status");
@@ -906,7 +906,7 @@ globalThis.fetch = async (url, options) => {
     const reused = await run("search-description", "workflow", "--threshold", "0.9", "--limit", "2", "--format", "json");
     expect(reused.status, reused.stderr).toBe(0);
     expect(JSON.parse(reused.stdout).map((match: { function: { description: string } }) => match.function.description).sort())
-      .toEqual(["Purpose of one using gpt-5.6-luna", "Purpose of two using gpt-5.6-luna"]);
+      .toEqual(["Purpose of one using muse-spark-1.3-contributor", "Purpose of two using muse-spark-1.3-contributor"]);
     write(root, ".slopdex/config.json", JSON.stringify({
       dimensions: 2,
       descriptionProvider: "opencode",

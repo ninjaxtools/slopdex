@@ -32,12 +32,11 @@ By default only vector embeddings of code is used for search.
 slopdex search "keep the repository index synchronized" --format summary --limit 10
 ```
 
-You can also enable description generation which will automatically generate description with a configured LLM provider:
+You can also enable optional description generation which will automatically generate descriptions with a configured LLM provider:
 
-An LLM provider is optional and enables the description feature. I use [OpenCode
-Go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with DeepSeek or Muse Spark, which are fairly
-good low-cost models. If you sign up for OpenCode Go through this link, we both receive $5 in
-credit.
+I use [OpenCode Go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with DeepSeek or Muse Spark,
+which are fairly good low-cost models. If you sign up for OpenCode Go through this link, we both
+receive $5 in credit.
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
@@ -163,7 +162,7 @@ slopdex update-git --force-reindex
 | `--model <name>` | Embedding model; `text-embedding-3-large` for OpenAI, `jina-embeddings-v4` for Jina. |
 | `--dimensions <number>` | Positive embedding dimension count; OpenAI `3072`, Jina `1024`. Must be supported by the model. |
 | `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use Zen or Go with `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json`. |
-| `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go, then the persisted model unless overridden. Published OpenCode models use their documented protocol. |
+| `--description-model <name>` | Description model; `gpt-5.6-luna` for OpenAI and `muse-spark-1.3-contributor` for Zen/Go, then the persisted model unless overridden. Published OpenCode models use their documented protocol. |
 | `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
 | `--verbose` | Write one stderr notice for every external model call instead of one per call kind/provider/model. |
 | `-h`, `--help` | Show CLI usage without refreshing. |

@@ -1076,7 +1076,7 @@ Options:
   --provider <openai|jina>            Embedding provider
   --model <name>                      Embedding model
   --description-provider <name>       Description provider: openai, opencode, or opencode-go
-  --description-model <name>          Description model (provider default: gpt-5.6-sol or gpt-5.6-luna)
+  --description-model <name>          Description model (provider default: gpt-5.6-luna or muse-spark-1.3-contributor)
   --reranker-candidates <number>       Candidates sent to the OpenAI LLM reranker (default: 10)
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)

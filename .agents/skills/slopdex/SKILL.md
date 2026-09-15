@@ -152,7 +152,7 @@ Usage: `slopdex <command> [arguments] [options]`. Quote queries and regexes. Boo
 | `--model <name>` | Embedding model; OpenAI `text-embedding-3-large`, Jina `jina-embeddings-v4`. |
 | `--dimensions <number>` | Positive dimensions supported by the model; OpenAI `3072`, Jina `1024`. |
 | `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json`. |
-| `--description-model <name>` | Description model; `gpt-5.6-sol` for OpenAI/Zen and `gpt-5.6-luna` for Go. |
+| `--description-model <name>` | Description model; `gpt-5.6-luna` for OpenAI and `muse-spark-1.3-contributor` for Zen/Go. |
 | `--reranker-candidates <number>` | With `config reranker openai`, embedding-ranked functions sent to the LLM; range `1`-`100`, default `10`. |
 | `--ignore-errors` | Silence saved-diagnostic warnings without deleting records. |
 | `--verbose` | Report every external model request on stderr instead of once per call kind/provider/model. Config `"verbose": true` has the same effect. |
