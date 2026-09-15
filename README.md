@@ -4,14 +4,14 @@
 
 Slopdex helps with doing analysis on codebases that contain a lot of AI generated code.
 
-The main functions supported at the moment are
+The main supported functions are
 
-- `slopdex search`
-   which does plain semantic search
+- `slopdex search <query>`
+   <br/>which finds code similar to the query
 - `slopdex cross-search`
-   which finds clusters of similar code
+   <br/>which finds clusters of similar code
 
-Finding clusters of similar code with `cross-search` helps eliminating code duplication, and with `--cohesion` helps with identifying similar code that is not necessarily duplicated but spread across the codebase, which could indicate that a refactoring could make it more cohesive.
+`cross-search` helps with finding duplicated code, and with `--cohesion` helps with identifying similar code that is not necessarily duplicated but spread out across the codebase, which could indicate that a refactoring could make it more cohesive.
 
 ## Getting started
 
