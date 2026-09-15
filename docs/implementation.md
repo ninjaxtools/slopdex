@@ -160,17 +160,3 @@ npm run check
 The build produces ESM library and CLI files with declarations and source maps in `dist/`. `tsup.config.ts` reads `package.json` and injects `__SLOPDEX_VERSION__`; source-mode version output falls back to reading package metadata. `prepack` runs build and smoke checks.
 
 The repository skill lives at `.agents/skills/slopdex/SKILL.md` and is included in the package. `npm run install:skill:opencode` copies it into the OpenCode skill directory.
-
-### Parser parity
-
-```bash
-npm run check:parser-parity
-# Or supply another built reference executable:
-npm run check:parser-parity -- /path/to/treesitter-index
-```
-
-The default reference is `../treesitter-index/target/debug/treesitter-index`. The check covers eight shared languages; the reference has no C grammar. Callable regression tests also run in `npm run check` without a sibling checkout.
-
-The tools index different information: `treesitter-index` includes declarations, types, imports, and `.pyi` stubs; Slopdex extracts callable implementations, nested callables, and bound closures, and also supports `.pyw` and C. Native Node grammar versions are pinned for compatibility with `tree-sitter@0.21`; the reference uses newer Python and Rust grammars. Rust `unsafe extern` blocks and async closures currently produce syntax-recovery warnings in Slopdex and are excluded from passing parity fixtures.
-
-After parser behavior changes, explicitly run `slopdex update-files <path...>` to reparse unchanged files and refresh their symbols, signatures, and embeddings.
