@@ -430,4 +430,47 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     }
     migrated.close();
   });
+
+  it("serves identical results through a snapshot reader", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+
+    // No refresh yet: the reader falls back to live queries exactly.
+    const empty = index.cachedSimilarityReader();
+    for (const callable of index.allFunctions()) {
+      expect(empty.similarToFunction(callable.id, { limit: 3, minSimilarity: 0.3 }))
+        .toEqual(index.similarToFunction(callable.id, { limit: 3, minSimilarity: 0.3 }));
+    }
+
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.5 });
+    const reader = index.cachedSimilarityReader();
+    const queries = [
+      { limit: 1, minSimilarity: 0.9 },
+      { limit: 3, minSimilarity: 0.5 },
+      { limit: 10, minSimilarity: 0.5 },
+      { limit: 3, minSimilarity: -1 },
+      { limit: 3, minSimilarity: 0.5, maxSimilarity: 0.8 },
+      { limit: 3, minSimilarity: 0.5, excludePaths: ["beta.ts"] },
+      { limit: 3, minSimilarity: 0.5, nameRegex: "Numbers$" },
+      { limit: 3, minSimilarity: 0.1, minLines: 1 },
+    ];
+    for (const callable of index.allFunctions()) {
+      for (const query of queries) {
+        expect(reader.similarToFunction(callable.id, query))
+          .toEqual(index.cachedSimilarToFunction(callable.id, query));
+        expect(reader.similarToFunction(callable.id, query))
+          .toEqual(index.similarToFunction(callable.id, query));
+      }
+    }
+
+    // A scoring-mode mismatch cannot be served from this snapshot.
+    const firstId = index.allFunctions()[0]!.id;
+    expect(() => reader.similarToFunction(firstId, { limit: 1, minSimilarity: -1, includeDescriptions: true }))
+      .toThrow(/description/);
+    expect(() => reader.similarToFunction(firstId, { limit: 1, minSimilarity: 0.5, nameRegex: "[" }))
+      .toThrow(/Invalid name regex/);
+    index.close();
+  });
 });

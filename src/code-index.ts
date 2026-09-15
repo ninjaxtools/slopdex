@@ -1310,6 +1310,9 @@ export class CodeIndex {
    * computed at a higher floor than requested, or too truncated to satisfy the
    * filters. A cache entry flagged complete holds every pair above its floor,
    * so short results from it are exact and need no live query.
+   *
+   * Prefer {@link cachedSimilarityReader} inside per-function loops: it loads
+   * the validity snapshot once instead of re-reading it for every function.
    */
   public cachedSimilarToFunction(functionId: number, options: {
     includeDescriptions?: boolean;
@@ -1320,29 +1323,73 @@ export class CodeIndex {
     minLines?: number;
     nameRegex?: string;
   }): SimilarityResult[] {
+    return this.cachedSimilarityReader({
+      ...(options.includeDescriptions ? { includeDescriptions: true } : {}),
+    }).similarToFunction(functionId, options);
+  }
+
+  /**
+   * Snapshot the similarity-cache validity state (per-mode states, embedding
+   * triples, generation) once for a run of neighbor lookups. The returned
+   * lookup behaves exactly like {@link cachedSimilarToFunction} but avoids
+   * re-reading whole tables per function; refresh the cache first and create
+   * one reader per analysis run. Best-effort under concurrent writers, like the
+   * refresh itself: a concurrent mutation mid-run is picked up by the next run.
+   */
+  public cachedSimilarityReader(options: {
+    includeDescriptions?: boolean;
+  } = {}): {
+    similarToFunction: (functionId: number, query: {
+      includeDescriptions?: boolean;
+      limit: number;
+      minSimilarity: number;
+      maxSimilarity?: number;
+      excludePaths?: readonly string[];
+      minLines?: number;
+      nameRegex?: string;
+    }) => SimilarityResult[];
+  } {
     const mode = options.includeDescriptions ? "code-description-file-average" : "code";
-    const live = (): SimilarityResult[] => this.similarToFunction(functionId, options);
     const states = this.#database.similarityCacheStates(mode);
-    const state = states.get(functionId);
-    if (!state || state.generation !== this.#database.getGeneration()) {
-      return live();
-    }
     const triples = this.#database.similarityCacheTriples();
-    const triple = triples.find((value) => value.functionId === functionId);
-    if (!triple
-      || triple.codeEmbeddingId !== state.codeEmbeddingId
-      || triple.descriptionEmbeddingId !== state.descriptionEmbeddingId
-      || triple.fileDescriptionEmbeddingId !== state.fileDescriptionEmbeddingId) {
-      return live();
-    }
-    if (state.floor > options.minSimilarity) {
-      return live();
-    }
-    const cached = this.#database.cachedSimilarityNeighbors(functionId, mode);
-    const filtered = filterSimilarityResults(cached, options);
-    if (filtered.length >= options.limit) return filtered.slice(0, options.limit);
-    if (state.complete) return filtered;
-    return live();
+    const tripleById = new Map(triples.map((triple) => [triple.functionId, triple]));
+    const generation = this.#database.getGeneration();
+    return {
+      similarToFunction: (functionId, query) => {
+        const live = (): SimilarityResult[] => this.similarToFunction(functionId, query);
+        // The reader is fixed to one scoring mode; a mismatched query cannot be
+        // served from this snapshot and falls back to a live query.
+        if ((query.includeDescriptions === true) !== (mode !== "code")) {
+          return live();
+        }
+        const state = states.get(functionId);
+        if (!state || state.generation !== generation) {
+          return live();
+        }
+        const triple = tripleById.get(functionId);
+        if (!triple
+          || triple.codeEmbeddingId !== state.codeEmbeddingId
+          || triple.descriptionEmbeddingId !== state.descriptionEmbeddingId
+          || triple.fileDescriptionEmbeddingId !== state.fileDescriptionEmbeddingId) {
+          return live();
+        }
+        if (state.floor > query.minSimilarity) {
+          return live();
+        }
+        compileNameRegex(query.nameRegex);
+        const cached = this.#database.cachedSimilarityNeighbors(functionId, mode, {
+          limit: query.limit,
+          minSimilarity: query.minSimilarity,
+          ...(query.maxSimilarity !== undefined ? { maxSimilarity: query.maxSimilarity } : {}),
+          ...(query.minLines !== undefined ? { minLines: query.minLines } : {}),
+          ...(query.nameRegex !== undefined ? { nameRegex: query.nameRegex } : {}),
+          ...(query.excludePaths !== undefined ? { excludePaths: query.excludePaths } : {}),
+        });
+        if (cached.length >= query.limit) return cached;
+        if (state.complete) return cached;
+        return live();
+      },
+    };
   }
 
   public vectorForFile(filePath: string): number[] {
@@ -1559,25 +1606,4 @@ function groupBy<T>(values: readonly T[], keyFor: (value: T) => string): Map<str
     groups.set(key, group);
   }
   return groups;
-}
-
-function filterSimilarityResults(
-  cached: readonly SimilarityResult[],
-  options: {
-    minSimilarity: number;
-    maxSimilarity?: number;
-    excludePaths?: readonly string[];
-    minLines?: number;
-    nameRegex?: string;
-  },
-): SimilarityResult[] {
-  const excluded = new Set(options.excludePaths ?? []);
-  const nameRegex = compileNameRegex(options.nameRegex);
-  const minLines = options.minLines ?? 1;
-  return cached.filter((match) =>
-    match.similarity >= options.minSimilarity
-    && (options.maxSimilarity === undefined || match.similarity < options.maxSimilarity)
-    && match.function.lineCount >= minLines
-    && !excluded.has(match.function.path)
-    && (!nameRegex || nameRegex.test(match.function.qualifiedName)));
 }

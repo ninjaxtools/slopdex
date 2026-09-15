@@ -55,25 +55,24 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
       ...(options.onCacheProgress ? { onProgress: options.onCacheProgress } : {}),
     });
   }
+  // One validity snapshot for the whole run: per-function lookups must not
+  // re-read the state tables for every source.
+  const cacheReader = useCache ? options.source.cachedSimilarityReader({
+    includeDescriptions: scoring.similarityMode === "code-description-file-average",
+  }) : undefined;
   const neighborsFor = (callable: IndexedFunction): SimilarityResult[] => {
     throwIfAborted(options.signal);
-    const matches = (useCache
-      ? options.source.cachedSimilarToFunction(callable.id, {
-        includeDescriptions: scoring.similarityMode === "code-description-file-average",
-        limit: neighbors,
-        minSimilarity,
-        ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
-        minLines,
-        ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
-      })
-      : options.source.similarToFunction(callable.id, {
-        includeDescriptions: scoring.similarityMode === "code-description-file-average",
-        limit: neighbors,
-        minSimilarity,
-        ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
-        minLines,
-        ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
-      })).filter((match) => candidateIds.has(match.function.id));
+    const query = {
+      includeDescriptions: scoring.similarityMode === "code-description-file-average",
+      limit: neighbors,
+      minSimilarity,
+      ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+      minLines,
+      ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
+    };
+    const matches = (cacheReader ? cacheReader.similarToFunction(callable.id, query)
+      : options.source.similarToFunction(callable.id, query))
+      .filter((match) => candidateIds.has(match.function.id));
     neighborCache.set(callable.id, new Set(matches.map((match) => match.function.id)));
     return matches;
   };

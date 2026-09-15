@@ -971,7 +971,22 @@ export class IndexDatabase {
     }]));
   }
 
-  public cachedSimilarityNeighbors(sourceId: number, mode: string): Array<SimilarityResult> {
+  public cachedSimilarityNeighbors(
+    sourceId: number,
+    mode: string,
+    filter?: {
+      limit: number;
+      minSimilarity: number;
+      maxSimilarity?: number;
+      minLines?: number;
+      nameRegex?: string;
+      excludePaths?: readonly string[];
+    },
+  ): Array<SimilarityResult> {
+    const excludePaths = filter?.excludePaths ?? [];
+    const pathFilter = excludePaths.length > 0
+      ? `AND f.path NOT IN (${excludePaths.map(() => "?").join(", ")})`
+      : "";
     const rows = this.#db.prepare(`
       SELECT f.*, c.similarity, c.similarity AS base_similarity,
         c.code_similarity AS code_similarity,
@@ -979,8 +994,25 @@ export class IndexDatabase {
         c.file_description_similarity AS file_description_similarity
       FROM similarity_cache c JOIN functions f ON f.id = c.target_id
       WHERE c.source_id = ? AND c.similarity_mode = ?
+        AND c.similarity >= ?
+        AND (? IS NULL OR c.similarity < ?)
+        AND f.line_count >= ?
+        AND (? IS NULL OR slopdex_regexp(?, f.qualified_name))
+        ${pathFilter}
       ORDER BY c.similarity DESC, f.id ASC
-    `).all(sourceId, mode) as unknown as Array<FunctionRow & {
+      ${filter ? "LIMIT ?" : ""}
+    `).all(
+      sourceId,
+      mode,
+      filter?.minSimilarity ?? -1,
+      filter?.maxSimilarity ?? null,
+      filter?.maxSimilarity ?? null,
+      filter?.minLines ?? 1,
+      filter?.nameRegex ?? null,
+      filter?.nameRegex ?? null,
+      ...excludePaths,
+      ...(filter ? [filter.limit] : []),
+    ) as unknown as Array<FunctionRow & {
       similarity: number;
       base_similarity: number;
       code_similarity: number | null;

@@ -69,16 +69,16 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
       ...(options.onCacheProgress ? { onProgress: options.onCacheProgress } : {}),
     });
   }
+  // One validity snapshot for the whole run: per-function lookups must not
+  // re-read the state tables for every source.
+  const cacheReader = useCache ? options.source.cachedSimilarityReader({ includeDescriptions }) : undefined;
   for (let index = 0; index < sourceFunctions.length; index += 1) {
     throwIfAborted(options.signal);
     const source = sourceFunctions[index]!;
-    const vector = options.source.vectorForFunction(source.id);
     const canonicalSourceFile = sourceRoot ? await canonicalFile(sourceRoot, source.path) : undefined;
     const excludedTargetPaths = canonicalSourceFile ? targetPathsByCanonicalFile.get(canonicalSourceFile) : undefined;
     const excludePaths = excludedTargetPaths ? { excludePaths: excludedTargetPaths } : {};
-    const similar = useCache
-      ? options.source.cachedSimilarToFunction.bind(options.source)
-      : options.source.similarToFunction.bind(options.source);
+    const similar = cacheReader ? cacheReader.similarToFunction : options.source.similarToFunction.bind(options.source);
     const candidates = sameIndex
       ? similar(source.id, {
         includeDescriptions,
@@ -89,7 +89,7 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
         ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
         ...excludePaths,
       })
-      : target.searchByVector(vector, {
+      : target.searchByVector(options.source.vectorForFunction(source.id), {
         ...(includeDescriptions ? {
           descriptionVector: options.source.vectorForFunction(source.id, "description"),
           fileDescriptionVector: options.source.vectorForFile(source.path),
