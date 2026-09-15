@@ -1,6 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 
+import * as sqliteVec from "sqlite-vec";
+
 import { CodeIndex } from "../src/code-index.js";
 import { crossSearch } from "../src/search/cross-search.js";
 import type { IndexProgress } from "../src/types.js";
@@ -241,12 +243,7 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
   });
 
   it("stores only pairs at or above the refresh floor", async () => {
-    const root = temporaryRoot();
-    seed(root);
-    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
-    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
-    const indexPath = index.indexPath;
-    const readSimilarities = (): number[] => {
+    const readSimilarities = (indexPath: string): number[] => {
       const db = new DatabaseSync(indexPath, { readOnly: true });
       try {
         return (db.prepare("SELECT similarity FROM similarity_cache").all() as Array<{ similarity: number }>)
@@ -255,7 +252,7 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
         db.close();
       }
     };
-    const readFloors = (): number[] => {
+    const readFloors = (indexPath: string): number[] => {
       const db = new DatabaseSync(indexPath, { readOnly: true });
       try {
         return (db.prepare("SELECT DISTINCT floor FROM similarity_cache_state").all() as Array<{ floor: number }>)
@@ -265,16 +262,25 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
       }
     };
 
-    await index.refreshSimilarityCache({ width: 10, minSimilarity: -1 });
-    const allPairs = readSimilarities();
+    const fullRoot = temporaryRoot();
+    seed(fullRoot);
+    const full = new CodeIndex({ rootDir: fullRoot, provider: new FakeEmbeddingProvider() });
+    await full.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await full.refreshSimilarityCache({ width: 10, minSimilarity: -1 });
+    const allPairs = readSimilarities(full.indexPath);
     expect(Math.min(...allPairs)).toBeLessThan(0.7);
+    full.close();
 
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
     await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.7 });
-    const floored = readSimilarities();
+    const floored = readSimilarities(index.indexPath);
     expect(floored.length).toBeGreaterThan(0);
     expect(floored.length).toBeLessThan(allPairs.length);
     expect(Math.min(...floored)).toBeGreaterThanOrEqual(0.7 - 1e-9);
-    expect(readFloors()).toEqual([0.7]);
+    expect(readFloors(index.indexPath)).toEqual([0.7]);
     index.close();
   });
 
@@ -397,7 +403,8 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     const indexPath = original.indexPath;
     original.close();
 
-    const downgrade = new DatabaseSync(indexPath);
+    const downgrade = new DatabaseSync(indexPath, { allowExtension: true });
+    sqliteVec.load(downgrade);
     downgrade.exec(`
       ALTER TABLE similarity_cache_state DROP COLUMN floor;
       ALTER TABLE similarity_cache_state DROP COLUMN stored_count;
