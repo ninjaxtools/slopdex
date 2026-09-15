@@ -31,9 +31,7 @@ export OPENAI_API_KEY="your-api-key"
 slopdex search "validate an authenticated session"
 ```
 
-The index is created or updated on every command and tracks the current git commit. Changing branches works too.
-
-Add `.slopdex/` to your repository's `.gitignore`.
+The index tracks the current git commit and is created or updated on every command and stored in `.slopdex/index.sqlite`. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
 
 ### Search code
 
@@ -69,17 +67,6 @@ You can list and configure one of OpenCode's models like this:
 ```bash
 slopdex models opencode-go
 slopdex config model opencode-go/gpt-5.6-luna
-```
-
-### Reranking
-
-Optionally a second-stage reranker can be enabled for `search` and `search-description`:
-
-```bash
-export COHERE_API_KEY="your-api-key"
-slopdex config reranker cohere
-# Or: export JINA_API_KEY="your-api-key" && slopdex config reranker jina
-# Or use an LLM: export OPENAI_API_KEY="your-api-key" && slopdex config reranker openai
 ```
 
 ### Find duplicate-code
@@ -130,6 +117,27 @@ When code is similar but not actually duplicated, then `--cohesion` can help fin
 
 ```bash
 slopdex cross-search --cross-file-only --cohesion --threshold 0.8
+```
+### Use with agents
+
+Just put this in your `AGENTS.md` file, no skill required:
+
+```
+- use semantic code search to find code with: `slopdex search "..." --threshold 0.5`
+- when reviewing uncommitted code avoid introducing duplicates by looking for related matches: `slopdex cross-search --uncommitted --threshold 0.8`
+```
+
+Any other use, like doing a full `cross-search` is probably better done interactively with the agent, in which case you can just ask the agent to run `slopdex --help` to get usage information.
+
+### Reranking
+
+Optionally a second-stage reranker can be enabled for `search` and `search-description`:
+
+```bash
+export COHERE_API_KEY="your-api-key"
+slopdex config reranker cohere
+# Or: export JINA_API_KEY="your-api-key" && slopdex config reranker jina
+# Or use an LLM: export OPENAI_API_KEY="your-api-key" && slopdex config reranker openai
 ```
 
 ### Compare repositories

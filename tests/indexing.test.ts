@@ -193,17 +193,26 @@ export function multiply(a: number, b: number) { return a * b; }
 });
 
 describe("filesystem indexing", () => {
-  it("re-indexes every source file on every refresh and reuses embeddings", async () => {
+  it("skips the write when nothing changed and reuses embeddings", async () => {
     const root = temporaryRoot();
     write(root, "src/value.ts", `export function value() { return 1; }\n`);
     const provider = new CountingEmbeddingProvider();
     const index = new CodeIndex({ rootDir: root, provider });
 
     const first = await index.updateFromWorkingTree();
+    const generation = index.status().generation;
     const second = await index.updateFromWorkingTree();
 
     expect(first.filesUpdated).toBe(1);
-    expect(second.filesUpdated).toBe(1);
+    expect(second).toMatchObject({
+      filesUpdated: 0,
+      filesDeleted: 0,
+      functionsAdded: 0,
+      functionsUpdated: 0,
+      functionsDeleted: 0,
+      embeddingsCreated: 0,
+    });
+    expect(index.status().generation).toBe(generation);
     expect(provider.documentCount).toBe(1);
     expect(index.status().gitCheckpoint).toBeNull();
     expect(index.allFunctions()[0]!.sourceMode).toBe("working-tree");

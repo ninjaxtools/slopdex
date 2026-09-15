@@ -76,6 +76,23 @@ describe("similarity cache", () => {
     index.close();
   });
 
+  it("survives a no-change working-tree refresh without rebuilding", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFromWorkingTree();
+    await index.refreshSimilarityCache({ width: 10 });
+
+    const refresh = await index.updateFromWorkingTree();
+    expect(refresh).toMatchObject({ filesUpdated: 0, filesDeleted: 0 });
+    const generation = index.status().generation;
+    const second = await index.refreshSimilarityCache({ width: 10 });
+    expect(second.sourcesRefreshed).toBe(0);
+    expect(index.status().generation).toBe(generation);
+    expect(index.similarityCacheInfo().cachedSources).toBe(index.status().functionCount);
+    index.close();
+  });
+
   it("incrementally updates changed functions and stays exact", async () => {
     const root = temporaryRoot();
     seed(root);

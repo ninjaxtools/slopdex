@@ -226,6 +226,9 @@ export class CodeIndex {
     }
 
     await gitignore.assertUnchanged(options.signal);
+    if (this.#isWorkingTreeClean(indexedFiles, prepared)) {
+      return emptyStats(this.#database.getCheckpoint());
+    }
     return this.#database.applyUpdate({
       files: prepared,
       deletePaths: indexedFiles.map((file) => file.path),
@@ -233,6 +236,36 @@ export class CodeIndex {
       expectedGeneration: generation,
       completeDiagnosticsScan: true,
       embeddingsCreated,
+    });
+  }
+
+  /**
+   * Whether a working-tree refresh changed nothing: same file set, same
+   * content, same language, still working-tree rows, no checkout to clear,
+   * and no recorded errors to retry. Skipping the write avoids a generation
+   * bump and, via foreign-key cascades, needlessly invalidating the
+   * similarity cache for unchanged files. Description state must already be
+   * quiescent: a refresh is what lazily clears stored descriptions after
+   * disableDescriptions, so a stale description count must fall through to
+   * the rewrite, and enabled indexes keep the legacy behavior.
+   */
+  #isWorkingTreeClean(indexedFiles: IndexedFileState[], prepared: PreparedFile[]): boolean {
+    if (this.#database.getCheckpoint() !== null) return false;
+    if (this.#database.needsDiagnosticsScan()) return false;
+    if (this.#database.filesWithErrors().length > 0) return false;
+    if (this.#database.descriptionsEnabled()) return false;
+    if (indexedFiles.length !== prepared.length) return false;
+    const status = this.status();
+    if (status.descriptionCount > 0 || status.fileDescriptionCount > 0) return false;
+    const indexedByPath = new Map(indexedFiles.map((file) => [file.path, file]));
+    return prepared.every((file) => {
+      if (file.unavailable || file.errors.length > 0) return false;
+      const indexed = indexedByPath.get(file.path);
+      return !!indexed
+        && indexed.sourceMode === "working-tree"
+        && indexed.blobOid === file.blobOid
+        && indexed.language === file.language
+        && indexed.contentHash === file.contentHash;
     });
   }
 

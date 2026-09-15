@@ -1032,62 +1032,83 @@ Commands:
   search-description <query>          Search functions using description embeddings
   cross-search                        Find nearest functions for each source function
 
-Languages (automatically detected with Tree-sitter):
-  Python (.py, .pyw), JavaScript (.js, .mjs, .cjs), JSX (.jsx),
-  TypeScript (.ts, .mts, .cts), TSX (.tsx), Rust (.rs), Go (.go),
-  Java (.java), and C (.c, .h). Indexes named callables with bodies.
+Examples:
+  Search code:
+    slopdex search "validate an authenticated session"
 
-File discovery respects root and nested .gitignore rules, including for tracked files.
-Working-tree updates use current rules; committed-only snapshots use rules from that commit.
+    slopdex search "keep the repository index synchronized"
+    0.4284  tests/languages.test.ts :: refresh
+    0.4200  src/cli.ts :: refreshIndex
+    0.4113  src/code-index.ts :: CodeIndex.updateFromGit
+    ...
 
-Analysis Examples:
-  Duplicate Analysis:
-    slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --matches 5 --limit 5
+  Enable descriptions, then search by their meaning:
+    slopdex descriptions enable
+    slopdex search-description "keep the repository index synchronized"
 
-    Cluster 1 (3 functions, similarity 0.9124-0.9568)
-      src/auth/session.ts:18:1 :: validateSession
-      src/http/middleware.ts:42:1 :: authenticate
-      src/users/user-service.ts:27:3 :: UserService.authenticate
+    slopdex models opencode-go
+    slopdex config model opencode-go/gpt-5.6-luna
 
-    This found three substantial authentication functions in separate files with very
-    high similarity. Review them for repeated validation or session logic that could be shared.
-    Middleware and service locations may be intentional architectural layers, so this is
-    evidence to inspect rather than proof they should merge. Connected components may use
-    transitive links, so every function need not directly match every other function.
+  Find duplicate code:
+    Compare functions across files, exclude short wrappers, and group matches into clusters:
+      slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
 
-  Physical Cohesion Review:
-    slopdex cross-search --cohesion --threshold 0.8 --matches 20 --format summary
+      Cluster 1 (3 functions, similarity 0.9124-0.9568)
+        src/auth/session.ts:18:1 :: validateSession
+        src/http/middleware.ts:42:1 :: authenticate
+        src/users/user-service.ts:27:3 :: UserService.authenticate
 
-    src/auth/session.ts :: validateSession
-      0.9400  packages/http/middleware.ts :: authenticate  [distance 4]
-      0.9300  src/auth/token.ts :: validateToken  [distance 1]
+      This found three substantial authentication functions in separate files with very
+      high similarity. Review them for repeated validation or session logic that could be shared.
+      Middleware and service locations may be intentional architectural layers, so this is
+      evidence to inspect rather than proof they should merge. Connected components may use
+      transitive links, so every function need not directly match every other function.
 
-    --cohesion keeps cross-search's semantic matches but orders each source's matches
-    from greatest to least path distance. Similarity breaks distance ties. This highlights
-    related functions stored far apart without introducing a separate analysis command.
+    Using --cross-file-only is useful to exclude similar code in the same file.
 
-Reading Analysis Output:
-  With complete description indexes, search and cross-search combine code, callable
-  description, and file description similarity equally. Cross-repository search requires complete descriptions on both sides;
-  otherwise the analysis uses code-only similarity. Thresholds and limits apply after fusion.
-  JSON includes component scores and description-generator profiles for reproducibility.
-  Compare results only when similarity mode and weights match.
-  Compare values only with the same embedding profile and similar threshold, source-filter,
-  and minimum-line settings.
+    Review adjacent bands with threshold ranges:
+      slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
+      slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
 
-  Duplicate cluster line:
-    Cluster N           Display order by function count, then name; not severity
-    functions           Unique connected callables; higher may mean a larger duplicate family
-    similarity range    Raw cosine edge range; higher means stronger model-assessed resemblance
-                       A high minimum means all observed links are strong; a wide range may
-                       indicate that a weaker transitive edge joined tighter matches
-    callable location   path:line:column :: qualifiedFunctionName; inspect architectural roles
+  Restrict functions used in cross-search:
+    Only use uncommitted working-tree functions as sources:
+      slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9
 
-  Cohesion re-ranking:
-    distance            0 for the same file, 1 for files in the same folder, and
-                       1 plus directory-tree hops for files in different folders
-    ordering            Greater distance first; similarity breaks ties
-    JSON                Each match includes physicalDistance when --cohesion is enabled
+    Only use functions changed since origin/main as sources:
+      slopdex cross-search --changed-since origin/main --threshold 0.9
+
+    Only use matching symbols under src/services as sources:
+      slopdex cross-search --source-path src/services -e '^UserService\\.' --threshold 0.9
+
+  Find related code stored far apart:
+    --cohesion orders matches from farthest to nearest, which can highlight similar code
+    that could be made more cohesive through an abstraction:
+      slopdex cross-search --cross-file-only --cohesion --threshold 0.8
+
+      src/auth/session.ts :: validateSession
+        0.9400  packages/http/middleware.ts :: authenticate  [distance 4]
+        0.9300  src/auth/token.ts :: validateToken  [distance 1]
+
+      --cohesion keeps cross-search's semantic matches but orders each source's matches
+      from greatest to least path distance. Similarity breaks distance ties. This highlights
+      related functions stored far apart without introducing a separate analysis command.
+
+  Use with agents:
+    slopdex search "..." --threshold 0.5
+    slopdex cross-search --uncommitted --threshold 0.8
+
+  Reranking (second-stage reranker for search and search-description):
+    slopdex config reranker cohere
+    slopdex config reranker jina
+    slopdex config reranker openai
+
+  Compare repositories:
+    slopdex cross-search --target-root /path/to/other/repo --target-index /path/to/other/repo/.slopdex/index.sqlite --threshold 0.9
+
+  Inspect index health:
+    slopdex status
+    slopdex index-errors --format summary
+    slopdex --version
 
 Options:
   --version                           Show the package version
@@ -1125,17 +1146,9 @@ Options:
   --target-config <path>              Config file for a second indexed codebase
 
 Other Examples:
-  List published OpenCode Go models and save one for future index commands:
-    slopdex models opencode-go
-    slopdex config model opencode-go/gpt-5.6-luna
+  Save description state and parallelism without opening an index:
     slopdex config descriptions enable
     slopdex config parallelism 10
-
-  Show metadata for the current index:
-    slopdex status
-
-  Inspect indexing failures without refreshing the index or calling providers:
-    slopdex index-errors --format summary
 
   Index specific working-tree files:
     slopdex update-files src/service.ts src/model.ts
@@ -1150,34 +1163,10 @@ Other Examples:
   Index HEAD and overlay uncommitted working-tree changes:
     slopdex update-git --target HEAD
 
-  Find functions matching a semantic query:
-    slopdex search "validate an authenticated session" --limit 10
-
-  Enable hosted reranking for query searches:
-    slopdex config reranker cohere
-
-  Use OpenAI LLM reranking with high reasoning over the top 10 candidates:
-    slopdex config reranker openai
-
-  Enable purpose descriptions, then search by their meaning:
-    slopdex descriptions enable
-    slopdex search-description "maintain the repository index" --format summary
-
-  Review functions under a path against the whole codebase:
-    slopdex cross-search --source-path src/services --format summary
-
-  Review matching source symbols against the whole index:
-    slopdex cross-search -e '^UserService\\.' --source-path src --format summary
-
   Combine source restrictions (all must match):
     slopdex cross-search -e 'validate' --source-path src --changed-since origin/main --uncommitted
 
   Filter semantic search results by qualified symbol before applying the limit:
     slopdex search "validate session" -e '^Session\\.' --limit 10
-
-  -e/--regexp/--regex uses a case-sensitive JavaScript regex on qualified names. For cross-search
-  it filters sources only; targets keep their normal eligibility rules.
-  With --changed-since and --uncommitted, sources must be changed since the commit and
-  belong to an uncommitted file. --source-path and the regex filter further narrow that intersection.
 `);
 }

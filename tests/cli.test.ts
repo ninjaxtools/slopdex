@@ -625,15 +625,28 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
       "slopdex config parallelism 10",
       "slopdex config reranker cohere",
       "slopdex config reranker openai",
+      "slopdex config reranker jina",
       "slopdex update-files",
       "slopdex reindex-files",
       "slopdex delete-files",
       "slopdex update-git",
-      "slopdex search",
+      "slopdex search \"validate an authenticated session\"",
+      "slopdex search \"keep the repository index synchronized\"",
       "slopdex descriptions enable",
-      "slopdex search-description",
-      "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --matches 5 --limit 5",
-      "slopdex cross-search --cohesion --threshold 0.8 --matches 20 --format summary",
+      "slopdex search-description \"keep the repository index synchronized\"",
+      "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9",
+      "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9",
+      "slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9",
+      "slopdex cross-search --changed-since origin/main --threshold 0.9",
+      "slopdex cross-search --source-path src/services -e '^UserService\\.' --threshold 0.9",
+      "slopdex cross-search --cross-file-only --cohesion --threshold 0.8",
+      "slopdex search \"...\" --threshold 0.5",
+      "slopdex cross-search --uncommitted --threshold 0.8",
+      "slopdex cross-search --target-root /path/to/other/repo",
+      "slopdex index-errors --format summary",
+      "slopdex --version",
+      "slopdex cross-search -e 'validate' --source-path src --changed-since origin/main --uncommitted",
+      "slopdex search \"validate session\" -e '^Session\\.' --limit 10",
     ]) expect(result.stdout).toContain(example);
     expect(result.stdout).toContain("--source-path <path>");
     expect(result.stdout).toContain("--description-provider <name>");
@@ -658,12 +671,13 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
     expect(result.stdout).toContain("transitive links, so every function need not directly match every other function");
     expect(result.stdout).toContain("[distance 4]");
     expect(result.stdout).toContain("orders each source's matches");
-    expect(result.stdout).toContain("Reading Analysis Output:");
-    expect(result.stdout).toContain("Greater distance first; similarity breaks ties");
-    expect(result.stdout.indexOf("Commands:")).toBeLessThan(result.stdout.indexOf("Analysis Examples:"));
-    expect(result.stdout.indexOf("Analysis Examples:")).toBeLessThan(result.stdout.indexOf("Reading Analysis Output:"));
-    expect(result.stdout.indexOf("Reading Analysis Output:")).toBeLessThan(result.stdout.indexOf("Options:"));
+    expect(result.stdout.indexOf("Commands:")).toBeLessThan(result.stdout.indexOf("Examples:"));
+    expect(result.stdout.indexOf("Examples:")).toBeLessThan(result.stdout.indexOf("Options:"));
     expect(result.stdout.indexOf("Options:")).toBeLessThan(result.stdout.indexOf("Other Examples:"));
+    expect(result.stdout).not.toContain("Reading Analysis Output:");
+    expect(result.stdout).not.toContain("Greater distance first; similarity breaks ties");
+    expect(result.stdout).not.toContain("Languages (automatically detected");
+    expect(result.stdout).not.toContain("File discovery respects root");
     expect(result.stdout).not.toContain("--min-similarity");
     expect(result.stdout).not.toContain("--added-since");
   });
