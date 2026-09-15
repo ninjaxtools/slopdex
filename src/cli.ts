@@ -929,13 +929,13 @@ function openAIRerankerCandidateCount(value: string | undefined, defaultValue: n
   return count;
 }
 
-function similarityThreshold(defaultMin = -1): { min: number; max?: number } {
+function similarityThreshold(defaultMin = 0.3): { min: number; max?: number } {
   const threshold = parsed.values.threshold;
   if (threshold === undefined) return { min: defaultMin };
 
   const number = "[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:e[+-]?\\d+)?";
   const range = new RegExp(`^\\s*(${number})\\s*-\\s*(${number})\\s*$`, "i").exec(threshold);
-  if (!range) return { min: numberOption(threshold, -1, "threshold") };
+  if (!range) return { min: numberOption(threshold, defaultMin, "threshold") };
   const min = Number(range[1]);
   const max = Number(range[2]);
   if (!Number.isFinite(min) || !Number.isFinite(max)) throw new CodeIndexError("threshold range bounds must be numbers.");
@@ -1087,7 +1087,7 @@ Options:
   --ignore-errors                     Silence warnings about persisted indexing errors
   --verbose                           Log every external model call instead of one per kind/model
   --limit <number>                    Search result limit
-  --threshold <number|range>          Show similarities at/above a value or within a range
+  --threshold <number|range>          Show similarities at/above a value or within a range (default: 0.3)
   --format <json|summary|clusters>    Output format (default: summary; cross-search: clusters)
   --cohesion                          Re-rank cross-search matches by physical distance
   --include-symmetric-duplicates      Show both directions of same-index matches

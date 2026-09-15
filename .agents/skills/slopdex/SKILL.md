@@ -166,7 +166,7 @@ Explicit relative config/index paths resolve from the current directory. Source 
 | Argument | Applies to / behavior |
 | --- | --- |
 | `--limit <number>` | Positive integer. `search`/`search-description`: matches, default `10`. Cross-search: neighbors per source, default `5`. |
-| `--threshold <number\|min-max>` | Both query searches and cross-search. Inclusive minimum or half-open range; default `-1`. |
+| `--threshold <number\|min-max>` | Both query searches and cross-search. Inclusive minimum or half-open range; default `0.3`. |
 | `--format <json\|summary\|clusters>` | Both query searches, cross-search, and index-errors. Cohesion-ranked cross-search supports summary or JSONL, not clusters. |
 | `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Equivalent case-sensitive JavaScript regex options on qualified names. Query searches filter results before limiting; cross-search filters sources only. |
 | `--min-lines <number>` | Cross-search: positive source/candidate length minimum, default `2`. |

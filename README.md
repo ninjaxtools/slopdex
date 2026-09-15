@@ -176,7 +176,7 @@ Explicit relative config and index paths resolve from the current directory, not
 | Argument | Applies to | Meaning / default |
 | --- | --- | --- |
 | `--limit <number>` | Both query searches, cross-search | Positive integer. Query matches: `10`; cross-search neighbors per source: `5`. |
-| `--threshold <number\|min-max>` | Both query searches, cross-search | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `-1`. |
+| `--threshold <number\|min-max>` | Both query searches, cross-search | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `0.3`. |
 | `--format <json\|summary\|clusters>` | Both query searches, cross-search, index-errors | Output format; see the commands table. `clusters` is only for ordinary cross-search. |
 | `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Both query searches, cross-search | Equivalent case-sensitive JavaScript regex options over qualified names. Query searches filter results before limiting; cross-search filters sources only. |
 | `--min-lines <number>` | Cross-search | Minimum source and candidate callable length; positive integer, default `2`. Use `1` to include one-line wrappers. |

@@ -458,6 +458,41 @@ export function two(value: string) {
     expect(empty.stdout).toBe("");
   });
 
+  it("defaults --threshold to 0.3 and allows an explicit override", async () => {
+    const root = temporaryRoot();
+    initGit(root);
+    write(root, "one.ts", `export function one() {
+  return 1;
+}\n`);
+    write(root, "two.ts", `export function two() {
+  return 2;
+}\n`);
+    commitAll(root, "functions");
+    const openAI = new OpenAIEmbeddingProvider({ apiKey: "test" });
+    const vectors = [
+      [1, ...Array<number>(openAI.profile.dimensions - 1).fill(0)],
+      [0, 1, ...Array<number>(openAI.profile.dimensions - 2).fill(0)],
+    ];
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: {
+        profile: openAI.profile,
+        embedDocuments: async (inputs) => inputs.map((_, position) => vectors[position]!),
+        embedQuery: async () => vectors[0]!,
+      },
+    });
+    await index.updateFromGit();
+    index.close();
+
+    const defaultThreshold = await runCli(root, "cross-search");
+    expect(defaultThreshold.status).toBe(0);
+    expect(defaultThreshold.stdout).toBe("No clusters.\n");
+
+    const overridden = await runCli(root, "cross-search", "--threshold=-1");
+    expect(overridden.status).toBe(0);
+    expect(overridden.stdout).toMatch(/^Cluster 1 /);
+  });
+
   it("re-ranks cross-search matches by physical distance", async () => {
     const root = temporaryRoot();
     initGit(root);
@@ -585,6 +620,7 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
     expect(result.stdout).toContain("--source-path <path>");
     expect(result.stdout).toContain("--description-provider <name>");
     expect(result.stdout).toContain("--reranker-candidates <number>");
+    expect(result.stdout).toContain("--threshold <number|range>          Show similarities at/above a value or within a range (default: 0.3)");
     expect(result.stdout).toContain("--format <json|summary|clusters>");
     expect(result.stdout).toContain("--changed-since <commit>");
     expect(result.stdout).toContain("--uncommitted");
