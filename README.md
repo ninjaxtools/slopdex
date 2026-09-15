@@ -1,19 +1,19 @@
 # slopdex
 
-<img src="dexter2.png" align="center" width="280" alt="Dexter, the sloppy slime" />
+<img src="dexter2.png" width="280" alt="Dexter, the sloppy slime" />
 
-This is Dexter. He is a sloppy slime and could benefit from some vector search to clean up after himself.
+This is Dexter.
 
-<br clear="both" />
+He is a sloppy slime and could benefit from some vector search to clean up after himself.
 
 ## Getting started
 
-> **An embedding-provider API key is required:** use either OpenAI or Jina.
->
-> An LLM provider is optional and enables the description feature. I use
-> [OpenCode Go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with DeepSeek or Muse Spark,
-> which are fairly good low-cost models. **Referral disclosure:** if you sign up for
-> OpenCode Go through this link, we both receive $5 in credit.
+An embedding-provider API key is required. You can use either OpenAI or Jina.
+
+An LLM provider is optional and enables the description feature. I use [OpenCode
+Go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with DeepSeek or Muse Spark, which are fairly
+good low-cost models. If you sign up for OpenCode Go through this link, we both receive $5 in
+credit.
 
 ```bash
 npm install -g @ninjaxtools/slopdex
