@@ -1,6 +1,6 @@
-<img src="dexter2.png" align="right" width="320" hspace="20" alt="Dexter, the slopdex mascot" />
-
 # slopdex
+
+<img src="dexter2.png" align="right" width="280" hspace="20" alt="Dexter, the slopdex mascot" />
 
 This is Dexter. He is a sloppy slime and could benefit from some vector search to clean up after himself.
 
@@ -15,6 +15,10 @@ You can also configure OpenAI or Jina.
 ```bash
 npm install -g @ninjaxtools/slopdex
 export OPENAI_API_KEY="your-api-key"
+# Or configure any of the other providers:
+# export JINA_API_KEY="your-api-key"     # + pass --provider jina
+# export OPENCODE_API_KEY="your-api-key" # for OpenCode Zen/Go descriptions
+# opencode auth login                    # use stored credentials instead of env variables
 slopdex search "validate an authenticated session" --limit 10
 ```
 
