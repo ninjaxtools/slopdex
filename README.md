@@ -4,13 +4,14 @@
 
 This is Dexter. He is a sloppy slime and could benefit from some vector search to clean up after himself.
 
+Please note that an embedding-provider API key is required, which can be either OpenAI or Jina.
+
+Additionally, an LLM provider can be used for the description feature. I use [opencode go](https://opencode.ai/go?ref=RAR3Z744DZ). If you sign up with this link we both get $5 credit.
+
 <br clear="both" />
 
 ## Getting started
 
-An embedding-provider API key is required.
-I use [opencode go](https://opencode.ai/go?ref=RAR3Z744DZ) (If you sign up with this link we both get $5 credit.)
-You can also configure OpenAI or Jina. 
 
 ```bash
 npm install -g @ninjaxtools/slopdex
