@@ -1,8 +1,10 @@
-<img src="dexter.png" align="right" width="180" alt="Dexter, the slopdex mascot" />
-
 # slopdex
 
+<img src="dexter2.png" align="right" width="180" alt="Dexter, the slopdex mascot" />
+
 This is Dexter. He is a sloppy slime and could benefit from some vector search to clean up after himself.
+
+<br clear="both" />
 
 ## Getting started
 
