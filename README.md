@@ -2,7 +2,7 @@
 
 <img src="sloppy-dexter.png" width="280" align="right" alt="Dexter, the sloppy slime" />
 
-Slopdex is intended to help doing analysis on codebases that contain a lot of AI generated code.
+Slopdex helps with doing analysis on codebases that contain a lot of AI generated code.
 
 The main functions supported at the moment are
 
@@ -11,7 +11,7 @@ The main functions supported at the moment are
 - `slopdex cross-search`
    which finds clusters of similar code
 
-Finding clusters of similar code with `cross-search` helps eliminating code duplication, and with `--cohesion` helps with identifying similar code that is not necessarily duplicated but spread across the codebase, which could indicate that they could be refactored to be more cohesive.
+Finding clusters of similar code with `cross-search` helps eliminating code duplication, and with `--cohesion` helps with identifying similar code that is not necessarily duplicated but spread across the codebase, which could indicate that a refactoring could make it more cohesive.
 
 ## Getting started
 
