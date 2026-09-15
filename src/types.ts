@@ -121,7 +121,7 @@ export interface DescriptionStats {
   descriptionsEnabled: boolean;
 }
 
-export type IndexProgressPhase = "vectors" | "descriptions" | "description-vectors";
+export type IndexProgressPhase = "vectors" | "descriptions" | "description-vectors" | "similarity-cache";
 
 export interface IndexProgress {
   phase: IndexProgressPhase;
@@ -241,6 +241,8 @@ export interface CrossSearchOptions {
   nameRegex?: string;
   signal?: AbortSignal;
   onProgress?: (progress: { completed: number; total: number }) => void;
+  /** Receives similarity-cache fill progress; defaults to the source index's onProgress. */
+  onCacheProgress?: (progress: IndexProgress) => void;
 }
 
 export interface CrossSearchMatch extends SimilarityResult {
@@ -337,6 +339,8 @@ export interface CohesionAnalysisOptions {
   nameRegex?: string;
   signal?: AbortSignal;
   onProgress?: (progress: { completed: number; total: number }) => void;
+  /** Receives similarity-cache fill progress; defaults to the source index's onProgress. */
+  onCacheProgress?: (progress: IndexProgress) => void;
 }
 
 export interface CohesionReport<FunctionValue = IndexedFunction> {

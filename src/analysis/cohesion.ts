@@ -51,6 +51,7 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
     await options.source.refreshSimilarityCache({
       width: Math.min(200, Math.max(50, neighbors * 5)),
       ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.onCacheProgress ? { onProgress: options.onCacheProgress } : {}),
     });
   }
   const neighborsFor = (callable: IndexedFunction): SimilarityResult[] => {

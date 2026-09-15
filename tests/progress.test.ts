@@ -22,6 +22,7 @@ describe("terminal progress", () => {
     expect(renderProgress({ phase: "vectors", completed: 2, total: 4 })).toContain(" 50% 2/4");
     expect(renderProgress({ phase: "descriptions", completed: 4, total: 4 })).toContain("100% 4/4");
     expect(renderProgress({ phase: "description-vectors", completed: 1, total: 4 })).toContain("description vectors [");
+    expect(renderProgress({ phase: "similarity-cache", completed: 1, total: 4 })).toContain("similarity cache [");
   });
 
   it("does not write progress when stderr is not interactive", () => {

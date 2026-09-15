@@ -1119,6 +1119,8 @@ export class CodeIndex {
   public async refreshSimilarityCache(options: {
     width?: number;
     signal?: AbortSignal;
+    /** Overrides the index-level onProgress for the cache-fill bar. */
+    onProgress?: (progress: IndexProgress) => void;
   } = {}): Promise<{
     similarityMode: string;
     width: number;
@@ -1169,6 +1171,10 @@ export class CodeIndex {
     if (dirty.size === 0) {
       return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
     }
+    const report = options.onProgress ?? this.#onProgress;
+    const total = triples.length;
+    let completed = 0;
+    report?.({ phase: "similarity-cache", completed, total });
     const fullRefresh = states.size === 0 || dirty.size > Math.max(8, Math.ceil(triples.length * 0.25));
     if (fullRefresh) {
       for (const triple of triples) {
@@ -1187,6 +1193,8 @@ export class CodeIndex {
         });
         sourcesRefreshed += 1;
         pairsStored += neighbors.length;
+        completed += 1;
+        report?.({ phase: "similarity-cache", completed, total });
       }
       return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
     }
@@ -1213,6 +1221,8 @@ export class CodeIndex {
       });
       sourcesRefreshed += 1;
       pairsStored += top.length;
+      completed += 1;
+      report?.({ phase: "similarity-cache", completed, total });
     }
     for (const triple of triples) {
       throwIfAborted(options.signal);
@@ -1254,6 +1264,8 @@ export class CodeIndex {
         pairsStored += merged.length;
       }
       sourcesRefreshed += 1;
+      completed += 1;
+      report?.({ phase: "similarity-cache", completed, total });
     }
     return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
   }

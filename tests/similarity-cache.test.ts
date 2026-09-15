@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
 import { crossSearch } from "../src/search/cross-search.js";
+import type { IndexProgress } from "../src/types.js";
 import { FakeEmbeddingProvider, temporaryRoot, write } from "./helpers.js";
 
 function seed(root: string): void {
@@ -190,6 +191,52 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     const results = [];
     for await (const result of crossSearch({ source: index, minLines: 1 })) results.push(result);
     expect(results.length).toBeGreaterThan(0);
+    index.close();
+  });
+
+  it("reports similarity-cache fill progress like vector generation", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const events: IndexProgress[] = [];
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: new FakeEmbeddingProvider(),
+      onProgress: (value) => events.push(value),
+    });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    events.length = 0;
+
+    const functionCount = index.status().functionCount;
+    expect(functionCount).toBeGreaterThan(1);
+    await index.refreshSimilarityCache({ width: 10 });
+    const fill = events.filter((event) => event.phase === "similarity-cache");
+    expect(fill[0]).toEqual({ phase: "similarity-cache", completed: 0, total: functionCount });
+    expect(fill.at(-1)).toEqual({ phase: "similarity-cache", completed: functionCount, total: functionCount });
+    expect(fill.every((event, position) => position === 0 || event.completed >= fill[position - 1]!.completed)).toBe(true);
+
+    events.length = 0;
+    await index.refreshSimilarityCache({ width: 10 });
+    expect(events.filter((event) => event.phase === "similarity-cache")).toEqual([]);
+    index.close();
+  });
+
+  it("forwards cache-fill progress to cross-search callers", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+
+    const events: IndexProgress[] = [];
+    for await (const _result of crossSearch({
+      source: index,
+      limitPerFunction: 3,
+      includeSymmetricDuplicates: true,
+      minLines: 1,
+      onCacheProgress: (value) => events.push(value),
+    })) { /* drain */ }
+    expect(events.length).toBeGreaterThan(0);
+    expect(events[0]).toMatchObject({ phase: "similarity-cache", completed: 0 });
+    expect(events.at(-1)!.completed).toBe(events.at(-1)!.total);
     index.close();
   });
 });
