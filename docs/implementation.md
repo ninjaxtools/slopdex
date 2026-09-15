@@ -53,12 +53,13 @@ Storage uses Node's `node:sqlite` and `sqlite-vec`. Writable connections enable 
 - `functions`: identity, names, signatures, locations, source, provenance, and embedding/description references.
 - `embeddings`: code, description, and query vectors keyed by embedding profile, operation, and exact input.
 - `function_vectors`: synchronized `vec0` storage for filtered code-vector nearest-neighbor queries.
+- `similarity_cache` / `similarity_cache_state`: persisted per-function top-neighbor lists backing same-index cross-search and cohesion analysis (see below).
 - `description_cache`: generated description text keyed independently by description profile and complete source context.
 - `parse_cache`: successful Tree-sitter extraction results keyed by parser strategy, path, and file-content hash.
 - `callable_provenance`: first-seen committed source identity.
 - `indexing_errors`: diagnostics associated with files.
 
-Current schema version is `8`. Schemas 6 and 7 are migrated in place by adding file-description state when necessary and building the nearest-neighbor vector table; earlier schemas require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. Forced rebuilds clear logical index state while retaining content-addressed caches when possible; incompatible older databases are recreated. Enabled OpenAI description settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`.
+Current schema version is `9`. Schemas 6-8 migrate in place: 6 and 7 gain file-description state and the nearest-neighbor vector table, and 8 gains the similarity-cache tables; earlier schemas require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. Forced rebuilds clear logical index state while retaining content-addressed caches when possible; incompatible older databases are recreated. Enabled OpenAI description settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`.
 
 ### Diagnostics
 
@@ -96,6 +97,10 @@ similarity = (codeSimilarity + descriptionSimilarity + fileDescriptionSimilarity
 All component scores and the average are computed in one SQLite query. Name, line-count, and path exclusions plus similarity bounds apply before ranking/limiting. Range upper bounds are exclusive. Combined JSON includes component scores; analysis metadata records mode, weights, and description profiles. Cohesion JSON uses schema version 3 for the three-component scoring contract.
 
 Cross-search selects sources, queries neighbors per source, and deduplicates unordered same-index pairs unless symmetric results are requested. Self-matches are excluded in same-index queries. Same-file exclusion uses canonical roots and file identity to handle aliases. With the `cohesion` option, each selected match receives its physical path distance and matches are re-ranked by descending distance, then similarity. Cluster formatting builds connected components from emitted matches and sorts by member count, then name; transitive connectivity does not imply all-to-all similarity.
+
+### Similarity cache
+
+Same-index cross-search and cohesion analysis read through a persisted pairwise-similarity cache instead of issuing one vector query per source function on every run. `CodeIndex.refreshSimilarityCache({ width })` runs first: it compares each function's current code/description/file-description embedding triple against `similarity_cache_state` and re-queries only new or changed functions (full neighbor scans for the dirty set, then an exact merge-trim pass over clean functions reusing the symmetric dirty scans). Unchanged pairs are never recomputed, deleted functions disappear through foreign-key cascades plus a backfill check, and cache writes never touch the index generation. `cachedSimilarToFunction` then serves each source's top-`width` neighbors with the same threshold/line-count/name-regex/path filters as a live query, falling back to a live vector query on any miss, staleness, narrow entry, or filter truncation. Cross-index search still queries live vectors; read-only indexes read (but never refresh) the cache.
 
 ### Cohesion metrics
 

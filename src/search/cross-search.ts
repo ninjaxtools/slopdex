@@ -60,6 +60,13 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
     }));
   }
   const seenPairs = new Set<string>();
+  const useCache = sameIndex && !options.source.readOnly;
+  if (useCache) {
+    await options.source.refreshSimilarityCache({
+      width: Math.min(200, Math.max(50, limit * 5)),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+  }
   for (let index = 0; index < sourceFunctions.length; index += 1) {
     throwIfAborted(options.signal);
     const source = sourceFunctions[index]!;
@@ -67,8 +74,11 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
     const canonicalSourceFile = sourceRoot ? await canonicalFile(sourceRoot, source.path) : undefined;
     const excludedTargetPaths = canonicalSourceFile ? targetPathsByCanonicalFile.get(canonicalSourceFile) : undefined;
     const excludePaths = excludedTargetPaths ? { excludePaths: excludedTargetPaths } : {};
+    const similar = useCache
+      ? options.source.cachedSimilarToFunction.bind(options.source)
+      : options.source.similarToFunction.bind(options.source);
     const candidates = sameIndex
-      ? options.source.similarToFunction(source.id, {
+      ? similar(source.id, {
         includeDescriptions,
         limit,
         minSimilarity: options.minSimilarity ?? -1,

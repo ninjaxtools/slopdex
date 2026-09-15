@@ -46,16 +46,32 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
     .filter((callable) => candidateIds.has(callable.id));
 
   const neighborCache = new Map<number, Set<number>>();
+  const useCache = !options.source.readOnly;
+  if (useCache) {
+    await options.source.refreshSimilarityCache({
+      width: Math.min(200, Math.max(50, neighbors * 5)),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+  }
   const neighborsFor = (callable: IndexedFunction): SimilarityResult[] => {
     throwIfAborted(options.signal);
-    const matches = options.source.similarToFunction(callable.id, {
-      includeDescriptions: scoring.similarityMode === "code-description-file-average",
-      limit: neighbors,
-      minSimilarity,
-      ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
-      minLines,
-      ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
-    }).filter((match) => candidateIds.has(match.function.id));
+    const matches = (useCache
+      ? options.source.cachedSimilarToFunction(callable.id, {
+        includeDescriptions: scoring.similarityMode === "code-description-file-average",
+        limit: neighbors,
+        minSimilarity,
+        ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+        minLines,
+        ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
+      })
+      : options.source.similarToFunction(callable.id, {
+        includeDescriptions: scoring.similarityMode === "code-description-file-average",
+        limit: neighbors,
+        minSimilarity,
+        ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+        minLines,
+        ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
+      })).filter((match) => candidateIds.has(match.function.id));
     neighborCache.set(callable.id, new Set(matches.map((match) => match.function.id)));
     return matches;
   };

@@ -18,7 +18,7 @@ import type {
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "8";
+const SCHEMA_VERSION = "9";
 const KNN_TIE_OVERFETCH = 32;
 const VEC0_MAX_K = 4096;
 const VEC0_MAX_DIMENSIONS = 8192;
@@ -147,9 +147,13 @@ export class IndexDatabase {
     this.#db.close();
   }
 
+  public get isReadOnly(): boolean {
+    return this.#readOnly;
+  }
+
   #initializeSchema(): void {
     const existingVersion = this.#metadataTableExists() ? this.#metadata("schema_version") : null;
-    if (existingVersion && existingVersion !== "6" && existingVersion !== "7" && existingVersion !== SCHEMA_VERSION) {
+    if (existingVersion && existingVersion !== "6" && existingVersion !== "7" && existingVersion !== "8" && existingVersion !== SCHEMA_VERSION) {
       throw new IncompatibleIndexError(`Unsupported index schema version ${existingVersion}.`);
     }
     this.#db.exec(`
@@ -249,8 +253,19 @@ export class IndexDatabase {
         this.#db.exec("ROLLBACK");
         throw error;
       }
+    } else if (existingVersion === "8") {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(similarityCacheSchema());
+        this.#setMetadata("schema_version", SCHEMA_VERSION);
+        this.#db.exec("COMMIT");
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
     }
     this.#db.exec("CREATE INDEX IF NOT EXISTS files_description_embedding ON files(file_description_embedding_id);");
+    this.#db.exec(similarityCacheSchema());
   }
 
   #metadataTableExists(): boolean {
@@ -876,6 +891,185 @@ export class IndexDatabase {
     return bufferVector(row.vector);
   }
 
+  public similarityCacheTriples(): Array<{
+    functionId: number;
+    codeEmbeddingId: number;
+    descriptionEmbeddingId: number | null;
+    fileDescriptionEmbeddingId: number | null;
+  }> {
+    return this.#db.prepare(`
+      SELECT f.id AS functionId, f.embedding_id AS codeEmbeddingId,
+        f.description_embedding_id AS descriptionEmbeddingId,
+        files.file_description_embedding_id AS fileDescriptionEmbeddingId
+      FROM functions f JOIN files ON files.path = f.path
+      ORDER BY f.id
+    `).all() as Array<{
+      functionId: number;
+      codeEmbeddingId: number;
+      descriptionEmbeddingId: number | null;
+      fileDescriptionEmbeddingId: number | null;
+    }>;
+  }
+
+  public similarityCacheStates(mode: string): Map<number, {
+    codeEmbeddingId: number;
+    descriptionEmbeddingId: number | null;
+    fileDescriptionEmbeddingId: number | null;
+    cachedWidth: number;
+    generation: number;
+  }> {
+    const rows = this.#db.prepare(`
+      SELECT function_id AS functionId, code_embedding_id AS codeEmbeddingId,
+        description_embedding_id AS descriptionEmbeddingId,
+        file_description_embedding_id AS fileDescriptionEmbeddingId,
+        cached_width AS cachedWidth, generation
+      FROM similarity_cache_state WHERE similarity_mode = ?
+    `).all(mode) as Array<{
+      functionId: number;
+      codeEmbeddingId: number;
+      descriptionEmbeddingId: number | null;
+      fileDescriptionEmbeddingId: number | null;
+      cachedWidth: number;
+      generation: number;
+    }>;
+    return new Map(rows.map((row) => [row.functionId, {
+      codeEmbeddingId: row.codeEmbeddingId,
+      descriptionEmbeddingId: row.descriptionEmbeddingId,
+      fileDescriptionEmbeddingId: row.fileDescriptionEmbeddingId,
+      cachedWidth: row.cachedWidth,
+      generation: row.generation,
+    }]));
+  }
+
+  public cachedSimilarityNeighbors(sourceId: number, mode: string): Array<SimilarityResult> {
+    const rows = this.#db.prepare(`
+      SELECT f.*, c.similarity, c.similarity AS base_similarity,
+        c.code_similarity AS code_similarity,
+        c.description_similarity AS description_similarity,
+        c.file_description_similarity AS file_description_similarity
+      FROM similarity_cache c JOIN functions f ON f.id = c.target_id
+      WHERE c.source_id = ? AND c.similarity_mode = ?
+      ORDER BY c.similarity DESC, f.id ASC
+    `).all(sourceId, mode) as unknown as Array<FunctionRow & {
+      similarity: number;
+      base_similarity: number;
+      code_similarity: number | null;
+      description_similarity: number | null;
+      file_description_similarity: number | null;
+    }>;
+    const fused = mode !== "code";
+    return rows.map((row) => ({
+      function: toIndexedFunction(row),
+      similarity: row.similarity,
+      ...(fused && row.code_similarity !== null ? { codeSimilarity: row.code_similarity } : {}),
+      ...(fused && row.description_similarity !== null ? { descriptionSimilarity: row.description_similarity } : {}),
+      ...(fused && row.file_description_similarity !== null ? { fileDescriptionSimilarity: row.file_description_similarity } : {}),
+    }));
+  }
+
+  public storeSimilarityNeighbors(
+    sourceId: number,
+    mode: string,
+    neighbors: readonly SimilarityResult[],
+    state: {
+      codeEmbeddingId: number;
+      descriptionEmbeddingId: number | null;
+      fileDescriptionEmbeddingId: number | null;
+      cachedWidth: number;
+      generation: number;
+    },
+  ): void {
+    if (this.#readOnly) return;
+    this.#transaction(() => {
+      this.#db.prepare("DELETE FROM similarity_cache WHERE source_id = ? AND similarity_mode = ?").run(sourceId, mode);
+      const insert = this.#db.prepare(`
+        INSERT INTO similarity_cache(
+          source_id, target_id, similarity_mode, similarity,
+          code_similarity, description_similarity, file_description_similarity
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const neighbor of neighbors) {
+        insert.run(
+          sourceId,
+          neighbor.function.id,
+          mode,
+          neighbor.similarity,
+          neighbor.codeSimilarity ?? null,
+          neighbor.descriptionSimilarity ?? null,
+          neighbor.fileDescriptionSimilarity ?? null,
+        );
+      }
+      this.#db.prepare(`
+        INSERT INTO similarity_cache_state(
+          function_id, code_embedding_id, description_embedding_id,
+          file_description_embedding_id, similarity_mode, cached_width, generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(function_id, similarity_mode) DO UPDATE SET
+          code_embedding_id = excluded.code_embedding_id,
+          description_embedding_id = excluded.description_embedding_id,
+          file_description_embedding_id = excluded.file_description_embedding_id,
+          cached_width = excluded.cached_width,
+          generation = excluded.generation
+      `).run(
+        sourceId,
+        state.codeEmbeddingId,
+        state.descriptionEmbeddingId,
+        state.fileDescriptionEmbeddingId,
+        mode,
+        state.cachedWidth,
+        state.generation,
+      );
+    });
+  }
+
+  public similarityCacheInfo(): { cachedSources: number; cachedPairs: number } {
+    const sources = this.#db.prepare("SELECT COUNT(*) AS count FROM similarity_cache_state").get() as { count: number };
+    const pairs = this.#db.prepare("SELECT COUNT(*) AS count FROM similarity_cache").get() as { count: number };
+    return { cachedSources: Number(sources.count), cachedPairs: Number(pairs.count) };
+  }
+
+  public similarityCacheCounts(mode: string): Map<number, number> {
+    const rows = this.#db.prepare(`
+      SELECT source_id AS sourceId, COUNT(*) AS count
+      FROM similarity_cache WHERE similarity_mode = ? GROUP BY source_id
+    `).all(mode) as Array<{ sourceId: number; count: number }>;
+    return new Map(rows.map((row) => [row.sourceId, Number(row.count)]));
+  }
+
+  public touchSimilarityCacheState(
+    functionId: number,
+    mode: string,
+    state: {
+      codeEmbeddingId: number;
+      descriptionEmbeddingId: number | null;
+      fileDescriptionEmbeddingId: number | null;
+      cachedWidth: number;
+      generation: number;
+    },
+  ): void {
+    if (this.#readOnly) return;
+    this.#db.prepare(`
+      INSERT INTO similarity_cache_state(
+        function_id, code_embedding_id, description_embedding_id,
+        file_description_embedding_id, similarity_mode, cached_width, generation
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(function_id, similarity_mode) DO UPDATE SET
+        code_embedding_id = excluded.code_embedding_id,
+        description_embedding_id = excluded.description_embedding_id,
+        file_description_embedding_id = excluded.file_description_embedding_id,
+        cached_width = excluded.cached_width,
+        generation = excluded.generation
+    `).run(
+      functionId,
+      state.codeEmbeddingId,
+      state.descriptionEmbeddingId,
+      state.fileDescriptionEmbeddingId,
+      mode,
+      state.cachedWidth,
+      state.generation,
+    );
+  }
+
   public status(): IndexStatus {
     const functionCount = Number((this.#db.prepare("SELECT COUNT(*) AS count FROM functions").get() as { count: number }).count);
     const fileCount = Number((this.#db.prepare("SELECT COUNT(*) AS count FROM files").get() as { count: number }).count);
@@ -1014,6 +1208,33 @@ function errorsFromDatabase(database: DatabaseSync): IndexingError[] {
     ...JSON.parse(row.diagnostic) as IndexingIssue,
     id: row.id, sourceMode: row.source_mode, indexedCommit: row.indexed_commit,
   }));
+}
+
+function similarityCacheSchema(): string {
+  return `
+    CREATE TABLE IF NOT EXISTS similarity_cache (
+      source_id INTEGER NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+      target_id INTEGER NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+      similarity_mode TEXT NOT NULL,
+      similarity REAL NOT NULL,
+      code_similarity REAL,
+      description_similarity REAL,
+      file_description_similarity REAL,
+      PRIMARY KEY (source_id, target_id, similarity_mode)
+    );
+    CREATE INDEX IF NOT EXISTS similarity_cache_source ON similarity_cache(source_id, similarity_mode, similarity DESC);
+    CREATE INDEX IF NOT EXISTS similarity_cache_target ON similarity_cache(target_id, similarity_mode);
+    CREATE TABLE IF NOT EXISTS similarity_cache_state (
+      function_id INTEGER NOT NULL REFERENCES functions(id) ON DELETE CASCADE,
+      similarity_mode TEXT NOT NULL,
+      code_embedding_id INTEGER NOT NULL,
+      description_embedding_id INTEGER,
+      file_description_embedding_id INTEGER,
+      cached_width INTEGER NOT NULL,
+      generation INTEGER NOT NULL,
+      PRIMARY KEY (function_id, similarity_mode)
+    );
+  `;
 }
 
 function functionVectorsSchema(dimensions: number): string {

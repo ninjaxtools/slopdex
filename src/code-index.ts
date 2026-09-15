@@ -6,6 +6,7 @@ import { CodeIndexError, GitDivergenceError } from "./errors.js";
 import { GitRepository, type GitChange, type GitTreeEntry } from "./git/repository.js";
 import { GitignoreRules } from "./gitignore.js";
 import { CALLABLE_PARSER_CACHE_VERSION, languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
+import { analysisSimilarity } from "./search/similarity.js";
 import { SourcePolicy } from "./source-policy.js";
 import { IndexDatabase, type IndexedFileState, type PreparedCallable, type PreparedDescription, type PreparedFile } from "./storage/database.js";
 import { isDescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
@@ -44,6 +45,8 @@ import {
 const DEFAULT_MAX_FILE_SIZE = 1024 * 1024;
 const DEFAULT_BATCH_SIZE = 32;
 const RERANK_CANDIDATE_MULTIPLIER = 5;
+const DEFAULT_SIMILARITY_CACHE_WIDTH = 50;
+const MAX_SIMILARITY_CACHE_WIDTH = 200;
 
 export class CodeIndex {
   public readonly rootDir: string;
@@ -1097,6 +1100,202 @@ export class CodeIndex {
     return this.#database.vectorForFunction(functionId, kind);
   }
 
+  public get readOnly(): boolean {
+    return this.#database.isReadOnly;
+  }
+
+  public similarityCacheInfo(): { cachedSources: number; cachedPairs: number } {
+    return this.#database.similarityCacheInfo();
+  }
+
+  /**
+   * Incrementally refresh the persisted pairwise-similarity cache for same-index
+   * analysis. Only functions whose embeddings changed (plus a merge pass over the
+   * remaining functions when the changed set is small) are re-queried; unchanged
+   * pairs are reused. Call before cross-search/cohesion, then read through
+   * {@link cachedSimilarToFunction}. Best-effort under concurrent writers: a
+   * later refresh repairs any rows raced by an overlapping update.
+   */
+  public async refreshSimilarityCache(options: {
+    width?: number;
+    signal?: AbortSignal;
+  } = {}): Promise<{
+    similarityMode: string;
+    width: number;
+    sourcesRefreshed: number;
+    pairsStored: number;
+    skipped: boolean;
+  }> {
+    const width = Math.min(
+      MAX_SIMILARITY_CACHE_WIDTH,
+      Math.max(1, Math.floor(options.width ?? DEFAULT_SIMILARITY_CACHE_WIDTH)),
+    );
+    const mode = analysisSimilarity(this.status()).similarityMode;
+    const includeDescriptions = mode !== "code";
+    if (this.#database.isReadOnly) {
+      return { similarityMode: mode, width, sourcesRefreshed: 0, pairsStored: 0, skipped: true };
+    }
+    throwIfAborted(options.signal);
+    const generation = this.#database.getGeneration();
+    const triples = this.#database.similarityCacheTriples();
+    if (triples.length <= 1) {
+      return { similarityMode: mode, width, sourcesRefreshed: 0, pairsStored: 0, skipped: false };
+    }
+    const states = this.#database.similarityCacheStates(mode);
+    const tripleById = new Map(triples.map((triple) => [triple.functionId, triple]));
+    const dirty = new Set<number>();
+    for (const triple of triples) {
+      throwIfAborted(options.signal);
+      const state = states.get(triple.functionId);
+      if (!state
+        || state.codeEmbeddingId !== triple.codeEmbeddingId
+        || state.descriptionEmbeddingId !== triple.descriptionEmbeddingId
+        || state.fileDescriptionEmbeddingId !== triple.fileDescriptionEmbeddingId
+        || state.cachedWidth < width) {
+        dirty.add(triple.functionId);
+      }
+    }
+    if (dirty.size === 0) {
+      const counts = this.#database.similarityCacheCounts(mode);
+      const complete = triples.length - 1;
+      for (const triple of triples) {
+        if ((counts.get(triple.functionId) ?? 0) < Math.min(width, complete)) {
+          dirty.add(triple.functionId);
+        }
+      }
+    }
+    let sourcesRefreshed = 0;
+    let pairsStored = 0;
+    if (dirty.size === 0) {
+      return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
+    }
+    const fullRefresh = states.size === 0 || dirty.size > Math.max(8, Math.ceil(triples.length * 0.25));
+    if (fullRefresh) {
+      for (const triple of triples) {
+        throwIfAborted(options.signal);
+        const neighbors = this.similarToFunction(triple.functionId, {
+          ...(includeDescriptions ? { includeDescriptions: true } : {}),
+          limit: Math.min(width, triples.length - 1),
+          minSimilarity: -1,
+        }).slice(0, width);
+        this.#database.storeSimilarityNeighbors(triple.functionId, mode, neighbors, {
+          codeEmbeddingId: triple.codeEmbeddingId,
+          descriptionEmbeddingId: triple.descriptionEmbeddingId,
+          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
+          cachedWidth: width,
+          generation,
+        });
+        sourcesRefreshed += 1;
+        pairsStored += neighbors.length;
+      }
+      return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
+    }
+    const functionsById = new Map(this.allFunctions().map((callable) => [callable.id, callable]));
+    const lean = new Map<number, Map<number, SimilarityResult>>();
+    for (const dirtyId of dirty) {
+      throwIfAborted(options.signal);
+      const full = this.similarToFunction(dirtyId, {
+        ...(includeDescriptions ? { includeDescriptions: true } : {}),
+        limit: triples.length - 1,
+        minSimilarity: -1,
+      });
+      const byTarget = new Map<number, SimilarityResult>();
+      for (const match of full) byTarget.set(match.function.id, match);
+      lean.set(dirtyId, byTarget);
+      const triple = tripleById.get(dirtyId)!;
+      const top = full.slice(0, width);
+      this.#database.storeSimilarityNeighbors(dirtyId, mode, top, {
+        codeEmbeddingId: triple.codeEmbeddingId,
+        descriptionEmbeddingId: triple.descriptionEmbeddingId,
+        fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
+        cachedWidth: width,
+        generation,
+      });
+      sourcesRefreshed += 1;
+      pairsStored += top.length;
+    }
+    for (const triple of triples) {
+      throwIfAborted(options.signal);
+      if (dirty.has(triple.functionId)) continue;
+      const cached = this.#database.cachedSimilarityNeighbors(triple.functionId, mode);
+      const kept = cached.filter((match) => !dirty.has(match.function.id) && functionsById.has(match.function.id));
+      const added: SimilarityResult[] = [];
+      for (const [dirtyId, byTarget] of lean) {
+        if (dirtyId === triple.functionId) continue;
+        const match = byTarget.get(triple.functionId);
+        const dirtyFunction = functionsById.get(dirtyId);
+        if (match && dirtyFunction) {
+          const { function: _function, ...scores } = match;
+          added.push({ ...scores, function: dirtyFunction });
+        }
+      }
+      const merged = [...kept, ...added]
+        .sort((left, right) => right.similarity - left.similarity || left.function.id - right.function.id)
+        .slice(0, width);
+      const unchanged = merged.length === cached.length
+        && merged.every((match, index) => match.function.id === cached[index]!.function.id
+          && match.similarity === cached[index]!.similarity);
+      if (unchanged) {
+        this.#database.touchSimilarityCacheState(triple.functionId, mode, {
+          codeEmbeddingId: triple.codeEmbeddingId,
+          descriptionEmbeddingId: triple.descriptionEmbeddingId,
+          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
+          cachedWidth: width,
+          generation,
+        });
+      } else {
+        this.#database.storeSimilarityNeighbors(triple.functionId, mode, merged, {
+          codeEmbeddingId: triple.codeEmbeddingId,
+          descriptionEmbeddingId: triple.descriptionEmbeddingId,
+          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
+          cachedWidth: width,
+          generation,
+        });
+        pairsStored += merged.length;
+      }
+      sourcesRefreshed += 1;
+    }
+    return { similarityMode: mode, width, sourcesRefreshed, pairsStored, skipped: false };
+  }
+
+  /**
+   * Same-index neighbor lookup backed by {@link refreshSimilarityCache}.
+   * Returns cache rows filtered exactly like {@link similarToFunction} and falls
+   * back to a live vector query whenever the cache entry is missing, stale,
+   * narrower than requested, or too truncated to satisfy the filters.
+   */
+  public cachedSimilarToFunction(functionId: number, options: {
+    includeDescriptions?: boolean;
+    limit: number;
+    minSimilarity: number;
+    maxSimilarity?: number;
+    excludePaths?: readonly string[];
+    minLines?: number;
+    nameRegex?: string;
+  }): SimilarityResult[] {
+    const mode = options.includeDescriptions ? "code-description-file-average" : "code";
+    const live = (): SimilarityResult[] => this.similarToFunction(functionId, options);
+    const states = this.#database.similarityCacheStates(mode);
+    const state = states.get(functionId);
+    if (!state || state.cachedWidth < options.limit || state.generation !== this.#database.getGeneration()) {
+      return live();
+    }
+    const triples = this.#database.similarityCacheTriples();
+    const triple = triples.find((value) => value.functionId === functionId);
+    if (!triple
+      || triple.codeEmbeddingId !== state.codeEmbeddingId
+      || triple.descriptionEmbeddingId !== state.descriptionEmbeddingId
+      || triple.fileDescriptionEmbeddingId !== state.fileDescriptionEmbeddingId) {
+      return live();
+    }
+    const cached = this.#database.cachedSimilarityNeighbors(functionId, mode);
+    const filtered = filterSimilarityResults(cached, options);
+    if (filtered.length >= options.limit) return filtered.slice(0, options.limit);
+    const totalOthers = triples.length - 1;
+    if (cached.length < totalOthers) return live();
+    return filtered;
+  }
+
   public vectorForFile(filePath: string): number[] {
     return this.#database.vectorForFile(filePath);
   }
@@ -1311,4 +1510,25 @@ function groupBy<T>(values: readonly T[], keyFor: (value: T) => string): Map<str
     groups.set(key, group);
   }
   return groups;
+}
+
+function filterSimilarityResults(
+  cached: readonly SimilarityResult[],
+  options: {
+    minSimilarity: number;
+    maxSimilarity?: number;
+    excludePaths?: readonly string[];
+    minLines?: number;
+    nameRegex?: string;
+  },
+): SimilarityResult[] {
+  const excluded = new Set(options.excludePaths ?? []);
+  const nameRegex = compileNameRegex(options.nameRegex);
+  const minLines = options.minLines ?? 1;
+  return cached.filter((match) =>
+    match.similarity >= options.minSimilarity
+    && (options.maxSimilarity === undefined || match.similarity < options.maxSimilarity)
+    && match.function.lineCount >= minLines
+    && !excluded.has(match.function.path)
+    && (!nameRegex || nameRegex.test(match.function.qualifiedName)));
 }
