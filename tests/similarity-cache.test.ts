@@ -93,6 +93,53 @@ describe("similarity cache", () => {
     index.close();
   });
 
+  it("never narrows repaired rows on incremental refresh", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await index.refreshSimilarityCache({ width: 1, minSimilarity: -1 });
+
+    // Widen one entry through read-repair.
+    const firstId = index.allFunctions()[0]!.id;
+    index.cachedSimilarToFunction(firstId, { limit: 3, minSimilarity: -1 });
+    const widths = (): number[] => {
+      const db = new DatabaseSync(index.indexPath, { readOnly: true });
+      try {
+        return (db.prepare("SELECT DISTINCT cached_width AS width FROM similarity_cache_state").all() as Array<{ width: number }>)
+          .map((row) => row.width);
+      } finally {
+        db.close();
+      }
+    };
+    expect(widths()).toContain(200);
+
+    // Dirty an unrelated file, then refresh at the narrow width again.
+    write(root, "beta.ts", `
+export function authenticateUser(user: string) { return Boolean(user); }
+export function multiplyNumbers(a: number, b: number) { return a * b * 2; }
+`);
+    await index.updateFiles({ upsert: ["beta.ts"] });
+    await index.refreshSimilarityCache({ width: 1, minSimilarity: -1 });
+    expect(widths()).toContain(200);
+    const states = (): Array<{ function_id: number; complete: number }> => {
+      const db = new DatabaseSync(index.indexPath, { readOnly: true });
+      try {
+        return db.prepare("SELECT function_id, complete FROM similarity_cache_state").all() as
+          Array<{ function_id: number; complete: number }>;
+      } finally {
+        db.close();
+      }
+    };
+    // The repaired row stays complete even though other rows are incomplete.
+    expect(states().find((row) => row.function_id === firstId)).toMatchObject({ complete: 1 });
+
+    // Steady state is a no-op again.
+    const settled = await index.refreshSimilarityCache({ width: 1, minSimilarity: -1 });
+    expect(settled.sourcesRefreshed).toBe(0);
+    index.close();
+  });
+
   it("incrementally updates changed functions and stays exact", async () => {
     const root = temporaryRoot();
     seed(root);

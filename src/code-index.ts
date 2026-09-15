@@ -1253,26 +1253,32 @@ export class CodeIndex {
     }
     const functionsById = new Map(this.allFunctions().map((callable) => [callable.id, callable]));
     const lean = new Map<number, Map<number, SimilarityResult>>();
+    // Dirty scans must cover the widest band any clean row keeps, or merged
+    // rows would silently lose pairs below the request floor.
+    let scanFloor = floor;
+    for (const state of states.values()) scanFloor = Math.min(scanFloor, state.floor);
     for (const dirtyId of dirty) {
       throwIfAborted(options.signal);
+      const prior = states.get(dirtyId);
+      const keepWidth = Math.max(width, prior?.cachedWidth ?? width);
       const full = this.similarToFunction(dirtyId, {
         ...(includeDescriptions ? { includeDescriptions: true } : {}),
         limit: triples.length - 1,
-        minSimilarity: floor,
+        minSimilarity: scanFloor,
       });
       const byTarget = new Map<number, SimilarityResult>();
       for (const match of full) byTarget.set(match.function.id, match);
       lean.set(dirtyId, byTarget);
       const triple = tripleById.get(dirtyId)!;
-      const top = full.slice(0, width);
+      const top = full.slice(0, keepWidth);
       this.#database.storeSimilarityNeighbors(dirtyId, mode, top, {
         codeEmbeddingId: triple.codeEmbeddingId,
         descriptionEmbeddingId: triple.descriptionEmbeddingId,
         fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-        cachedWidth: width,
+        cachedWidth: keepWidth,
         generation,
-        floor,
-        complete: full.length <= width,
+        floor: scanFloor,
+        complete: full.length <= keepWidth,
       });
       sourcesRefreshed += 1;
       pairsStored += top.length;
@@ -1282,41 +1288,48 @@ export class CodeIndex {
     for (const triple of triples) {
       throwIfAborted(options.signal);
       if (dirty.has(triple.functionId)) continue;
+      // Never narrow a row the read-repair path widened: keep the lowest
+      // floor served and the widest entry stored, or every refresh demotes
+      // repaired rows and every analysis run re-repairs them with full scans.
+      const prior = states.get(triple.functionId);
+      const keepFloor = Math.min(floor, prior?.floor ?? floor);
+      const keepWidth = Math.max(width, prior?.cachedWidth ?? width);
       const cached = this.#database.cachedSimilarityNeighbors(triple.functionId, mode);
-      const kept = cached.filter((match) => match.similarity >= floor
+      const kept = cached.filter((match) => match.similarity >= keepFloor
         && !dirty.has(match.function.id) && functionsById.has(match.function.id));
       const added: SimilarityResult[] = [];
       for (const [dirtyId, byTarget] of lean) {
         if (dirtyId === triple.functionId) continue;
         const match = byTarget.get(triple.functionId);
         const dirtyFunction = functionsById.get(dirtyId);
-        if (match && dirtyFunction) {
+        if (match && match.similarity >= keepFloor && dirtyFunction) {
           const { function: _function, ...scores } = match;
           added.push({ ...scores, function: dirtyFunction });
         }
       }
       const plusOne = [...kept, ...added]
         .sort((left, right) => right.similarity - left.similarity || left.function.id - right.function.id)
-        .slice(0, width + 1);
-      const merged = plusOne.slice(0, width);
-      const contributorsComplete = triples.every((candidate) =>
-        dirty.has(candidate.functionId) || states.get(candidate.functionId)?.complete === true);
-      const complete = plusOne.length <= width && contributorsComplete;
+        .slice(0, keepWidth + 1);
+      const merged = plusOne.slice(0, keepWidth);
+      // Completeness is per-row: the merge reuses this row's own pairs and
+      // exact dirty scans covering its whole band, so it stays complete
+      // exactly when it was complete and nothing was truncated. A global
+      // check here would let one incomplete row flip the entire index to
+      // incomplete on every refresh, and every later lookup would re-scan.
+      const complete = plusOne.length <= keepWidth && (prior?.complete ?? false);
       const unchanged = merged.length === cached.length
         && merged.every((match, index) => match.function.id === cached[index]!.function.id
           && match.similarity === cached[index]!.similarity);
       if (unchanged) {
-        // Rows are untouched, but the merge already applied the new floor and
-        // width: record them without rewriting the neighbor rows. When narrowing
-        // dropped no rows, the previous (lower) floor still holds.
-        const narrowed = cached.some((match) => match.similarity < floor);
+        // Rows are untouched: record the preserved floor and width without
+        // rewriting the neighbor rows.
         this.#database.touchSimilarityCacheState(triple.functionId, mode, {
           codeEmbeddingId: triple.codeEmbeddingId,
           descriptionEmbeddingId: triple.descriptionEmbeddingId,
           fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-          cachedWidth: width,
+          cachedWidth: keepWidth,
           generation,
-          floor: narrowed ? floor : (states.get(triple.functionId)?.floor ?? floor),
+          floor: keepFloor,
           storedCount: merged.length,
           complete,
         });
@@ -1325,9 +1338,9 @@ export class CodeIndex {
           codeEmbeddingId: triple.codeEmbeddingId,
           descriptionEmbeddingId: triple.descriptionEmbeddingId,
           fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-          cachedWidth: width,
+          cachedWidth: keepWidth,
           generation,
-          floor,
+          floor: keepFloor,
           complete,
         });
         pairsStored += merged.length;
