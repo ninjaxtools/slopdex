@@ -6,20 +6,21 @@ This is Dexter. He is a sloppy slime and could benefit from some vector search t
 
 Please note that an embedding-provider API key is required, which can be either OpenAI or Jina.
 
-Additionally, an LLM provider can be used for the description feature. I use [opencode go](https://opencode.ai/go?ref=RAR3Z744DZ). If you sign up with this link we both get $5 credit.
+Additionally, an LLM provider can be used for the description feature. I use [opencode go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with either DeepSeek or Muse Spark which are fairly good low cost models. Please note that if you sign up to OpenCode Go with the provided link we both get $5 credit.
 
 <br clear="both" />
 
 ## Getting started
 
-
 ```bash
 npm install -g @ninjaxtools/slopdex
+
 export OPENAI_API_KEY="your-api-key"
 # Or configure any of the other providers:
 # export JINA_API_KEY="your-api-key"     # + pass --provider jina
 # export OPENCODE_API_KEY="your-api-key" # for OpenCode Zen/Go descriptions
 # opencode auth login                    # use stored credentials instead of env variables
+
 slopdex search "validate an authenticated session" --limit 10
 ```
 
