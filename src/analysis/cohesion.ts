@@ -1,7 +1,7 @@
 import path from "node:path";
 
 import { CodeIndexError } from "../errors.js";
-import { analysisSimilarity } from "../search/similarity.js";
+import { analysisSimilarity, similarityCacheFloor } from "../search/similarity.js";
 import type {
   CohesionAnalysisOptions,
   CohesionFileReport,
@@ -48,9 +48,10 @@ export async function analyzeCohesion(options: CohesionAnalysisOptions): Promise
   const neighborCache = new Map<number, Set<number>>();
   const useCache = !options.source.readOnly;
   if (useCache) {
+    // Anchored like cross-search: threshold sweeps share one cache band.
     await options.source.refreshSimilarityCache({
       width: Math.min(200, Math.max(50, neighbors * 5)),
-      minSimilarity,
+      minSimilarity: similarityCacheFloor(minSimilarity),
       ...(options.signal ? { signal: options.signal } : {}),
       ...(options.onCacheProgress ? { onProgress: options.onCacheProgress } : {}),
     });

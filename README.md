@@ -69,7 +69,7 @@ slopdex models opencode-go
 slopdex config model opencode-go/gpt-5.6-luna
 ```
 
-### Find duplicate-code
+### Find duplicate code
 
 Compare functions across files, exclude short wrappers, and group matches into clusters:
 
@@ -113,7 +113,7 @@ slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 
 
 ### Find related code stored far apart
 
-When code is similar but not actually duplicated, then `--cohesion` can help find similar code that exists far apart in the filesystem tree, which could potentially by elminated through the use of an abstraction, by ordering matches from farthest to nearest.
+When code is similar but not actually duplicated, then `--cohesion` can help find similar code that exists far apart in the filesystem tree, which could potentially be refactored to make it more cohesive, by ordering matches from farthest to nearest.
 
 ```bash
 slopdex cross-search --cross-file-only --cohesion --threshold 0.8

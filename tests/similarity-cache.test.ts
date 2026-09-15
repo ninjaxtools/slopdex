@@ -5,6 +5,7 @@ import * as sqliteVec from "sqlite-vec";
 
 import { CodeIndex } from "../src/code-index.js";
 import { crossSearch } from "../src/search/cross-search.js";
+import { similarityCacheFloor, SIMILARITY_CACHE_FLOOR_ANCHOR } from "../src/search/similarity.js";
 import type { IndexProgress } from "../src/types.js";
 import { FakeEmbeddingProvider, temporaryRoot, write } from "./helpers.js";
 
@@ -672,6 +673,59 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
         row.stored_count === 200 && row.complete === 0 && row.cached_width === 200 && row.floor === -1)).toBe(true);
     } finally {
       db.close();
+    }
+    index.close();
+  });
+
+  it("anchors refresh floors so threshold sweeps share one cache band", () => {
+    expect(SIMILARITY_CACHE_FLOOR_ANCHOR).toBe(0.3);
+    expect(similarityCacheFloor(undefined)).toBe(-1);
+    expect(similarityCacheFloor(0.9)).toBe(0.3);
+    expect(similarityCacheFloor(0.3)).toBe(0.3);
+    expect(similarityCacheFloor(0.1)).toBe(0.1);
+  });
+
+  it("builds one shared band for cross-searches above the anchor", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    const floors = (): number[] => {
+      const db = new DatabaseSync(index.indexPath, { readOnly: true });
+      try {
+        return (db.prepare("SELECT DISTINCT floor FROM similarity_cache_state").all() as Array<{ floor: number }>)
+          .map((row) => row.floor);
+      } finally {
+        db.close();
+      }
+    };
+    const snapshot = async (minSimilarity: number): Promise<unknown> => {
+      const results = [];
+      for await (const result of crossSearch({
+        source: index,
+        limitPerFunction: 3,
+        includeSymmetricDuplicates: true,
+        minSimilarity,
+        minLines: 1,
+      })) results.push(result);
+      return results.map((result) => ({
+        source: result.source.id,
+        matches: result.matches.map((match) => [match.function.id, match.similarity] as const),
+      }));
+    };
+
+    const high = await snapshot(0.9);
+    expect(floors()).toEqual([0.3]);
+    const mid = await snapshot(0.5);
+    // No expansion rebuild: the band is still the anchored one.
+    expect(floors()).toEqual([0.3]);
+    expect(high).toBeDefined();
+    expect(mid).toBeDefined();
+    for (const minSimilarity of [0.9, 0.5]) {
+      for (const callable of index.allFunctions()) {
+        expect(index.cachedSimilarToFunction(callable.id, { limit: 3, minSimilarity }))
+          .toEqual(index.similarToFunction(callable.id, { limit: 3, minSimilarity }));
+      }
     }
     index.close();
   });

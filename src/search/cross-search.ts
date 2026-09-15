@@ -5,7 +5,7 @@ import { IncompatibleIndexError } from "../errors.js";
 import { cohesionLocation } from "../analysis/cohesion.js";
 import type { CrossSearchOptions, CrossSearchResult } from "../types.js";
 import { assertPositiveInteger, compileNameRegex, throwIfAborted } from "../utils.js";
-import { analysisSimilarity } from "./similarity.js";
+import { analysisSimilarity, similarityCacheFloor } from "./similarity.js";
 
 export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<CrossSearchResult> {
   const target = options.target ?? options.source;
@@ -62,9 +62,11 @@ export async function* crossSearch(options: CrossSearchOptions): AsyncGenerator<
   const seenPairs = new Set<string>();
   const useCache = sameIndex && !options.source.readOnly;
   if (useCache) {
+    // Anchor the floor so threshold sweeps at or above the default share one
+    // cache band; reads still apply the caller's own threshold.
     await options.source.refreshSimilarityCache({
       width: Math.min(200, Math.max(50, limit * 5)),
-      minSimilarity: options.minSimilarity ?? -1,
+      minSimilarity: similarityCacheFloor(options.minSimilarity),
       ...(options.signal ? { signal: options.signal } : {}),
       ...(options.onCacheProgress ? { onProgress: options.onCacheProgress } : {}),
     });
