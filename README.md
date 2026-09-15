@@ -1,6 +1,6 @@
 # slopdex
 
-<img src="dexter2.png" width="280" alt="Dexter, the sloppy slime" />
+<img src="sloppy-dexter.png" width="280" alt="Dexter, the sloppy slime" />
 
 This is Dexter.
 
