@@ -1,6 +1,6 @@
 # Implementation and library API
 
-For installation, command examples, configuration, and result interpretation, see the [operator README](../README.md). This document covers the implementation and programmatic interface.
+For installation, see the [operator README](../README.md). For command examples, configuration, and result interpretation, see the [command reference](reference.md). This document covers the implementation and programmatic interface.
 
 ## Code map
 
@@ -84,7 +84,7 @@ Description generation is cached under both a model-specific key (provider, mode
 
 `search` embeds a query and, when descriptions are complete, scores code, callable-description, and containing-file-description vectors. `search-description` scores callable and file descriptions. Filter-compatible code-only searches up to sqlite-vec's 8,192-dimension limit use the synchronized `vec0` nearest-neighbor table; larger custom profiles plus fused, regex, upper-bound, and multi-path searches retain the exact scalar scoring path. Analysis uses code-only cosine similarity unless all indexed callables and files have enabled description embeddings. Cross-index analysis requires completeness on both sides. Description-generator models may differ across indexes even though embedding profiles must match.
 
-An optional `Reranker` performs a second-stage pass for the two natural-language query methods. After applying name and similarity filters, Cohere and Jina retrieve five times the requested result limit. `OpenAILLMReranker` retrieves its configured candidate count (10 by default), or the result limit when larger. Every reranker receives the query plus candidate path, code metadata/source, and purpose description when available, then returns the requested number in relevance order. Results preserve the embedding/fused `similarity` and add `rerankScore`.
+An optional `Reranker` performs a second-stage pass for the two natural-language query methods. After applying name and similarity filters, Cohere and Jina retrieve five times the requested result limit (all threshold-passing candidates when no limit is requested). `OpenAILLMReranker` retrieves its configured candidate count (10 by default), or the result limit when larger; without a requested limit it reranks all threshold-passing candidates up to its 100-candidate maximum. Every reranker receives the query plus candidate path, code metadata/source, and purpose description when available, then returns the requested number (or all candidates when unlimited) in relevance order. Results preserve the embedding/fused `similarity` and add `rerankScore`.
 
 Cohere defaults to `rerank-v4.0-pro` with `COHERE_API_KEY`; Jina defaults to `jina-reranker-v3.5` with `JINA_API_KEY`. The OpenAI LLM path defaults to `gpt-5.6-luna`, sends a strict JSON schema through the Responses API with high reasoning, no reasoning summary, and `store: false`, and validates result cardinality, indexes, uniqueness, and 0-1 scores. Its prompt preserves descriptions before source and caps source-bearing candidate text at 12,000 tokens each and 80,000 tokens in aggregate. Reranking does not participate in index metadata or cross-search because it creates no persisted artifacts and cross-search is callable-to-callable analysis rather than natural-language retrieval.
 

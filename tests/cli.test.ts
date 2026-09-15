@@ -404,7 +404,7 @@ export function two(value: string) {
       "cross-search",
       "--cross-file-only",
       "--include-symmetric-duplicates",
-      "--limit",
+      "--matches",
       "1",
       "--format",
       "json",
@@ -433,7 +433,7 @@ export function two(value: string) {
       "--cross-file-only",
       "--min-lines",
       "3",
-      "--limit",
+      "--matches",
       "1",
       "--threshold",
       "0.8-1.1",
@@ -446,13 +446,13 @@ export function two(value: string) {
     expect(regexRow.matches.map((match: { function: { qualifiedName: string } }) => match.function.qualifiedName)).toEqual(["external"]);
 
     const sourceRegex = await runCli(root, "cross-search", "-e", "^one$", "--source-path", "same.ts",
-      "--cross-file-only", "--min-lines", "3", "--limit", "1", "--threshold", "0.8-1.1", "--format", "json");
+      "--cross-file-only", "--min-lines", "3", "--matches", "1", "--threshold", "0.8-1.1", "--format", "json");
     expect(sourceRegex.status).toBe(0);
     const selected = JSON.parse(sourceRegex.stdout);
     expect(selected.source.qualifiedName).toBe("one");
     expect(selected.matches.map((match: { function: { qualifiedName: string } }) => match.function.qualifiedName)).toEqual(["external"]);
     expect((await runCli(root, "cross-search", "--regex", "^one$", "--source-path", "same.ts",
-      "--cross-file-only", "--min-lines", "3", "--limit", "1", "--threshold", "0.8-1.1", "--format", "json")).stdout).toBe(sourceRegex.stdout);
+      "--cross-file-only", "--min-lines", "3", "--matches", "1", "--threshold", "0.8-1.1", "--format", "json")).stdout).toBe(sourceRegex.stdout);
     const empty = await runCli(root, "cross-search", "--regexp", "^missing$", "--format", "json");
     expect(empty.status).toBe(0);
     expect(empty.stdout).toBe("");
@@ -519,12 +519,12 @@ export function two(value: string) {
     await index.updateFromGit();
     index.close();
 
-    const summary = await runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--limit", "2");
+    const summary = await runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--matches", "2");
     expect(summary.status).toBe(0);
     expect(summary.stdout).toContain("[distance 4]");
     expect(summary.stdout.indexOf("packages/feature/three.ts")).toBeLessThan(summary.stdout.indexOf("src/two.ts"));
 
-    const json = await runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--limit", "2", "--format", "json");
+    const json = await runCli(root, "cross-search", "--cohesion", "--include-symmetric-duplicates", "--matches", "2", "--format", "json");
     expect(json.status).toBe(0);
     const rows = json.stdout.trim().split("\n").map((line) => JSON.parse(line));
     const one = rows.find((row) => row.source.qualifiedName === "one");
@@ -582,6 +582,24 @@ export function two(value: string) {
     expect(invalidDescriptionProvider.stderr).toContain("Unsupported description provider: unknown");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
+    for (const command of ["search", "search-description"]) {
+      const matchesRejected = await runCli(root, command, "query", "--matches", "2");
+      expect(matchesRejected.status).toBe(2);
+      expect(matchesRejected.stderr).toContain("--matches is only available for cross-search");
+      expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+    }
+
+    for (const args of [
+      ["cross-search", "--matches", "0"],
+      ["cross-search", "--limit", "0"],
+      ["search", "query", "--limit", "0"],
+    ]) {
+      const invalid = await runCli(root, ...args);
+      expect(invalid.status).toBe(2);
+      expect(invalid.stderr).toMatch(/must be a positive integer/);
+      expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+    }
+
   });
 });
 
@@ -614,8 +632,8 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
       "slopdex search",
       "slopdex descriptions enable",
       "slopdex search-description",
-      "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5",
-      "slopdex cross-search --cohesion --threshold 0.8 --limit 20 --format summary",
+      "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --matches 5 --limit 5",
+      "slopdex cross-search --cohesion --threshold 0.8 --matches 20 --format summary",
     ]) expect(result.stdout).toContain(example);
     expect(result.stdout).toContain("--source-path <path>");
     expect(result.stdout).toContain("--description-provider <name>");
@@ -629,6 +647,8 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
     expect(result.stdout).toContain("--no-reindex");
     expect(result.stdout).toContain("--cross-file-only");
     expect(result.stdout).toContain("--min-lines <number>");
+    expect(result.stdout).toContain("--matches <number>");
+    expect(result.stdout).toContain("--limit <number>");
     expect(result.stdout).toContain("--regex <regex>");
     expect(result.stdout).toContain("-e, --regexp <regex>");
     expect(result.stdout).toContain("--cohesion");

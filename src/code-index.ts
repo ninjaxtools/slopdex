@@ -982,8 +982,8 @@ export class CodeIndex {
   public async searchDescription(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
     if (!this.#database.descriptionsEnabled()) throw new CodeIndexError("Descriptions are not enabled; run descriptions enable first.");
     if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
-    const limit = options.limit ?? 10;
-    assertPositiveInteger(limit, "limit");
+    const limit = options.limit;
+    if (limit !== undefined) assertPositiveInteger(limit, "limit");
     const candidateLimit = this.#candidateLimit(limit);
     compileNameRegex(options.nameRegex);
     throwIfAborted(options.signal);
@@ -991,7 +991,9 @@ export class CodeIndex {
     throwIfAborted(options.signal);
     const includeFileDescriptions = this.#descriptionScoringAvailable();
     const results = this.#database.searchVector(vector, {
-      descriptions: true, limit: candidateLimit, minSimilarity: options.minSimilarity ?? -1,
+      descriptions: true,
+      ...(candidateLimit === undefined ? {} : { limit: candidateLimit }),
+      minSimilarity: options.minSimilarity ?? -1,
       ...(includeFileDescriptions ? { fileDescriptionVector: vector } : {}),
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -1001,8 +1003,8 @@ export class CodeIndex {
 
   public async similaritySearch(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
     if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
-    const limit = options.limit ?? 10;
-    assertPositiveInteger(limit, "limit");
+    const limit = options.limit;
+    if (limit !== undefined) assertPositiveInteger(limit, "limit");
     const candidateLimit = this.#candidateLimit(limit);
     compileNameRegex(options.nameRegex);
     throwIfAborted(options.signal);
@@ -1010,7 +1012,7 @@ export class CodeIndex {
     const includeDescriptions = this.#descriptionScoringAvailable();
     const results = this.searchByVector(vector, {
       ...(includeDescriptions ? { descriptionVector: vector, fileDescriptionVector: vector } : {}),
-      limit: candidateLimit,
+      ...(candidateLimit === undefined ? {} : { limit: candidateLimit }),
       ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
       minSimilarity: options.minSimilarity ?? -1,
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
@@ -1018,7 +1020,8 @@ export class CodeIndex {
     return await this.#rerank(options.query, results, limit, options.signal);
   }
 
-  #candidateLimit(limit: number): number {
+  #candidateLimit(limit: number | undefined): number | undefined {
+    if (limit === undefined) return undefined;
     if (!this.reranker) return limit;
     if (this.reranker.maximumCandidateCount !== undefined && limit > this.reranker.maximumCandidateCount) {
       throw new CodeIndexError(`${this.reranker.profile.provider} reranker supports at most ${this.reranker.maximumCandidateCount} results.`);
@@ -1034,16 +1037,16 @@ export class CodeIndex {
   async #rerank(
     query: string,
     candidates: SimilarityResult[],
-    limit: number,
+    limit: number | undefined,
     signal?: AbortSignal,
   ): Promise<SimilarityResult[]> {
-    if (!this.reranker || candidates.length === 0) return candidates.slice(0, limit);
+    if (!this.reranker || candidates.length === 0) return limit === undefined ? candidates : candidates.slice(0, limit);
     const documents = candidates.map(({ function: callable }) => [
       `path: ${callable.path}`,
       callable.description ? `description:\n${callable.description}` : null,
       callable.embeddingInput,
     ].filter((value): value is string => value !== null).join("\n"));
-    const rerankLimit = Math.min(limit, candidates.length);
+    const rerankLimit = limit === undefined ? candidates.length : Math.min(limit, candidates.length);
     const rankings = await this.reranker.rerank(query, documents, signal ? { limit: rerankLimit, signal } : { limit: rerankLimit });
     throwIfAborted(signal);
     const seen = new Set<number>();
@@ -1449,7 +1452,7 @@ export class CodeIndex {
   public searchByVector(vector: readonly number[], options: {
     descriptionVector?: readonly number[];
     fileDescriptionVector?: readonly number[];
-    limit: number;
+    limit?: number;
     minSimilarity: number;
     maxSimilarity?: number;
     excludePaths?: readonly string[];

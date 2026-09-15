@@ -74,6 +74,23 @@ export function belowThreshold() { return 3; }
     index.close();
   });
 
+  it("defaults to unlimited threshold-filtered results unless --limit is passed", async () => {
+    const root = temporaryRoot();
+    write(root, "functions.ts", Array.from({ length: 12 }, (_, index) =>
+      `export function f${String(index).padStart(2, "0")}() { return ${index}; }`).join("\n"));
+    const provider: EmbeddingProvider = {
+      profile: { provider: "controlled", model: "unlimited", dimensions: 2 },
+      embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    const index = new CodeIndex({ rootDir: root, provider });
+    await index.updateFiles({ upsert: ["functions.ts"] });
+
+    expect(await index.similaritySearch({ query: "anything", minSimilarity: 0.5 })).toHaveLength(12);
+    expect(await index.similaritySearch({ query: "anything", minSimilarity: 0.5, limit: 5 })).toHaveLength(5);
+    index.close();
+  });
+
   it("retains scalar search support above sqlite-vec's dimension limit", async () => {
     const root = temporaryRoot();
     write(root, "function.ts", "export function largeVector() { return 1; }\n");

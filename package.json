@@ -23,6 +23,7 @@
     ".agents/skills/slopdex/SKILL.md",
     "dist",
     "docs/implementation.md",
+    "docs/reference.md",
     "README.md",
     "scripts/install-opencode-skill.mjs"
   ],

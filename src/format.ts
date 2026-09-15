@@ -25,7 +25,7 @@ function distanceDetails(match: SimilarityResult | CrossSearchMatch): string {
     : "";
 }
 
-export function formatSimilarityClusters(results: readonly CrossSearchResult[], sameIndex: boolean): string {
+export function formatSimilarityClusters(results: readonly CrossSearchResult[], sameIndex: boolean, limit?: number): string {
   const combined = results.some((result) => result.matches.some((match) => match.descriptionSimilarity !== undefined));
   const nodes = new Map<string, { function: IndexedFunction; role: "source" | "target" }>();
   const neighbors = new Map<string, Set<string>>();
@@ -76,8 +76,9 @@ export function formatSimilarityClusters(results: readonly CrossSearchResult[], 
   }
   clusters.sort((left, right) => right.members.length - left.members.length
     || clusterFunctionName(left.members[0]!, sameIndex).localeCompare(clusterFunctionName(right.members[0]!, sameIndex)));
-  if (clusters.length === 0) return "No clusters.";
-  return clusters.map((cluster, index) => {
+  const limited = limit !== undefined ? clusters.slice(0, limit) : clusters;
+  if (limited.length === 0) return "No clusters.";
+  return limited.map((cluster, index) => {
     const similarity = cluster.min === cluster.max
       ? cluster.min.toFixed(4)
       : `${cluster.min.toFixed(4)}-${cluster.max.toFixed(4)}`;

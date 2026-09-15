@@ -82,6 +82,24 @@ describe("formatSimilarityClusters", () => {
     expect(formatSimilarityClusters([], true)).toBe("No clusters.");
   });
 
+  it("limits emitted clusters to the output limit without changing membership", () => {
+    const one = indexedFunction("src/one.ts", "one", 1);
+    const two = indexedFunction("src/two.ts", "two", 2);
+    const three = indexedFunction("src/three.ts", "three", 3);
+    const four = indexedFunction("src/four.ts", "four", 4);
+    const five = indexedFunction("src/five.ts", "five", 5);
+    const results: CrossSearchResult[] = [
+      { source: one, matches: [{ function: two, similarity: 0.95 }] },
+      { source: two, matches: [{ function: three, similarity: 0.85 }] },
+      { source: four, matches: [{ function: five, similarity: 0.9 }] },
+    ];
+
+    const limited = formatSimilarityClusters(results, true, 1);
+    expect(limited).toContain("Cluster 1 (3 functions");
+    expect(limited).not.toContain("Cluster 2");
+    expect(formatSimilarityClusters(results, true)).toContain("Cluster 2");
+  });
+
   it("labels source and target members in cross-index clusters", () => {
     const source = indexedFunction("src/same.ts", "same", 1);
     const target = indexedFunction("src/same.ts", "same", 1);

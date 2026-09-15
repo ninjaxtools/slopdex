@@ -769,7 +769,7 @@ export class IndexDatabase {
     descriptions?: boolean;
     descriptionVector?: readonly number[];
     fileDescriptionVector?: readonly number[];
-    limit: number;
+    limit?: number;
     minSimilarity: number;
     maxSimilarity?: number;
     excludeId?: number;
@@ -787,12 +787,13 @@ export class IndexDatabase {
       .concat(fileDescription ? ["file_description_similarity"] : [])
       .join(" + ");
     const excludePaths = options.excludePaths ?? [];
-    if (!options.descriptions && !fused && options.maxSimilarity === undefined
+    if (options.limit !== undefined
+      && !options.descriptions && !fused && options.maxSimilarity === undefined
       && options.nameRegex === undefined && excludePaths.length <= 1 && options.limit <= VEC0_MAX_K
       && this.#profile.dimensions <= VEC0_MAX_DIMENSIONS) {
       const excludeIdFilter = options.excludeId === undefined ? "" : "AND function_id_filter != ?";
       const excludePathFilter = excludePaths.length === 0 ? "" : "AND path != ?";
-      const candidateLimit = Math.min(options.limit + KNN_TIE_OVERFETCH, VEC0_MAX_K);
+      const candidateLimit = Math.min((options.limit as number) + KNN_TIE_OVERFETCH, VEC0_MAX_K);
       const rows = this.#db.prepare(`
         WITH nearest AS MATERIALIZED (
           SELECT function_id, distance
@@ -814,12 +815,13 @@ export class IndexDatabase {
         ...excludePaths,
         options.minSimilarity,
       ) as unknown as Array<FunctionRow & { similarity: number; base_similarity: number }>;
-      const boundary = rows[options.limit - 1];
+      const limit = options.limit as number;
+      const boundary = rows[limit - 1];
       const last = rows.at(-1);
       const ambiguousTie = rows.length === candidateLimit && boundary && last
         && Math.abs(boundary.similarity - last.similarity) <= Number.EPSILON;
       if (!ambiguousTie) {
-        return rows.slice(0, options.limit)
+        return rows.slice(0, limit)
           .map((row) => ({ function: toIndexedFunction(row), similarity: row.similarity }));
       }
     }
@@ -866,7 +868,7 @@ export class IndexDatabase {
       options.minSimilarity,
       options.maxSimilarity ?? null,
       options.maxSimilarity ?? null,
-      options.limit,
+      options.limit ?? -1,
     ) as unknown as Array<FunctionRow & {
       similarity: number;
       base_similarity: number;

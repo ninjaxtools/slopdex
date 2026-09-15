@@ -93,6 +93,7 @@ const parsed = (() => {
         regex: { type: "string" },
         regexp: { type: "string", short: "e" },
         limit: { type: "string" },
+        matches: { type: "string" },
         threshold: { type: "string" },
         format: { type: "string" },
         cohesion: { type: "boolean", default: false },
@@ -262,7 +263,7 @@ async function main(): Promise<void> {
         const results = await (command === "search-description" ? index.searchDescription.bind(index) : index.similaritySearch.bind(index))({
           query,
           ...(nameRegex !== undefined ? { nameRegex } : {}),
-          limit: numberOption(parsed.values.limit, 10, "limit"),
+          ...(parsed.values.limit === undefined ? {} : { limit: positiveIntegerOption(parsed.values.limit, 1, "limit") }),
           minSimilarity: threshold.min,
           ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
         });
@@ -334,11 +335,14 @@ async function runCrossSearch(
   const format = outputFormat(parsed.values.cohesion ? "summary" : "clusters");
   const threshold = similarityThreshold();
   const indexProgress = sourceOptions.onProgress;
+  const outputLimit = parsed.values.limit === undefined
+    ? undefined
+    : positiveIntegerOption(parsed.values.limit, 1, "limit");
   const searchOptions: CrossSearchOptions = {
     source,
     ...(target ? { target } : {}),
     sourceFilter: crossSearchSourceFilter(),
-    limitPerFunction: numberOption(parsed.values.limit, 5, "limit"),
+    limitPerFunction: positiveIntegerOption(parsed.values.matches, 5, "matches"),
     minSimilarity: threshold.min,
     ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
     includeSymmetricDuplicates: parsed.values["include-symmetric-duplicates"],
@@ -355,10 +359,12 @@ async function runCrossSearch(
     if (format === "clusters") {
       const results: CrossSearchResult[] = [];
       for await (const result of crossSearch(searchOptions)) results.push(result);
-      process.stdout.write(`${formatSimilarityClusters(results, !target)}\n`);
+      process.stdout.write(`${formatSimilarityClusters(results, !target, outputLimit)}\n`);
       return;
     }
+    let emitted = 0;
     for await (const result of crossSearch(searchOptions)) {
+      if (outputLimit !== undefined && emitted >= outputLimit) break;
       if (format === "summary") {
         process.stdout.write(`${formatSimilaritySummary(result.matches, result.source)}\n`);
       } else {
@@ -368,6 +374,7 @@ async function runCrossSearch(
           scoring: result.scoring,
         })}\n`);
       }
+      emitted += 1;
     }
   } finally {
     target?.close();
@@ -826,6 +833,9 @@ function validateInvocation(): void {
   if (parsed.values.cohesion && command !== "cross-search") {
     throw new CodeIndexError("--cohesion is only available for cross-search.");
   }
+  if (parsed.values.matches !== undefined && command !== "cross-search") {
+    throw new CodeIndexError("--matches is only available for cross-search.");
+  }
   const nameRegex = qualifiedNameRegex();
   if (nameRegex !== undefined) {
     if (!["search", "search-description", "cross-search"].includes(command!)) {
@@ -893,7 +903,7 @@ function validateInvocation(): void {
     case "search":
     case "search-description": {
       if (!positionals.join(" ").trim()) throw new CodeIndexError(`${command} requires a query.`);
-      validateLimit(10);
+      validateOutputLimit();
       similarityThreshold();
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
@@ -905,7 +915,8 @@ function validateInvocation(): void {
       if (parsed.values["target-config"] && !parsed.values["target-root"]) {
         throw new CodeIndexError("--target-config requires --target-root and --target-index.");
       }
-      validateLimit(5);
+      validateMatches(5);
+      validateOutputLimit();
       similarityThreshold();
       if (parsed.values.cohesion && outputFormat("summary") === "clusters") {
         throw new CodeIndexError("clusters format does not preserve cohesion match order; use summary or json.");
@@ -919,8 +930,12 @@ function validateInvocation(): void {
   }
 }
 
-function validateLimit(defaultValue: number): void {
-  positiveIntegerOption(parsed.values.limit, defaultValue, "limit");
+function validateMatches(defaultValue: number): void {
+  positiveIntegerOption(parsed.values.matches, defaultValue, "matches");
+}
+
+function validateOutputLimit(): void {
+  if (parsed.values.limit !== undefined) positiveIntegerOption(parsed.values.limit, 1, "limit");
 }
 
 function positiveIntegerOption(value: string | undefined, defaultValue: number, name: string): number {
@@ -1027,7 +1042,7 @@ Working-tree updates use current rules; committed-only snapshots use rules from 
 
 Analysis Examples:
   Duplicate Analysis:
-    slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
+    slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --matches 5 --limit 5
 
     Cluster 1 (3 functions, similarity 0.9124-0.9568)
       src/auth/session.ts:18:1 :: validateSession
@@ -1041,7 +1056,7 @@ Analysis Examples:
     transitive links, so every function need not directly match every other function.
 
   Physical Cohesion Review:
-    slopdex cross-search --cohesion --threshold 0.8 --limit 20 --format summary
+    slopdex cross-search --cohesion --threshold 0.8 --matches 20 --format summary
 
     src/auth/session.ts :: validateSession
       0.9400  packages/http/middleware.ts :: authenticate  [distance 4]
@@ -1092,7 +1107,8 @@ Options:
   --callables                         With reindex-files, also regenerate callable descriptions
   --ignore-errors                     Silence warnings about persisted indexing errors
   --verbose                           Log every external model call instead of one per kind/model
-  --limit <number>                    Search result limit
+  --limit <number>                    Output limit (default: unlimited; threshold filters results)
+  --matches <number>                  Cross-search matches per source function (default: 5)
   --threshold <number|range>          Show similarities at/above a value or within a range (default: 0.3)
   --format <json|summary|clusters>    Output format (default: summary; cross-search: clusters)
   --cohesion                          Re-rank cross-search matches by physical distance

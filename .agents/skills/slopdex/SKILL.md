@@ -64,16 +64,16 @@ The next index-using command applies the configured description state. A bare mo
 ### Find duplicate candidates
 
 ```bash
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --matches 5 --limit 5
 ```
 
-The default output is connected clusters. This excludes same-file matches and short functions. For source-by-source matches, add `--format summary`.
+The default output is connected clusters. This excludes same-file matches and short functions, keeps 5 matches per source, and emits at most 5 clusters. For source-by-source matches, add `--format summary`. `--limit` caps emitted clusters/sources (unlimited by default); `--matches` caps matches per source (default 5).
 
 Broaden discovery through adjacent score bands when needed:
 
 ```bash
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limit 5
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.8-0.85 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --matches 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.8-0.85 --matches 5
 ```
 
 Ranges include the lower bound and exclude the upper bound. Use `--min-lines 1` when one-line wrappers are relevant.
@@ -99,7 +99,7 @@ Here a source must have changed since the commit and belong to an uncommitted fi
 ### Review physical cohesion
 
 ```bash
-slopdex cross-search --cohesion --threshold 0.8 --limit 20 --format summary
+slopdex cross-search --cohesion --threshold 0.8 --matches 20 --format summary
 slopdex cross-search --cohesion --source-path src/services --threshold 0.8 --format summary
 ```
 
@@ -165,7 +165,8 @@ Explicit relative config/index paths resolve from the current directory. Source 
 
 | Argument | Applies to / behavior |
 | --- | --- |
-| `--limit <number>` | Positive integer. `search`/`search-description`: matches, default `10`. Cross-search: neighbors per source, default `5`. |
+| `--limit <number>` | Positive integer output limit; unlimited unless passed. Query matches, or cross-search clusters (`clusters`) / matched sources (`summary`/JSONL). Threshold filters results. |
+| `--matches <number>` | Cross-search only: matches kept per source function; default `5`. |
 | `--threshold <number\|min-max>` | Both query searches and cross-search. Inclusive minimum or half-open range; default `0.3`. |
 | `--format <json\|summary\|clusters>` | Both query searches, cross-search, and index-errors. Cohesion-ranked cross-search supports summary or JSONL, not clusters. |
 | `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Equivalent case-sensitive JavaScript regex options on qualified names. Query searches filter results before limiting; cross-search filters sources only. |
