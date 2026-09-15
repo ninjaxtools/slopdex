@@ -1200,6 +1200,12 @@ export class IndexDatabase {
     return (this.#db.prepare("SELECT DISTINCT path FROM indexing_errors").all() as Array<{ path: string }>).map((row) => row.path);
   }
 
+  public filesWithFileTooLargeErrors(): string[] {
+    return (this.#db.prepare(
+      "SELECT DISTINCT path FROM indexing_errors WHERE json_extract(diagnostic, '$.code') = 'file-too-large'",
+    ).all() as Array<{ path: string }>).map((row) => row.path);
+  }
+
   public needsDiagnosticsScan(): boolean {
     return this.#metadata("diagnostics_scan_pending") === "true";
   }

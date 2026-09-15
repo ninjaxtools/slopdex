@@ -241,8 +241,10 @@ export class CodeIndex {
 
   /**
    * Whether a working-tree refresh changed nothing: same file set, same
-   * content, same language, still working-tree rows, no checkout to clear,
-   * and no recorded errors to retry. Skipping the write avoids a generation
+   * content, same language, and still working-tree rows, with no checkout to
+   * clear. Recorded indexing errors never force a refresh on their own; a
+   * file with errors is retried only when its content changes or via an
+   * explicit updateFiles upsert. Skipping the write avoids a generation
    * bump and, via foreign-key cascades, needlessly invalidating the
    * similarity cache for unchanged files. Description state must already be
    * quiescent: a refresh is what lazily clears stored descriptions after
@@ -251,15 +253,12 @@ export class CodeIndex {
    */
   #isWorkingTreeClean(indexedFiles: IndexedFileState[], prepared: PreparedFile[]): boolean {
     if (this.#database.getCheckpoint() !== null) return false;
-    if (this.#database.needsDiagnosticsScan()) return false;
-    if (this.#database.filesWithErrors().length > 0) return false;
     if (this.#database.descriptionsEnabled()) return false;
     if (indexedFiles.length !== prepared.length) return false;
     const status = this.status();
     if (status.descriptionCount > 0 || status.fileDescriptionCount > 0) return false;
     const indexedByPath = new Map(indexedFiles.map((file) => [file.path, file]));
     return prepared.every((file) => {
-      if (file.unavailable || file.errors.length > 0) return false;
       const indexed = indexedByPath.get(file.path);
       return !!indexed
         && indexed.sourceMode === "working-tree"
@@ -281,8 +280,10 @@ export class CodeIndex {
     const overlayWorkingTree = target === head && options.includeWorkingTree !== false;
     const checkpoint = this.#database.getCheckpoint();
     const generation = this.#database.getGeneration();
-    const diagnosticsScan = this.#database.needsDiagnosticsScan();
-    const retryPaths = new Set(this.#database.filesWithErrors());
+    // Only file-too-large state transitions (e.g. maxFileSize config change)
+    // re-evaluate an unchanged blob; all other recorded errors never force a
+    // retry on their own.
+    const tooLargePaths = new Set(this.#database.filesWithFileTooLargeErrors());
     let reconcileAll = checkpoint === null;
     if (checkpoint && !(await this.#git.isAncestor(checkpoint, target))) {
       if (!options.rebuildOnDivergence) throw new GitDivergenceError(checkpoint, target);
@@ -322,8 +323,12 @@ export class CodeIndex {
       const claimedRenameSources = new Set<string>();
       for (const entry of eligibleEntries) {
         const indexed = indexedByPath.get(entry.path);
-        if (indexed?.sourceMode === "git" && indexed.blobOid === entry.oid && entry.size <= this.#maxFileSize
-          && !diagnosticsScan && !retryPaths.has(entry.path)) continue;
+        // Recorded indexing errors never force a retry on their own; an
+        // unchanged blob is skipped unless its file-too-large state flipped
+        // (e.g. maxFileSize config change). Other errors are retried only
+        // when the blob changes or via an explicit updateFiles upsert.
+        if (indexed?.sourceMode === "git" && indexed.blobOid === entry.oid
+          && (entry.size > this.#maxFileSize) === tooLargePaths.has(entry.path)) continue;
         const matches = renameCandidates.filter((candidate) => (
           candidate.blobOid === entry.oid && !claimedRenameSources.has(candidate.path)
         ));
@@ -340,9 +345,10 @@ export class CodeIndex {
       for (const targetPath of eligibleTargetPaths) {
         const indexed = indexedByPath.get(targetPath);
         const entry = tree.get(targetPath)!;
+        const sizeStateFlipped = indexed?.sourceMode === "git" && indexed.blobOid === entry.oid
+          && (entry.size > this.#maxFileSize) !== tooLargePaths.has(targetPath);
         if (
-          (diagnosticsScan || retryPaths.has(targetPath) || entry.size > this.#maxFileSize
-            || !indexed || (indexed.sourceMode === "git" && indexed.blobOid !== entry.oid))
+          (!indexed || (indexed.sourceMode === "git" && indexed.blobOid !== entry.oid) || sizeStateFlipped)
           && !upserts.has(targetPath)
         ) {
           upserts.set(targetPath, { entry });
@@ -386,8 +392,8 @@ export class CodeIndex {
     }
     for (const [filePath, { entry, previousPath }] of upserts) {
       const indexed = indexedByPath.get(filePath);
-      if (!previousPath && indexed?.sourceMode === "git" && indexed.blobOid === entry.oid && entry.size <= this.#maxFileSize
-        && !diagnosticsScan && !retryPaths.has(filePath)) upserts.delete(filePath);
+      if (!previousPath && indexed?.sourceMode === "git" && indexed.blobOid === entry.oid
+        && (entry.size > this.#maxFileSize) === tooLargePaths.has(filePath)) upserts.delete(filePath);
     }
 
     const workingPrepared: PreparedFile[] = [];
@@ -495,7 +501,6 @@ export class CodeIndex {
     let embeddingsCreated = await this.#attachEmbeddings([...prepared, ...workingPrepared], options.signal);
     const noChanges = (
       !reconcileAll
-      && !diagnosticsScan
       && checkpoint === target
       && prepared.length === 0
       && deletes.size === 0

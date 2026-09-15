@@ -74,7 +74,7 @@ describe("persistent indexing diagnostics", () => {
     expect(parseFileCallables("modern.ts", 'export type * from "./types.js"; function good() {}', () => {}).errors).toEqual([]);
   });
 
-  it("continues after a parser exception and retries failed Git files even when the blob is unchanged", async () => {
+  it("continues after a parser exception and does not retry failed Git files when the blob is unchanged", async () => {
     const root = temporaryRoot();
     initGit(root);
     write(root, "a.ts", "function first() {}\n");
@@ -87,8 +87,19 @@ describe("persistent indexing diagnostics", () => {
     expect(index.allFunctions().map((item) => item.name)).toEqual(["second"]);
     const secondId = index.allFunctions()[0]!.id;
     expect(index.indexErrors()).toMatchObject([{ path: "a.ts", code: "parse-failed", source: "function first() {}\n" }]);
+    const generation = index.status().generation;
+    // Recorded errors never force a refresh on their own: an unchanged blob
+    // is a no-op and keeps the error until the content changes.
     const update = await index.updateFromGit();
-    expect(update.filesUpdated).toBe(1);
+    expect(update.filesUpdated).toBe(0);
+    expect(index.status().generation).toBe(generation);
+    expect(index.allFunctions().find((item) => item.name === "second")!.id).toBe(secondId);
+    expect(index.indexErrors()).toHaveLength(1);
+    // Changing the blob retries the file and clears the error.
+    write(root, "a.ts", "function first() {}\n// touch\n");
+    commitAll(root, "touch a");
+    const recovery = await index.updateFromGit();
+    expect(recovery.filesUpdated).toBe(1);
     expect(index.allFunctions().map((item) => item.name)).toEqual(["first", "second"]);
     expect(index.allFunctions().find((item) => item.name === "second")!.id).toBe(secondId);
     expect(index.indexErrors()).toEqual([]);

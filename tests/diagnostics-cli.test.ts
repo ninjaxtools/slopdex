@@ -49,11 +49,15 @@ describe("CLI indexing diagnostics", () => {
     expect(summary.stdout).toContain(":: broken");
     expect(summary.stderr).toBe("");
     expect(readIndexErrors(indexPath)).toEqual(stored);
-    for (const args of [["status", "--no-reindex"], ["cross-search", "--no-reindex"], ["--help"]]) {
+    for (const args of [["status", "--no-reindex"], ["cross-search", "--no-reindex"]]) {
       const result = run(root, ...args);
       expect(result.status, result.stderr).toBe(0);
       expect(result.stderr).toContain("unresolved indexing error(s)");
     }
+    // --help exits before index diagnostics are read and stays silent.
+    const help = run(root, "--help");
+    expect(help.status).toBe(0);
+    expect(help.stderr).not.toContain("unresolved indexing error(s)");
     const silenced = run(root, "status", "--no-reindex", "--ignore-errors");
     expect(silenced.status).toBe(0);
     expect(JSON.parse(silenced.stdout)).toMatchObject({ indexingErrorCount: stored.length, failedFileCount: 1 });
