@@ -32,7 +32,7 @@ By default only vector embeddings of code is used for search.
 slopdex search "keep the repository index synchronized" --format summary --limit 10
 ```
 
-You can also enable optional description generation which will automatically generate descriptions with a configured LLM provider:
+You can also enable optional description generation which will automatically generate descriptions with a configured LLM provider and include them in the search.
 
 I use [OpenCode Go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with DeepSeek or Muse Spark,
 which are fairly good low-cost models. If you sign up for OpenCode Go through this link, we both
@@ -54,10 +54,9 @@ You can list and configure one of OpenCode's models like this:
 ```bash
 slopdex models opencode-go
 slopdex config model opencode-go/gpt-5.6-luna
-slopdex config descriptions enable
 ```
 
-OpenCode Zen and Go use `OPENCODE_API_KEY`, falling back to the key stored by `opencode auth login` in `~/.local/share/opencode/auth.json`.
+### Reranking
 
 Optionally a second-stage reranker can be enabled for `search` and `search-description`:
 
