@@ -1335,6 +1335,12 @@ export class CodeIndex {
    * re-reading whole tables per function; refresh the cache first and create
    * one reader per analysis run. Best-effort under concurrent writers, like the
    * refresh itself: a concurrent mutation mid-run is picked up by the next run.
+   *
+   * A fallback scan doubles as a read-repair: when the entry is fresh but
+   * unusable (missing, recorded at a higher floor, or incomplete), the scan is
+   * widened to the full cache width and written back, so later lookups hit.
+   * Stale entries are left for the refresh, dense-at-max-width entries cannot
+   * be improved, and read-only indexes never write.
    */
   public cachedSimilarityReader(options: {
     includeDescriptions?: boolean;
@@ -1354,6 +1360,21 @@ export class CodeIndex {
     const triples = this.#database.similarityCacheTriples();
     const tripleById = new Map(triples.map((triple) => [triple.functionId, triple]));
     const generation = this.#database.getGeneration();
+    const readFiltered = (functionId: number, query: {
+      limit: number;
+      minSimilarity: number;
+      maxSimilarity?: number;
+      excludePaths?: readonly string[];
+      minLines?: number;
+      nameRegex?: string;
+    }): SimilarityResult[] => this.#database.cachedSimilarityNeighbors(functionId, mode, {
+      limit: query.limit,
+      minSimilarity: query.minSimilarity,
+      ...(query.maxSimilarity !== undefined ? { maxSimilarity: query.maxSimilarity } : {}),
+      ...(query.minLines !== undefined ? { minLines: query.minLines } : {}),
+      ...(query.nameRegex !== undefined ? { nameRegex: query.nameRegex } : {}),
+      ...(query.excludePaths !== undefined ? { excludePaths: query.excludePaths } : {}),
+    });
     return {
       similarToFunction: (functionId, query) => {
         const live = (): SimilarityResult[] => this.similarToFunction(functionId, query);
@@ -1362,31 +1383,60 @@ export class CodeIndex {
         if ((query.includeDescriptions === true) !== (mode !== "code")) {
           return live();
         }
-        const state = states.get(functionId);
-        if (!state || state.generation !== generation) {
-          return live();
-        }
-        const triple = tripleById.get(functionId);
-        if (!triple
-          || triple.codeEmbeddingId !== state.codeEmbeddingId
-          || triple.descriptionEmbeddingId !== state.descriptionEmbeddingId
-          || triple.fileDescriptionEmbeddingId !== state.fileDescriptionEmbeddingId) {
-          return live();
-        }
-        if (state.floor > query.minSimilarity) {
-          return live();
-        }
         compileNameRegex(query.nameRegex);
-        const cached = this.#database.cachedSimilarityNeighbors(functionId, mode, {
-          limit: query.limit,
-          minSimilarity: query.minSimilarity,
-          ...(query.maxSimilarity !== undefined ? { maxSimilarity: query.maxSimilarity } : {}),
-          ...(query.minLines !== undefined ? { minLines: query.minLines } : {}),
-          ...(query.nameRegex !== undefined ? { nameRegex: query.nameRegex } : {}),
-          ...(query.excludePaths !== undefined ? { excludePaths: query.excludePaths } : {}),
+        const triple = tripleById.get(functionId);
+        if (!triple) {
+          return live();
+        }
+        const state = states.get(functionId);
+        const tripleMatches = !!state
+          && triple.codeEmbeddingId === state.codeEmbeddingId
+          && triple.descriptionEmbeddingId === state.descriptionEmbeddingId
+          && triple.fileDescriptionEmbeddingId === state.fileDescriptionEmbeddingId;
+        if (state && (!tripleMatches || state.generation !== generation)) {
+          return live();
+        }
+        if (state && state.floor <= query.minSimilarity) {
+          const cached = readFiltered(functionId, query);
+          if (cached.length >= query.limit) return cached;
+          if (state.complete) return cached;
+          if (state.storedCount >= MAX_SIMILARITY_CACHE_WIDTH) return live();
+        } else if (this.#database.isReadOnly || this.#database.getGeneration() !== generation) {
+          return live();
+        }
+        // Repair never narrows: entries keep the lowest floor they have served,
+        // so alternating thresholds cannot thrash the cache.
+        const repairFloor = Math.min(query.minSimilarity, state?.floor ?? query.minSimilarity);
+        const width = MAX_SIMILARITY_CACHE_WIDTH;
+        const scanned = this.similarToFunction(functionId, {
+          ...(mode !== "code" ? { includeDescriptions: true } : {}),
+          limit: Math.min(width + 1, tripleById.size - 1),
+          minSimilarity: repairFloor,
         });
+        const neighbors = scanned.slice(0, width);
+        const complete = scanned.length <= width;
+        this.#database.storeSimilarityNeighbors(functionId, mode, neighbors, {
+          codeEmbeddingId: triple.codeEmbeddingId,
+          descriptionEmbeddingId: triple.descriptionEmbeddingId,
+          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
+          cachedWidth: width,
+          generation,
+          floor: repairFloor,
+          complete,
+        });
+        states.set(functionId, {
+          codeEmbeddingId: triple.codeEmbeddingId,
+          descriptionEmbeddingId: triple.descriptionEmbeddingId,
+          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
+          cachedWidth: width,
+          generation,
+          floor: repairFloor,
+          storedCount: neighbors.length,
+          complete,
+        });
+        const cached = readFiltered(functionId, query);
         if (cached.length >= query.limit) return cached;
-        if (state.complete) return cached;
+        if (complete) return cached;
         return live();
       },
     };

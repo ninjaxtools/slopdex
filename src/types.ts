@@ -121,7 +121,7 @@ export interface DescriptionStats {
   descriptionsEnabled: boolean;
 }
 
-export type IndexProgressPhase = "vectors" | "descriptions" | "description-vectors" | "similarity-cache";
+export type IndexProgressPhase = "vectors" | "descriptions" | "description-vectors" | "similarity-cache" | "cross-search";
 
 export interface IndexProgress {
   phase: IndexProgressPhase;

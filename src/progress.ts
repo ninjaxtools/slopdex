@@ -8,6 +8,7 @@ const PHASE_LABELS: Record<IndexProgressPhase, string> = {
   descriptions: "descriptions",
   "description-vectors": "description vectors",
   "similarity-cache": "similarity cache",
+  "cross-search": "cross-search",
 };
 
 let active: TerminalProgress | undefined;

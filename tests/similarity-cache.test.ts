@@ -473,4 +473,142 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
       .toThrow(/Invalid name regex/);
     index.close();
   });
+
+  it("heals poisoned completeness flags through read-repair", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.9 });
+    const indexPath = index.indexPath;
+    const dumpStates = (): Array<{ function_id: number; floor: number; stored_count: number; complete: number; cached_width: number }> => {
+      const db = new DatabaseSync(indexPath, { readOnly: true });
+      try {
+        return db.prepare("SELECT function_id, floor, stored_count, complete, cached_width FROM similarity_cache_state ORDER BY function_id").all() as
+          Array<{ function_id: number; floor: number; stored_count: number; complete: number; cached_width: number }>;
+      } finally {
+        db.close();
+      }
+    };
+    expect(dumpStates().every((row) => row.complete === 1)).toBe(true);
+
+    // Simulate stale flags (e.g. carried over by a migration): sparse but
+    // correct rows marked incomplete, forcing live fallbacks on every run.
+    const poison = new DatabaseSync(indexPath);
+    poison.exec("UPDATE similarity_cache_state SET complete = 0");
+    poison.close();
+    expect(dumpStates().every((row) => row.complete === 0)).toBe(true);
+
+    const reader = index.cachedSimilarityReader();
+    for (const callable of index.allFunctions()) {
+      for (const query of [
+        { limit: 1, minSimilarity: 0.9 },
+        { limit: 3, minSimilarity: 0.9 },
+        { limit: 3, minSimilarity: 0.95 },
+        { limit: 3, minSimilarity: 0.9, excludePaths: ["beta.ts"] },
+      ]) {
+        expect(reader.similarToFunction(callable.id, query))
+          .toEqual(index.similarToFunction(callable.id, query));
+      }
+    }
+    const healed = dumpStates();
+    expect(healed.every((row) => row.complete === 1 && row.floor === 0.9 && row.cached_width === 200)).toBe(true);
+
+    // A second identical run performs no further rewrites.
+    for (const callable of index.allFunctions()) {
+      reader.similarToFunction(callable.id, { limit: 3, minSimilarity: 0.9 });
+    }
+    expect(dumpStates()).toEqual(healed);
+    index.close();
+  });
+
+  it("repairs missing entries without waiting for a refresh", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+
+    const reader = index.cachedSimilarityReader();
+    for (const callable of index.allFunctions()) {
+      expect(reader.similarToFunction(callable.id, { limit: 3, minSimilarity: 0.5 }))
+        .toEqual(index.similarToFunction(callable.id, { limit: 3, minSimilarity: 0.5 }));
+    }
+    expect(index.similarityCacheInfo().cachedSources).toBe(index.status().functionCount);
+    const db = new DatabaseSync(index.indexPath, { readOnly: true });
+    try {
+      const floors = (db.prepare("SELECT DISTINCT floor FROM similarity_cache_state").all() as Array<{ floor: number }>)
+        .map((row) => row.floor);
+      expect(floors).toEqual([0.5]);
+    } finally {
+      db.close();
+    }
+    index.close();
+  });
+
+  it("does not thrash the cache on alternating thresholds", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: 0.9 });
+    const indexPath = index.indexPath;
+    const dumpStates = (): unknown => {
+      const db = new DatabaseSync(indexPath, { readOnly: true });
+      try {
+        return db.prepare("SELECT function_id, floor, stored_count, complete, cached_width FROM similarity_cache_state ORDER BY function_id").all();
+      } finally {
+        db.close();
+      }
+    };
+
+    const reader = index.cachedSimilarityReader();
+    const firstId = index.allFunctions()[0]!.id;
+    expect(reader.similarToFunction(firstId, { limit: 4, minSimilarity: 0.3 }))
+      .toEqual(index.similarToFunction(firstId, { limit: 4, minSimilarity: 0.3 }));
+    // Expansion repair lowers the floor once instead of recomputing per query.
+    const lowered = dumpStates() as Array<{ floor: number }>;
+    expect(lowered.find((row) => row.floor === 0.3)).toBeDefined();
+
+    // Higher thresholds reuse the widened entry without rewriting it.
+    expect(reader.similarToFunction(firstId, { limit: 4, minSimilarity: 0.9 }))
+      .toEqual(index.similarToFunction(firstId, { limit: 4, minSimilarity: 0.9 }));
+    const settled = dumpStates();
+    expect(reader.similarToFunction(firstId, { limit: 4, minSimilarity: 0.3 }))
+      .toEqual(index.similarToFunction(firstId, { limit: 4, minSimilarity: 0.3 }));
+    expect(reader.similarToFunction(firstId, { limit: 4, minSimilarity: 0.9 }))
+      .toEqual(index.similarToFunction(firstId, { limit: 4, minSimilarity: 0.9 }));
+    expect(dumpStates()).toEqual(settled);
+    index.close();
+  });
+
+  it("leaves dense-at-max-width entries to live queries", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await index.refreshSimilarityCache({ width: 10, minSimilarity: -1 });
+    const indexPath = index.indexPath;
+
+    // Fabricate a maxed-out truncated entry: repair cannot improve it, so reads
+    // must fall back without rewriting.
+    const fabricate = new DatabaseSync(indexPath);
+    fabricate.exec("UPDATE similarity_cache_state SET stored_count = 200, complete = 0, cached_width = 200, floor = -1");
+    fabricate.close();
+
+    const reader = index.cachedSimilarityReader();
+    for (const callable of index.allFunctions()) {
+      expect(reader.similarToFunction(callable.id, { limit: 10, minSimilarity: -1 }))
+        .toEqual(index.similarToFunction(callable.id, { limit: 10, minSimilarity: -1 }));
+    }
+    const db = new DatabaseSync(indexPath, { readOnly: true });
+    try {
+      const states = db.prepare("SELECT stored_count, complete, cached_width, floor FROM similarity_cache_state").all() as
+        Array<{ stored_count: number; complete: number; cached_width: number; floor: number }>;
+      expect(states.every((row) =>
+        row.stored_count === 200 && row.complete === 0 && row.cached_width === 200 && row.floor === -1)).toBe(true);
+    } finally {
+      db.close();
+    }
+    index.close();
+  });
 });

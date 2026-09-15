@@ -333,6 +333,7 @@ async function runCrossSearch(
   const target = targetOptions ? new CodeIndexClass({ ...targetOptions, readOnly: true }) : undefined;
   const format = outputFormat(parsed.values.cohesion ? "summary" : "clusters");
   const threshold = similarityThreshold();
+  const indexProgress = sourceOptions.onProgress;
   const searchOptions: CrossSearchOptions = {
     source,
     ...(target ? { target } : {}),
@@ -344,6 +345,11 @@ async function runCrossSearch(
     crossFileOnly: parsed.values["cross-file-only"],
     cohesion: parsed.values.cohesion,
     minLines: minimumLines(),
+    // Per-source read progress (including read-repair scans) on the terminal bar.
+    ...(indexProgress ? {
+      onProgress: (value: { completed: number; total: number }) =>
+        indexProgress({ phase: "cross-search", ...value }),
+    } : {}),
   };
   try {
     if (format === "clusters") {
