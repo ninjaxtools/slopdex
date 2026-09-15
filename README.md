@@ -1,30 +1,51 @@
+<img src="dexter.png" align="right" width="180" alt="Dexter, the slopdex mascot" />
+
 # slopdex
 
-Search functions by meaning, find duplicate-code candidates, and locate related functions spread across a codebase.
+This is Dexter. He is a sloppy slime and could benefit from some vector search to clean up after himself.
 
-## Start here
+## Getting started
 
-Requires an embedding-provider API key. Install, set your key, and run commands from the repository you want to analyze (or pass `--root /path/to/repo`):
-
-Coding agents should start with the bundled [Slopdex agent skill](.agents/skills/slopdex/SKILL.md).
+An embedding-provider API key is required.
+I use [opencode go](https://opencode.ai/go?ref=RAR3Z744DZ) (If you sign up with this link we both get $5 credit.)
+You can also configure OpenAI or Jina. 
 
 ```bash
 npm install -g @ninjaxtools/slopdex
 export OPENAI_API_KEY="your-api-key"
-slopdex search "validate an authenticated session" --format summary --limit 10
+slopdex search "validate an authenticated session" --limit 10
 ```
 
-The first command creates the index automatically. Later commands refresh it before searching.
+The index is created or updated on every command and tracks the current git commit. Changing branches works too.
 
 Add `.slopdex/` to your repository's `.gitignore`.
 
 ### Search code
 
+By default only vector embeddings of code is used for search.
+
 ```bash
 slopdex search "keep the repository index synchronized" --format summary --limit 10
 ```
 
-Optionally enable a hosted second-stage reranker for `search` and `search-description`:
+You can also enable description generation which will automatically generate description with a configured LLM provider:
+
+```bash
+slopdex descriptions enable
+slopdex search-description "keep the repository index synchronized" --format summary --limit 10
+```
+
+You can list and configure one of OpenCode's models like this:
+
+```bash
+slopdex models opencode-go
+slopdex config model opencode-go/gpt-5.6-luna
+slopdex config descriptions enable
+```
+
+OpenCode Zen and Go use `OPENCODE_API_KEY`, falling back to the key stored by `opencode auth login` in `~/.local/share/opencode/auth.json`.
+
+Optionally a second-stage reranker can be enabled for `search` and `search-description`:
 
 ```bash
 export COHERE_API_KEY="your-api-key"
@@ -33,39 +54,22 @@ slopdex config reranker cohere
 # Or use an LLM: export OPENAI_API_KEY="your-api-key" && slopdex config reranker openai
 ```
 
-The config command is the only CLI switch for reranking. Use `slopdex config reranker disable` to return to embedding-only ordering. An optional final argument selects a model, for example `slopdex config reranker cohere rerank-v4.0-fast`. OpenAI LLM reranking defaults to `gpt-5.6-luna` with high reasoning and receives the top 10 embedding results; change the pool with `--reranker-candidates`, for example `slopdex config reranker openai gpt-5.6-luna --reranker-candidates 20`.
+### Find duplicate-code
 
-To search generated descriptions of each function's role instead:
-
-```bash
-slopdex descriptions enable
-slopdex search-description "keep the repository index synchronized" --format summary --limit 10
-```
-
-The default description provider requires `OPENAI_API_KEY` even when Jina supplies embeddings. OpenCode Zen and Go use `OPENCODE_API_KEY`, falling back to the key stored by `opencode auth login` in `~/.local/share/opencode/auth.json`. Description generation can add provider costs; see [descriptions and scoring](#descriptions-and-scoring).
-
-`descriptions disable` turns off description generation while retaining cached data.
-
-To choose from OpenCode's current published models and persist description settings without creating an index:
-
-```bash
-slopdex models opencode-go
-slopdex config model opencode-go/gpt-5.6-luna
-slopdex config descriptions enable
-```
-
-The next index-using command creates or refreshes the index and applies the configured description state.
-You can also pass the selection separately as `slopdex config model --description-provider opencode-go --description-model gpt-5.6-luna`.
-
-### Find duplicate-code candidates
+Compare functions across files, exclude short wrappers, and group matches into clusters:
 
 ```bash
 slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
 ```
 
-Compare functions across files, exclude short wrappers, and group strong matches into clusters. `--limit 5` selects up to five neighbors **per source function**, not five clusters.
+Review adjacent bands with threshold ranges:
 
-### Review changed code or one module
+```bash
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limit 5
+```
+
+Restrict source functions that are used in the cross-search:
 
 ```bash
 slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9
@@ -73,15 +77,13 @@ slopdex cross-search --changed-since origin/main --format summary --threshold 0.
 slopdex cross-search --source-path src/services -e '^UserService\.' --format summary --threshold 0.9
 ```
 
-These select source functions while keeping the full eligible index available for matches.
-
 ### Find related code stored far apart
+
+When code is similar but not actually duplicated, then `--cohesion` can help find similar code that exists far apart in the filesystem tree, which could potentially by elminated through the use of an abstraction, by ordering matches from farthest to nearest.
 
 ```bash
 slopdex cross-search --cohesion --threshold 0.8 --limit 20 --format summary
 ```
-
-`--cohesion` keeps the semantic matches selected by cross-search, annotates them with physical distance, and orders each source's matches from farthest to nearest. Similarity breaks distance ties.
 
 ### Compare repositories
 
@@ -92,17 +94,15 @@ slopdex cross-search \
   --threshold 0.9 --format summary
 ```
 
-Both indexes refresh automatically and must use identical embedding profiles. The target is refreshed with the source command's embedding provider; target configuration supplies file-selection and description settings. Use `--target-config` for a non-default target config.
-
 ### Inspect index health
+
+If some functions can't be indexed a warning is printed. Index errors can be investigated and fixed with the `index-errors` command to ensure the index is complete.
 
 ```bash
 slopdex status
 slopdex index-errors --format summary
 slopdex --version
 ```
-
-`status` refreshes the index and reports coverage, profiles, checkpoint, and error counts. `index-errors` reads saved failures without refreshing or requiring credentials. `--version` prints the built package version.
 
 ## Commands
 
@@ -174,13 +174,6 @@ Explicit relative config and index paths resolve from the current directory, not
 | `--target-root <path>` | Cross-search | Second repository root; requires `--target-index`. |
 | `--target-index <path>` | Cross-search | Second index file; requires `--target-root`. |
 | `--target-config <path>` | Cross-search | Target config; defaults to `<target-root>/.slopdex/config.json`. Requires both target options. |
-
-Review adjacent similarity bands without repeating boundary matches:
-
-```bash
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9 --limit 5
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9 --limit 5
-```
 
 ### Refresh and recovery
 
