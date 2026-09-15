@@ -95,6 +95,8 @@ Cluster 1 (3 functions, similarity 0.9124-0.9568)
 ...
 ```
 
+Using `--cross-file-only` is useful to exclude similar code in the same file.
+
 Review adjacent bands with threshold ranges:
 
 ```bash
@@ -102,7 +104,7 @@ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
 slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
 ```
 
-Restrict source functions that are used in the cross-search:
+### Restrict functions used in the cross-search
 
 Only use uncommitted working-tree functions as sources:
 
@@ -127,7 +129,7 @@ slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 
 When code is similar but not actually duplicated, then `--cohesion` can help find similar code that exists far apart in the filesystem tree, which could potentially by elminated through the use of an abstraction, by ordering matches from farthest to nearest.
 
 ```bash
-slopdex cross-search --cohesion --threshold 0.8
+slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 ```
 
 ### Compare repositories
