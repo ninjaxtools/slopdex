@@ -1,10 +1,6 @@
 # slopdex
 
-<p align="right">
-  <img src="sloppy-dexter.png" width="280" alt="Dexter, the sloppy slime" />
-  <br />
-  <sub><em>Dexter, the sloppy slime</em></sub>
-</p>
+<img src="sloppy-dexter.png" width="280" align="right" alt="Dexter, the sloppy slime" />
 
 Slopdex is intended to help doing analysis on codebases that contain a lot of AI generated code.
 
