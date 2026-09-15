@@ -37,7 +37,6 @@
     "test": "vitest",
     "test:run": "vitest run",
     "smoke": "node scripts/smoke.mjs",
-    "install:skill:opencode": "node scripts/install-opencode-skill.mjs",
     "install:local": "npm run build && npm install -g .",
     "publish:minor": "npm version minor && npm publish --access public",
     "prepack": "npm run build && npm run smoke",
