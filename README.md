@@ -40,7 +40,7 @@ Add `.slopdex/` to your repository's `.gitignore`.
 By default only vector embeddings of code is used for search.
 
 ```bash
-slopdex search "keep the repository index synchronized"
+$ slopdex search "keep the repository index synchronized"
 0.4284  tests/languages.test.ts :: refresh
 0.4200  src/cli.ts :: refreshIndex
 0.4113  src/code-index.ts :: CodeIndex.updateFromGit
@@ -87,7 +87,7 @@ slopdex config reranker cohere
 Compare functions across files, exclude short wrappers, and group matches into clusters:
 
 ```bash
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
+$ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
 Cluster 1 (3 functions, similarity 0.9124-0.9568)
   src/auth/session.ts:18:1 :: validateSession
   src/http/middleware.ts:42:1 :: authenticate
