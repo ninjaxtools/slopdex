@@ -39,11 +39,11 @@ By default only vector embeddings of code is used for search.
 slopdex search "keep the repository index synchronized" --format summary --limit 10
 ```
 
-You can also enable optional description generation which will automatically generate descriptions with a configured LLM provider and include them in the search.
+You can also enable optional description generation which will automatically generate file and function descriptions with a configured LLM provider and include them in the search.
 
-I use [OpenCode Go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with DeepSeek or Muse Spark,
-which are fairly good low-cost models. If you sign up for OpenCode Go through this link, we both
-receive $5 in credit.
+I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low-cost models. If you
+sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
+$5 in credit.
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
