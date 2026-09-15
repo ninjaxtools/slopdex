@@ -119,6 +119,8 @@ slopdex --version
 
 ## Commands
 
+> **WARNING!** LLM generated text below
+
 Usage: `slopdex <command> [arguments] [options]`.
 
 | Command | Purpose | Output |
