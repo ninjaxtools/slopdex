@@ -5,23 +5,12 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
 
-import { CodeIndex } from "./code-index.js";
-import { JinaEmbeddingProvider } from "./embeddings/jina.js";
-import { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { clearProgress, TerminalProgress } from "./progress.js";
-import { CohereReranker, JinaReranker } from "./rerankers/hosted.js";
-import { OpenAILLMReranker } from "./rerankers/openai.js";
-import { crossSearch } from "./search/cross-search.js";
-import {
-  descriptionProviderBaseUrl,
-  isDescriptionProviderName,
-  OpenAIDescriptionProvider,
-  type DescriptionProviderName,
-} from "./descriptions/openai.js";
-import { readIndexErrorCounts, readIndexErrors, resetIndexState } from "./storage/database.js";
 import { compileNameRegex, DEFAULT_PARALLELISM } from "./utils.js";
+import type { CodeIndex } from "./code-index.js";
+import type { DescriptionProviderName } from "./descriptions/openai.js";
 import type {
   CodeIndexOptions,
   CrossSearchOptions,
@@ -34,6 +23,14 @@ import type {
   DescriptionProfile,
   UpdateStats,
 } from "./types.js";
+
+// Lightweight copies kept in sync with src/descriptions/openai.ts so --help,
+// --version, and config validation do not need to load the heavy `ai` SDK.
+const DESCRIPTION_PROVIDER_NAMES = ["openai", "opencode", "opencode-go"] as const;
+
+function isDescriptionProviderName(value: string): value is DescriptionProviderName {
+  return (DESCRIPTION_PROVIDER_NAMES as readonly string[]).includes(value);
+}
 
 declare const __SLOPDEX_VERSION__: string;
 
@@ -128,9 +125,28 @@ if (parsed.values.version) {
   process.exit(0);
 }
 
-// Read persisted diagnostics at exit so cached, failed, and help invocations also
-// report them, and update/delete commands report the final state rather than stale errors.
+if (parsed.values.help || !command) {
+  printHelp();
+  process.exit(parsed.values.help ? 0 : 1);
+}
+
+// Read persisted diagnostics at exit so failed and update/delete commands report
+// the final state rather than stale errors. Registered after the --help early
+// exit, and uses only node:sqlite directly so --help never loads the heavy
+// index/provider graph (ai SDK, tree-sitter, sqlite-vec).
 const diagnosticIndexes = new Set<string>();
+function readErrorCountsLight(indexPath: string): { errors: number; files: number } {
+  const database = new DatabaseSync(indexPath, { readOnly: true });
+  try {
+    if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'indexing_errors'").get()) {
+      return { errors: 0, files: 0 };
+    }
+    const counts = database.prepare("SELECT COUNT(*) AS errors, COUNT(DISTINCT path) AS files FROM indexing_errors").get() as { errors: number; files: number };
+    return { errors: Number(counts.errors), files: Number(counts.files) };
+  } finally {
+    database.close();
+  }
+}
 process.on("exit", () => {
   if (parsed.values["ignore-errors"]) return;
   try {
@@ -144,7 +160,7 @@ process.on("exit", () => {
   for (const indexPath of diagnosticIndexes) {
     try {
       if (!existsSync(indexPath)) continue;
-      const { errors, files } = readIndexErrorCounts(indexPath);
+      const { errors, files } = readErrorCountsLight(indexPath);
       if (errors === 0) continue;
       process.stderr.write(`slopdex: warning: ${errors} unresolved indexing error(s) in ${files} file(s); run slopdex index-errors --index ${JSON.stringify(indexPath)} to inspect, or use --ignore-errors to silence this warning.\n`);
     } catch {
@@ -152,11 +168,6 @@ process.on("exit", () => {
     }
   }
 });
-
-if (parsed.values.help || !command) {
-  printHelp();
-  process.exit(parsed.values.help ? 0 : 1);
-}
 
 void main().catch((error: unknown) => {
   clearProgress();
@@ -179,6 +190,7 @@ async function main(): Promise<void> {
   const config = loadConfig(rootDir, parsed.values.config);
   if (command === "index-errors") {
     const indexPath = path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex/index.sqlite"));
+    const { readIndexErrors } = await import("./storage/database.js");
     const errors = existsSync(indexPath) ? readIndexErrors(indexPath) : [];
     if (outputFormat("summary") === "summary") {
       process.stdout.write(errors.length === 0 ? "No indexing errors.\n" : `${errors.map((error) =>
@@ -187,9 +199,9 @@ async function main(): Promise<void> {
     } else printJson(errors);
     return;
   }
-  const provider = createProvider(config);
-  const reranker = command === "search" || command === "search-description" ? createReranker(config) : undefined;
-  const descriptionProvider = createDescriptionProvider(config);
+  const provider = await createProvider(config);
+  const reranker = command === "search" || command === "search-description" ? await createReranker(config) : undefined;
+  const descriptionProvider = await createDescriptionProvider(config);
   const progress = new TerminalProgress();
   const indexOptions: CodeIndexOptions = {
     rootDir,
@@ -216,6 +228,7 @@ async function main(): Promise<void> {
     parsed.values["no-reindex"],
     descriptionRefresh(config),
   );
+  const { CodeIndex } = await import("./code-index.js");
   const index = new CodeIndex(indexOptions);
   try {
     switch (command) {
@@ -289,7 +302,7 @@ async function runCrossSearch(
   const targetConfig = targetRootDir && !usesSourceAsTarget
     ? loadConfig(targetRootDir, parsed.values["target-config"])
     : undefined;
-  const targetDescriptionProvider = targetConfig ? createDescriptionProvider(targetConfig) : undefined;
+  const targetDescriptionProvider = targetConfig ? await createDescriptionProvider(targetConfig) : undefined;
   const targetOptions: CodeIndexOptions | undefined = targetRootDir && resolvedTargetPath && !usesSourceAsTarget ? {
     rootDir: targetRootDir,
     indexPath: resolvedTargetPath,
@@ -315,7 +328,9 @@ async function runCrossSearch(
       descriptionRefresh(targetConfig!),
     );
   }
-  const target = targetOptions ? new CodeIndex({ ...targetOptions, readOnly: true }) : undefined;
+  const { CodeIndex: CodeIndexClass } = await import("./code-index.js");
+  const { crossSearch } = await import("./search/cross-search.js");
+  const target = targetOptions ? new CodeIndexClass({ ...targetOptions, readOnly: true }) : undefined;
   const format = outputFormat(parsed.values.cohesion ? "summary" : "clusters");
   const threshold = similarityThreshold();
   const searchOptions: CrossSearchOptions = {
@@ -365,6 +380,7 @@ async function ensureIndexUpdated(
   diagnosticIndexes.add(resolveIndexPath(options));
   const initialized = await initializeMissingIndex(options, label, target, noReindex, hooks);
   if (initialized) return initialized;
+  const { CodeIndex } = await import("./code-index.js");
   try {
     const index = new CodeIndex(options);
     try {
@@ -383,6 +399,7 @@ async function ensureIndexUpdated(
     const indexPath = resolveIndexPath(options);
     const descriptionProfile = descriptionProfileForRebuild(indexPath, options.rootDir);
     try {
+      const { resetIndexState } = await import("./storage/database.js");
       resetIndexState(indexPath, options.rootDir, options.provider.profile);
     } catch (resetError) {
       if (!(resetError instanceof IncompatibleIndexError)) throw resetError;
@@ -417,15 +434,18 @@ async function initializeIndex(
   descriptionProfile: DescriptionProfile | null = null,
   hooks?: DescriptionRefreshHooks,
 ): Promise<UpdateStats> {
+  const { CodeIndex } = await import("./code-index.js");
+  const rebuiltDescriptionProvider = descriptionProfile && !options.descriptionProvider
+    ? await createDescriptionProvider({
+      descriptionProvider: descriptionProfile.provider as DescriptionProviderName,
+      descriptionModel: descriptionProfile.model,
+      parallelism: options.parallelism ?? DEFAULT_PARALLELISM,
+      ...(options.verbose ? { verbose: true } : {}),
+    })
+    : undefined;
   const index = new CodeIndex({
     ...options, indexPath,
-    ...(descriptionProfile && !options.descriptionProvider
-      ? { descriptionProvider: new OpenAIDescriptionProvider({
-        provider: descriptionProfile.provider as DescriptionProviderName,
-        model: descriptionProfile.model,
-        parallelism: options.parallelism ?? DEFAULT_PARALLELISM,
-        ...(options.verbose ? { verbose: true } : {}),
-      }) } : {}),
+    ...(rebuiltDescriptionProvider ? { descriptionProvider: rebuiltDescriptionProvider } : {}),
   });
   try {
     if (descriptionProfile) await index.useDescriptions();
@@ -553,8 +573,9 @@ function commandLineConfig(config: FileConfig): FileConfig {
   };
 }
 
-function createDescriptionProvider(config: FileConfig): OpenAIDescriptionProvider | undefined {
+async function createDescriptionProvider(config: FileConfig): Promise<import("./types.js").DescriptionProvider | undefined> {
   if (!config.descriptionProvider && !config.descriptionModel) return undefined;
+  const { OpenAIDescriptionProvider } = await import("./descriptions/openai.js");
   return new OpenAIDescriptionProvider({
     ...(config.descriptionProvider ? { provider: config.descriptionProvider } : {}),
     ...(config.descriptionModel ? { model: config.descriptionModel } : {}),
@@ -696,6 +717,7 @@ async function resolveConfiguredModel(positionalModel: string | undefined): Prom
 }
 
 async function fetchPublishedModels(provider: OpenCodeDescriptionProvider): Promise<PublishedModel[]> {
+  const { descriptionProviderBaseUrl } = await import("./descriptions/openai.js");
   const url = `${descriptionProviderBaseUrl(provider)}/models`;
   let response: Response;
   try {
@@ -738,8 +760,9 @@ function writeConfigFile(configPath: string, config: FileConfig): void {
   renameSync(temporaryPath, configPath);
 }
 
-function createProvider(config: FileConfig): EmbeddingProvider {
+async function createProvider(config: FileConfig): Promise<EmbeddingProvider> {
   if ((config.provider ?? "openai") === "jina") {
+    const { JinaEmbeddingProvider } = await import("./embeddings/jina.js");
     return new JinaEmbeddingProvider({
       ...(config.model ? { model: config.model } : {}),
       ...(config.dimensions ? { dimensions: config.dimensions } : {}),
@@ -747,6 +770,7 @@ function createProvider(config: FileConfig): EmbeddingProvider {
       ...(config.verbose ? { verbose: true } : {}),
     });
   }
+  const { OpenAIEmbeddingProvider } = await import("./embeddings/openai.js");
   return new OpenAIEmbeddingProvider({
     ...(config.model ? { model: config.model } : {}),
     ...(config.dimensions ? { dimensions: config.dimensions } : {}),
@@ -755,21 +779,23 @@ function createProvider(config: FileConfig): EmbeddingProvider {
   });
 }
 
-function createReranker(config: FileConfig): Reranker | undefined {
+async function createReranker(config: FileConfig): Promise<Reranker | undefined> {
   if (config.rerankingEnabled !== true) return undefined;
-  if (config.rerankerProvider === "cohere") {
-    return new CohereReranker({
-      ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
-      ...(config.verbose ? { verbose: true } : {}),
-    });
-  }
-  if (config.rerankerProvider === "jina") {
+  if (config.rerankerProvider === "cohere" || config.rerankerProvider === "jina") {
+    const { CohereReranker, JinaReranker } = await import("./rerankers/hosted.js");
+    if (config.rerankerProvider === "cohere") {
+      return new CohereReranker({
+        ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
+        ...(config.verbose ? { verbose: true } : {}),
+      });
+    }
     return new JinaReranker({
       ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
       ...(config.verbose ? { verbose: true } : {}),
     });
   }
   if (config.rerankerProvider === "openai") {
+    const { OpenAILLMReranker } = await import("./rerankers/openai.js");
     return new OpenAILLMReranker({
       ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
       ...(config.rerankerCandidates ? { candidateCount: config.rerankerCandidates } : {}),

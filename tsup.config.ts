@@ -10,7 +10,10 @@ export default defineConfig({
   dts: true,
   sourcemap: true,
   clean: true,
-  splitting: false,
+  // Enabled so `src/cli.ts` dynamic imports stay lazy: --help/--version load
+  // only the light CLI chunk, not the heavy index/provider graph (ai SDK,
+  // tree-sitter, sqlite-vec).
+  splitting: true,
   removeNodeProtocol: false,
   define: { __SLOPDEX_VERSION__: JSON.stringify(version) },
 });
