@@ -10,19 +10,12 @@ He is a sloppy slime and could benefit from some vector search to clean up after
 
 An embedding-provider API key is required. You can use either OpenAI or Jina.
 
-An LLM provider is optional and enables the description feature. I use [OpenCode
-Go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with DeepSeek or Muse Spark, which are fairly
-good low-cost models. If you sign up for OpenCode Go through this link, we both receive $5 in
-credit.
-
 ```bash
 npm install -g @ninjaxtools/slopdex
 
 export OPENAI_API_KEY="your-api-key"
-# Or configure any of the other providers:
-# export JINA_API_KEY="your-api-key"     # + pass --provider jina
-# export OPENCODE_API_KEY="your-api-key" # for OpenCode Zen/Go descriptions
-# opencode auth login                    # use stored credentials instead of env variables
+# Or
+# export JINA_API_KEY="your-api-key" # and pass --provider jina
 
 slopdex search "validate an authenticated session" --limit 10
 ```
@@ -41,7 +34,18 @@ slopdex search "keep the repository index synchronized" --format summary --limit
 
 You can also enable description generation which will automatically generate description with a configured LLM provider:
 
+An LLM provider is optional and enables the description feature. I use [OpenCode
+Go](https://opencode.ai/go?ref=RAR3Z744DZ) usually with DeepSeek or Muse Spark, which are fairly
+good low-cost models. If you sign up for OpenCode Go through this link, we both receive $5 in
+credit.
+
 ```bash
+export OPENAI_API_KEY="your-api-key"
+# Or
+# export OPENCODE_API_KEY="your-api-key" # for OpenCode Zen/Go descriptions
+# Or
+# opencode auth login                    # use stored credentials instead of env variables
+
 slopdex descriptions enable
 slopdex search-description "keep the repository index synchronized" --format summary --limit 10
 ```
