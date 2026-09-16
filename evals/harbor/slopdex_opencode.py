@@ -60,8 +60,6 @@ SLOPDEX_BLOCK = """{marker}
 
 - Use semantic code search to find code by meaning instead of guessing paths:
   `slopdex search "<describe the code you need>" --threshold {threshold}`
-- Before finishing a change, check uncommitted code for duplicates:
-  `slopdex cross-search --uncommitted --threshold 0.8`
 - Run `slopdex --help` for all commands and options.
 """
 
@@ -70,8 +68,6 @@ GREP_BLOCK = """{marker}
 
 - Use keyword search to find code by meaning instead of guessing paths:
   `rg -n "<describe the code you need>"` (or `grep -rn "<pattern>" .`)
-- Before finishing a change, check uncommitted code for duplicates:
-  `rg -n "<distinctive identifier from your change>"`
 - Run `rg --help` for all options.
 """
 
