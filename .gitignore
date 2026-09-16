@@ -5,3 +5,6 @@ coverage/
 *.sqlite-shm
 *.sqlite-wal
 similarities.jsonl
+__pycache__/
+evals/harbor/jobs/
+evals/harbor/cache/
