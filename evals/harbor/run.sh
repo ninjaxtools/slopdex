@@ -23,8 +23,27 @@ DATASET="${DATASET:-terminal-bench@2.0}"
 N_TASKS="${N_TASKS:-10}"
 ATTEMPTS="${ATTEMPTS:-1}"
 CONCURRENCY="${CONCURRENCY:-4}"
+# Agent wall-clock budget: task base timeout (usually 900s) x this multiplier.
+# Coding tasks with compile/test loops need headroom; 4 = 1h per trial.
+AGENT_TIMEOUT_MULT="${AGENT_TIMEOUT_MULT:-4}"
 JOB_NAME="${JOB_NAME:-slopdex-$MODE-$INDEX_MODE}"
 JOBS_DIR="${JOBS_DIR:-$PWD/jobs}"
+# Task selection: file with one Terminal-Bench task name per line (`#`
+# comments and blanks ignored), passed as repeated -i filters. Defaults to
+# codebase_tasks.txt (existing-codebase tasks only); set TASKS_FILE="" to run
+# the whole dataset.
+TASKS_FILE="${TASKS_FILE-$PWD/codebase_tasks.txt}"
+
+TASK_ARGS=()
+if [[ -n "${TASKS_FILE:-}" && -f "$TASKS_FILE" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line//[[:space:]]/}"
+    if [[ -n "$line" ]]; then
+      TASK_ARGS+=(-i "$line")
+    fi
+  done < "$TASKS_FILE"
+fi
 
 AK=(--ak "mode=$MODE")
 if [[ "$MODE" == "slopdex" ]]; then
@@ -75,9 +94,11 @@ harbor run \
   --model "$MODEL" \
   "${AK[@]}" \
   "${AE[@]}" \
+  "${TASK_ARGS[@]}" \
   --n-tasks "$N_TASKS" \
   -k "$ATTEMPTS" \
   -n "$CONCURRENCY" \
+  --agent-timeout-multiplier "$AGENT_TIMEOUT_MULT" \
   --job-name "$JOB_NAME" \
   -o "$JOBS_DIR" \
   "$@"
