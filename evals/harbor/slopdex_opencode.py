@@ -267,16 +267,44 @@ class SlopdexOpenCode(OpenCode):
             command=(
                 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
                 'cd "$ROOT"; '
+                "cp AGENTS.md /tmp/slopdex_agents_backup.md 2>/dev/null "
+                "|| rm -f /tmp/slopdex_agents_backup.md; "
                 f"grep -qF {shlex.quote(MARKER)} AGENTS.md 2>/dev/null || "
                 f"printf '%s' {shlex.quote(block)} >> AGENTS.md"
             ),
         )
         if self._mode != "slopdex":
             return
-        await self._ignored_index_artifacts(environment)
         await self._write_slopdex_config(environment)
         identity = await self._index_identity(environment, instruction)
         await self._prepare_index(environment, identity)
+
+    async def _cleanup_workspace(self, environment: BaseEnvironment) -> None:
+        """Remove every trace the harness left in the task repo.
+
+        Verifiers diff the repo against the base commit, so our AGENTS.md
+        block and .slopdex/ must not leak into grading.
+        """
+        if self._agents_md_block() is None:
+            return
+        try:
+            await self.exec_as_agent(
+                environment,
+                command=(
+                    'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
+                    'cd "$ROOT"; '
+                    "if git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then "
+                    "git checkout -- AGENTS.md; "
+                    "elif [ -f /tmp/slopdex_agents_backup.md ]; then "
+                    "cp /tmp/slopdex_agents_backup.md AGENTS.md; "
+                    "else rm -f AGENTS.md; fi; "
+                    "rm -f /tmp/slopdex_agents_backup.md; "
+                    "if ! git ls-files --error-unmatch .slopdex >/dev/null 2>&1; then "
+                    "rm -rf .slopdex; fi"
+                ),
+            )
+        except Exception:
+            self.logger.exception("slopdex eval workspace cleanup failed")
 
     async def _write_slopdex_config(self, environment: BaseEnvironment) -> None:
         config = json.dumps(self._slopdex_config(), indent=2) + "\n"
@@ -286,17 +314,6 @@ class SlopdexOpenCode(OpenCode):
                 'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
                 'cd "$ROOT"; mkdir -p .slopdex; '
                 f"printf '%s' {shlex.quote(config)} > .slopdex/config.json"
-            ),
-        )
-
-    async def _ignored_index_artifacts(self, environment: BaseEnvironment) -> None:
-        await self.exec_as_agent(
-            environment,
-            command=(
-                'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
-                'cd "$ROOT"; '
-                "if [ -d .git ] && ! grep -qxF '.slopdex/' .gitignore 2>/dev/null; "
-                "then printf '.slopdex/\\n' >> .gitignore; fi"
             ),
         )
 
@@ -506,4 +523,7 @@ class SlopdexOpenCode(OpenCode):
         context: AgentContext,
     ) -> None:
         await self._prepare_workspace(environment, instruction)
-        await super().run(instruction, environment, context)
+        try:
+            await super().run(instruction, environment, context)
+        finally:
+            await self._cleanup_workspace(environment)
