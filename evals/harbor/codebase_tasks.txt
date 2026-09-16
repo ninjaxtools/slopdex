@@ -1,32 +1,35 @@
-# Terminal-Bench tasks that start with an existing codebase the agent must
-# read and modify (fix/extend/refactor/port). Selected from terminal-bench-2
-# @ 69671fb (the commit Harbor resolves for terminal-bench@2.0) using
-# task_features.py evidence plus per-task review of instruction.md,
-# solution/solve.sh and environment/Dockerfile.
+# Terminal-Bench tasks with MULTI-FILE codebases the agent must search to
+# localize code (fix/extend/build across many files). Selected from
+# terminal-bench-2 @ 69671fb (the commit Harbor resolves for
+# terminal-bench@2.0) using task_features.py evidence plus per-task review of
+# instruction.md, solution/solve.sh and environment/Dockerfile.
 #
-# Commented-out tasks meet the modify-existing-code criterion but in languages
-# slopdex does not index (Python, JavaScript/TypeScript, Rust, Go, Java, C).
-break-filter-js-from-html
+# Single-file tasks are excluded: the agent reads the one file directly, so
+# no search tool can add value (verified: break-filter-js-from-html was
+# solved by both arms with zero search calls).
 build-cython-ext
-circuit-fibsqrt
-feal-differential-cryptanalysis
-feal-linear-cryptanalysis
-fix-code-vulnerability
-fix-ocaml-gc
-headless-terminal
-largest-eigenval
 make-doom-for-mips
-model-extraction-relu-logits
-modernize-scientific-stack
-portfolio-optimization
-pytorch-model-cli
 sanitize-git-repo
-schemelike-metacircular-eval
-write-compressor
-# cobol-modernization: reads COBOL (unsupported), Python written fresh
-# custom-memory-heap-crash: C++ (unsupported)
+# --- excluded: single file (or fully enumerated files), nothing to search ---
+# break-filter-js-from-html: filter.py
+# circuit-fibsqrt: sim.c
+# feal-differential-cryptanalysis: feal.py
+# feal-linear-cryptanalysis: feal.c + decrypt.c
+# fix-code-vulnerability: bottle.py (single-file module)
+# headless-terminal: base_terminal.py
+# largest-eigenval: eigen.py + eval.py
+# model-extraction-relu-logits: forward.py
+# modernize-scientific-stack: analyze_climate.py
+# portfolio-optimization: 5 files, all named in the instruction
+# pytorch-model-cli: model.py (+ vendored C libs)
+# schemelike-metacircular-eval: interp.py
+# write-compressor: decomp.c
+# --- excluded: unsupported languages (slopdex cannot index them) ---
+# cobol-modernization: reads COBOL, Python written fresh
+# custom-memory-heap-crash: C++
+# fix-ocaml-gc: OCaml repo (fix is in C, but navigation is OCaml)
 # overfull-hbox: LaTeX only
 # prove-plus-comm: Coq
 # query-optimize: SQL
-# rstan-to-pystan: reads R (unsupported), Python written fresh
+# rstan-to-pystan: reads R, Python written fresh
 # tune-mjcf: XML config
