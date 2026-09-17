@@ -8,3 +8,6 @@ similarities.jsonl
 __pycache__/
 evals/harbor/jobs/
 evals/harbor/cache/
+evals/swebench/jobs/
+evals/swebench/cache/
+evals/swebench/.venv/
