@@ -11,11 +11,11 @@ Slopdex helps with doing analysis on codebases that contain a lot of AI generate
 The main supported functions are
 
 - `slopdex search <query>`
-   <br/>which finds code similar to the query
-- `slopdex describe <query>`
-   <br/>which explains existing code relevant to a task
+   <br/>find code similar to the query
 - `slopdex cross-search`
-   <br/>which finds clusters of similar code
+   <br/>find clusters of similar code
+- `slopdex describe <query>`
+   <br/>explain code relevant to a task (uses an LLM)
 
 `cross-search` helps with finding duplicated code, and with `--cohesion` helps with identifying similar code that is not necessarily duplicated but spread out across the codebase, which could indicate that a refactoring could make it more cohesive.
 
@@ -71,15 +71,15 @@ slopdex models opencode-go
 slopdex config model opencode-go/gpt-5.6-luna
 ```
 
-### Explore code for a task
+### Search and describe
 
-`describe` searches the index the same way `search` does, then asks the configured description model to explain the matching files, functions, and line numbers and how they fit together. It is a discovery guide: it describes what exists, not how to implement something new.
+The intention of the `describe` command is to use a low-cost model to summarise vector search findings to provide more relevant pre-processed results to a more powerful calling agent. It first performs a vector search and then uses the results to provide a tailored summary/description of relevant code and pre-generated generated file and function descriptions. 
 
 ```bash
 slopdex describe "I want to implement a new rpc endpoint"
 ```
 
-Files whose best match scores above `--describe-full-file-threshold` (default `0.8`) are sent to the model in full. Every other matching file contributes its generated description, and matching functions always contribute their description and source code.
+For the best matching files (configured with `--describe-full-file-threshold`, default `0.8`) the full file contents are used.
 
 ### Find duplicate code
 
