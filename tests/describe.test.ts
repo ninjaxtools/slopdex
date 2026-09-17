@@ -1,4 +1,4 @@
-import { rmSync } from "node:fs";
+import { rmSync, symlinkSync } from "node:fs";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -83,6 +83,89 @@ describe("describe context", () => {
     expect(context.files.every((file) => file.content === null)).toBe(true);
     expect(context.fileContentErrors).toHaveLength(1);
     expect(context.fileContentErrors[0]).toContain("b.ts");
+    index.close();
+  });
+
+  it("does not return changed working-tree source as indexed content", async () => {
+    const root = temporaryRoot();
+    write(root, "server.ts", "export function alpha() { return 1; }\n");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["server.ts"] });
+    write(root, "server.ts", "export function unindexed() { return 2; }\n");
+
+    const context = await index.describe({ query: "alpha", minSimilarity: -1, fullFileThreshold: -1 });
+
+    expect(context.files[0]!.content).toBeNull();
+    expect(context.fileContentErrors).toHaveLength(1);
+    expect(context.fileContentErrors[0]).toContain("Source changed since indexing: server.ts");
+    expect(context.functions[0]!.source).toContain("function alpha");
+    index.close();
+  });
+
+  it("does not follow a symlink that replaces an indexed working-tree file", async () => {
+    const root = temporaryRoot();
+    write(root, "server.ts", "export function alpha() { return 1; }\n");
+    write(root, "outside.ts", "export function secret() { return 2; }\n");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["server.ts"] });
+    rmSync(path.join(root, "server.ts"));
+    symlinkSync(path.join(root, "outside.ts"), path.join(root, "server.ts"));
+
+    const context = await index.describe({ query: "alpha", minSimilarity: -1, fullFileThreshold: -1 });
+
+    expect(context.files[0]!.content).toBeNull();
+    expect(context.fileContentErrors).toHaveLength(1);
+    expect(context.fileContentErrors[0]).toContain("no longer a regular file");
+    expect(JSON.stringify(context)).not.toContain("function secret");
+    index.close();
+  });
+
+  it("preserves reranker order and scores while respecting its candidate maximum", async () => {
+    const root = temporaryRoot();
+    for (const name of ["one", "two", "three"]) {
+      write(root, `${name}.ts`, `export function ${name}() { return ${JSON.stringify(name)}; }\n`);
+    }
+    let candidateCount = 0;
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: {
+        profile: { provider: "controlled", model: "equal", dimensions: 2 },
+        embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
+        embedQuery: async () => [1, 0],
+      },
+      reranker: {
+        profile: { provider: "limited", model: "controlled" },
+        maximumCandidateCount: 2,
+        rerank: async (_query, documents) => {
+          candidateCount = documents.length;
+          return [{ index: 1, score: 0.9 }, { index: 0, score: 0.8 }];
+        },
+      },
+    });
+    await index.updateFiles({ upsert: ["one.ts", "two.ts", "three.ts"] });
+
+    const context = await index.describe({ query: "numbered function", minSimilarity: -1, includeFileContents: false });
+
+    expect(candidateCount).toBe(2);
+    expect(context.functions.map(({ qualifiedName, rerankScore }) => ({ qualifiedName, rerankScore }))).toEqual([
+      { qualifiedName: "two", rerankScore: 0.9 },
+      { qualifiedName: "one", rerankScore: 0.8 },
+    ]);
+    expect(context.files.map((file) => file.path)).toEqual(["two.ts", "one.ts"]);
+    index.close();
+  });
+
+  it("returns an empty context when no callable meets the threshold", async () => {
+    const root = temporaryRoot();
+    write(root, "server.ts", "export function alpha() { return 1; }\n");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    await index.updateFiles({ upsert: ["server.ts"] });
+
+    const context = await index.describe({ query: "alpha", minSimilarity: 2, fullFileThreshold: -1 });
+
+    expect(context.files).toEqual([]);
+    expect(context.functions).toEqual([]);
+    expect(context.fileContentErrors).toEqual([]);
     index.close();
   });
 });

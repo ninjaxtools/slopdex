@@ -230,6 +230,8 @@ export interface DescribeFunction {
   startLine: number;
   endLine: number;
   similarity: number;
+  /** Provider relevance score when a second-stage reranker ordered this result. */
+  rerankScore?: number;
   description: string | null;
   source: string;
 }

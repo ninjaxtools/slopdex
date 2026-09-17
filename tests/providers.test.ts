@@ -10,6 +10,7 @@ import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
 import { parseCallables } from "../src/parser/callable-parser.js";
 import { CohereReranker, JinaReranker } from "../src/rerankers/hosted.js";
 import { OpenAILLMReranker } from "../src/rerankers/openai.js";
+import type { DescribeContext } from "../src/types.js";
 import { temporaryRoot, write } from "./helpers.js";
 
 const servers: Server[] = [];
@@ -42,6 +43,54 @@ describe("OpenAI description provider", () => {
     expect(requests[0]!.instructions).toContain("requested file or callable within its codebase");
     const requestInput = requests[0]!.input as Array<{ content: Array<{ text: string }> }>;
     expect(JSON.parse(requestInput[0]!.content[0]!.text)).toMatchObject({ repository: "example", path: "client.ts", fileContext: fileSource });
+  });
+
+  it("sends complete discovery context with describe-only instructions", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const url = await startServer(requests, {
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{ type: "output_text", text: "Existing delivery code is in client.ts:1.", annotations: [] }],
+      }],
+    });
+    const context: DescribeContext = {
+      repository: "example",
+      query: "deliver messages",
+      minSimilarity: 0.3,
+      fullFileThreshold: 0.8,
+      files: [{ path: "client.ts", similarity: 0.95, description: "Delivers messages.", content: fileSource }],
+      functions: [{
+        path: "client.ts",
+        qualifiedName: "deliver",
+        kind: "function",
+        signature: "function deliver()",
+        startLine: 1,
+        endLine: 1,
+        similarity: 0.95,
+        rerankScore: 0.99,
+        description: "Delivers application messages.",
+        source: fileSource,
+      }],
+      fileContentErrors: [],
+    };
+    const provider = new OpenAIDescriptionProvider({ apiKey: "test", baseUrl: url });
+
+    await expect(provider.describeContext(context)).resolves.toBe("Existing delivery code is in client.ts:1.");
+
+    expect(requests[0]!.instructions).toContain("Explain existing code relevant to a request");
+    expect(requests[0]!.instructions).toContain("Do not propose an implementation");
+    const requestInput = requests[0]!.input as Array<{ content: Array<{ text: string }> }>;
+    expect(JSON.parse(requestInput[0]!.content[0]!.text)).toEqual({
+      repository: "example",
+      request: "deliver messages",
+      minSimilarity: 0.3,
+      fullFileThreshold: 0.8,
+      files: [{ path: "client.ts", similarity: 0.95, description: "Delivers messages.", content: fileSource }],
+      functions: context.functions,
+    });
   });
 
   it("reuses one growing conversation for callables in the same file", async () => {

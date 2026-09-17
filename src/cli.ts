@@ -1241,7 +1241,7 @@ Options:
   --callables                         With reindex-files, also regenerate callable descriptions
   --ignore-errors                     Silence warnings about persisted indexing errors
   --verbose                           Log every external model call instead of one per kind/model
-  --limit <number>                    Output limit (default: unlimited; threshold filters results)
+  --limit <number>                    Output limit (default: unlimited; capped by reranker maximum)
   --matches <number>                  Cross-search matches per source function (default: 5)
   --threshold <number|range>          Show similarities at/above a value or within a range (default: 0.3)
   --describe-full-file-threshold <number> Include whole files scoring above this similarity for describe (default: 0.8)

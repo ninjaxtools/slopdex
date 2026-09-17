@@ -1090,8 +1090,7 @@ export class CodeIndex {
         similarity,
         description: this.#database.fileDescription(filePath)?.description ?? null,
         content: null,
-      }))
-      .sort((left, right) => right.similarity - left.similarity || left.path.localeCompare(right.path));
+      }));
     const functions: DescribeFunction[] = results
       .map((result) => ({
         path: result.function.path,
@@ -1101,13 +1100,10 @@ export class CodeIndex {
         startLine: result.function.startLine,
         endLine: result.function.endLine,
         similarity: result.similarity,
+        ...(result.rerankScore !== undefined ? { rerankScore: result.rerankScore } : {}),
         description: result.function.description,
         source: result.function.source,
-      }))
-      .sort((left, right) =>
-        right.similarity - left.similarity
-        || left.path.localeCompare(right.path)
-        || left.startLine - right.startLine);
+      }));
     const fileContentErrors: string[] = [];
     if (options.includeFileContents !== false) {
       const pending = files.filter((file) => file.similarity > fullFileThreshold);
@@ -1143,14 +1139,23 @@ export class CodeIndex {
   }
 
   async #readIndexedSource(state: IndexedFileState): Promise<string> {
-    if (state.sourceMode === "working-tree") return await readFile(path.join(this.rootDir, state.path), "utf8");
+    if (state.sourceMode === "working-tree") {
+      const sourcePath = path.join(this.rootDir, state.path);
+      const file = await lstat(sourcePath);
+      if (!file.isFile()) throw new CodeIndexError("Indexed path is no longer a regular file.");
+      const source = await readFile(sourcePath, "utf8");
+      if (sha256(source) !== state.contentHash) {
+        throw new CodeIndexError(`Source changed since indexing: ${state.path}; update the index first.`);
+      }
+      return source;
+    }
     if (!state.blobOid) throw new CodeIndexError("File has no indexed Git blob.");
     return (await this.#git.readBlob(state.blobOid)).toString("utf8");
   }
 
   #candidateLimit(limit: number | undefined): number | undefined {
-    if (limit === undefined) return undefined;
     if (!this.reranker) return limit;
+    if (limit === undefined) return this.reranker.maximumCandidateCount;
     if (this.reranker.maximumCandidateCount !== undefined && limit > this.reranker.maximumCandidateCount) {
       throw new CodeIndexError(`${this.reranker.profile.provider} reranker supports at most ${this.reranker.maximumCandidateCount} results.`);
     }
