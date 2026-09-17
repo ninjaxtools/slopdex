@@ -88,6 +88,8 @@ An optional `Reranker` performs a second-stage pass for the two natural-language
 
 Cohere defaults to `rerank-v4.0-pro` with `COHERE_API_KEY`; Jina defaults to `jina-reranker-v3.5` with `JINA_API_KEY`. The OpenAI LLM path defaults to `gpt-5.6-luna`, sends a strict JSON schema through the Responses API with high reasoning, no reasoning summary, and `store: false`, and validates result cardinality, indexes, uniqueness, and 0-1 scores. Its prompt preserves descriptions before source and caps source-bearing candidate text at 12,000 tokens each and 80,000 tokens in aggregate. Reranking does not participate in index metadata or cross-search because it creates no persisted artifacts and cross-search is callable-to-callable analysis rather than natural-language retrieval.
 
+`CodeIndex.describe` reuses the natural-language search, groups results by file, keeps the highest result similarity per file, and collects file descriptions, callable descriptions/sources/locations, and similarity scores into a `DescribeContext`. Complete indexed sources are attached only for files strictly above the caller's full-file threshold, and one read failure aborts every whole-file source and is reported through the context's `fileContentErrors` so the caller can still proceed with descriptions and callable code. `OpenAIDescriptionProvider.describeContext` turns that context into a one-shot discovery explanation using dedicated instructions that forbid implementation advice.
+
 When descriptions are complete:
 
 ```text
@@ -145,6 +147,7 @@ Exports include `CodeIndex`, `crossSearch`, `analyzeCohesion`, `cohesionLocation
 - Set `sourceFilter.nameRegex` for source-only cross-search/cohesion filtering; combine it with `path` and a filter type (`all`, `changed-since`, or `uncommitted`). `changed-since` also accepts `uncommitted: true`.
 - Top-level analysis `nameRegex` filters both sources and candidates. Query `SimilaritySearchOptions.nameRegex` filters result names before limiting.
 - Call `await index.useDescriptions()`, then `await index.searchDescription({ query: "maintain the repository index" })`. Select a model via `descriptionProvider: new OpenAIDescriptionProvider({ model: "gpt-5.6-sol" })` in index options. Custom description providers implement both stateless file/callable methods and may add `startFile()` for contextual sessions.
+- Call `await index.describe({ query: "implement a new rpc endpoint" })` to gather a `DescribeContext` of matching files, callables, descriptions, and optionally complete sources; pass it to `new OpenAIDescriptionProvider().describeContext(context)` for the generated explanation.
 - Inspect failures through `index.indexErrors()` or exported `readIndexErrors(indexPath)` without a provider. Records use `IndexingError`.
 - `analyzeCohesion` remains a programmatic report API. The CLI exposes physical-distance review through `cross-search --cohesion` instead of a separate command.
 

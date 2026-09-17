@@ -22,6 +22,7 @@ import type {
   CodeIndexOptions,
   CohesionAnalysisOptions,
   CrossSearchOptions,
+  DescribeOptions,
   ReindexFilesOptions,
   SimilaritySearchOptions,
   UpdateFilesOptions,
@@ -51,6 +52,10 @@ export function reindexFiles(index: CodeIndex, options?: ReindexFilesOptions) {
 
 export function similaritySearch(index: CodeIndex, options: SimilaritySearchOptions) {
   return index.similaritySearch(options);
+}
+
+export function describe(index: CodeIndex, options: DescribeOptions) {
+  return index.describe(options);
 }
 
 export function useDescriptions(index: CodeIndex, options?: { signal?: AbortSignal }) {

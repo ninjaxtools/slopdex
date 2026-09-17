@@ -10,7 +10,7 @@ import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { clearProgress, TerminalProgress } from "./progress.js";
 import { compileNameRegex, DEFAULT_PARALLELISM } from "./utils.js";
 import type { CodeIndex } from "./code-index.js";
-import type { DescriptionProviderName } from "./descriptions/openai.js";
+import type { DescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
 import type {
   CodeIndexOptions,
   CrossSearchOptions,
@@ -95,6 +95,7 @@ const parsed = (() => {
         limit: { type: "string" },
         matches: { type: "string" },
         threshold: { type: "string" },
+        "describe-full-file-threshold": { type: "string" },
         format: { type: "string" },
         cohesion: { type: "boolean", default: false },
         "include-symmetric-duplicates": { type: "boolean", default: false },
@@ -201,7 +202,9 @@ async function main(): Promise<void> {
     return;
   }
   const provider = await createProvider(config);
-  const reranker = command === "search" || command === "search-description" ? await createReranker(config) : undefined;
+  const reranker = command === "search" || command === "search-description" || command === "describe"
+    ? await createReranker(config)
+    : undefined;
   const descriptionProvider = await createDescriptionProvider(config);
   const progress = new TerminalProgress();
   const indexOptions: CodeIndexOptions = {
@@ -276,6 +279,9 @@ async function main(): Promise<void> {
         } else printJson(results.map(presentMatch));
         break;
       }
+      case "describe":
+        await runDescribe(index, descriptionProvider);
+        break;
       case "cross-search":
         await runCrossSearch(index, indexOptions, provider);
         break;
@@ -285,6 +291,55 @@ async function main(): Promise<void> {
   } finally {
     index.close();
   }
+}
+
+async function runDescribe(
+  index: CodeIndex,
+  descriptionProvider: OpenAIDescriptionProvider | undefined,
+): Promise<void> {
+  if (!descriptionProvider) throw new CodeIndexError("describe requires a description provider.");
+  const query = positionals.join(" ").trim();
+  const threshold = similarityThreshold();
+  const nameRegex = qualifiedNameRegex();
+  const context = await index.describe({
+    query,
+    ...(nameRegex !== undefined ? { nameRegex } : {}),
+    ...(parsed.values.limit === undefined ? {} : { limit: positiveIntegerOption(parsed.values.limit, 1, "limit") }),
+    minSimilarity: threshold.min,
+    ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
+    fullFileThreshold: describeFullFileThreshold(),
+  });
+  if (context.fileContentErrors.length > 0) {
+    for (const message of context.fileContentErrors) process.stderr.write(`slopdex: ${message}\n`);
+    process.stderr.write("slopdex: continuing without full file contents.\n");
+  }
+  let description: string;
+  try {
+    description = await descriptionProvider.describeContext(context);
+  } catch (error) {
+    if (!context.files.some((file) => file.content !== null)) throw error;
+    process.stderr.write(`slopdex: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write("slopdex: retrying the description without full file contents.\n");
+    description = await descriptionProvider.describeContext({
+      ...context,
+      files: context.files.map((file) => (file.content === null ? file : { ...file, content: null })),
+    });
+  }
+  const format = outputFormat("summary");
+  if (format === "json") {
+    printJson({
+      query,
+      description,
+      files: context.files.map(({ path: filePath, similarity, description: fileDescription }) => ({
+        path: filePath,
+        similarity,
+        description: fileDescription,
+      })),
+      functions: context.functions.map(({ source: _source, ...rest }) => rest),
+    });
+    return;
+  }
+  process.stdout.write(`${description}\n`);
 }
 
 async function runCrossSearch(
@@ -487,6 +542,29 @@ function descriptionProfileForRebuild(indexPath: string, rootDir: string): Descr
   }
 }
 
+function storedDescriptionProfile(indexPath: string, rootDir: string): DescriptionProfile | null {
+  if (!existsSync(indexPath)) return null;
+  const db = new DatabaseSync(indexPath, { readOnly: true });
+  try {
+    const metadata = new Map((db.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>)
+      .map((row) => [row.key, row.value]));
+    if (metadata.get("root_dir") !== path.resolve(rootDir)) return null;
+    const value = metadata.get("description_profile");
+    if (!value) return null;
+    const profile = JSON.parse(value) as Partial<DescriptionProfile>;
+    if (typeof profile.model !== "string" || !profile.model || !isDescriptionProviderName(profile.provider ?? "")) return null;
+    return {
+      provider: profile.provider!,
+      model: profile.model,
+      strategyVersion: typeof profile.strategyVersion === "string" ? profile.strategyVersion : "callable-purpose-v2",
+    };
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
 async function refreshIndex(
   index: CodeIndex,
   label: string,
@@ -586,12 +664,23 @@ function commandLineConfig(config: FileConfig): FileConfig {
   };
 }
 
-async function createDescriptionProvider(config: FileConfig): Promise<import("./types.js").DescriptionProvider | undefined> {
-  if (!config.descriptionProvider && !config.descriptionModel) return undefined;
-  const { OpenAIDescriptionProvider } = await import("./descriptions/openai.js");
-  return new OpenAIDescriptionProvider({
-    ...(config.descriptionProvider ? { provider: config.descriptionProvider } : {}),
-    ...(config.descriptionModel ? { model: config.descriptionModel } : {}),
+async function createDescriptionProvider(config: FileConfig): Promise<OpenAIDescriptionProvider | undefined> {
+  if (command !== "describe" && !config.descriptionProvider && !config.descriptionModel) return undefined;
+  let provider = config.descriptionProvider;
+  let model = config.descriptionModel;
+  if (command === "describe" && !provider && !model) {
+    const rootDir = path.resolve(parsed.values.root!);
+    const indexPath = path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex", "index.sqlite"));
+    const stored = storedDescriptionProfile(indexPath, rootDir);
+    if (stored) {
+      provider = stored.provider as DescriptionProviderName;
+      model = stored.model;
+    }
+  }
+  const { OpenAIDescriptionProvider: Provider } = await import("./descriptions/openai.js");
+  return new Provider({
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
     parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
     ...(config.verbose ? { verbose: true } : {}),
   });
@@ -830,6 +919,9 @@ function validateInvocation(): void {
     && (command !== "config" || positionals[0] !== "reranker" || positionals[1] !== "openai")) {
     throw new CodeIndexError("--reranker-candidates is only available with config reranker openai.");
   }
+  if (parsed.values["describe-full-file-threshold"] !== undefined && command !== "describe") {
+    throw new CodeIndexError("--describe-full-file-threshold is only available for describe.");
+  }
   if (parsed.values.cohesion && command !== "cross-search") {
     throw new CodeIndexError("--cohesion is only available for cross-search.");
   }
@@ -838,8 +930,8 @@ function validateInvocation(): void {
   }
   const nameRegex = qualifiedNameRegex();
   if (nameRegex !== undefined) {
-    if (!["search", "search-description", "cross-search"].includes(command!)) {
-      throw new CodeIndexError("-e/--regexp/--regex is only available for search, search-description, and cross-search.");
+    if (!["search", "search-description", "describe", "cross-search"].includes(command!)) {
+      throw new CodeIndexError("-e/--regexp/--regex is only available for search, search-description, describe, and cross-search.");
     }
     compileNameRegex(nameRegex, parsed.values.regex !== undefined ? "--regex value" : "-e/--regexp value");
   }
@@ -908,6 +1000,13 @@ function validateInvocation(): void {
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
     }
+    case "describe":
+      if (!positionals.join(" ").trim()) throw new CodeIndexError("describe requires a query.");
+      validateOutputLimit();
+      similarityThreshold();
+      describeFullFileThreshold();
+      if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      return;
     case "cross-search":
       if (Boolean(parsed.values["target-root"]) !== Boolean(parsed.values["target-index"])) {
         throw new CodeIndexError("Cross-index search requires both --target-root and --target-index.");
@@ -962,6 +1061,10 @@ function similarityThreshold(defaultMin = 0.3): { min: number; max?: number } {
   if (!Number.isFinite(min) || !Number.isFinite(max)) throw new CodeIndexError("threshold range bounds must be numbers.");
   if (min >= max) throw new CodeIndexError("threshold range minimum must be less than its maximum.");
   return { min, max };
+}
+
+function describeFullFileThreshold(): number {
+  return numberOption(parsed.values["describe-full-file-threshold"], 0.8, "describe-full-file-threshold");
 }
 
 function outputFormat(defaultValue: "json" | "summary" | "clusters"): "json" | "summary" | "clusters" {
@@ -1028,6 +1131,7 @@ Commands:
   delete-files <path...>              Remove specific files from the index
   update-git                          Index a Git snapshot plus working-tree changes
   search <query>                      Search functions by semantic similarity
+  describe <query>                    Explain relevant existing code for a task
   descriptions <enable|disable>       Enable or disable automatic purpose descriptions
   search-description <query>          Search functions using description embeddings
   cross-search                        Find nearest functions for each source function
@@ -1048,6 +1152,15 @@ Examples:
 
     slopdex models opencode-go
     slopdex config model opencode-go/gpt-5.6-luna
+
+  Explain existing code for a task:
+    slopdex describe "I want to implement a new rpc endpoint"
+
+    Relevant vector-search matches are sent to the configured description model
+    together with file descriptions, callable descriptions, and callable source.
+    Files scoring above --describe-full-file-threshold (default 0.8) are included
+    in full. The output explains what exists and how it fits together for the
+    task without proposing an implementation.
 
   Find duplicate code:
     Compare functions across files, exclude short wrappers, and group matches into clusters:
@@ -1131,6 +1244,7 @@ Options:
   --limit <number>                    Output limit (default: unlimited; threshold filters results)
   --matches <number>                  Cross-search matches per source function (default: 5)
   --threshold <number|range>          Show similarities at/above a value or within a range (default: 0.3)
+  --describe-full-file-threshold <number> Include whole files scoring above this similarity for describe (default: 0.8)
   --format <json|summary|clusters>    Output format (default: summary; cross-search: clusters)
   --cohesion                          Re-rank cross-search matches by physical distance
   --include-symmetric-duplicates      Show both directions of same-index matches

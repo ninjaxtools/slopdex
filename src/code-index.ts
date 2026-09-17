@@ -13,6 +13,10 @@ import { isDescriptionProviderName, OpenAIDescriptionProvider } from "./descript
 import type {
   CodeIndexOptions,
   CrossSearchSourceFilter,
+  DescribeContext,
+  DescribeFile,
+  DescribeFunction,
+  DescribeOptions,
   EmbeddingProfile,
   IndexProgress,
   IndexProgressPhase,
@@ -1056,6 +1060,92 @@ export class CodeIndex {
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
     return await this.#rerank(options.query, results, limit, options.signal);
+  }
+
+  /**
+   * Gather the relevant files, callables, descriptions, and optionally complete
+   * file sources for a natural-language request. The result is a discovery
+   * context for a description model, not an implementation plan.
+   */
+  public async describe(options: DescribeOptions): Promise<DescribeContext> {
+    if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
+    const minSimilarity = options.minSimilarity ?? -1;
+    const fullFileThreshold = options.fullFileThreshold ?? 0.8;
+    if (!Number.isFinite(fullFileThreshold)) throw new CodeIndexError("fullFileThreshold must be a finite number.");
+    const results = await this.similaritySearch({
+      query: options.query,
+      ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+      minSimilarity,
+      ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    const grouped = new Map<string, number>();
+    for (const result of results) {
+      grouped.set(result.function.path, Math.max(grouped.get(result.function.path) ?? -Infinity, result.similarity));
+    }
+    const files: DescribeFile[] = [...grouped]
+      .map(([filePath, similarity]) => ({
+        path: filePath,
+        similarity,
+        description: this.#database.fileDescription(filePath)?.description ?? null,
+        content: null,
+      }))
+      .sort((left, right) => right.similarity - left.similarity || left.path.localeCompare(right.path));
+    const functions: DescribeFunction[] = results
+      .map((result) => ({
+        path: result.function.path,
+        qualifiedName: result.function.qualifiedName,
+        kind: result.function.kind,
+        signature: result.function.signature,
+        startLine: result.function.startLine,
+        endLine: result.function.endLine,
+        similarity: result.similarity,
+        description: result.function.description,
+        source: result.function.source,
+      }))
+      .sort((left, right) =>
+        right.similarity - left.similarity
+        || left.path.localeCompare(right.path)
+        || left.startLine - right.startLine);
+    const fileContentErrors: string[] = [];
+    if (options.includeFileContents !== false) {
+      const pending = files.filter((file) => file.similarity > fullFileThreshold);
+      const states = pending.length === 0
+        ? new Map<string, IndexedFileState>()
+        : new Map(this.#database.getFileStates().map((state) => [state.path, state]));
+      const contents = new Map<string, string>();
+      for (const file of pending) {
+        throwIfAborted(options.signal);
+        const state = states.get(file.path);
+        try {
+          if (!state) throw new CodeIndexError("File is not present in the index.");
+          contents.set(file.path, await this.#readIndexedSource(state));
+        } catch (error) {
+          fileContentErrors.push(
+            `cannot include full content of ${file.path}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (fileContentErrors.length === 0) {
+        for (const file of pending) file.content = contents.get(file.path) ?? null;
+      }
+    }
+    return {
+      repository: path.basename(this.rootDir),
+      query: options.query,
+      minSimilarity,
+      fullFileThreshold,
+      files,
+      functions,
+      fileContentErrors,
+    };
+  }
+
+  async #readIndexedSource(state: IndexedFileState): Promise<string> {
+    if (state.sourceMode === "working-tree") return await readFile(path.join(this.rootDir, state.path), "utf8");
+    if (!state.blobOid) throw new CodeIndexError("File has no indexed Git blob.");
+    return (await this.#git.readBlob(state.blobOid)).toString("utf8");
   }
 
   #candidateLimit(limit: number | undefined): number | undefined {

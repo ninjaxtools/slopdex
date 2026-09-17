@@ -12,6 +12,8 @@ The main supported functions are
 
 - `slopdex search <query>`
    <br/>which finds code similar to the query
+- `slopdex describe <query>`
+   <br/>which explains existing code relevant to a task
 - `slopdex cross-search`
    <br/>which finds clusters of similar code
 
@@ -68,6 +70,16 @@ You can list and configure one of OpenCode's models like this:
 slopdex models opencode-go
 slopdex config model opencode-go/gpt-5.6-luna
 ```
+
+### Explore code for a task
+
+`describe` searches the index the same way `search` does, then asks the configured description model to explain the matching files, functions, and line numbers and how they fit together. It is a discovery guide: it describes what exists, not how to implement something new.
+
+```bash
+slopdex describe "I want to implement a new rpc endpoint"
+```
+
+Files whose best match scores above `--describe-full-file-threshold` (default `0.8`) are sent to the model in full. Every other matching file contributes its generated description, and matching functions always contribute their description and source code.
 
 ### Find duplicate code
 

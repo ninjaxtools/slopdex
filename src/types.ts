@@ -206,6 +206,46 @@ export interface SimilarityScores {
   fileDescriptionSimilarity?: number;
 }
 
+export interface DescribeOptions extends SimilaritySearchOptions {
+  /** Files whose top result similarity is above this value contribute complete source. Defaults to 0.8. */
+  fullFileThreshold?: number;
+  /** Set false to omit every file source; defaults to true. */
+  includeFileContents?: boolean;
+}
+
+export interface DescribeFile {
+  path: string;
+  /** Highest result similarity among this file's matching callables. */
+  similarity: number;
+  description: string | null;
+  /** Complete indexed source when the file exceeded the threshold and every read succeeded; otherwise null. */
+  content: string | null;
+}
+
+export interface DescribeFunction {
+  path: string;
+  qualifiedName: string;
+  kind: CallableKind;
+  signature: string | null;
+  startLine: number;
+  endLine: number;
+  similarity: number;
+  description: string | null;
+  source: string;
+}
+
+export interface DescribeContext {
+  /** Repository directory name; matches description-generation inputs. */
+  repository: string;
+  query: string;
+  minSimilarity: number;
+  fullFileThreshold: number;
+  files: DescribeFile[];
+  functions: DescribeFunction[];
+  /** Read failures; when non-empty every full file source was omitted. */
+  fileContentErrors: string[];
+}
+
 export interface AnalysisSimilarity {
   similarityMode: "code" | "code-description-file-average";
   similarityWeights: { code: number; description: number; fileDescription: number };

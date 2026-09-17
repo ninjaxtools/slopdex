@@ -11,6 +11,7 @@ Usage: `slopdex <command> [arguments] [options]`.
 | `config descriptions <enable\|disable>` | Persist whether the next index-using command should enable or disable descriptions. Does not open an index. | Updated setting summary; optional JSON |
 | `config reranker <cohere\|jina\|openai\|disable> [model]` | Enable a hosted or OpenAI LLM query reranker, optionally selecting a model, or disable it. OpenAI accepts `--reranker-candidates <number>` from 1 to 100 and defaults to 10. Does not open an index. | Updated setting summary; optional JSON |
 | `search <query>` | Search function code by meaning. Quote multiword queries. | Summary; optional JSON array |
+| `describe <query>` | Gather relevant existing code and have the configured description model explain how it fits together for the query. Never proposes an implementation. | Generated explanation; optional JSON object |
 | `descriptions <enable\|disable>` | Enable or disable automatic purpose descriptions. Re-enabling with unchanged inputs reuses cached descriptions. | JSON statistics |
 | `search-description <query>` | Search purpose descriptions after enabling them. | Summary including description text; optional JSON array |
 | `cross-search` | Find neighbors for each selected function in this or another index. | `clusters` by default; optional `summary` or JSONL |
@@ -56,11 +57,12 @@ Explicit relative config and index paths resolve from the current directory, not
 
 | Argument | Applies to | Meaning / default |
 | --- | --- | --- |
-| `--limit <number>` | Both query searches, cross-search | Positive integer output limit; unlimited unless passed. Query matches, or cross-search output entries (clusters for `clusters`, matched sources for `summary`/JSONL). Threshold filters results; scans all sources and only truncates emitted output. |
+| `--limit <number>` | Both query searches, describe, cross-search | Positive integer output limit; unlimited unless passed. Query matches, or cross-search output entries (clusters for `clusters`, matched sources for `summary`/JSONL). Threshold filters results; scans all sources and only truncates emitted output. In describe, it caps the matching callables used as context. |
 | `--matches <number>` | Cross-search | Positive integer matches kept per source function; default `5`. |
-| `--threshold <number\|min-max>` | Both query searches, cross-search | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `0.3`. |
-| `--format <json\|summary\|clusters>` | Both query searches, cross-search, index-errors | Output format; see the commands table. `clusters` is only for ordinary cross-search. |
-| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Both query searches, cross-search | Equivalent case-sensitive JavaScript regex options over qualified names. Query searches filter results before limiting; cross-search filters sources only. |
+| `--threshold <number\|min-max>` | Both query searches, describe, cross-search | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `0.3`. |
+| `--describe-full-file-threshold <number>` | Describe | Include a file's complete indexed source when its highest result similarity is strictly above this value; default `0.8`. Files at or below it contribute only their description. |
+| `--format <json\|summary\|clusters>` | Both query searches, describe, cross-search, index-errors | Output format; see the commands table. `clusters` is only for ordinary cross-search. |
+| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Both query searches, describe, cross-search | Equivalent case-sensitive JavaScript regex options over qualified names. Query searches and describe filter results before limiting; cross-search filters sources only. |
 | `--min-lines <number>` | Cross-search | Minimum source and candidate callable length; positive integer, default `2`. Use `1` to include one-line wrappers. |
 | `--source-path <path>` | Cross-search | Select sources in a file or recursive directory, relative to the repository root (or absolute within it). |
 | `--changed-since <commit>` | Cross-search | Select added, modified, or moved functions relative to an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
@@ -99,6 +101,14 @@ Cluster 1 (3 functions, similarity 0.9124-0.9568)
 - A cluster groups functions connected by matches. Its range covers observed links; not every pair necessarily matches directly.
 - Clusters sort by member count, then name. Cluster number is not severity.
 - Locations identify where to inspect behavior, callers, and architectural roles. Wrappers, adapters, tests, and separate interface implementations can legitimately resemble one another.
+
+### Task descriptions
+
+`describe` runs the same natural-language vector search as `search`, groups the results by file, and sends file descriptions, callable descriptions, matching callable source, locations, and similarity scores to the configured description model. The model explains what exists and how those locations fit together. It is instructed to describe existing code only and not to propose an implementation. `--description-provider`/`--description-model` (or the config file) select the model; without an explicit selection, the index's stored description profile is reused, falling back to the provider default.
+
+A file's complete indexed source is sent only when its highest result similarity is above `--describe-full-file-threshold` (default `0.8`); files at or below it are represented by their description alone. `--threshold` (default `0.3`) selects which callables are included. If reading a whole file fails, the error is reported on stderr and every whole-file source is dropped before the request. If the model request itself fails after whole files were included, the error is reported and the request is retried with file descriptions, callable descriptions, and callable source only.
+
+The default output is the explanation text. With `--format json`, stdout is an object with `query`, `description`, and metadata-only `files` and `functions` arrays (paths, qualified names, line numbers, similarities, descriptions).
 
 ### Physical cohesion
 
