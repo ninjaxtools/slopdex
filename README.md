@@ -15,9 +15,13 @@ The main supported functions are
 - `slopdex cross-search`
    <br/>find clusters of similar code
 - `slopdex describe <query>`
-   <br/>explain code relevant to a task (uses an LLM)
+   <br/>explain code relevant to a task
 
-`cross-search` helps with finding duplicated code, and with `--cohesion` helps with identifying similar code that is not necessarily duplicated but spread out across the codebase, which could indicate that a refactoring could make it more cohesive.
+`search` does a vector search to find functions similar to the query.
+
+`cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
+
+`describe` does a `search` first, then passes the result through the configured LLM model to create a tailored description.
 
 ## Getting started
 
@@ -70,6 +74,8 @@ You can list and configure one of OpenCode's models like this:
 slopdex models opencode-go
 slopdex config model opencode-go/gpt-5.6-luna
 ```
+
+File and function descriptions are cached. Function descriptions will only be regenerated when functions change. File descriptions need to be regenerated explcitily with the `reindex-files` command.
 
 ### Search and describe
 
