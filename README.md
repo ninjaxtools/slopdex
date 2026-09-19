@@ -6,7 +6,7 @@ This readme is written by a human.
 
 <img src="sloppy-dexter.png" width="280" align="right" alt="Dexter, the sloppy slime" />
 
-Slopdex helps with doing analysis on codebases that contain a lot of AI generated ~~slime~~ code.
+Slopdex helps with doing analysis on codebases that contain a lot of AI generated ~~slop~~ slime.
 
 The main supported functions are
 
