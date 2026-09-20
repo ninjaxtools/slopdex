@@ -161,6 +161,8 @@ Use the recovery flag named in the error: `--rebuild-on-divergence` for Git hist
 
 Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, OpenAI LLM reranking, and OpenCode Go descriptions (requires `JINA_API_KEY`, `OPENAI_API_KEY` for query searches, plus `OPENCODE_API_KEY` or the `opencode-go` entry in `~/.local/share/opencode/auth.json` when descriptions are enabled):
 
+Run `slopdex config` without arguments to configure every option interactively. Description generation is asked first; declining it skips all LLM provider and model prompts. OpenCode Zen and Go model choices are fetched from the selected provider and support type-to-filter selection.
+
 ```json
 {
   "provider": "jina",
@@ -194,6 +196,7 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Ope
 | `exclude` | Additional repository-relative exclusion globs. |
 | `maxFileSize` | Maximum source-file size in bytes; positive integer, default `1048576`. |
 | `embeddingBatchSize` | Embedding inputs per batch; positive integer, default `32`. |
+| `parallelism` | Concurrent external provider requests; positive integer, default `10`. |
 | `verbose` | When true, report every external model request on stderr; false/unset reports each call kind/provider/model once per process. |
 
 Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`); OpenCode providers also fall back to `~/.local/share/opencode/auth.json`. Reranker settings do not change the stored index and do not require a rebuild. Changing the embedding profile requires rebuilding with `--force-reindex --yes-really-rebuild-the-index`.

@@ -11,6 +11,7 @@ import { clearProgress, TerminalProgress } from "./progress.js";
 import { compileNameRegex, DEFAULT_PARALLELISM } from "./utils.js";
 import type { CodeIndex } from "./code-index.js";
 import type { DescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
+import type { FileConfig, OpenCodeDescriptionProvider, PublishedModel } from "./config-wizard.js";
 import type {
   CodeIndexOptions,
   CrossSearchOptions,
@@ -33,34 +34,6 @@ function isDescriptionProviderName(value: string): value is DescriptionProviderN
 }
 
 declare const __SLOPDEX_VERSION__: string;
-
-interface FileConfig {
-  provider?: "openai" | "jina";
-  model?: string;
-  dimensions?: number;
-  indexPath?: string;
-  include?: string[];
-  exclude?: string[];
-  maxFileSize?: number;
-  embeddingBatchSize?: number;
-  parallelism?: number;
-  descriptionProvider?: DescriptionProviderName;
-  descriptionModel?: string;
-  descriptionFallbackModel?: string;
-  descriptionsEnabled?: boolean;
-  rerankerProvider?: "cohere" | "jina" | "openai";
-  rerankerModel?: string;
-  rerankerCandidates?: number;
-  rerankingEnabled?: boolean;
-  verbose?: boolean;
-}
-
-type OpenCodeDescriptionProvider = Exclude<DescriptionProviderName, "openai">;
-
-interface PublishedModel {
-  provider: OpenCodeDescriptionProvider;
-  model: string;
-}
 
 interface DescriptionRefreshHooks {
   beforeRefresh?: (index: CodeIndex) => void | Promise<void>;
@@ -733,10 +706,17 @@ async function runModels(): Promise<void> {
 
 async function runConfig(rootDir: string): Promise<void> {
   const configPath = path.resolve(parsed.values.config ?? path.join(rootDir, ".slopdex", "config.json"));
-  const config = readConfigFile(configPath);
+  let config = readConfigFile(configPath);
   const action = positionals[0];
   let result: Record<string, unknown>;
-  if (action === "descriptions") {
+  if (!action) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new CodeIndexError("config without an action requires an interactive terminal.");
+    }
+    const { configureInteractively } = await import("./config-wizard.js");
+    config = await configureInteractively(config, fetchPublishedModels);
+    result = { ...config };
+  } else if (action === "descriptions") {
     config.descriptionsEnabled = positionals[1] === "enable";
     result = { descriptionsEnabled: config.descriptionsEnabled };
   } else if (action === "model") {
@@ -977,6 +957,7 @@ function validateInvocation(): void {
       return;
     case "config":
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      if (positionals.length === 0) return;
       if (positionals[0] === "descriptions") {
         if (positionals.length !== 2 || (positionals[1] !== "enable" && positionals[1] !== "disable")) {
           throw new CodeIndexError("config descriptions requires enable or disable.");
@@ -1012,7 +993,7 @@ function validateInvocation(): void {
         if (provider === "openai") openAIRerankerCandidateCount(parsed.values["reranker-candidates"], 10, "reranker candidate count");
         return;
       }
-      throw new CodeIndexError("config requires descriptions, model, fallback-model, parallelism, or reranker.");
+      throw new CodeIndexError("config accepts no arguments for interactive setup, or requires descriptions, model, fallback-model, parallelism, or reranker.");
     case "index-errors":
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
@@ -1161,6 +1142,7 @@ function printHelp(): void {
 
 Commands:
   models [opencode|opencode-go]        List current published OpenCode models
+  config                              Interactively configure all settings
   config model <model|provider/model>  Validate and save an OpenCode description model
   config fallback-model <model>        Validate and save a same-provider fallback model
   config descriptions <enable|disable> Save description state without opening an index

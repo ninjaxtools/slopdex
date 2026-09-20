@@ -703,6 +703,14 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
 });
 
 describe("CLI model configuration", { timeout: testTimeoutMs }, () => {
+  it("requires a terminal for argument-free interactive configuration", async () => {
+    const root = temporaryRoot();
+    const result = await runCli(root, "config");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("config without an action requires an interactive terminal");
+  });
+
   it("lists published models and validates index-free config changes", async () => {
     const root = temporaryRoot();
     const configPath = path.join(root, ".slopdex", "config.json");
