@@ -31,8 +31,8 @@ slopdex update-files src/service.ts src/model.ts
 slopdex reindex-files
 slopdex reindex-files --callables
 slopdex delete-files src/removed.ts
-slopdex update-git --target HEAD --rebuild-on-divergence
-slopdex update-git --force-reindex
+slopdex update-git --target HEAD --rebuild-on-divergence --yes-really-rebuild-the-index
+slopdex update-git --force-reindex --yes-really-rebuild-the-index
 ```
 
 ### Location, providers, and diagnostics
@@ -81,8 +81,9 @@ Explicit relative config and index paths resolve from the current directory, not
 | Argument | Meaning |
 | --- | --- |
 | `--target <ref>` | Git snapshot for `update-git`; default `HEAD`. Non-HEAD targets exclude working-tree changes. Later commands normally refresh back to HEAD. |
-| `--rebuild-on-divergence` | Allow reconciliation when the saved checkpoint is not an ancestor of the target, such as after a rebase or branch switch. |
-| `--force-reindex` | Recreate an **incompatible** index (repository, provider, model, dimensions, strategy, or schema mismatch). A compatible index still follows normal refresh behavior. |
+| `--rebuild-on-divergence` | Allow reconciliation when the saved checkpoint is not an ancestor of the target, such as after a rebase or branch switch. Requires `--yes-really-rebuild-the-index`. |
+| `--force-reindex` | Recreate an **incompatible** index (repository, provider, model, dimensions, strategy, or schema mismatch). A compatible index still follows normal refresh behavior. Requires `--yes-really-rebuild-the-index`. |
+| `--yes-really-rebuild-the-index` | Confirm the destructive rebuild requested by `--rebuild-on-divergence` or `--force-reindex`. |
 | `--no-reindex` | With Git, still reconcile the committed snapshot but skip working-tree overlays. Without Git, reuse a non-empty index; missing/empty indexes are still populated. Not a general offline switch. |
 
 ## Reading results
@@ -154,7 +155,7 @@ Parse, extraction, read, and file-size failures are saved while healthy callable
 
 Saved failures trigger stderr warnings, including on cached runs, help, and cross-search targets. `--ignore-errors` silences warnings without clearing records. Updates retry failed files; successful indexing, deletion, or exclusion clears their diagnostics. Version output bypasses diagnostics.
 
-Use the recovery flag named in the error: `--rebuild-on-divergence` for Git history changes, `--force-reindex` for incompatible indexes. Schema versions 6 and 7 migrate in place; earlier schemas require `--force-reindex`, with compatible rebuilds preserving reusable artifact caches. For provider/authentication failures, fix the reported configuration and rerun. For source-change-during-indexing errors, rerun after edits settle. Exit status is `0` on success, `2` for argument/domain errors, and `1` for other failures (or invocation without a command).
+Use the recovery flag named in the error: `--rebuild-on-divergence` for Git history changes, `--force-reindex` for incompatible indexes. Both require `--yes-really-rebuild-the-index`. Schema versions 6 and 7 migrate in place; earlier schemas require `--force-reindex`, with compatible rebuilds preserving reusable artifact caches. For provider/authentication failures, fix the reported configuration and rerun. For source-change-during-indexing errors, rerun after edits settle. Exit status is `0` on success, `2` for argument/domain errors, and `1` for other failures (or invocation without a command).
 
 ## Configuration
 
@@ -195,7 +196,7 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Ope
 | `embeddingBatchSize` | Embedding inputs per batch; positive integer, default `32`. |
 | `verbose` | When true, report every external model request on stderr; false/unset reports each call kind/provider/model once per process. |
 
-Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`); OpenCode providers also fall back to `~/.local/share/opencode/auth.json`. Reranker settings do not change the stored index and do not require a rebuild. Changing the embedding profile requires rebuilding with `--force-reindex`.
+Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`); OpenCode providers also fall back to `~/.local/share/opencode/auth.json`. Reranker settings do not change the stored index and do not require a rebuild. Changing the embedding profile requires rebuilding with `--force-reindex --yes-really-rebuild-the-index`.
 
 ## Development
 

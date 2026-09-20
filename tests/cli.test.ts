@@ -347,7 +347,7 @@ globalThis.fetch = async (_url, options) => {
     expect(incompatible.status).toBe(2);
     expect(incompatible.stderr).toContain("Embedding provider, model, dimensions, or strategy differs");
 
-    const rebuilt = await runCli(root, "status", "--force-reindex");
+    const rebuilt = await runCli(root, "status", "--force-reindex", "--yes-really-rebuild-the-index");
     expect(rebuilt.status).toBe(0);
     expect(rebuilt.stderr).toContain("warning: index is incompatible");
     expect(rebuilt.stderr).toContain("rebuilding automatically because --force-reindex was specified");
@@ -355,6 +355,20 @@ globalThis.fetch = async (_url, options) => {
       embeddingProfile: { provider: "openai", model: "text-embedding-3-large", dimensions: 3072 },
     });
   });
+
+  it.each(["--force-reindex", "--rebuild-on-divergence"])(
+    "requires explicit confirmation before using %s",
+    async (rebuildFlag) => {
+      const root = temporaryRoot();
+
+      const result = await runCli(root, "status", rebuildFlag);
+
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain(`${rebuildFlag} require`);
+      expect(result.stderr).toContain("--yes-really-rebuild-the-index");
+      expect(existsSync(path.join(root, ".slopdex/index.sqlite"))).toBe(false);
+    },
+  );
 
   it("supports clusters, changed-since, and uncommitted filters", async () => {
     const root = temporaryRoot();
@@ -661,6 +675,7 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
     expect(result.stdout).toContain("--uncommitted");
     expect(result.stdout).toContain("--target-config <path>");
     expect(result.stdout).toContain("--force-reindex");
+    expect(result.stdout).toContain("--yes-really-rebuild-the-index");
     expect(result.stdout).toContain("--no-reindex");
     expect(result.stdout).toContain("--cross-file-only");
     expect(result.stdout).toContain("--min-lines <number>");
@@ -1027,7 +1042,9 @@ globalThis.fetch = async (url, options) => {
       similarityWeights: { code: 1 / 3, description: 1 / 3, fileDescription: 1 / 3 },
     });
 
-    const rebuilt = await run("status", "--model", "text-embedding-3-small", "--force-reindex");
+    const rebuilt = await run(
+      "status", "--model", "text-embedding-3-small", "--force-reindex", "--yes-really-rebuild-the-index",
+    );
     expect(rebuilt.status, rebuilt.stderr).toBe(0);
     expect(JSON.parse(rebuilt.stdout)).toMatchObject({
       functionCount: 2, descriptionCount: 2, descriptionsEnabled: true,

@@ -59,7 +59,7 @@ Storage uses Node's `node:sqlite` and `sqlite-vec`. Writable connections enable 
 - `callable_provenance`: first-seen committed source identity.
 - `indexing_errors`: diagnostics associated with files.
 
-Current schema version is `10`. Schemas 6-9 migrate in place: 6 and 7 gain file-description state and the nearest-neighbor vector table, 8 gains the similarity-cache tables, and 9 gains the similarity-cache floor/completeness columns (backfilled from existing rows); earlier schemas require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. Forced rebuilds clear logical index state while retaining content-addressed caches when possible; incompatible older databases are recreated. Enabled OpenAI description settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`.
+Current schema version is `10`. Schemas 6-9 migrate in place: 6 and 7 gain file-description state and the nearest-neighbor vector table, 8 gains the similarity-cache tables, and 9 gains the similarity-cache floor/completeness columns (backfilled from existing rows); earlier schemas require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. Forced rebuilds clear logical index state while retaining content-addressed caches when possible; incompatible older databases are recreated. Enabled OpenAI description settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`. Both destructive CLI rebuild modes require `--yes-really-rebuild-the-index`.
 
 ### Diagnostics
 

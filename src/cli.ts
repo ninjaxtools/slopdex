@@ -104,6 +104,7 @@ const parsed = (() => {
         "cross-file-only": { type: "boolean", default: false },
         "rebuild-on-divergence": { type: "boolean", default: false },
         "force-reindex": { type: "boolean", default: false },
+        "yes-really-rebuild-the-index": { type: "boolean", default: false },
         "no-reindex": { type: "boolean", default: false },
         callables: { type: "boolean", default: false },
         "ignore-errors": { type: "boolean", default: false },
@@ -939,6 +940,16 @@ function numberOption(value: string | undefined, defaultValue: number, name: str
 }
 
 function validateInvocation(): void {
+  if ((parsed.values["rebuild-on-divergence"] || parsed.values["force-reindex"])
+    && !parsed.values["yes-really-rebuild-the-index"]) {
+    const rebuildFlags = [
+      parsed.values["rebuild-on-divergence"] ? "--rebuild-on-divergence" : undefined,
+      parsed.values["force-reindex"] ? "--force-reindex" : undefined,
+    ].filter((value): value is string => value !== undefined).join(" and ");
+    throw new CodeIndexError(
+      `Using ${rebuildFlags} requires --yes-really-rebuild-the-index.`,
+    );
+  }
   if (parsed.values["reranker-candidates"] !== undefined
     && (command !== "config" || positionals[0] !== "reranker" || positionals[1] !== "openai")) {
     throw new CodeIndexError("--reranker-candidates is only available with config reranker openai.");
@@ -1268,8 +1279,9 @@ Options:
   --reranker-candidates <number>       Candidates sent to the OpenAI LLM reranker (default: 10)
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)
-  --rebuild-on-divergence             Rebuild after a rebase or branch change
-  --force-reindex                     Rebuild an incompatible existing index
+  --rebuild-on-divergence             Rebuild after a rebase or branch change (requires confirmation)
+  --force-reindex                     Rebuild an incompatible existing index (requires confirmation)
+  --yes-really-rebuild-the-index      Confirm a destructive index rebuild
   --no-reindex                        Skip worktree overlays or reuse a non-Git index
   --callables                         With reindex-files, also regenerate callable descriptions
   --ignore-errors                     Silence warnings about persisted indexing errors
