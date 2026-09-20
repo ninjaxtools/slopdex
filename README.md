@@ -73,7 +73,10 @@ You can list and configure one of OpenCode's models like this:
 ```bash
 slopdex models opencode-go
 slopdex config model opencode-go/gpt-5.6-luna
+slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
 ```
+
+The optional fallback model uses the same provider. After the primary model fails, it becomes the active model for later requests; if it fails, Slopdex switches back to the primary. Failover retries use exponential backoff.
 
 File and function descriptions are cached. Function descriptions will only be regenerated when functions change. File descriptions need to be regenerated explcitily with the `reindex-files` command.
 

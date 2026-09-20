@@ -8,6 +8,7 @@ Usage: `slopdex <command> [arguments] [options]`.
 | --- | --- | --- |
 | `models [opencode\|opencode-go]` | Fetch valid models from the current published Zen and/or Go catalogs. | Qualified `provider/model` lines; optional JSON array |
 | `config model <model\|provider/model>` | Validate a published OpenCode model and persist its provider/model selection without opening an index. Bare IDs auto-resolve only when unambiguous. | Updated setting summary; optional JSON |
+| `config fallback-model <model\|provider/model>` | Validate and persist an optional fallback description model on the same provider. | Updated setting summary; optional JSON |
 | `config descriptions <enable\|disable>` | Persist whether the next index-using command should enable or disable descriptions. Does not open an index. | Updated setting summary; optional JSON |
 | `config reranker <cohere\|jina\|openai\|disable> [model]` | Enable a hosted or OpenAI LLM query reranker, optionally selecting a model, or disable it. OpenAI accepts `--reranker-candidates <number>` from 1 to 100 and defaults to 10. Does not open an index. | Updated setting summary; optional JSON |
 | `search <query>` | Search function code by meaning. Quote multiword queries. | Summary; optional JSON array |
@@ -46,6 +47,7 @@ slopdex update-git --force-reindex
 | `--dimensions <number>` | Positive embedding dimension count; OpenAI `3072`, Jina `1024`. Must be supported by the model. |
 | `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use Zen or Go with `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json`. |
 | `--description-model <name>` | Description model; `gpt-5.6-luna` for OpenAI and `muse-spark-1.3-contributor` for Zen/Go, then the persisted model unless overridden. Published OpenCode models use their documented protocol. |
+| `--description-fallback-model <name>` | Optional same-provider model that becomes active when the primary fails; the primary becomes active again if the fallback fails. Failover retries use exponential backoff. |
 | `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
 | `--verbose` | Write one stderr notice for every external model call instead of one per call kind/provider/model. |
 | `-h`, `--help` | Show CLI usage without refreshing. |
@@ -168,6 +170,8 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Ope
   "rerankerModel": "gpt-5.6-luna",
   "rerankerCandidates": 10,
   "descriptionProvider": "opencode-go",
+  "descriptionModel": "gpt-5.6-luna",
+  "descriptionFallbackModel": "muse-spark-1.3-contributor",
   "verbose": true,
   "exclude": ["**/fixtures/**"]
 }
@@ -178,6 +182,7 @@ Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, Ope
 | `provider`, `model`, `dimensions` | Embedding settings; defaults are listed in the CLI table. |
 | `descriptionProvider` | Description provider: `openai`, `opencode` (Zen), or `opencode-go`; defaults to `openai`. |
 | `descriptionModel` | Description model; provider default unless explicitly set. |
+| `descriptionFallbackModel` | Optional fallback description model on the same provider. A failure switches the active model, and failover retries use exponential backoff. |
 | `descriptionsEnabled` | When true or false, the next index-using command applies that enabled state during its normal refresh. Unset leaves persisted index state unchanged. |
 | `rerankingEnabled` | Enables second-stage ranking for `search` and `search-description`; disabled/unset by default. Prefer changing it through `config reranker`. |
 | `rerankerProvider` | Reranker: `cohere`, `jina`, or `openai`. OpenAI uses an LLM rather than a dedicated reranking endpoint. |

@@ -46,6 +46,7 @@ interface FileConfig {
   parallelism?: number;
   descriptionProvider?: DescriptionProviderName;
   descriptionModel?: string;
+  descriptionFallbackModel?: string;
   descriptionsEnabled?: boolean;
   rerankerProvider?: "cohere" | "jina" | "openai";
   rerankerModel?: string;
@@ -80,6 +81,7 @@ const parsed = (() => {
         model: { type: "string" },
         "description-provider": { type: "string" },
         "description-model": { type: "string" },
+        "description-fallback-model": { type: "string" },
         "reranker-candidates": { type: "string" },
         dimensions: { type: "string" },
         target: { type: "string" },
@@ -628,6 +630,11 @@ function commandLineConfig(config: FileConfig): FileConfig {
   if (descriptionProviderValue !== undefined && !isDescriptionProviderName(descriptionProviderValue)) {
     throw new CodeIndexError(`Unsupported description provider: ${descriptionProviderValue}`);
   }
+  const descriptionFallbackModel = parsed.values["description-fallback-model"] ?? config.descriptionFallbackModel;
+  if (descriptionFallbackModel !== undefined
+    && (typeof descriptionFallbackModel !== "string" || !descriptionFallbackModel.trim())) {
+    throw new CodeIndexError("descriptionFallbackModel must be a non-empty string.");
+  }
   if (config.rerankingEnabled !== undefined && typeof config.rerankingEnabled !== "boolean") {
     throw new CodeIndexError("rerankingEnabled must be a boolean.");
   }
@@ -659,13 +666,14 @@ function commandLineConfig(config: FileConfig): FileConfig {
     ...(parsed.values.model ? { model: parsed.values.model } : {}),
     ...(descriptionProviderValue ? { descriptionProvider: descriptionProviderValue } : {}),
     ...(parsed.values["description-model"] ? { descriptionModel: parsed.values["description-model"] } : {}),
+    ...(descriptionFallbackModel ? { descriptionFallbackModel } : {}),
     ...(dimensions ? { dimensions } : {}),
     ...(parsed.values.verbose ? { verbose: true } : {}),
   };
 }
 
 async function createDescriptionProvider(config: FileConfig): Promise<OpenAIDescriptionProvider | undefined> {
-  if (command !== "describe" && !config.descriptionProvider && !config.descriptionModel) return undefined;
+  if (command !== "describe" && !config.descriptionProvider && !config.descriptionModel && !config.descriptionFallbackModel) return undefined;
   let provider = config.descriptionProvider;
   let model = config.descriptionModel;
   if (command === "describe" && !provider && !model) {
@@ -681,6 +689,7 @@ async function createDescriptionProvider(config: FileConfig): Promise<OpenAIDesc
   return new Provider({
     ...(provider ? { provider } : {}),
     ...(model ? { model } : {}),
+    ...(config.descriptionFallbackModel ? { fallbackModel: config.descriptionFallbackModel } : {}),
     parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
     ...(config.verbose ? { verbose: true } : {}),
   });
@@ -730,10 +739,20 @@ async function runConfig(rootDir: string): Promise<void> {
     config.descriptionsEnabled = positionals[1] === "enable";
     result = { descriptionsEnabled: config.descriptionsEnabled };
   } else if (action === "model") {
-    const selected = await resolveConfiguredModel(positionals[1]);
+    const selected = await resolveConfiguredModel(positionals[1], parsed.values["description-model"], "config model");
     config.descriptionProvider = selected.provider;
     config.descriptionModel = selected.model;
     result = { descriptionProvider: selected.provider, descriptionModel: selected.model };
+  } else if (action === "fallback-model") {
+    const selected = await resolveConfiguredModel(
+      positionals[1], parsed.values["description-fallback-model"], "config fallback-model", config.descriptionProvider,
+    );
+    if (config.descriptionProvider && config.descriptionProvider !== selected.provider) {
+      throw new CodeIndexError("Fallback model provider must match the configured description provider.");
+    }
+    config.descriptionProvider = selected.provider;
+    config.descriptionFallbackModel = selected.model;
+    result = { descriptionProvider: selected.provider, descriptionFallbackModel: selected.model };
   } else if (action === "parallelism") {
     const parallelism = Number(positionals[1]);
     config.parallelism = parallelism;
@@ -779,27 +798,32 @@ async function runConfig(rootDir: string): Promise<void> {
   else process.stdout.write(`Updated ${configPath}: ${Object.entries(result).map(([key, value]) => `${key}=${value}`).join(" ")}\n`);
 }
 
-async function resolveConfiguredModel(positionalModel: string | undefined): Promise<PublishedModel> {
-  const optionModel = parsed.values["description-model"];
+async function resolveConfiguredModel(
+  positionalModel: string | undefined,
+  optionModel: string | undefined,
+  setting: "config model" | "config fallback-model",
+  defaultProvider?: DescriptionProviderName,
+): Promise<PublishedModel> {
   if (positionalModel && optionModel && positionalModel !== optionModel) {
-    throw new CodeIndexError("config model argument and --description-model must match when both are supplied.");
+    const option = setting === "config model" ? "--description-model" : "--description-fallback-model";
+    throw new CodeIndexError(`${setting} argument and ${option} must match when both are supplied.`);
   }
   let reference = positionalModel ?? optionModel;
-  if (!reference) throw new CodeIndexError("config model requires a model ID or provider/model reference.");
-  let provider = parsed.values["description-provider"];
+  if (!reference) throw new CodeIndexError(`${setting} requires a model ID or provider/model reference.`);
+  let provider = parsed.values["description-provider"] ?? defaultProvider;
   const separator = reference.indexOf("/");
   if (separator !== -1) {
     const qualifiedProvider = reference.slice(0, separator);
     reference = reference.slice(separator + 1);
-    if (provider && provider !== qualifiedProvider) {
+    if (parsed.values["description-provider"] && parsed.values["description-provider"] !== qualifiedProvider) {
       throw new CodeIndexError("Model reference and --description-provider must select the same provider.");
     }
     provider = qualifiedProvider;
   }
-  if (!reference) throw new CodeIndexError("config model requires a non-empty model ID.");
+  if (!reference) throw new CodeIndexError(`${setting} requires a non-empty model ID.`);
   if (provider !== undefined) {
     if (!isOpenCodeDescriptionProvider(provider)) {
-      throw new CodeIndexError("config model provider must be opencode or opencode-go.");
+      throw new CodeIndexError(`${setting} provider must be opencode or opencode-go.`);
     }
     const models = await fetchPublishedModels(provider);
     if (!models.some(({ model }) => model === reference)) {
@@ -954,6 +978,12 @@ function validateInvocation(): void {
         }
         return;
       }
+      if (positionals[0] === "fallback-model") {
+        if (positionals.length > 2 || (!positionals[1] && !parsed.values["description-fallback-model"])) {
+          throw new CodeIndexError("config fallback-model requires a model ID or provider/model reference.");
+        }
+        return;
+      }
       if (positionals[0] === "parallelism") {
         const value = Number(positionals[1]);
         if (positionals.length !== 2 || !Number.isInteger(value) || value < 1) {
@@ -971,7 +1001,7 @@ function validateInvocation(): void {
         if (provider === "openai") openAIRerankerCandidateCount(parsed.values["reranker-candidates"], 10, "reranker candidate count");
         return;
       }
-      throw new CodeIndexError("config requires descriptions, model, parallelism, or reranker.");
+      throw new CodeIndexError("config requires descriptions, model, fallback-model, parallelism, or reranker.");
     case "index-errors":
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
@@ -1121,6 +1151,7 @@ function printHelp(): void {
 Commands:
   models [opencode|opencode-go]        List current published OpenCode models
   config model <model|provider/model>  Validate and save an OpenCode description model
+  config fallback-model <model>        Validate and save a same-provider fallback model
   config descriptions <enable|disable> Save description state without opening an index
   config parallelism <count>           Save the concurrent provider request limit (default: 10)
   config reranker <provider|disable>    Save Cohere, Jina, or OpenAI reranking settings
@@ -1152,6 +1183,7 @@ Examples:
 
     slopdex models opencode-go
     slopdex config model opencode-go/gpt-5.6-luna
+    slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
 
   Explain existing code for a task:
     slopdex describe "I want to implement a new rpc endpoint"
@@ -1232,6 +1264,7 @@ Options:
   --model <name>                      Embedding model
   --description-provider <name>       Description provider: openai, opencode, or opencode-go
   --description-model <name>          Description model (provider default: gpt-5.6-luna or muse-spark-1.3-contributor)
+  --description-fallback-model <name> Fallback description model on the same provider
   --reranker-candidates <number>       Candidates sent to the OpenAI LLM reranker (default: 10)
   --dimensions <number>               Embedding dimensions
   --target <ref>                      Target ref for update-git (default: HEAD)

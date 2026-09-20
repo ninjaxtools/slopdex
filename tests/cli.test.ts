@@ -621,6 +621,7 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
       "slopdex status",
       "slopdex models opencode-go",
       "slopdex config model opencode-go/gpt-5.6-luna",
+      "slopdex config fallback-model opencode-go/muse-spark-1.3-contributor",
       "slopdex config descriptions enable",
       "slopdex config parallelism 10",
       "slopdex config reranker cohere",
@@ -651,6 +652,7 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
     ]) expect(result.stdout).toContain(example);
     expect(result.stdout).toContain("--source-path <path>");
     expect(result.stdout).toContain("--description-provider <name>");
+    expect(result.stdout).toContain("--description-fallback-model <name>");
     expect(result.stdout).toContain("--reranker-candidates <number>");
     expect(result.stdout).toContain("--threshold <number|range>          Show similarities at/above a value or within a range (default: 0.3)");
     expect(result.stdout).toContain("--describe-full-file-threshold <number>");
@@ -698,7 +700,7 @@ globalThis.fetch = async (input, options) => {
     return Response.json({data: [{id: 'gpt-5.6-sol'}, {id: 'shared-model'}]});
   }
   if (url === 'https://opencode.ai/zen/go/v1/models') {
-    return Response.json({data: [{id: 'gpt-5.6-luna'}, {id: 'shared-model'}]});
+    return Response.json({data: [{id: 'gpt-5.6-luna'}, {id: 'muse-spark-1.3-contributor'}, {id: 'shared-model'}]});
   }
   const body = JSON.parse(options.body);
   if (url === 'https://api.openai.com/v1/embeddings') {
@@ -747,6 +749,23 @@ globalThis.fetch = async (input, options) => {
       descriptionProvider: "opencode-go",
       descriptionModel: "gpt-5.6-luna",
     });
+
+    const fallback = await run("config", "fallback-model", "muse-spark-1.3-contributor", "--format", "json");
+    expect(fallback.status, fallback.stderr).toBe(0);
+    expect(JSON.parse(fallback.stdout)).toMatchObject({
+      configPath,
+      descriptionProvider: "opencode-go",
+      descriptionFallbackModel: "muse-spark-1.3-contributor",
+    });
+    expect(JSON.parse(readFileSync(configPath, "utf8"))).toMatchObject({
+      descriptionProvider: "opencode-go",
+      descriptionModel: "gpt-5.6-luna",
+      descriptionFallbackModel: "muse-spark-1.3-contributor",
+    });
+
+    const mismatchedFallback = await run("config", "fallback-model", "opencode/gpt-5.6-sol");
+    expect(mismatchedFallback.status).toBe(2);
+    expect(mismatchedFallback.stderr).toContain("Fallback model provider must match");
 
     const invalid = await run("config", "model", "opencode-go/not-published");
     expect(invalid.status).toBe(2);

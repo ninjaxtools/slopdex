@@ -21,6 +21,7 @@ import { DEFAULT_PARALLELISM, throwIfAborted } from "../utils.js";
 export interface OpenAIDescriptionProviderOptions {
   apiKey?: string;
   model?: string;
+  fallbackModel?: string;
   baseUrl?: string;
   provider?: DescriptionProviderName;
   verbose?: boolean;
@@ -47,6 +48,7 @@ const PROVIDERS: Record<DescriptionProviderName, { apiKey: string; baseUrl: stri
 
 const EMPTY_DESCRIPTION_MESSAGE = "Description provider returned an empty description.";
 const EMPTY_DESCRIPTION_RETRIES = 5;
+const MODEL_FAILOVER_RETRIES = 5;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
 
 function openCodeAuthPath(): string {
@@ -96,6 +98,8 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
   readonly #apiKeyHint: string;
   readonly #baseUrl: string;
   readonly #openCode: boolean;
+  readonly #fallbackModel: string | undefined;
+  #activeModel: string;
   readonly #verbose: boolean;
   readonly #retryDelayMs: number;
   readonly #parallelism: number;
@@ -113,6 +117,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
       : `${this.#apiKeyName} or ${displayPath(openCodeAuthPath())}`;
     this.#baseUrl = (options.baseUrl ?? defaults.baseUrl).replace(/\/$/, "");
     this.#openCode = provider !== "openai";
+    this.#fallbackModel = options.fallbackModel;
     this.#verbose = options.verbose ?? false;
     this.#retryDelayMs = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
     this.#parallelism = options.parallelism ?? DEFAULT_PARALLELISM;
@@ -121,6 +126,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
       model: options.model ?? defaults.model,
       strategyVersion: "callable-purpose-v2",
     };
+    this.#activeModel = this.profile.model;
   }
 
   public async describe(input: DescriptionInput, options?: { signal?: AbortSignal }): Promise<string> {
@@ -203,14 +209,16 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
   ): Promise<string> {
     throwIfAborted(options?.signal);
     if (!this.#apiKey) throw new CodeIndexError(`${this.#apiKeyHint} is required to generate descriptions.`);
-    const { model, responses } = await this.#languageModel(headers);
-    reportModelCall("descriptions", this.profile, this.#verbose, this.#parallelism);
+    const failoverEnabled = this.#fallbackModel !== undefined && this.#fallbackModel !== this.profile.model;
+    let modelName = failoverEnabled ? this.#activeModel : this.profile.model;
     let retryDelayMs = this.#retryDelayMs;
     for (let attempt = 0; ; attempt += 1) {
+      const { model, responses } = await this.#languageModel(headers, modelName);
+      reportModelCall("descriptions", { ...this.profile, model: modelName }, this.#verbose, this.#parallelism);
       throwIfAborted(options?.signal);
-      let text: string;
+      let failure: CodeIndexError;
       try {
-        ({ text } = await generateText({
+        const { text } = await generateText({
           model,
           ...(responses ? {} : { system: instructions }),
           messages,
@@ -218,25 +226,37 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
           ...(responses ? { providerOptions: { openai: { instructions, store: false } } } : {}),
           ...(headers ? { headers } : {}),
           ...(options?.signal ? { abortSignal: options.signal } : {}),
-        }));
+        });
+        const description = text.trim();
+        if (description) return description;
+        failure = new CodeIndexError(EMPTY_DESCRIPTION_MESSAGE);
       } catch (error) {
         if (options?.signal?.aborted) throw error;
         const detail = APICallError.isInstance(error) && error.responseBody
           ? error.responseBody.slice(0, 1000)
           : error instanceof Error ? error.message : String(error);
-        throw new CodeIndexError(`Description request failed: ${detail}`, { cause: error });
+        failure = new CodeIndexError(`Description request failed: ${detail}`, { cause: error });
       }
-      const description = text.trim();
-      if (description) return description;
-      if (attempt >= EMPTY_DESCRIPTION_RETRIES) throw new CodeIndexError(EMPTY_DESCRIPTION_MESSAGE);
-      process.stderr.write(`slopdex: ${EMPTY_DESCRIPTION_MESSAGE}\n`);
+      if (!failoverEnabled) {
+        if (failure.message !== EMPTY_DESCRIPTION_MESSAGE || attempt >= EMPTY_DESCRIPTION_RETRIES) throw failure;
+        process.stderr.write(`slopdex: ${EMPTY_DESCRIPTION_MESSAGE}\n`);
+        await wait(retryDelayMs, undefined, options?.signal ? { signal: options.signal } : undefined);
+        retryDelayMs *= 2;
+        continue;
+      }
+      const nextModel = modelName === this.profile.model ? this.#fallbackModel! : this.profile.model;
+      this.#activeModel = nextModel;
+      process.stderr.write(
+        `slopdex: description model ${JSON.stringify(modelName)} failed; switching to ${JSON.stringify(nextModel)}: ${failure.message}\n`,
+      );
+      if (attempt >= MODEL_FAILOVER_RETRIES) throw failure;
       await wait(retryDelayMs, undefined, options?.signal ? { signal: options.signal } : undefined);
       retryDelayMs *= 2;
+      modelName = nextModel;
     }
   }
 
-  async #languageModel(headers: Record<string, string> | undefined) {
-    const model = this.profile.model;
+  async #languageModel(headers: Record<string, string> | undefined, model: string) {
     if (this.profile.provider === "openai" || /^(gpt-|grok-|muse-spark-)/.test(model)) {
       return {
         model: createOpenAI({ apiKey: this.#apiKey, baseURL: this.#baseUrl }).responses(model),
