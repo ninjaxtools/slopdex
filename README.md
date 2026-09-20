@@ -43,7 +43,7 @@ The index tracks the current git commit and is created or updated on every comma
 
 By default only vector embeddings of code is used for search.
 
-```bash
+```console
 $ slopdex search "keep the repository index synchronized"
 0.4284  tests/languages.test.ts :: refresh
 0.4200  src/cli.ts :: refreshIndex
@@ -102,7 +102,7 @@ For the best matching files (configured with `--describe-full-file-threshold`, d
 
 Compare functions across files, exclude short wrappers, and group matches into clusters:
 
-```bash
+```console
 $ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
 Cluster 1 (3 functions, similarity 0.9124-0.9568)
   src/auth/session.ts:18:1 :: validateSession
