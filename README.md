@@ -27,14 +27,11 @@ The main supported functions are
 
 An embedding-provider API key is required. You can use either OpenAI or Jina.
 
-```bash
-npm install -g @ninjaxtools/slopdex
-
-export OPENAI_API_KEY="your-api-key"
-# Or
-# export JINA_API_KEY="your-api-key" # and pass --provider jina
-
-slopdex search "validate an authenticated session"
+```console
+$ npm install -g @ninjaxtools/slopdex
+$ export OPENAI_API_KEY="your-api-key"
+$ slopdex search "validate an authenticated session"
+...
 ```
 
 The index tracks the current git commit and is created or updated on every command and stored in `.slopdex/index.sqlite`. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
@@ -57,26 +54,26 @@ I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low
 sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
 $5 in credit.
 
-```bash
-export OPENAI_API_KEY="your-api-key"
+```console
+$ export OPENAI_API_KEY="your-api-key"
 # Or
 # export OPENCODE_API_KEY="your-api-key" # for OpenCode Zen/Go descriptions
 # Or
 # opencode auth login                    # use stored credentials instead of env variables
 
-slopdex descriptions enable
-slopdex search-description "keep the repository index synchronized"
+$ slopdex descriptions enable
+$ slopdex search-description "keep the repository index synchronized"
 ```
 
 You can list and configure one of OpenCode's models like this (or use the interactive config):
 
-```bash
-slopdex models opencode-go
-slopdex config model opencode-go/gpt-5.6-luna
-slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
+```console
+$ slopdex models opencode-go
+$ slopdex config model opencode-go/gpt-5.6-luna
+$ slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
 ```
 
-The fallback-model is used if the main model reports and error and if the fallback-model reports and error the main model is tried again.
+The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
 
 File and function descriptions are cached. Function descriptions will only be regenerated when functions change. File descriptions need to be regenerated explcitily with the `reindex-files` command.
 
@@ -84,16 +81,16 @@ File and function descriptions are cached. Function descriptions will only be re
 
 To configure all configurable settings interactively run:
 
-```bash
-slopdex config
+```console
+$ slopdex config
 ```
 
 ### Search and describe
 
 The intention of the `describe` command is to use a low-cost model to summarise vector search findings to provide more relevant pre-processed results to a more powerful calling agent. It first performs a vector search and then uses the results to provide a tailored summary/description of relevant code and pre-generated generated file and function descriptions. 
 
-```bash
-slopdex describe "I want to implement a new rpc endpoint"
+```console
+$ slopdex describe "I want to implement a new rpc endpoint"
 ```
 
 For the best matching files (configured with `--describe-full-file-threshold`, default `0.8`) the full file contents are used.
@@ -113,39 +110,39 @@ Cluster 1 (3 functions, similarity 0.9124-0.9568)
 
 Using `--cross-file-only` is useful to exclude similar code in the same file.
 
-Review adjacent bands with threshold ranges:
+You can use threshold ranges as well:
 
-```bash
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
+```console
+$ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
+$ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
 ```
 
 ### Restrict functions used in the cross-search
 
 Only use uncommitted working-tree functions as sources:
 
-```bash
-slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9
+```console
+$ slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9
 ```
 
 Only use functions changed since origin/main as sources:
 
-```bash
-slopdex cross-search --changed-since origin/main --threshold 0.9
+```console
+$ slopdex cross-search --changed-since origin/main --threshold 0.9
 ```
 
 Only use matching symbols under src/services as sources:
 
-```bash
-slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 0.9
+```console
+$ slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 0.9
 ```
 
 ### Find related code stored far apart
 
 When code is similar but not actually duplicated, then `--cohesion` can help find similar code that exists far apart in the filesystem tree, which could potentially be refactored to make it more cohesive, by ordering matches from farthest to nearest.
 
-```bash
-slopdex cross-search --cross-file-only --cohesion --threshold 0.8
+```console
+$ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 ```
 ### Use with agents
 
@@ -162,17 +159,17 @@ Any other use, like doing a full `cross-search` is probably better done interact
 
 Optionally a second-stage reranker can be enabled for `search` and `search-description`:
 
-```bash
-export COHERE_API_KEY="your-api-key"
-slopdex config reranker cohere
+```console
+$ export COHERE_API_KEY="your-api-key"
+$ slopdex config reranker cohere
 # Or: export JINA_API_KEY="your-api-key" && slopdex config reranker jina
 # Or use an LLM: export OPENAI_API_KEY="your-api-key" && slopdex config reranker openai
 ```
 
 ### Compare repositories
 
-```bash
-slopdex cross-search \
+```console
+$ slopdex cross-search \
   --target-root /path/to/other/repo \
   --target-index /path/to/other/repo/.slopdex/index.sqlite \
   --threshold 0.9
@@ -182,10 +179,10 @@ slopdex cross-search \
 
 If some functions can't be indexed a warning is printed. Index errors can be investigated and fixed with the `index-errors` command to ensure the index is complete.
 
-```bash
-slopdex status
-slopdex index-errors --format summary
-slopdex --version
+```console
+$ slopdex status
+$ slopdex index-errors --format summary
+$ slopdex --version
 ```
 
 ## Commands
