@@ -29,7 +29,7 @@ export interface PreparedDescription {
   vector?: readonly number[];
 }
 
-export interface PreparedFileDescription {
+interface PreparedFileDescription {
   path: string;
   contentHash: string;
   descriptionKey: string;
@@ -1269,19 +1269,6 @@ export function resetIndexState(
       database.exec("ROLLBACK");
       throw error;
     }
-  } finally {
-    database.close();
-  }
-}
-
-export function readIndexErrorCounts(indexPath: string): { errors: number; files: number } {
-  const database = new DatabaseSync(indexPath, { readOnly: true });
-  try {
-    if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'indexing_errors'").get()) {
-      return { errors: 0, files: 0 };
-    }
-    const counts = database.prepare("SELECT COUNT(*) AS errors, COUNT(DISTINCT path) AS files FROM indexing_errors").get() as { errors: number; files: number };
-    return { errors: Number(counts.errors), files: Number(counts.files) };
   } finally {
     database.close();
   }

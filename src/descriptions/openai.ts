@@ -28,7 +28,7 @@ export interface OpenAIDescriptionProviderOptions {
   parallelism?: number;
 }
 
-export const DESCRIPTION_PROVIDER_NAMES = ["openai", "opencode", "opencode-go"] as const;
+const DESCRIPTION_PROVIDER_NAMES = ["openai", "opencode", "opencode-go"] as const;
 export type DescriptionProviderName = typeof DESCRIPTION_PROVIDER_NAMES[number];
 
 export function isDescriptionProviderName(value: string): value is DescriptionProviderName {
@@ -49,12 +49,12 @@ const EMPTY_DESCRIPTION_MESSAGE = "Description provider returned an empty descri
 const EMPTY_DESCRIPTION_RETRIES = 5;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
 
-export function openCodeAuthPath(): string {
+function openCodeAuthPath(): string {
   const dataHome = process.env.XDG_DATA_HOME?.trim() || path.join(homedir(), ".local", "share");
   return path.join(dataHome, "opencode", "auth.json");
 }
 
-export function openCodeAuthKey(provider: DescriptionProviderName): string | undefined {
+function openCodeAuthKey(provider: DescriptionProviderName): string | undefined {
   let auth: unknown;
   try {
     auth = JSON.parse(readFileSync(openCodeAuthPath(), "utf8"));
