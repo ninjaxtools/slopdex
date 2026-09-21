@@ -194,6 +194,10 @@ $ slopdex index-errors --format summary
 $ slopdex --version
 ```
 
+## Related Work
+
+- [qmd](https://github.com/tobi/qmd)
+
 ## Commands
 
 See [Command reference](docs/reference.md).
