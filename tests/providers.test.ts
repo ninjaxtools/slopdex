@@ -449,7 +449,7 @@ describe("rerankers", () => {
       reasoning: { effort: "high" },
       text: { format: { type: "json_schema", name: "function_ranking", strict: true } },
     });
-    expect(requests[0]!.instructions).toContain("purpose descriptions and source code");
+    expect(requests[0]!.instructions).toContain("purpose descriptions and source code when present");
     expect(requests[0]).not.toHaveProperty("max_output_tokens");
     expect((requests[0]!.reasoning as Record<string, unknown>)).not.toHaveProperty("summary");
     expect(JSON.stringify(requests[0]!.input)).toContain("second function");

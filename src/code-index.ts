@@ -6,9 +6,10 @@ import { CodeIndexError, GitDivergenceError } from "./errors.js";
 import { GitRepository, type GitChange, type GitTreeEntry } from "./git/repository.js";
 import { GitignoreRules } from "./gitignore.js";
 import { CALLABLE_PARSER_CACHE_VERSION, languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
+import { chunkMarkdown, isMarkdownPath } from "./parser/markdown.js";
 import { analysisSimilarity } from "./search/similarity.js";
 import { SourcePolicy } from "./source-policy.js";
-import { IndexDatabase, type IndexedFileState, type PreparedCallable, type PreparedDescription, type PreparedFile } from "./storage/database.js";
+import { IndexDatabase, type IndexedFileState, type PreparedCallable, type PreparedDescription, type PreparedFile, type PreparedMarkdownChunk } from "./storage/database.js";
 import { isDescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
 import type {
   CodeIndexOptions,
@@ -23,6 +24,11 @@ import type {
   IndexStatus,
   IndexedFunction,
   IndexingError,
+  MarkdownChunk,
+  MarkdownSearchOptions,
+  MarkdownSearchResult,
+  SearchOptions,
+  SearchResult,
   SimilarityResult,
   SimilaritySearchOptions,
   DescriptionProvider,
@@ -118,6 +124,10 @@ export class CodeIndex {
 
   public allFunctions(): IndexedFunction[] {
     return this.#database.allFunctions();
+  }
+
+  public allMarkdownChunks(): MarkdownChunk[] {
+    return this.#database.allMarkdownChunks();
   }
 
   public indexErrors(): IndexingError[] {
@@ -288,7 +298,7 @@ export class CodeIndex {
     // re-evaluate an unchanged blob; all other recorded errors never force a
     // retry on their own.
     const tooLargePaths = new Set(this.#database.filesWithFileTooLargeErrors());
-    let reconcileAll = checkpoint === null;
+    let reconcileAll = checkpoint === null || this.#database.needsMarkdownScan();
     if (checkpoint && !(await this.#git.isAncestor(checkpoint, target))) {
       if (!options.rebuildOnDivergence) throw new GitDivergenceError(checkpoint, target);
       reconcileAll = true;
@@ -670,8 +680,9 @@ export class CodeIndex {
   ): PreparedFile {
     const content = buffer.toString("utf8");
     const contentHash = sha256(content);
+    const markdown = isMarkdownPath(relativePath);
     const parseKey = sha256(`${CALLABLE_PARSER_CACHE_VERSION}\0${relativePath}\0${contentHash}`);
-    let parsed = this.#database.cachedParse(parseKey);
+    let parsed = markdown ? { callables: [], errors: [] } : this.#database.cachedParse(parseKey);
     if (!parsed) {
       parsed = parseFileCallables(relativePath, content, this.#onWarning);
       if (!parsed.errors.some((error) => error.code === "parse-failed" || error.code === "extraction-error")) {
@@ -680,7 +691,7 @@ export class CodeIndex {
     } else if (parsed.errors.length > 0) {
       this.#onWarning(`Cannot fully parse ${relativePath}: tree-sitter reported syntax errors; indexing recoverable callables only.`);
     }
-    const language = languageForPath(relativePath) ?? path.extname(relativePath).slice(1);
+    const language = markdown ? "markdown" : languageForPath(relativePath) ?? path.extname(relativePath).slice(1);
     return {
       path: relativePath,
       contentHash,
@@ -693,6 +704,9 @@ export class CodeIndex {
       ...(provenance.previousPath ? { previousPath: provenance.previousPath } : {}),
       ...(provenance.replacePath ? { replacePath: provenance.replacePath } : {}),
       callables: parsed.callables as PreparedCallable[],
+      markdownChunks: markdown
+        ? chunkMarkdown(content).map((chunk): PreparedMarkdownChunk => ({ ...chunk, embeddingKey: "" }))
+        : [],
       errors: parsed.errors,
     };
   }
@@ -729,7 +743,8 @@ export class CodeIndex {
     this.#onWarning(`Cannot index ${relativePath}: ${message}`);
     return {
       ...provenance, path: relativePath, contentHash: sha256(""), source: "", byteSize,
-      language: languageForPath(relativePath) ?? "unknown", callables: [], unavailable: true,
+      language: isMarkdownPath(relativePath) ? "markdown" : languageForPath(relativePath) ?? "unknown",
+      callables: [], markdownChunks: [], unavailable: true,
       errors: [{
         path: relativePath, language: languageForPath(relativePath), scope: "file", code, message,
         qualifiedName: null, startLine: null, startColumn: null, endLine: null, endColumn: null, source: null,
@@ -739,26 +754,26 @@ export class CodeIndex {
 
   async #attachEmbeddings(files: PreparedFile[], signal?: AbortSignal): Promise<number> {
     if (this.#database.descriptionsEnabled()) {
-      await this.#attachDescriptions(files.filter((file) => !file.unavailable), signal);
+      await this.#attachDescriptions(files.filter((file) => !file.unavailable && file.language !== "markdown"), signal);
     }
     throwIfAborted(signal);
     const profile = JSON.stringify(normalizeProfile(this.provider.profile));
-    const unique = new Map<string, PreparedCallable[]>();
+    const unique = new Map<string, Array<PreparedCallable | PreparedMarkdownChunk>>();
     for (const file of files) {
-      for (const callable of file.callables) {
-        callable.embeddingKey = embeddingKey(profile, "document", callable.embeddingInput);
-        const values = unique.get(callable.embeddingKey) ?? [];
-        values.push(callable);
-        unique.set(callable.embeddingKey, values);
+      for (const item of [...file.callables, ...file.markdownChunks]) {
+        item.embeddingKey = embeddingKey(profile, "document", item.embeddingInput);
+        const values = unique.get(item.embeddingKey) ?? [];
+        values.push(item);
+        unique.set(item.embeddingKey, values);
       }
     }
-    const missing: Array<[string, PreparedCallable[]]> = [];
-    for (const [key, callables] of unique) {
+    const missing: Array<[string, Array<PreparedCallable | PreparedMarkdownChunk>]> = [];
+    for (const [key, items] of unique) {
       const vector = this.#database.cachedEmbedding(key);
       if (vector) {
-        for (const callable of callables) callable.vector = vector;
+        for (const item of items) item.vector = vector;
       } else {
-        missing.push([key, callables]);
+        missing.push([key, items]);
       }
     }
     if (missing.length === 0) return 0;
@@ -766,14 +781,14 @@ export class CodeIndex {
     this.#progress("vectors", 0, missing.length);
     await forEachConcurrent(chunk(missing, this.#embeddingBatchSize), this.#parallelism, async (batch, _index, workerSignal) => {
       const vectors = await this.provider.embedDocuments(
-        batch.map(([, callables]) => callables[0]!.embeddingInput),
+        batch.map(([, items]) => items[0]!.embeddingInput),
         { signal: workerSignal },
       );
       if (vectors.length !== batch.length) throw new CodeIndexError("Embedding provider returned an unexpected number of vectors.");
       vectors.forEach((vector, index) => {
         const converted = normalizeEmbeddingVector(vector, this.provider.profile.dimensions);
         this.#database.storeEmbedding(batch[index]![0], converted);
-        for (const callable of batch[index]![1]) callable.vector = converted;
+        for (const item of batch[index]![1]) item.vector = converted;
       });
       completed += batch.length;
       this.#progress("vectors", completed, missing.length);
@@ -1007,6 +1022,7 @@ export class CodeIndex {
         sourceMode: file.sourceMode, indexedCommit: null, language: file.language,
         byteSize: buffer.byteLength, source,
         errors: [],
+        markdownChunks: [],
         callables: callables.map(({ description: _description, descriptionEmbeddingId: _descriptionEmbeddingId, ...callable }) => ({
           ...callable,
           embeddingKey: "",
@@ -1041,6 +1057,108 @@ export class CodeIndex {
       ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
     });
     return await this.#rerank(options.query, results, limit, options.signal);
+  }
+
+  public async searchCode(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
+    if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
+    const limit = options.limit;
+    if (limit !== undefined) assertPositiveInteger(limit, "limit");
+    const candidateLimit = this.#candidateLimit(limit);
+    compileNameRegex(options.nameRegex);
+    throwIfAborted(options.signal);
+    const vector = await this.#queryEmbedding(options.query, options.signal);
+    throwIfAborted(options.signal);
+    const results = this.#database.searchVector(vector, {
+      ...(candidateLimit === undefined ? {} : { limit: candidateLimit }),
+      minSimilarity: options.minSimilarity ?? -1,
+      ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
+      ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+    });
+    return await this.#rerank(options.query, results, limit, options.signal);
+  }
+
+  public async searchMarkdown(options: MarkdownSearchOptions): Promise<MarkdownSearchResult[]> {
+    if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
+    const limit = options.limit;
+    if (limit !== undefined) assertPositiveInteger(limit, "limit");
+    const candidateLimit = this.#candidateLimit(limit);
+    throwIfAborted(options.signal);
+    const vector = await this.#queryEmbedding(options.query, options.signal);
+    throwIfAborted(options.signal);
+    const results = this.#database.searchMarkdown(vector, {
+      ...(candidateLimit === undefined ? {} : { limit: candidateLimit }),
+      minSimilarity: options.minSimilarity ?? -1,
+      ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+    });
+    return await this.#rerankMarkdown(options.query, results, limit, options.signal);
+  }
+
+  public async search(options: SearchOptions): Promise<SearchResult[]> {
+    if (!options.query.trim()) throw new CodeIndexError("query must not be empty.");
+    const limit = options.limit;
+    if (limit !== undefined) assertPositiveInteger(limit, "limit");
+    compileNameRegex(options.nameRegex);
+    const requested = options.indexes === undefined
+      ? new Set(["code", "descriptions", "markdown"] as const)
+      : new Set(options.indexes);
+    if (requested.size === 0) throw new CodeIndexError("at least one search index must be selected.");
+    for (const index of requested) {
+      if (index !== "code" && index !== "descriptions" && index !== "markdown") {
+        throw new CodeIndexError(`Unknown search index: ${String(index)}.`);
+      }
+    }
+    if (options.indexes !== undefined && requested.has("descriptions") && !this.#database.descriptionsEnabled()) {
+      throw new CodeIndexError("Descriptions are not enabled; run descriptions enable first.");
+    }
+    if (!this.#database.descriptionsEnabled()) requested.delete("descriptions");
+
+    const candidateLimit = this.#candidateLimit(limit);
+    throwIfAborted(options.signal);
+    const vector = await this.#queryEmbedding(options.query, options.signal);
+    throwIfAborted(options.signal);
+    const functionOptions = {
+      ...(candidateLimit === undefined ? {} : { limit: candidateLimit }),
+      minSimilarity: options.minSimilarity ?? -1,
+      ...(options.nameRegex !== undefined ? { nameRegex: options.nameRegex } : {}),
+      ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+    };
+    const includeCode = requested.has("code");
+    const includeDescriptions = requested.has("descriptions");
+    let functions: SimilarityResult[] = [];
+    if (includeCode && includeDescriptions) {
+      const complete = this.#descriptionScoringAvailable();
+      functions = this.#database.searchVector(vector, {
+        ...functionOptions,
+        ...(complete ? { descriptionVector: vector, fileDescriptionVector: vector } : {}),
+      });
+    } else if (includeCode) {
+      functions = this.#database.searchVector(vector, functionOptions);
+    } else if (includeDescriptions) {
+      functions = this.#database.searchVector(vector, {
+        ...functionOptions,
+        descriptions: true,
+        ...(this.#descriptionScoringAvailable() ? { fileDescriptionVector: vector } : {}),
+      });
+    }
+    const markdown = requested.has("markdown")
+      ? this.#database.searchMarkdown(vector, {
+        ...(candidateLimit === undefined ? {} : { limit: candidateLimit }),
+        minSimilarity: options.minSimilarity ?? -1,
+        ...(options.maxSimilarity !== undefined ? { maxSimilarity: options.maxSimilarity } : {}),
+      })
+      : [];
+    const candidates: SearchResult[] = [
+      ...functions.map((result): SearchResult => ({ type: "function", ...result })),
+      ...markdown.map((result): SearchResult => ({ type: "markdown", ...result })),
+    ].sort((left, right) => right.similarity - left.similarity
+      || left.type.localeCompare(right.type)
+      || (left.type === "function" ? left.function.id : left.chunk.id)
+        - (right.type === "function" ? right.function.id : right.chunk.id));
+    const selected = candidateLimit === undefined ? candidates : candidates.slice(0, candidateLimit);
+    const documents = selected.map((result) => result.type === "function"
+      ? this.#functionRerankDocument(result)
+      : `path: ${result.chunk.path}\n${result.chunk.content}`);
+    return await this.#rerankCandidates(options.query, selected, documents, limit, options.signal);
   }
 
   public async similaritySearch(options: SimilaritySearchOptions): Promise<SimilarityResult[]> {
@@ -1173,12 +1291,36 @@ export class CodeIndex {
     limit: number | undefined,
     signal?: AbortSignal,
   ): Promise<SimilarityResult[]> {
-    if (!this.reranker || candidates.length === 0) return limit === undefined ? candidates : candidates.slice(0, limit);
-    const documents = candidates.map(({ function: callable }) => [
+    const documents = candidates.map((candidate) => this.#functionRerankDocument(candidate));
+    return await this.#rerankCandidates(query, candidates, documents, limit, signal);
+  }
+
+  #functionRerankDocument({ function: callable }: SimilarityResult): string {
+    return [
       `path: ${callable.path}`,
       callable.description ? `description:\n${callable.description}` : null,
       callable.embeddingInput,
-    ].filter((value): value is string => value !== null).join("\n"));
+    ].filter((value): value is string => value !== null).join("\n");
+  }
+
+  async #rerankMarkdown(
+    query: string,
+    candidates: MarkdownSearchResult[],
+    limit: number | undefined,
+    signal?: AbortSignal,
+  ): Promise<MarkdownSearchResult[]> {
+    const documents = candidates.map(({ chunk }) => `path: ${chunk.path}\n${chunk.content}`);
+    return await this.#rerankCandidates(query, candidates, documents, limit, signal);
+  }
+
+  async #rerankCandidates<T extends { rerankScore?: number }>(
+    query: string,
+    candidates: T[],
+    documents: string[],
+    limit: number | undefined,
+    signal?: AbortSignal,
+  ): Promise<Array<T & { rerankScore?: number }>> {
+    if (!this.reranker || candidates.length === 0) return limit === undefined ? candidates : candidates.slice(0, limit);
     const rerankLimit = limit === undefined ? candidates.length : Math.min(limit, candidates.length);
     const rankings = await this.reranker.rerank(query, documents, signal ? { limit: rerankLimit, signal } : { limit: rerankLimit });
     throwIfAborted(signal);

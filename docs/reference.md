@@ -11,10 +11,12 @@ Usage: `slopdex <command> [arguments] [options]`.
 | `config fallback-model <model\|provider/model>` | Validate and persist an optional fallback description model on the same provider. | Updated setting summary; optional JSON |
 | `config descriptions <enable\|disable>` | Persist whether the next index-using command should enable or disable descriptions. Does not open an index. | Updated setting summary; optional JSON |
 | `config reranker <cohere\|jina\|openai\|disable> [model]` | Enable a hosted or OpenAI LLM query reranker, optionally selecting a model, or disable it. OpenAI accepts `--reranker-candidates <number>` from 1 to 100 and defaults to 10. Does not open an index. | Updated setting summary; optional JSON |
-| `search <query>` | Search function code by meaning. Quote multiword queries. | Summary; optional JSON array |
+| `search <query>` | Search code, available descriptions, and heading-aware Markdown together. Quote multiword queries. | Mixed summary; optional discriminated JSON array |
+| `search-code <query>` | Search function code only. | Summary; optional JSON array |
+| `search-descriptions <query>` | Search purpose descriptions after enabling them. | Summary including description text; optional JSON array |
+| `search-md <query>` | Search heading-aware chunks from `.md` and `.markdown` files only. | Summary with chunk text; optional JSON array |
 | `describe <query>` | Gather relevant existing code and have the configured description model explain how it fits together for the query. Never proposes an implementation. | Generated explanation; optional JSON object |
 | `descriptions <enable\|disable>` | Enable or disable automatic purpose descriptions. Re-enabling with unchanged inputs reuses cached descriptions. | JSON statistics |
-| `search-description <query>` | Search purpose descriptions after enabling them. | Summary including description text; optional JSON array |
 | `cross-search` | Find neighbors for each selected function in this or another index. | `clusters` by default; optional `summary` or JSONL |
 | `status` | Refresh and show index metadata, counts, and profiles. | JSON object |
 | `index-errors` | Read saved file/function indexing failures. | Summary; optional JSON array |
@@ -59,12 +61,15 @@ Explicit relative config and index paths resolve from the current directory, not
 
 | Argument | Applies to | Meaning / default |
 | --- | --- | --- |
-| `--limit <number>` | Both query searches, describe, cross-search | Positive integer output limit; unlimited unless passed or capped by a reranker's advertised maximum. Query matches, or cross-search output entries (clusters for `clusters`, matched sources for `summary`/JSONL). Threshold filters results; scans all sources and only truncates emitted output. In describe, it caps the matching callables used as context. |
+| `--limit <number>` | Query searches, describe, cross-search | Positive integer output limit; unlimited unless passed or capped by a reranker's advertised maximum. Query matches, or cross-search output entries (clusters for `clusters`, matched sources for `summary`/JSONL). Threshold filters results; scans all sources and only truncates emitted output. In describe, it caps the matching callables used as context. |
 | `--matches <number>` | Cross-search | Positive integer matches kept per source function; default `5`. |
-| `--threshold <number\|min-max>` | Both query searches, describe, cross-search | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `0.3`. |
+| `--threshold <number\|min-max>` | Query searches, describe, cross-search | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `0.3`. |
+| `--code` | `search` | Select the callable-code index. If any index selector is present, unselected indexes are omitted. |
+| `--descriptions` | `search` | Select callable and file descriptions. Requires descriptions to be enabled. |
+| `--md` | `search` | Select heading-aware Markdown chunks. |
 | `--describe-full-file-threshold <number>` | Describe | Include a file's complete indexed source when its highest result similarity is strictly above this value; default `0.8`. Files at or below it contribute only their description. |
-| `--format <json\|summary\|clusters>` | Both query searches, describe, cross-search, index-errors | Output format; see the commands table. `clusters` is only for ordinary cross-search. |
-| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Both query searches, describe, cross-search | Equivalent case-sensitive JavaScript regex options over qualified names. Query searches and describe filter results before limiting; cross-search filters sources only. |
+| `--format <json\|summary\|clusters>` | Query searches, describe, cross-search, index-errors | Output format; see the commands table. `clusters` is only for ordinary cross-search. |
+| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Function query searches, combined search, describe, cross-search | Equivalent case-sensitive JavaScript regex options over qualified names. Query searches and describe filter function results before limiting; Markdown results in combined search are unaffected. Cross-search filters sources only. |
 | `--min-lines <number>` | Cross-search | Minimum source and candidate callable length; positive integer, default `2`. Use `1` to include one-line wrappers. |
 | `--source-path <path>` | Cross-search | Select sources in a file or recursive directory, relative to the repository root (or absolute within it). |
 | `--changed-since <commit>` | Cross-search | Select added, modified, or moved functions relative to an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
@@ -139,7 +144,7 @@ Tree-sitter extraction, generated descriptions, and document/query vectors are c
 
 When Slopdex makes external vector, description, or reranking model calls, stderr identifies the call kind, provider, and model. By default each combination is reported once per process regardless of request count. Pass `--verbose`, or set `"verbose": true` in config, to report every request. Cache hits do not produce notices because they do not call a model.
 
-With complete descriptions, `search` and cross-search average **one-third code similarity + one-third callable-description similarity + one-third file-description similarity**. `search-description` averages callable and file descriptions without code. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Stale file descriptions remain searchable until explicitly reindexed. Thresholds and limits apply to the selected score.
+With complete descriptions, function results from `search` average **one-third code similarity + one-third callable-description similarity + one-third file-description similarity**. `search-descriptions` averages callable and file descriptions without code, while `search-code` uses code only. Markdown results retain their own chunk similarity and are ranked in the same candidate set as function results. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Stale file descriptions remain searchable until explicitly reindexed. Thresholds and limits apply to the selected score.
 
 Text output labels combined scores. JSON exposes `codeSimilarity`, `descriptionSimilarity`, `fileDescriptionSimilarity`, and cross-search scoring mode/weights. Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, and source/candidate filters.
 
@@ -187,7 +192,7 @@ Run `slopdex config` without arguments to configure every option interactively. 
 | `descriptionModel` | Description model; provider default unless explicitly set. |
 | `descriptionFallbackModel` | Optional fallback description model on the same provider. A failure switches the active model, and failover retries use exponential backoff. |
 | `descriptionsEnabled` | When true or false, the next index-using command applies that enabled state during its normal refresh. Unset leaves persisted index state unchanged. |
-| `rerankingEnabled` | Enables second-stage ranking for `search` and `search-description`; disabled/unset by default. Prefer changing it through `config reranker`. |
+| `rerankingEnabled` | Enables second-stage ranking for query searches; disabled/unset by default. Prefer changing it through `config reranker`. |
 | `rerankerProvider` | Reranker: `cohere`, `jina`, or `openai`. OpenAI uses an LLM rather than a dedicated reranking endpoint. |
 | `rerankerModel` | Provider model; defaults to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, or OpenAI `gpt-5.6-luna`. |
 | `rerankerCandidates` | Embedding-ranked candidates sent to the OpenAI LLM; integer from `1` to `100`, default `10`. The requested result limit takes precedence when larger, up to 100. |

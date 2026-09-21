@@ -11,6 +11,7 @@ export type { JinaEmbeddingProviderOptions } from "./embeddings/jina.js";
 export { CohereReranker, JinaReranker } from "./rerankers/hosted.js";
 export type { CohereRerankerOptions, JinaRerankerOptions } from "./rerankers/hosted.js";
 export { OpenAILLMReranker } from "./rerankers/openai.js";
+export { chunkMarkdown } from "./parser/markdown.js";
 export type { OpenAILLMRerankerOptions } from "./rerankers/openai.js";
 export { CodeIndexError, GitDivergenceError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 export type * from "./types.js";
@@ -23,7 +24,9 @@ import type {
   CohesionAnalysisOptions,
   CrossSearchOptions,
   DescribeOptions,
+  MarkdownSearchOptions,
   ReindexFilesOptions,
+  SearchOptions,
   SimilaritySearchOptions,
   UpdateFilesOptions,
   UpdateFromGitOptions,
@@ -54,6 +57,14 @@ export function similaritySearch(index: CodeIndex, options: SimilaritySearchOpti
   return index.similaritySearch(options);
 }
 
+export function search(index: CodeIndex, options: SearchOptions) {
+  return index.search(options);
+}
+
+export function searchCode(index: CodeIndex, options: SimilaritySearchOptions) {
+  return index.searchCode(options);
+}
+
 export function describe(index: CodeIndex, options: DescribeOptions) {
   return index.describe(options);
 }
@@ -68,6 +79,10 @@ export function disableDescriptions(index: CodeIndex) {
 
 export function searchDescription(index: CodeIndex, options: SimilaritySearchOptions) {
   return index.searchDescription(options);
+}
+
+export function searchMarkdown(index: CodeIndex, options: MarkdownSearchOptions) {
+  return index.searchMarkdown(options);
 }
 
 export function crossSearchFunctions(options: CrossSearchOptions) {

@@ -63,7 +63,7 @@ describe("CLI index initialization", { timeout: testTimeoutMs }, () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toContain("index not found");
     expect(result.stderr).toContain("initializing automatically from HEAD and the working tree");
-    expect(JSON.parse(result.stdout)).toMatchObject({ gitCheckpoint: head, fileCount: 0, functionCount: 0 });
+    expect(JSON.parse(result.stdout)).toMatchObject({ gitCheckpoint: head, fileCount: 1, functionCount: 0, markdownChunkCount: 0 });
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(true);
   });
 
@@ -73,13 +73,13 @@ describe("CLI index initialization", { timeout: testTimeoutMs }, () => {
     write(root, "README.md", "# Example\n");
     commitAll(root, "initial");
     write(root, "README.md", "# Changed locally\n");
-    write(root, "notes.md", "Untracked notes\n");
+    write(root, "notes.txt", "Untracked notes\n");
 
     const result = await runCli(root, "status");
 
     expect(result.status).toBe(0);
     expect(result.stderr).toContain("index not found");
-    expect(JSON.parse(result.stdout)).toMatchObject({ fileCount: 0, functionCount: 0 });
+    expect(JSON.parse(result.stdout)).toMatchObject({ fileCount: 1, functionCount: 0, markdownChunkCount: 0 });
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(true);
   });
 
@@ -228,7 +228,7 @@ globalThis.fetch = async (_url, options) => {
 
     write(root, "README.md", "# Updated\n");
     const target = commitAll(root, "updated");
-    write(root, "notes.md", "Uncommitted\n");
+    write(root, "notes.txt", "Uncommitted\n");
     const result = await runCli(root, "status");
 
     expect(result.status).toBe(0);
@@ -577,12 +577,17 @@ export function two(value: string) {
     expect(conflictingAliases.stderr).toContain("are aliases and cannot use different values");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
+    const misplacedIndexSelector = await runCli(root, "search-code", "query", "--md");
+    expect(misplacedIndexSelector.status).toBe(2);
+    expect(misplacedIndexSelector.stderr).toContain("only available for search");
+    expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
+
     const emptyRange = await runCli(root, "cross-search", "--threshold", "0.9-0.9");
     expect(emptyRange.status).toBe(2);
     expect(emptyRange.stderr).toContain("minimum must be less than its maximum");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    for (const command of ["cross-search", "search", "search-description"]) {
+    for (const command of ["cross-search", "search", "search-descriptions"]) {
       for (const option of ["-e", "--regex"]) {
         const invalidSourceRegex = await runCli(root, command, ...(command.startsWith("search") ? ["query"] : []), option, "[");
         expect(invalidSourceRegex.status).toBe(2);
@@ -596,7 +601,7 @@ export function two(value: string) {
     expect(invalidDescriptionProvider.stderr).toContain("Unsupported description provider: unknown");
     expect(existsSync(path.join(root, ".slopdex", "index.sqlite"))).toBe(false);
 
-    for (const command of ["search", "search-description"]) {
+    for (const command of ["search", "search-descriptions"]) {
       const matchesRejected = await runCli(root, command, "query", "--matches", "2");
       expect(matchesRejected.status).toBe(2);
       expect(matchesRejected.stderr).toContain("--matches is only available for cross-search");
@@ -647,9 +652,11 @@ describe("CLI help", { timeout: testTimeoutMs }, () => {
       "slopdex update-git",
       "slopdex search \"validate an authenticated session\"",
       "slopdex search \"keep the repository index synchronized\"",
+      "slopdex search-code \"keep the repository index synchronized\"",
+      "slopdex search-md \"configure the embedding provider\"",
       "slopdex describe \"I want to implement a new rpc endpoint\"",
       "slopdex descriptions enable",
-      "slopdex search-description \"keep the repository index synchronized\"",
+      "slopdex search-descriptions \"keep the repository index synchronized\"",
       "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9",
       "slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9",
       "slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9",
@@ -834,6 +841,7 @@ describe("CLI reranker configuration", { timeout: testTimeoutMs }, () => {
       "export function one() { return 1; }",
       "export function two() { return 2; }",
     ].join("\n"));
+    write(root, "guide.md", "# Guide\n\nDeployment documentation.\n");
     write(root, ".slopdex/config.json", JSON.stringify({ dimensions: 2 }));
     write(root, ".slopdex/mock-api.mjs", `
 globalThis.fetch = async (url, options) => {
@@ -907,6 +915,24 @@ globalThis.fetch = async (url, options) => {
     const disabled = await run("config", "reranker", "disable");
     expect(disabled.status, disabled.stderr).toBe(0);
     expect(JSON.parse(readFileSync(configPath, "utf8")).rerankingEnabled).toBe(false);
+
+    const combined = await run("search", "anything", "--format", "json");
+    expect(JSON.parse(combined.stdout).map((result: { type: string }) => result.type))
+      .toEqual(["function", "function", "markdown"]);
+    const markdownOnly = await run("search", "anything", "--md", "--format", "json");
+    expect(JSON.parse(markdownOnly.stdout)).toMatchObject([{ type: "markdown", chunk: { path: "guide.md" } }]);
+    const selectedCode = await run("search", "anything", "--code", "--format", "json");
+    expect(JSON.parse(selectedCode.stdout).map((result: { type: string }) => result.type))
+      .toEqual(["function", "function"]);
+    const codeOnly = await run("search-code", "anything", "--format", "json");
+    expect(JSON.parse(codeOnly.stdout)).toHaveLength(2);
+    const dedicatedMarkdown = await run("search-md", "anything", "--format", "json");
+    expect(JSON.parse(dedicatedMarkdown.stdout)).toMatchObject([{ chunk: { path: "guide.md" } }]);
+    expect((await run("search-md", "anything", "--threshold", "1.1")).stdout).toBe("No matches.\n");
+    expect((await run("search", "anything", "--threshold", "1.1")).stdout).toBe("No matches.\n");
+    const unavailableDescriptions = await run("search", "anything", "--descriptions");
+    expect(unavailableDescriptions.status).toBe(2);
+    expect(unavailableDescriptions.stderr).toContain("run descriptions enable first");
   });
 
   it("rejects invalid reranker configuration before creating an index", async () => {
@@ -991,21 +1017,24 @@ globalThis.fetch = async (url, options) => {
     expect(disabled.status, disabled.stderr).toBe(0);
     expect(JSON.parse(disabled.stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: false });
     expect(JSON.parse((await run("status")).stdout)).toMatchObject({ descriptionCount: 0, descriptionsEnabled: false });
-    expect((await run("search-description", "workflow")).stderr).toContain("run descriptions enable first");
+    expect((await run("search-descriptions", "workflow")).stderr).toContain("run descriptions enable first");
     expect(JSON.parse((await run("descriptions", "enable")).stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
 
-    const search = await run("search-description", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
+    const search = await run("search-descriptions", "workflow", "--threshold", "0.9", "--limit", "1", "--format", "json");
     expect(search.status, search.stderr).toBe(0);
     expect(JSON.parse(search.stdout)[0].function.description).toBe("Purpose of one using muse-spark-1.3-contributor");
     expect(JSON.parse(search.stdout)[0].function).not.toHaveProperty("descriptionEmbeddingId");
-    const text = await run("search-description", "workflow");
+    const selectedDescriptions = await run("search", "workflow", "--descriptions", "--threshold", "0.9", "--format", "json");
+    expect(JSON.parse(selectedDescriptions.stdout)).toMatchObject([{ type: "function", function: { name: "one" } }]);
+    const text = await run("search-descriptions", "workflow");
     expect(text.stdout).toContain("Purpose of one using muse-spark-1.3-contributor");
+    expect((await run("search-description", "workflow")).status).toBe(0);
 
     write(root, "src/b.ts", "export function two() { return 2; }\n");
     const updated = await run("status");
     expect(updated.status, updated.stderr).toBe(0);
     expect(JSON.parse(updated.stdout)).toMatchObject({ functionCount: 2, descriptionCount: 2, descriptionsEnabled: true });
-    for (const command of ["search", "search-description"]) {
+    for (const command of ["search", "search-descriptions"]) {
       const filtered = await run(command, "workflow", "-e", "^two$", "--limit", "1", "--format", "json");
       expect(filtered.status, filtered.stderr).toBe(0);
       expect(JSON.parse(filtered.stdout).map((match: { function: { name: string } }) => match.function.name)).toEqual(["two"]);
@@ -1017,7 +1046,7 @@ globalThis.fetch = async (url, options) => {
     );
     expect(changedModel.status, changedModel.stderr).toBe(0);
     expect(JSON.parse(changedModel.stdout)).toEqual({ descriptionsCreated: 0, fileDescriptionsCreated: 0, descriptionsEnabled: true });
-    const reused = await run("search-description", "workflow", "--threshold", "0.9", "--limit", "2", "--format", "json");
+    const reused = await run("search-descriptions", "workflow", "--threshold", "0.9", "--limit", "2", "--format", "json");
     expect(reused.status, reused.stderr).toBe(0);
     expect(JSON.parse(reused.stdout).map((match: { function: { description: string } }) => match.function.description).sort())
       .toEqual(["Purpose of one using muse-spark-1.3-contributor", "Purpose of two using muse-spark-1.3-contributor"]);
@@ -1105,11 +1134,11 @@ globalThis.fetch = async (url, options) => {
 
   it("validates description search arguments and explains how to enable descriptions", async () => {
     const root = temporaryRoot();
-    const missingQuery = await runCli(root, "search-description");
+    const missingQuery = await runCli(root, "search-descriptions");
     expect(missingQuery.status).toBe(2);
-    expect(missingQuery.stderr).toContain("search-description requires a query");
+    expect(missingQuery.stderr).toContain("search-descriptions requires a query");
     expect(existsSync(path.join(root, ".slopdex/index.sqlite"))).toBe(false);
-    const disabled = await runCli(root, "search-description", "workflow");
+    const disabled = await runCli(root, "search-descriptions", "workflow");
     expect(disabled.status).toBe(2);
     expect(disabled.stderr).toContain("run descriptions enable first");
 

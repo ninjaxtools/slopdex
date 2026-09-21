@@ -11,13 +11,13 @@ Slopdex helps with doing analysis on codebases that contain a lot of AI generate
 The main supported functions are
 
 - `slopdex search <query>`
-   <br/>find code similar to the query
+   <br/>find relevant code, descriptions, and Markdown
 - `slopdex cross-search`
    <br/>find clusters of similar code
 - `slopdex describe <query>`
    <br/>explain code relevant to a task
 
-`search` does a vector search to find functions similar to the query.
+`search` searches function code, available descriptions, and Markdown by default. Use `--code`, `--descriptions`, or `--md` to select indexes; when any selector is present, only the selected indexes are searched. The dedicated `search-code`, `search-descriptions`, and `search-md` commands search one index directly.
 
 `cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
 
@@ -36,9 +36,9 @@ $ slopdex search "validate an authenticated session"
 
 The index tracks the current git commit and is created or updated on every command and stored in `.slopdex/index.sqlite`. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
 
-### Search code
+### Search
 
-By default only vector embeddings of code is used for search.
+By default all available indexes are searched and ranked together.
 
 ```console
 $ slopdex search "keep the repository index synchronized"
@@ -49,6 +49,15 @@ $ slopdex search "keep the repository index synchronized"
 ```
 
 You can also enable optional description generation which will automatically generate file and function descriptions with a configured LLM provider and include them in the search.
+
+### Search Markdown
+
+Markdown files (`.md` and `.markdown`) are indexed automatically. Search their heading-aware chunks separately, or select Markdown in a combined search:
+
+```console
+$ slopdex search-md "configure the embedding provider"
+$ slopdex search "configure the embedding provider" --code --md
+```
 
 I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low-cost models. If you
 sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
@@ -62,7 +71,7 @@ $ export OPENAI_API_KEY="your-api-key"
 # opencode auth login                    # use stored credentials instead of env variables
 
 $ slopdex descriptions enable
-$ slopdex search-description "keep the repository index synchronized"
+$ slopdex search-descriptions "keep the repository index synchronized"
 ```
 
 You can list and configure one of OpenCode's models like this (or use the interactive config):
@@ -157,7 +166,7 @@ Any other use, like doing a full `cross-search` is probably better done interact
 
 ### Reranking
 
-Optionally a second-stage reranker can be enabled for `search` and `search-description`:
+Optionally a second-stage reranker can be enabled for all query-search commands:
 
 ```console
 $ export COHERE_API_KEY="your-api-key"

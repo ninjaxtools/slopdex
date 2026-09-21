@@ -52,6 +52,25 @@ export interface IndexedFunction extends ParsedCallable {
   descriptionEmbeddingId: number | null;
 }
 
+export interface MarkdownChunk {
+  id: number;
+  path: string;
+  headingPath: string[];
+  startLine: number;
+  endLine: number;
+  content: string;
+  sourceHash: string;
+  sourceMode: SourceMode;
+  embeddingId: number;
+}
+
+export interface MarkdownSearchResult {
+  chunk: MarkdownChunk;
+  similarity: number;
+  /** Provider relevance score when a second-stage reranker ordered this result. */
+  rerankScore?: number;
+}
+
 export interface EmbeddingProfile {
   provider: "openai" | "jina" | string;
   model: string;
@@ -199,6 +218,15 @@ export interface SimilaritySearchOptions {
   signal?: AbortSignal;
 }
 
+export type MarkdownSearchOptions = Omit<SimilaritySearchOptions, "nameRegex">;
+
+export type SearchIndex = "code" | "descriptions" | "markdown";
+
+export interface SearchOptions extends SimilaritySearchOptions {
+  /** Indexes to search. Defaults to code, available descriptions, and Markdown. */
+  indexes?: readonly SearchIndex[];
+}
+
 export interface SimilarityScores {
   similarity: number;
   codeSimilarity?: number;
@@ -258,6 +286,10 @@ export interface SimilarityResult extends SimilarityScores {
   /** Provider relevance score when a second-stage reranker ordered this result. */
   rerankScore?: number;
 }
+
+export type SearchResult =
+  | (SimilarityResult & { type: "function" })
+  | (MarkdownSearchResult & { type: "markdown" });
 
 export type CrossSearchSourceFilter = (
   | { type: "all"; path?: string }
@@ -414,6 +446,7 @@ export interface IndexStatus {
   rootDir: string;
   indexPath: string;
   functionCount: number;
+  markdownChunkCount: number;
   fileCount: number;
   generation: number;
   gitCheckpoint: string | null;

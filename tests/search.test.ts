@@ -377,7 +377,7 @@ export function added() { return 2; }
     const database = new DatabaseSync(indexPath, { allowExtension: true });
     sqliteVec.load(database);
     database.enableLoadExtension(false);
-    expect(database.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "10" });
+    expect(database.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
     expect(database.prepare("SELECT COUNT(*) AS count FROM function_vectors").get()).toEqual({ count: 2 });
     database.close();
   });

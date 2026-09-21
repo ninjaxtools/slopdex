@@ -19,6 +19,9 @@ import type {
   CrossSearchSourceFilter,
   EmbeddingProvider,
   IndexedFunction,
+  MarkdownSearchResult,
+  SearchIndex,
+  SearchResult,
   SimilarityResult,
   Reranker,
   DescriptionProfile,
@@ -80,6 +83,9 @@ const parsed = (() => {
         "yes-really-rebuild-the-index": { type: "boolean", default: false },
         "no-reindex": { type: "boolean", default: false },
         callables: { type: "boolean", default: false },
+        code: { type: "boolean", default: false },
+        descriptions: { type: "boolean", default: false },
+        md: { type: "boolean", default: false },
         "ignore-errors": { type: "boolean", default: false },
         verbose: { type: "boolean", default: false },
         version: { type: "boolean", default: false },
@@ -178,7 +184,7 @@ async function main(): Promise<void> {
     return;
   }
   const provider = await createProvider(config);
-  const reranker = command === "search" || command === "search-description" || command === "describe"
+  const reranker = ["search", "search-code", "search-description", "search-descriptions", "search-md", "describe"].includes(command!)
     ? await createReranker(config)
     : undefined;
   const descriptionProvider = await createDescriptionProvider(config);
@@ -233,13 +239,35 @@ async function main(): Promise<void> {
       case "descriptions":
         printJson(descriptionsAction === "enable" ? await index.useDescriptions() : index.disableDescriptions());
         break;
-      case "search":
-      case "search-description": {
+      case "search": {
         const query = positionals.join(" ").trim();
         if (!query) throw new CodeIndexError(`${command} requires a query.`);
         const threshold = similarityThreshold();
         const nameRegex = qualifiedNameRegex();
-        const results = await (command === "search-description" ? index.searchDescription.bind(index) : index.similaritySearch.bind(index))({
+        const indexes = selectedSearchIndexes();
+        const results = await index.search({
+          query,
+          ...(indexes ? { indexes } : {}),
+          ...(nameRegex !== undefined ? { nameRegex } : {}),
+          ...(parsed.values.limit === undefined ? {} : { limit: positiveIntegerOption(parsed.values.limit, 1, "limit") }),
+          minSimilarity: threshold.min,
+          ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
+        });
+        const format = outputFormat("summary");
+        if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+        if (format === "summary") process.stdout.write(`${results.length > 0 ? results.map(formatSearchResult).join("\n") : "No matches."}\n`);
+        else printJson(results.map(presentSearchResult));
+        break;
+      }
+      case "search-code":
+      case "search-description":
+      case "search-descriptions": {
+        const query = positionals.join(" ").trim();
+        if (!query) throw new CodeIndexError(`${command} requires a query.`);
+        const threshold = similarityThreshold();
+        const nameRegex = qualifiedNameRegex();
+        const descriptions = command === "search-description" || command === "search-descriptions";
+        const results = await (descriptions ? index.searchDescription.bind(index) : index.searchCode.bind(index))({
           query,
           ...(nameRegex !== undefined ? { nameRegex } : {}),
           ...(parsed.values.limit === undefined ? {} : { limit: positiveIntegerOption(parsed.values.limit, 1, "limit") }),
@@ -249,10 +277,27 @@ async function main(): Promise<void> {
         const format = outputFormat("summary");
         if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
         if (format === "summary") {
-          process.stdout.write(`${command === "search-description"
+          process.stdout.write(`${descriptions
             ? results.map((match) => `${formatSimilaritySummary([match])}\n  ${match.function.description}`).join("\n")
             : formatSimilaritySummary(results)}\n`);
         } else printJson(results.map(presentMatch));
+        break;
+      }
+      case "search-md": {
+        const query = positionals.join(" ").trim();
+        if (!query) throw new CodeIndexError("search-md requires a query.");
+        const threshold = similarityThreshold();
+        const results = await index.searchMarkdown({
+          query,
+          ...(parsed.values.limit === undefined ? {} : { limit: positiveIntegerOption(parsed.values.limit, 1, "limit") }),
+          minSimilarity: threshold.min,
+          ...(threshold.max !== undefined ? { maxSimilarity: threshold.max } : {}),
+        });
+        const format = outputFormat("summary");
+        if (format === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+        if (format === "summary") {
+          process.stdout.write(`${results.length > 0 ? results.map(formatMarkdownResult).join("\n\n") : "No matches."}\n`);
+        } else printJson(results);
         break;
       }
       case "describe":
@@ -943,10 +988,13 @@ function validateInvocation(): void {
   if (parsed.values.matches !== undefined && command !== "cross-search") {
     throw new CodeIndexError("--matches is only available for cross-search.");
   }
+  if ((parsed.values.code || parsed.values.descriptions || parsed.values.md) && command !== "search") {
+    throw new CodeIndexError("--code, --descriptions, and --md are only available for search.");
+  }
   const nameRegex = qualifiedNameRegex();
   if (nameRegex !== undefined) {
-    if (!["search", "search-description", "describe", "cross-search"].includes(command!)) {
-      throw new CodeIndexError("-e/--regexp/--regex is only available for search, search-description, describe, and cross-search.");
+    if (!["search", "search-code", "search-description", "search-descriptions", "describe", "cross-search"].includes(command!)) {
+      throw new CodeIndexError("-e/--regexp/--regex is only available for function searches, describe, and cross-search.");
     }
     compileNameRegex(nameRegex, parsed.values.regex !== undefined ? "--regex value" : "-e/--regexp value");
   }
@@ -1015,13 +1063,21 @@ function validateInvocation(): void {
       if (positionals.length === 0) throw new CodeIndexError("delete-files requires at least one path.");
       return;
     case "search":
-    case "search-description": {
+    case "search-code":
+    case "search-description":
+    case "search-descriptions": {
       if (!positionals.join(" ").trim()) throw new CodeIndexError(`${command} requires a query.`);
       validateOutputLimit();
       similarityThreshold();
       if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
       return;
     }
+    case "search-md":
+      if (!positionals.join(" ").trim()) throw new CodeIndexError("search-md requires a query.");
+      validateOutputLimit();
+      similarityThreshold();
+      if (outputFormat("summary") === "clusters") throw new CodeIndexError("clusters format is only available for cross-search.");
+      return;
     case "describe":
       if (!positionals.join(" ").trim()) throw new CodeIndexError("describe requires a query.");
       validateOutputLimit();
@@ -1133,6 +1189,32 @@ function presentMatch(value: SimilarityResult) {
   return { ...scores, function: presentFunction(callable) };
 }
 
+function presentSearchResult(value: SearchResult) {
+  if (value.type === "markdown") return value;
+  const { type, ...result } = value;
+  return { type, ...presentMatch(result) };
+}
+
+function formatSearchResult(value: SearchResult): string {
+  return value.type === "function" ? formatSimilaritySummary([value]) : formatMarkdownResult(value);
+}
+
+function formatMarkdownResult(result: MarkdownSearchResult): string {
+  const score = result.rerankScore === undefined
+    ? result.similarity.toFixed(4)
+    : `${result.rerankScore.toFixed(4)} rerank (${result.similarity.toFixed(4)} similarity)`;
+  const heading = result.chunk.headingPath.join(" > ");
+  return `${score}  ${result.chunk.path}:${result.chunk.startLine}${heading ? ` :: ${heading}` : ""}\n${result.chunk.content}`;
+}
+
+function selectedSearchIndexes(): SearchIndex[] | undefined {
+  const indexes: SearchIndex[] = [];
+  if (parsed.values.code) indexes.push("code");
+  if (parsed.values.descriptions) indexes.push("descriptions");
+  if (parsed.values.md) indexes.push("markdown");
+  return indexes.length > 0 ? indexes : undefined;
+}
+
 function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
@@ -1154,10 +1236,12 @@ Commands:
   reindex-files                       Regenerate stale file descriptions
   delete-files <path...>              Remove specific files from the index
   update-git                          Index a Git snapshot plus working-tree changes
-  search <query>                      Search functions by semantic similarity
+  search <query>                      Search code, descriptions, and Markdown
+  search-code <query>                 Search function code only
+  search-descriptions <query>         Search function descriptions only
+  search-md <query>                   Search heading-aware Markdown chunks only
   describe <query>                    Explain relevant existing code for a task
   descriptions <enable|disable>       Enable or disable automatic purpose descriptions
-  search-description <query>          Search functions using description embeddings
   cross-search                        Find nearest functions for each source function
 
 Examples:
@@ -1170,9 +1254,15 @@ Examples:
     0.4113  src/code-index.ts :: CodeIndex.updateFromGit
     ...
 
+  Search Markdown documentation:
+    slopdex search-md "configure the embedding provider"
+
+  Search only callable source:
+    slopdex search-code "keep the repository index synchronized"
+
   Enable descriptions, then search by their meaning:
     slopdex descriptions enable
-    slopdex search-description "keep the repository index synchronized"
+    slopdex search-descriptions "keep the repository index synchronized"
 
     slopdex models opencode-go
     slopdex config model opencode-go/gpt-5.6-luna
@@ -1235,7 +1325,7 @@ Examples:
     slopdex search "..." --threshold 0.5
     slopdex cross-search --uncommitted --threshold 0.8
 
-  Reranking (second-stage reranker for search and search-description):
+  Reranking (second-stage reranker for query searches):
     slopdex config reranker cohere
     slopdex config reranker jina
     slopdex config reranker openai
@@ -1266,6 +1356,9 @@ Options:
   --yes-really-rebuild-the-index      Confirm a destructive index rebuild
   --no-reindex                        Skip worktree overlays or reuse a non-Git index
   --callables                         With reindex-files, also regenerate callable descriptions
+  --code                              With search, include only the code index unless combined
+  --descriptions                      With search, include only descriptions unless combined
+  --md                                With search, include only the Markdown index unless combined
   --ignore-errors                     Silence warnings about persisted indexing errors
   --verbose                           Log every external model call instead of one per kind/model
   --limit <number>                    Output limit (default: unlimited; capped by reranker maximum)

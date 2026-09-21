@@ -8,7 +8,7 @@ For installation, see the [operator README](../README.md). For command examples,
 | --- | --- |
 | `src/cli.ts` | Argument parsing, configuration, automatic refresh/recovery, diagnostics, and output selection. |
 | `src/code-index.ts` | Index lifecycle, file preparation, Git/working-tree reconciliation, embedding/description caching, and search facade. |
-| `src/parser/` | Language dispatch, native Tree-sitter extraction, callable identity, and recoverable diagnostics. |
+| `src/parser/` | Language dispatch, native Tree-sitter extraction, callable identity, Markdown chunking, and recoverable diagnostics. |
 | `src/source-policy.ts`, `src/gitignore.ts` | Supported paths, built-in/config exclusions, nested ignore rules. |
 | `src/git/repository.ts` | Git commits, trees, blobs, diffs, ancestry, and working-tree changes. |
 | `src/embeddings/`, `src/descriptions/`, `src/rerankers/` | Provider requests and provider profiles. |
@@ -51,7 +51,8 @@ Storage uses Node's `node:sqlite` and `sqlite-vec`. Writable connections enable 
 - `metadata`: repository root, embedding and description profiles, generation, checkpoint, schema version, and feature/scan state.
 - `files`: paths, content hashes, blob IDs, source mode, previous paths, language, and size.
 - `functions`: identity, names, signatures, locations, source, provenance, and embedding/description references.
-- `embeddings`: code, description, and query vectors keyed by embedding profile, operation, and exact input.
+- `markdown_chunks`: heading ancestry, section locations and text, and embedding references.
+- `embeddings`: code, Markdown, description, and query vectors keyed by embedding profile, operation, and exact input.
 - `function_vectors`: synchronized `vec0` storage for filtered code-vector nearest-neighbor queries.
 - `similarity_cache` / `similarity_cache_state`: persisted per-function top-neighbor lists backing same-index cross-search and cohesion analysis (see below).
 - `description_cache`: generated description text keyed independently by description profile and complete source context.
@@ -59,7 +60,7 @@ Storage uses Node's `node:sqlite` and `sqlite-vec`. Writable connections enable 
 - `callable_provenance`: first-seen committed source identity.
 - `indexing_errors`: diagnostics associated with files.
 
-Current schema version is `10`. Schemas 6-9 migrate in place: 6 and 7 gain file-description state and the nearest-neighbor vector table, 8 gains the similarity-cache tables, and 9 gains the similarity-cache floor/completeness columns (backfilled from existing rows); earlier schemas require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. Forced rebuilds clear logical index state while retaining content-addressed caches when possible; incompatible older databases are recreated. Enabled OpenAI description settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`. Both destructive CLI rebuild modes require `--yes-really-rebuild-the-index`.
+Current schema version is `11`. Schemas 6-10 migrate in place: 6 and 7 gain file-description state and the nearest-neighbor vector table, 8 gains the similarity-cache tables, 9 gains the similarity-cache floor/completeness columns (backfilled from existing rows), and 10 gains Markdown chunks and schedules a full source scan. Earlier schemas require `--force-reindex`. Metadata validation rejects incompatible roots, embedding profiles, and unsupported schemas. Forced rebuilds clear logical index state while retaining content-addressed caches when possible; incompatible older databases are recreated. Enabled OpenAI description settings are preserved for the same repository where possible. Git divergence reconciliation is a separate operation controlled by `--rebuild-on-divergence`. Both destructive CLI rebuild modes require `--yes-really-rebuild-the-index`.
 
 ### Diagnostics
 
@@ -76,15 +77,17 @@ Embedding profiles consist of provider, model, dimensions, and strategy version.
 
 Embedding inputs identify language, callable kind, qualified symbol, signature, documentation, and source. For Python, a function's first-statement docstring is included in a separate `documentation` section in addition to remaining part of the callable source.
 
+Markdown inputs are chunked at ATX headings. A chunk contains the non-empty text before the next heading, prefixed by every active ancestor heading through that section's level. Heading-like lines inside fenced code blocks are treated as content. Preamble text before the first heading is indexed without a heading path, while heading-only sections produce no chunk.
+
 Purpose generation uses the AI SDK and strategy `callable-purpose-v2`. The default is OpenAI's Responses API with `gpt-5.6-luna`; OpenCode Zen and Go are also selectable, both defaulting to `muse-spark-1.3-contributor` unless overridden. OpenCode catalog models are routed through their published protocol using the OpenAI Responses, Anthropic Messages, Google Generative AI, or OpenAI-compatible adapter. Generation opens one conversation per file: stable instructions and complete file context form the prefix, the first request describes the file overall, then callable prompts and generated answers are appended sequentially in source order. This avoids repeating the file within a request and gives provider prompt caches an increasingly large reusable prefix. Responses requests use `store: false`. File and callable text are embedded with the configured embedding provider.
 
 Description generation is cached under both a model-specific key (provider, model, strategy, source) and a model-shared key (strategy, source), so file-context, path, or generation-strategy changes invalidate relevant cached results while a description-provider/model change reuses already-assigned or already-generated text for unchanged sources. Description text identity is independent of the embedding profile, allowing an embedding-model change to reuse generation output while producing the required new vector. Every validated description and vector is cached before indexing continues. If generation resumes partway through a file, completed file/callable prompts and cached answers are replayed locally before the next request so the conversation prefix remains equivalent. Ordinary source updates retain the previous file description and its source hash, making staleness explicit without incurring automatic regeneration; `reindex-files` replaces stale file descriptions, optionally continuing through callable regeneration. `useDescriptions` persists the profile and enabled state; `disableDescriptions` turns automatic updates and description search/scoring off without deleting cached artifacts. Function references are attached only by the final logical transaction, so provider failure cannot expose partially updated callable records. Deleting a function removes it from description search but retains reusable cache rows.
 
 ## Similarity and analysis
 
-`search` embeds a query and, when descriptions are complete, scores code, callable-description, and containing-file-description vectors. `search-description` scores callable and file descriptions. Filter-compatible code-only searches up to sqlite-vec's 8,192-dimension limit use the synchronized `vec0` nearest-neighbor table; larger custom profiles plus fused, regex, upper-bound, and multi-path searches retain the exact scalar scoring path. Analysis uses code-only cosine similarity unless all indexed callables and files have enabled description embeddings. Cross-index analysis requires completeness on both sides. Description-generator models may differ across indexes even though embedding profiles must match.
+`search` embeds one query and searches code, enabled descriptions, and heading-aware Markdown by default. Selecting `code` and `descriptions` fuses callable code, callable-description, and containing-file-description scores when description coverage is complete; Markdown chunks remain separate candidates. All function and Markdown candidates are merged by embedding similarity before one global limit and reranking pass. `search-code`, `search-descriptions`, and `search-md` isolate each collection. Filter-compatible code-only searches up to sqlite-vec's 8,192-dimension limit use the synchronized `vec0` nearest-neighbor table; larger custom profiles plus fused, regex, upper-bound, multi-path, and Markdown searches retain the exact scalar scoring path. Analysis uses code-only cosine similarity unless all indexed callables and files have enabled description embeddings. Cross-index analysis requires completeness on both sides. Description-generator models may differ across indexes even though embedding profiles must match.
 
-An optional `Reranker` performs a second-stage pass for the two natural-language query methods. After applying name and similarity filters, Cohere and Jina retrieve five times the requested result limit (all threshold-passing candidates when no limit is requested). `OpenAILLMReranker` retrieves its configured candidate count (10 by default), or the result limit when larger; without a requested limit, candidates and output are capped at its 100-candidate maximum. Every reranker receives the query plus candidate path, code metadata/source, and purpose description when available, then returns the requested number (or every selected candidate when unlimited) in relevance order. Results preserve the embedding/fused `similarity` and add `rerankScore`.
+An optional `Reranker` performs a second-stage pass for the natural-language query methods. After applying similarity and any applicable name filters, Cohere and Jina retrieve five times the requested result limit (all threshold-passing candidates when no limit is requested). `OpenAILLMReranker` retrieves its configured candidate count (10 by default), or the result limit when larger; without a requested limit, candidates and output are capped at its 100-candidate maximum. Every reranker receives the query plus candidate path and content, including code metadata/source and purpose description when available, then returns the requested number (or every selected candidate when unlimited) in relevance order. Results preserve the embedding/fused `similarity` and add `rerankScore`.
 
 Cohere defaults to `rerank-v4.0-pro` with `COHERE_API_KEY`; Jina defaults to `jina-reranker-v3.5` with `JINA_API_KEY`. The OpenAI LLM path defaults to `gpt-5.6-luna`, sends a strict JSON schema through the Responses API with high reasoning, no reasoning summary, and `store: false`, and validates result cardinality, indexes, uniqueness, and 0-1 scores. Its prompt preserves descriptions before source and caps source-bearing candidate text at 12,000 tokens each and 80,000 tokens in aggregate. Reranking does not participate in index metadata or cross-search because it creates no persisted artifacts and cross-search is callable-to-callable analysis rather than natural-language retrieval.
 
@@ -131,21 +134,26 @@ const index = openCodeIndex({
 
 try {
   await index.updateFromGit();
-  const results = await index.similaritySearch({
+  const results = await index.search({
     query: "validate an authenticated session",
+    indexes: ["code", "markdown"], // Omit to search code, available descriptions, and Markdown.
     limit: 10,
   });
-  console.log(results);
+  for (const result of results) {
+    if (result.type === "function") console.log(result.function.qualifiedName);
+    else console.log(result.chunk.path, result.chunk.headingPath);
+  }
 } finally {
   index.close();
 }
 ```
 
-Exports include `CodeIndex`, `crossSearch`, `analyzeCohesion`, `cohesionLocation`, embedding/description providers, `CohereReranker`, `JinaReranker`, `OpenAILLMReranker`, error types, and the contracts in `src/types.ts`. Standalone update/search helpers wrap the corresponding index methods.
+Exports include `CodeIndex`, `search`, `searchCode`, `searchMarkdown`, `crossSearch`, `analyzeCohesion`, `cohesionLocation`, embedding/description providers, `CohereReranker`, `JinaReranker`, `OpenAILLMReranker`, error types, and the contracts in `src/types.ts`. Standalone update/search helpers wrap the corresponding index methods. Combined `SearchResult` values use `type: "function" | "markdown"` for narrowing.
 
 - Use `updateFromWorkingTree()` when Git is unavailable. Unlike the CLI, the library does not automatically refresh before queries or fall back from Git.
 - Set `sourceFilter.nameRegex` for source-only cross-search/cohesion filtering; combine it with `path` and a filter type (`all`, `changed-since`, or `uncommitted`). `changed-since` also accepts `uncommitted: true`.
 - Top-level analysis `nameRegex` filters both sources and candidates. Query `SimilaritySearchOptions.nameRegex` filters result names before limiting.
+- Use `index.searchCode()` for code only, `index.searchDescription()` for descriptions only, or `index.searchMarkdown()` for Markdown only. `index.similaritySearch()` retains the callable-focused code/description fusion used by existing library consumers.
 - Call `await index.useDescriptions()`, then `await index.searchDescription({ query: "maintain the repository index" })`. Select models via `descriptionProvider: new OpenAIDescriptionProvider({ model: "gpt-5.6-sol", fallbackModel: "muse-spark-1.3-contributor" })` in index options. The optional fallback uses the same provider and remains active after primary failure until it also fails; failover retries use exponential backoff. Custom description providers implement both stateless file/callable methods and may add `startFile()` for contextual sessions.
 - Call `await index.describe({ query: "implement a new rpc endpoint" })` to gather a `DescribeContext` of matching files, callables, descriptions, and optionally complete sources; pass it to `new OpenAIDescriptionProvider().describeContext(context)` for the generated explanation.
 - Inspect failures through `index.indexErrors()` or exported `readIndexErrors(indexPath)` without a provider. Records use `IndexingError`.

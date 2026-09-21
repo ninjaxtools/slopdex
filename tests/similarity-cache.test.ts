@@ -241,7 +241,7 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     expect(indexedNames(await crossSearchSnapshot(migrated)).length).toBeGreaterThan(0);
     const migratedDb = new DatabaseSync(indexPath, { readOnly: true });
     expect(migratedDb.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get())
-      .toEqual({ value: "10" });
+      .toEqual({ value: "11" });
     migratedDb.close();
     migrated.close();
   });
@@ -481,7 +481,7 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     const migrated = new CodeIndex({ rootDir: root, provider });
     const migratedDb = new DatabaseSync(indexPath, { readOnly: true });
     expect(migratedDb.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get())
-      .toEqual({ value: "10" });
+      .toEqual({ value: "11" });
     const states = migratedDb.prepare("SELECT floor, stored_count, complete FROM similarity_cache_state").all() as
       Array<{ floor: number; stored_count: number; complete: number }>;
     expect(states.length).toBeGreaterThan(0);

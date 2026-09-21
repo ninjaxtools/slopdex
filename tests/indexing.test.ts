@@ -348,7 +348,7 @@ describe("Git indexing", () => {
     await index.updateFromGit();
     const stable = index.allFunctions()[0]!;
 
-    write(root, "README.md", "# Documentation only\n");
+    write(root, "README.txt", "Documentation only\n");
     const target = commitAll(root, "documentation");
     const stats = await index.updateFromGit();
 
@@ -588,14 +588,14 @@ describe("Git indexing", () => {
     initGit(root);
     write(root, "stable.ts", `export function stable() { return 1; }\n`);
     const base = commitAll(root, "base");
-    write(root, "main.md", "main\n");
+    write(root, "main.txt", "main\n");
     commitAll(root, "main");
     const provider = new CountingEmbeddingProvider();
     const index = new CodeIndex({ rootDir: root, provider });
     await index.updateFromGit();
 
     git(root, "checkout", "-q", "-b", "other", base);
-    write(root, "other.md", "other\n");
+    write(root, "other.txt", "other\n");
     const target = commitAll(root, "other");
     const stats = await index.updateFromGit({ rebuildOnDivergence: true });
 

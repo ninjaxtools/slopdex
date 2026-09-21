@@ -11,6 +11,8 @@ import type {
   IndexedFunction,
   IndexingError,
   IndexingIssue,
+  MarkdownChunk,
+  MarkdownSearchResult,
   ParsedCallable,
   SourceMode,
   SimilarityResult,
@@ -18,7 +20,7 @@ import type {
   UpdateStats,
 } from "../types.js";
 
-const SCHEMA_VERSION = "10";
+const SCHEMA_VERSION = "11";
 const KNN_TIE_OVERFETCH = 32;
 const VEC0_MAX_K = 4096;
 const VEC0_MAX_DIMENSIONS = 8192;
@@ -43,6 +45,17 @@ export interface PreparedCallable extends ParsedCallable {
   description?: PreparedDescription;
 }
 
+export interface PreparedMarkdownChunk {
+  headingPath: string[];
+  startLine: number;
+  endLine: number;
+  content: string;
+  sourceHash: string;
+  embeddingInput: string;
+  embeddingKey: string;
+  vector?: readonly number[];
+}
+
 export interface PreparedFile {
   path: string;
   contentHash: string;
@@ -55,6 +68,7 @@ export interface PreparedFile {
   previousPath?: string;
   replacePath?: string;
   callables: PreparedCallable[];
+  markdownChunks: PreparedMarkdownChunk[];
   fileDescription?: PreparedFileDescription;
   errors: IndexingIssue[];
   unavailable?: boolean;
@@ -101,6 +115,18 @@ interface FunctionRow {
   embedding_id: number;
   description: string | null;
   description_embedding_id: number | null;
+}
+
+interface MarkdownChunkRow {
+  id: number;
+  path: string;
+  heading_path: string;
+  start_line: number;
+  end_line: number;
+  content: string;
+  source_hash: string;
+  source_mode: SourceMode;
+  embedding_id: number;
 }
 
 export class IndexDatabase {
@@ -153,7 +179,7 @@ export class IndexDatabase {
 
   #initializeSchema(): void {
     const existingVersion = this.#metadataTableExists() ? this.#metadata("schema_version") : null;
-    if (existingVersion && existingVersion !== "6" && existingVersion !== "7" && existingVersion !== "8" && existingVersion !== "9" && existingVersion !== SCHEMA_VERSION) {
+    if (existingVersion && existingVersion !== "6" && existingVersion !== "7" && existingVersion !== "8" && existingVersion !== "9" && existingVersion !== "10" && existingVersion !== SCHEMA_VERSION) {
       throw new IncompatibleIndexError(`Unsupported index schema version ${existingVersion}.`);
     }
     this.#db.exec(`
@@ -221,6 +247,18 @@ export class IndexDatabase {
       CREATE INDEX IF NOT EXISTS functions_path ON functions(path);
       CREATE INDEX IF NOT EXISTS functions_embedding ON functions(embedding_id);
       CREATE INDEX IF NOT EXISTS functions_description_embedding ON functions(description_embedding_id);
+      CREATE TABLE IF NOT EXISTS markdown_chunks (
+        id INTEGER PRIMARY KEY,
+        path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE ON UPDATE CASCADE,
+        heading_path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        embedding_id INTEGER NOT NULL REFERENCES embeddings(id)
+      );
+      CREATE INDEX IF NOT EXISTS markdown_chunks_path ON markdown_chunks(path);
+      CREATE INDEX IF NOT EXISTS markdown_chunks_embedding ON markdown_chunks(embedding_id);
       CREATE TABLE IF NOT EXISTS indexing_errors (
         id INTEGER PRIMARY KEY,
         path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE ON UPDATE CASCADE,
@@ -248,6 +286,7 @@ export class IndexDatabase {
         if (!Number.isInteger(dimensions) || dimensions <= 0) throw new IncompatibleIndexError("Index has an invalid embedding profile.");
         if (dimensions <= VEC0_MAX_DIMENSIONS) this.#db.exec(functionVectorsSchema(dimensions));
         this.#setMetadata("schema_version", SCHEMA_VERSION);
+        if (existingVersion) this.#setMetadata("markdown_scan_pending", "true");
         this.#db.exec("COMMIT");
       } catch (error) {
         this.#db.exec("ROLLBACK");
@@ -258,6 +297,7 @@ export class IndexDatabase {
       try {
         this.#db.exec(similarityCacheSchema());
         this.#setMetadata("schema_version", SCHEMA_VERSION);
+        this.#setMetadata("markdown_scan_pending", "true");
         this.#db.exec("COMMIT");
       } catch (error) {
         this.#db.exec("ROLLBACK");
@@ -278,11 +318,17 @@ export class IndexDatabase {
           UPDATE similarity_cache_state SET complete = (stored_count < cached_width);
         `);
         this.#setMetadata("schema_version", SCHEMA_VERSION);
+        this.#setMetadata("markdown_scan_pending", "true");
         this.#db.exec("COMMIT");
       } catch (error) {
         this.#db.exec("ROLLBACK");
         throw error;
       }
+    } else if (existingVersion === "10") {
+      this.#transaction(() => {
+        this.#setMetadata("schema_version", SCHEMA_VERSION);
+        this.#setMetadata("markdown_scan_pending", "true");
+      });
     }
     this.#db.exec("CREATE INDEX IF NOT EXISTS files_description_embedding ON files(file_description_embedding_id);");
     this.#db.exec(similarityCacheSchema());
@@ -533,7 +579,7 @@ export class IndexDatabase {
     return this.#db.prepare(`
       SELECT path, content_hash AS contentHash, blob_oid AS blobOid,
         source_mode AS sourceMode, previous_path AS previousPath, language,
-        NOT EXISTS (
+        language != 'markdown' AND NOT EXISTS (
           SELECT 1 FROM indexing_errors ie
           WHERE ie.path = files.path
             AND json_extract(ie.diagnostic, '$.code') IN ('read-error', 'file-too-large')
@@ -619,6 +665,7 @@ export class IndexDatabase {
       const generation = this.getGeneration() + 1;
       this.#setMetadata("generation", String(generation));
       if (options.completeDiagnosticsScan) this.#deleteMetadata("diagnostics_scan_pending");
+      if (options.completeDiagnosticsScan) this.#deleteMetadata("markdown_scan_pending");
       if (options.checkpoint === null) this.#deleteMetadata("git_checkpoint");
       else if (options.checkpoint !== undefined) this.#setMetadata("git_checkpoint", options.checkpoint);
       return stats;
@@ -642,6 +689,7 @@ export class IndexDatabase {
       }
       | undefined;
     const oldMatches = reconcileFunctions(file.callables, oldRows);
+    const preserveFileDescription = !file.unavailable && file.language !== "markdown";
 
     if (sourcePath !== file.path) {
       const displacedRows = this.#rowsForPath(file.path);
@@ -668,15 +716,34 @@ export class IndexDatabase {
       file.sourceMode === "working-tree" ? file.previousPath ?? existingFile?.previous_path ?? null : null,
       file.language,
       file.byteSize,
-      file.fileDescription?.path ?? (file.unavailable ? null : existingFile?.file_description_path) ?? null,
-      file.fileDescription?.contentHash ?? (file.unavailable ? null : existingFile?.file_description_content_hash) ?? null,
-      file.fileDescription?.value.description ?? (file.unavailable ? null : existingFile?.file_description) ?? null,
+      file.fileDescription?.path ?? (preserveFileDescription ? existingFile?.file_description_path : null) ?? null,
+      file.fileDescription?.contentHash ?? (preserveFileDescription ? existingFile?.file_description_content_hash : null) ?? null,
+      file.fileDescription?.value.description ?? (preserveFileDescription ? existingFile?.file_description : null) ?? null,
       file.fileDescription
         ? this.#embeddingId(file.fileDescription.value.key, file.fileDescription.value.vector)
-        : file.unavailable ? null : existingFile?.file_description_embedding_id ?? null,
+        : preserveFileDescription ? existingFile?.file_description_embedding_id ?? null : null,
     );
     const insertError = this.#db.prepare("INSERT INTO indexing_errors(path, diagnostic) VALUES (?, ?)");
     for (const error of file.errors) insertError.run(file.path, JSON.stringify(error));
+
+    const insertMarkdownChunk = this.#db.prepare(`
+      INSERT INTO markdown_chunks(path, heading_path, start_line, end_line, content, source_hash, embedding_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const chunk of file.markdownChunks) {
+      if (chunk.vector) this.storeEmbedding(chunk.embeddingKey, chunk.vector);
+      const embedding = this.#db.prepare("SELECT id FROM embeddings WHERE embedding_key = ?").get(chunk.embeddingKey) as { id: number } | undefined;
+      if (!embedding) throw new CodeIndexError(`Missing embedding for markdown chunk in ${file.path}.`);
+      insertMarkdownChunk.run(
+        file.path,
+        JSON.stringify(chunk.headingPath),
+        chunk.startLine,
+        chunk.endLine,
+        chunk.content,
+        chunk.sourceHash,
+        embedding.id,
+      );
+    }
 
     const usedIds = new Set<number>();
     const orderedCallables = [
@@ -746,6 +813,14 @@ export class IndexDatabase {
   public allFunctions(): IndexedFunction[] {
     return (this.#db.prepare("SELECT * FROM functions ORDER BY path, start_line, start_column, id").all() as unknown as FunctionRow[])
       .map(toIndexedFunction);
+  }
+
+  public allMarkdownChunks(): MarkdownChunk[] {
+    return (this.#db.prepare(`
+      SELECT m.*, f.source_mode FROM markdown_chunks m
+      JOIN files f ON f.path = m.path
+      ORDER BY m.path, m.start_line, m.id
+    `).all() as unknown as MarkdownChunkRow[]).map(toMarkdownChunk);
   }
 
   public allFilePaths(): string[] {
@@ -882,6 +957,32 @@ export class IndexDatabase {
       ...(fused ? { descriptionSimilarity: options.descriptions ? row.base_similarity : row.description_similarity } : {}),
       ...(fileDescription ? { fileDescriptionSimilarity: row.file_description_similarity } : {}),
     }));
+  }
+
+  public searchMarkdown(vector: readonly number[], options: {
+    limit?: number;
+    minSimilarity: number;
+    maxSimilarity?: number;
+  }): MarkdownSearchResult[] {
+    const rows = this.#db.prepare(`
+      WITH scored AS (
+        SELECT m.*, f.source_mode, 1.0 - vec_distance_cosine(e.vector, ?) AS similarity
+        FROM markdown_chunks m
+        JOIN files f ON f.path = m.path
+        JOIN embeddings e ON e.id = m.embedding_id
+      )
+      SELECT * FROM scored
+      WHERE similarity >= ? AND (? IS NULL OR similarity < ?)
+      ORDER BY similarity DESC, id ASC
+      LIMIT ?
+    `).all(
+      vectorBuffer(vector),
+      options.minSimilarity,
+      options.maxSimilarity ?? null,
+      options.maxSimilarity ?? null,
+      options.limit ?? -1,
+    ) as unknown as Array<MarkdownChunkRow & { similarity: number }>;
+    return rows.map((row) => ({ chunk: toMarkdownChunk(row), similarity: row.similarity }));
   }
 
   public vectorForFunction(id: number, kind: "code" | "description" = "code"): number[] {
@@ -1158,7 +1259,7 @@ export class IndexDatabase {
     const fileCount = Number((this.#db.prepare("SELECT COUNT(*) AS count FROM files").get() as { count: number }).count);
     const describableFileCount = Number((this.#db.prepare(`
       SELECT COUNT(*) AS count FROM files f
-      WHERE NOT EXISTS (
+      WHERE f.language != 'markdown' AND NOT EXISTS (
         SELECT 1 FROM indexing_errors ie
         WHERE ie.path = f.path
           AND json_extract(ie.diagnostic, '$.code') IN ('read-error', 'file-too-large')
@@ -1168,17 +1269,19 @@ export class IndexDatabase {
       rootDir: this.#rootDir,
       indexPath: this.#indexPath,
       functionCount,
+      markdownChunkCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM markdown_chunks").get() as { count: number }).count),
       fileCount,
       generation: this.getGeneration(),
       gitCheckpoint: this.getCheckpoint(),
       embeddingProfile: this.#profile,
       descriptionsEnabled: this.descriptionsEnabled(),
       descriptionCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM functions WHERE description_embedding_id IS NOT NULL").get() as { count: number }).count),
-      fileDescriptionCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM files WHERE file_description_embedding_id IS NOT NULL").get() as { count: number }).count),
+      fileDescriptionCount: Number((this.#db.prepare("SELECT COUNT(*) AS count FROM files WHERE language != 'markdown' AND file_description_embedding_id IS NOT NULL").get() as { count: number }).count),
       describableFileCount,
       staleFileDescriptionCount: Number((this.#db.prepare(`
         SELECT COUNT(*) AS count FROM files f
-        WHERE (file_description_path IS NULL OR file_description_path != path
+        WHERE f.language != 'markdown'
+          AND (file_description_path IS NULL OR file_description_path != path
           OR file_description_content_hash IS NULL OR file_description_content_hash != content_hash)
           AND NOT EXISTS (
             SELECT 1 FROM indexing_errors ie
@@ -1208,6 +1311,10 @@ export class IndexDatabase {
 
   public needsDiagnosticsScan(): boolean {
     return this.#metadata("diagnostics_scan_pending") === "true";
+  }
+
+  public needsMarkdownScan(): boolean {
+    return this.#metadata("markdown_scan_pending") === "true";
   }
 }
 
@@ -1376,6 +1483,20 @@ function toIndexedFunction(row: FunctionRow): IndexedFunction {
     embeddingId: row.embedding_id,
     description: row.description,
     descriptionEmbeddingId: row.description_embedding_id,
+  };
+}
+
+function toMarkdownChunk(row: MarkdownChunkRow): MarkdownChunk {
+  return {
+    id: row.id,
+    path: row.path,
+    headingPath: JSON.parse(row.heading_path) as string[],
+    startLine: row.start_line,
+    endLine: row.end_line,
+    content: row.content,
+    sourceHash: row.source_hash,
+    sourceMode: row.source_mode,
+    embeddingId: row.embedding_id,
   };
 }
 

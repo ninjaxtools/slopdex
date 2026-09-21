@@ -195,6 +195,8 @@ def undocumented(value):
   it("recognizes extensions and excludes dependency and build trees", () => {
     const policy = new SourcePolicy();
     for (const fixture of fixtures) expect(policy.includes(fixture.path)).toBe(true);
+    expect(policy.includes("docs/guide.md")).toBe(true);
+    expect(policy.includes("README.markdown")).toBe(true);
     for (const [extension, language] of Object.entries({
       mts: "typescript", cts: "typescript", mjs: "javascript", cjs: "javascript", pyw: "python", h: "c",
     })) expect(languageForPath(`source.${extension}`)).toBe(language);

@@ -1,6 +1,7 @@
 import path from "node:path";
 
 import { languageForPath } from "./parser/callable-parser.js";
+import { isMarkdownPath } from "./parser/markdown.js";
 
 const DEFAULT_EXCLUDED_SEGMENTS = new Set([
   ".git",
@@ -31,7 +32,7 @@ export class SourcePolicy {
 
   public includes(relativePath: string): boolean {
     const normalized = relativePath.replaceAll("\\", "/");
-    if (!languageForPath(normalized)) return false;
+    if (!languageForPath(normalized) && !isMarkdownPath(normalized)) return false;
     if (hasExcludedSegment(normalized)) return false;
     if (this.#exclude.some((pattern) => path.matchesGlob(normalized, pattern))) return false;
     return this.#include.length === 0 || this.#include.some((pattern) => path.matchesGlob(normalized, pattern));
