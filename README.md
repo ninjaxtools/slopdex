@@ -195,6 +195,7 @@ $ slopdex --version
 ## Related Work
 
 - [qmd](https://github.com/tobi/qmd)
+- [treepeat](https://github.com/dsummersl/treepeat)
 
 ## Commands
 
