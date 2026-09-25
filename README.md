@@ -11,13 +11,13 @@ Slopdex helps with doing analysis on codebases that contain a lot of AI generate
 The main supported functions are
 
 - `slopdex search <query>`
-   <br/>find relevant code, descriptions, and Markdown
+   <br/>find code/docs similar to the query
 - `slopdex cross-search`
-   <br/>find clusters of similar code
+   <br/>find clusters of similar code/docs
 - `slopdex describe <query>`
    <br/>explain code relevant to a task
 
-`search` searches function code, available descriptions, and Markdown by default. Use `--code`, `--descriptions`, or `--md` to select indexes; when any selector is present, only the selected indexes are searched. The dedicated `search-code`, `search-descriptions`, and `search-md` commands search one index directly.
+`search` does a vector searche of code, and markdown, and when enabled generated code descriptions.
 
 `cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
 
@@ -48,16 +48,14 @@ $ slopdex search "keep the repository index synchronized"
 ...
 ```
 
-You can also enable optional description generation which will automatically generate file and function descriptions with a configured LLM provider and include them in the search.
-
-### Search Markdown
-
-Markdown files (`.md` and `.markdown`) are indexed automatically. Search their heading-aware chunks separately, or select Markdown in a combined search:
+To search code/docs individually:
 
 ```console
-$ slopdex search-md "configure the embedding provider"
-$ slopdex search "configure the embedding provider" --code --md
+$ slopdex search-code "configure the embedding provider"
+$ slopdex search-md "configure the embedding provider" 
 ```
+
+You can also enable optional description generation which will automatically generate file and function descriptions with a configured LLM provider and include them in the search.
 
 I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low-cost models. If you
 sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
