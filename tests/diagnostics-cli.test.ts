@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
 import { OpenAIEmbeddingProvider } from "../src/embeddings/openai.js";
-import { readIndexErrors } from "../src/database.js";
+import { readIndexErrors } from "../src/storage/database.js";
 import { temporaryRoot, write } from "./helpers.js";
 
 function run(root: string, ...args: string[]) {

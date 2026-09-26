@@ -2,11 +2,36 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { CodeIndexError } from "./errors.js";
+import type { EmbeddingProfile } from "./types.js";
 
 export const DEFAULT_PARALLELISM = 10;
 
 export function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export function embeddingKey(profile: string, operation: "document" | "query", input: string): string {
+  return sha256(`${profile}\0${operation}\0${input}`);
+}
+
+export function groupBy<T>(values: readonly T[], keyFor: (value: T) => string): Map<string, T[]> {
+  const groups = new Map<string, T[]>();
+  for (const value of values) {
+    const key = keyFor(value);
+    const group = groups.get(key) ?? [];
+    group.push(value);
+    groups.set(key, group);
+  }
+  return groups;
+}
+
+export function normalizeEmbeddingProfile(profile: EmbeddingProfile): Required<EmbeddingProfile> {
+  return {
+    provider: profile.provider,
+    model: profile.model,
+    dimensions: profile.dimensions,
+    strategyVersion: profile.strategyVersion ?? "callable-v2",
+  };
 }
 
 export function normalizeRelativePath(rootDir: string, inputPath: string): string {

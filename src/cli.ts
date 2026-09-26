@@ -1,43 +1,47 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
 
-import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
+import { CodeIndexError } from "./errors.js";
 import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { clearProgress, TerminalProgress } from "./progress.js";
 import { compileNameRegex } from "./utils.js";
 import {
   configFilePath, indexConfigOptions, isDescriptionProviderName, loadConfig,
-  readConfigFile, RERANKER_DEFAULT_MODELS, resolveConfig, validateConfig, writeConfigFile,
-  type EffectiveConfig, type OpenCodeDescriptionProvider, type PublishedModel,
+  readConfigFile, RERANKER_DEFAULT_MODELS, validateConfig, writeConfigFile,
+  type OpenCodeDescriptionProvider, type PublishedModel,
 } from "./config.js";
+import { printHelp } from "./cli/help.js";
+import { ensureIndexUpdated, resolveIndexPath, storedDescriptionProfile } from "./cli/index-lifecycle.js";
+import {
+  formatMarkdownResult,
+  formatSearchResult,
+  presentFunction,
+  presentMatch,
+  presentSearchResult,
+  printJson,
+} from "./cli/presentation.js";
+import {
+  createDescriptionProvider,
+  createProvider,
+  createReranker,
+  descriptionRefresh,
+} from "./cli/provider-factories.js";
 import type { CodeIndex } from "./code-index.js";
-import type { DescriptionProviderName, OpenAIDescriptionProvider } from "./openai-description.js";
+import type { DescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
 import type {
   CodeIndexOptions,
   CrossSearchOptions,
   CrossSearchResult,
   CrossSearchSourceFilter,
   EmbeddingProvider,
-  IndexedFunction,
-  MarkdownSearchResult,
   SearchIndex,
-  SearchResult,
-  SimilarityResult,
-  Reranker,
-  DescriptionProfile,
-  UpdateStats,
 } from "./types.js";
 
 declare const __SLOPDEX_VERSION__: string;
-
-interface DescriptionRefreshHooks {
-  beforeRefresh?: (index: CodeIndex) => void | Promise<void>;
-  afterRefresh?: (index: CodeIndex) => void | Promise<void>;
-}
 
 const parsed = (() => {
   try {
@@ -170,7 +174,7 @@ async function main(): Promise<void> {
   const config = loadConfig(rootDir, parsed.values.config, parsed.values);
   if (command === "index-errors") {
     const indexPath = config.indexPath;
-    const { readIndexErrors } = await import("./database.js");
+    const { readIndexErrors } = await import("./storage/database.js");
     const errors = existsSync(indexPath) ? readIndexErrors(indexPath) : [];
     if (outputFormat("summary") === "summary") {
       process.stdout.write(errors.length === 0 ? "No indexing errors.\n" : `${errors.map((error) =>
@@ -183,7 +187,10 @@ async function main(): Promise<void> {
   const reranker = ["search", "search-code", "search-description", "search-descriptions", "search-md", "describe"].includes(command!)
     ? await createReranker(config)
     : undefined;
-  const descriptionProvider = await createDescriptionProvider(config);
+  const descriptionProvider = await createDescriptionProvider(config, command === "describe" ? {
+    required: true,
+    storedProfile: storedDescriptionProfile(config.indexPath, config.rootDir),
+  } : undefined);
   const progress = new TerminalProgress();
   const indexOptions: CodeIndexOptions = {
     ...indexConfigOptions(config),
@@ -194,6 +201,7 @@ async function main(): Promise<void> {
     onWarning: () => {}, // Persisted diagnostics are reported once per index at exit.
   };
   const updateTarget = command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD";
+  diagnosticIndexes.add(resolveIndexPath(indexOptions));
   const updateStats = await ensureIndexUpdated(
     indexOptions,
     "index",
@@ -201,7 +209,7 @@ async function main(): Promise<void> {
     parsed.values["rebuild-on-divergence"],
     parsed.values["force-reindex"],
     parsed.values["no-reindex"],
-    descriptionRefresh(config),
+    descriptionRefresh(config, command === "descriptions" ? descriptionsAction : null),
   );
   const { CodeIndex } = await import("./code-index.js");
   const index = new CodeIndex(indexOptions);
@@ -378,6 +386,7 @@ async function runCrossSearch(
     ...(targetDescriptionProvider ? { descriptionProvider: targetDescriptionProvider } : {}),
   } : undefined;
   if (targetOptions) {
+    diagnosticIndexes.add(resolveIndexPath(targetOptions));
     await ensureIndexUpdated(
       targetOptions,
       "target index",
@@ -438,215 +447,6 @@ async function runCrossSearch(
   } finally {
     target?.close();
   }
-}
-
-async function ensureIndexUpdated(
-  options: CodeIndexOptions,
-  label: string,
-  target: string,
-  rebuildOnDivergence: boolean,
-  forceRebuild: boolean,
-  noReindex: boolean,
-  hooks?: DescriptionRefreshHooks,
-): Promise<UpdateStats> {
-  diagnosticIndexes.add(resolveIndexPath(options));
-  const initialized = await initializeMissingIndex(options, label, target, noReindex, hooks);
-  if (initialized) return initialized;
-  const { CodeIndex } = await import("./code-index.js");
-  try {
-    const index = new CodeIndex(options);
-    try {
-      await hooks?.beforeRefresh?.(index);
-      const stats = await refreshIndex(index, label, target, rebuildOnDivergence, noReindex);
-      await hooks?.afterRefresh?.(index);
-      return stats;
-    } finally {
-      index.close();
-    }
-  } catch (error) {
-    if (!forceRebuild || !(error instanceof IncompatibleIndexError)) throw error;
-    process.stderr.write(
-      `slopdex: warning: ${label} is incompatible (${error.message}); rebuilding automatically because --force-reindex was specified.\n`,
-    );
-    const indexPath = resolveIndexPath(options);
-    const descriptionProfile = descriptionProfileForRebuild(indexPath, options.rootDir);
-    try {
-      const { resetIndexState } = await import("./database.js");
-      resetIndexState(indexPath, options.rootDir, options.provider.profile);
-    } catch (resetError) {
-      if (!(resetError instanceof IncompatibleIndexError)) throw resetError;
-      removeIndexArtifacts(indexPath);
-    }
-    return initializeIndex(options, indexPath, label, target, noReindex, descriptionProfile, hooks);
-  }
-}
-
-async function initializeMissingIndex(
-  options: CodeIndexOptions,
-  label: string,
-  target: string,
-  noReindex: boolean,
-  hooks?: DescriptionRefreshHooks,
-): Promise<UpdateStats | null> {
-  const indexPath = resolveIndexPath(options);
-  if (existsSync(indexPath)) return null;
-
-  process.stderr.write(
-    `slopdex: ${label} not found at ${indexPath}; initializing automatically from ${target}${noReindex ? "" : " and the working tree"}.\n`,
-  );
-  return initializeIndex(options, indexPath, label, target, noReindex, null, hooks);
-}
-
-async function initializeIndex(
-  options: CodeIndexOptions,
-  indexPath: string,
-  label: string,
-  target: string,
-  noReindex: boolean,
-  descriptionProfile: DescriptionProfile | null = null,
-  hooks?: DescriptionRefreshHooks,
-): Promise<UpdateStats> {
-  const { CodeIndex } = await import("./code-index.js");
-  const rebuiltDescriptionProvider = descriptionProfile && !options.descriptionProvider
-    ? await createDescriptionProvider(resolveConfig(options.rootDir, {
-      indexPath,
-      descriptionProvider: descriptionProfile.provider,
-      descriptionModel: descriptionProfile.model,
-      parallelism: options.parallelism,
-      ...(options.verbose ? { verbose: true } : {}),
-    }))
-    : undefined;
-  const index = new CodeIndex({
-    ...options, indexPath,
-    ...(rebuiltDescriptionProvider ? { descriptionProvider: rebuiltDescriptionProvider } : {}),
-  });
-  try {
-    if (descriptionProfile) await index.useDescriptions();
-    await hooks?.beforeRefresh?.(index);
-    const stats = await refreshIndex(index, label, target, false, noReindex);
-    await hooks?.afterRefresh?.(index);
-    return stats;
-  } finally {
-    index.close();
-  }
-}
-
-function descriptionProfileForRebuild(indexPath: string, rootDir: string): DescriptionProfile | null {
-  const db = new DatabaseSync(indexPath, { readOnly: true });
-  try {
-    const metadata = new Map((db.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>)
-      .map((row) => [row.key, row.value]));
-    if (metadata.get("root_dir") !== path.resolve(rootDir) || metadata.get("descriptions_enabled") !== "true") return null;
-    const profile = JSON.parse(metadata.get("description_profile")!) as DescriptionProfile;
-    if (!isDescriptionProviderName(profile.provider)) {
-      throw new CodeIndexError("Rebuilding this description index requires its custom description provider through the library API.");
-    }
-    return profile;
-  } finally {
-    db.close();
-  }
-}
-
-function storedDescriptionProfile(indexPath: string, rootDir: string): DescriptionProfile | null {
-  if (!existsSync(indexPath)) return null;
-  const db = new DatabaseSync(indexPath, { readOnly: true });
-  try {
-    const metadata = new Map((db.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>)
-      .map((row) => [row.key, row.value]));
-    if (metadata.get("root_dir") !== path.resolve(rootDir)) return null;
-    const value = metadata.get("description_profile");
-    if (!value) return null;
-    const profile = JSON.parse(value) as Partial<DescriptionProfile>;
-    if (typeof profile.model !== "string" || !profile.model || !isDescriptionProviderName(profile.provider ?? "")) return null;
-    return {
-      provider: profile.provider!,
-      model: profile.model,
-      strategyVersion: typeof profile.strategyVersion === "string" ? profile.strategyVersion : "callable-purpose-v2",
-    };
-  } catch {
-    return null;
-  } finally {
-    db.close();
-  }
-}
-
-async function refreshIndex(
-  index: CodeIndex,
-  label: string,
-  target: string,
-  rebuildOnDivergence: boolean,
-  noReindex: boolean,
-): Promise<UpdateStats> {
-  try {
-    return await index.updateFromGit({ target, rebuildOnDivergence, includeWorkingTree: !noReindex });
-  } catch (error) {
-    if (!(error instanceof GitUnavailableError)) throw error;
-    const status = index.status();
-    if (noReindex && status.fileCount > 0) {
-      process.stderr.write(
-        `slopdex: warning: no Git repository is available for ${label}; full working-tree re-index skipped because --no-reindex was specified.\n`,
-      );
-      return {
-        filesUpdated: 0,
-        filesDeleted: 0,
-        functionsAdded: 0,
-        functionsUpdated: 0,
-        functionsDeleted: 0,
-        embeddingsCreated: 0,
-        checkpoint: status.gitCheckpoint,
-      };
-    }
-    process.stderr.write(
-      `slopdex: warning: no Git repository is available for ${label}; re-indexing all source files from the working tree.\n`,
-    );
-    return await index.updateFromWorkingTree();
-  }
-}
-
-function resolveIndexPath(options: CodeIndexOptions): string {
-  return path.resolve(options.indexPath ?? path.join(path.resolve(options.rootDir), ".slopdex", "index.sqlite"));
-}
-
-function removeIndexArtifacts(indexPath: string): void {
-  for (const suffix of ["", "-shm", "-wal", "-journal"]) rmSync(`${indexPath}${suffix}`, { force: true });
-}
-
-async function createDescriptionProvider(config: EffectiveConfig): Promise<OpenAIDescriptionProvider | undefined> {
-  if (command !== "describe" && !config.descriptionProvider && !config.descriptionModel && !config.descriptionFallbackModel) return undefined;
-  let provider = config.descriptionProvider;
-  let model = config.descriptionModel;
-  if (command === "describe" && !provider && !model) {
-    const stored = storedDescriptionProfile(config.indexPath, config.rootDir);
-    if (stored) {
-      provider = stored.provider as DescriptionProviderName;
-      model = stored.model;
-    }
-  }
-  const { OpenAIDescriptionProvider: Provider } = await import("./openai-description.js");
-  return new Provider({
-    ...(provider ? { provider } : {}),
-    ...(model ? { model } : {}),
-    ...(config.descriptionFallbackModel ? { fallbackModel: config.descriptionFallbackModel } : {}),
-    parallelism: config.parallelism,
-    ...(config.verbose ? { verbose: true } : {}),
-  });
-}
-
-function descriptionRefresh(config: EffectiveConfig): DescriptionRefreshHooks | undefined {
-  if (command === "descriptions") {
-    return descriptionsAction === "disable"
-      ? { beforeRefresh: (index) => { index.disableDescriptions(); } }
-      : enableDescriptionRefresh(false);
-  }
-  if (config.descriptionsEnabled === true) return enableDescriptionRefresh();
-  if (config.descriptionsEnabled === false) return { beforeRefresh: (index) => { index.disableDescriptions(); } };
-  return undefined;
-}
-
-function enableDescriptionRefresh(afterRefresh = true): DescriptionRefreshHooks {
-  return {
-    ...(afterRefresh ? { afterRefresh: async (index: CodeIndex) => { await index.useDescriptions(); } } : {}),
-  };
 }
 
 async function runModels(): Promise<void> {
@@ -786,7 +586,7 @@ async function resolveConfiguredModel(
 }
 
 async function fetchPublishedModels(provider: OpenCodeDescriptionProvider): Promise<PublishedModel[]> {
-  const { descriptionProviderBaseUrl } = await import("./openai-description.js");
+  const { descriptionProviderBaseUrl } = await import("./descriptions/openai.js");
   const url = `${descriptionProviderBaseUrl(provider)}/models`;
   let response: Response;
   try {
@@ -811,51 +611,6 @@ async function fetchPublishedModels(provider: OpenCodeDescriptionProvider): Prom
 
 function isOpenCodeDescriptionProvider(value: string): value is OpenCodeDescriptionProvider {
   return value === "opencode" || value === "opencode-go";
-}
-
-async function createProvider(config: EffectiveConfig): Promise<EmbeddingProvider> {
-  if (config.provider === "jina") {
-    const { JinaEmbeddingProvider } = await import("./embeddings/jina.js");
-    return new JinaEmbeddingProvider({
-      ...(config.model ? { model: config.model } : {}),
-      ...(config.dimensions ? { dimensions: config.dimensions } : {}),
-      parallelism: config.parallelism,
-      ...(config.verbose ? { verbose: true } : {}),
-    });
-  }
-  const { OpenAIEmbeddingProvider } = await import("./embeddings/openai.js");
-  return new OpenAIEmbeddingProvider({
-    ...(config.model ? { model: config.model } : {}),
-    ...(config.dimensions ? { dimensions: config.dimensions } : {}),
-    parallelism: config.parallelism,
-    ...(config.verbose ? { verbose: true } : {}),
-  });
-}
-
-async function createReranker(config: EffectiveConfig): Promise<Reranker | undefined> {
-  if (config.rerankingEnabled !== true) return undefined;
-  if (config.rerankerProvider === "cohere" || config.rerankerProvider === "jina") {
-    const { CohereReranker, JinaReranker } = await import("./rerankers/hosted.js");
-    if (config.rerankerProvider === "cohere") {
-      return new CohereReranker({
-        ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
-        ...(config.verbose ? { verbose: true } : {}),
-      });
-    }
-    return new JinaReranker({
-      ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
-      ...(config.verbose ? { verbose: true } : {}),
-    });
-  }
-  if (config.rerankerProvider === "openai") {
-    const { OpenAILLMReranker } = await import("./rerankers/openai.js");
-    return new OpenAILLMReranker({
-      ...(config.rerankerModel ? { model: config.rerankerModel } : {}),
-      ...(config.rerankerCandidates ? { candidateCount: config.rerankerCandidates } : {}),
-      ...(config.verbose ? { verbose: true } : {}),
-    });
-  }
-  throw new CodeIndexError("rerankerProvider is required when rerankingEnabled is true.");
 }
 
 function numberOption(value: string | undefined, defaultValue: number, name: string): number {
@@ -1080,228 +835,10 @@ function crossSearchSourceFilter(): CrossSearchSourceFilter {
   return { type: "all", ...restrictions };
 }
 
-function presentFunction(value: IndexedFunction) {
-  const { embeddingInput: _embeddingInput, embeddingId: _embeddingId, descriptionEmbeddingId: _descriptionEmbeddingId, ...result } = value;
-  return result;
-}
-
-function presentMatch(value: SimilarityResult) {
-  const { function: callable, ...scores } = value;
-  return { ...scores, function: presentFunction(callable) };
-}
-
-function presentSearchResult(value: SearchResult) {
-  if (value.type === "markdown") return value;
-  const { type, ...result } = value;
-  return { type, ...presentMatch(result) };
-}
-
-function formatSearchResult(value: SearchResult): string {
-  return value.type === "function" ? formatSimilaritySummary([value]) : formatMarkdownResult(value);
-}
-
-function formatMarkdownResult(result: MarkdownSearchResult): string {
-  const score = result.rerankScore === undefined
-    ? result.similarity.toFixed(4)
-    : `${result.rerankScore.toFixed(4)} rerank (${result.similarity.toFixed(4)} similarity)`;
-  const heading = result.chunk.headingPath.join(" > ");
-  return `${score}  ${result.chunk.path}:${result.chunk.startLine}${heading ? ` :: ${heading}` : ""}\n${result.chunk.content}`;
-}
-
 function selectedSearchIndexes(): SearchIndex[] | undefined {
   const indexes: SearchIndex[] = [];
   if (parsed.values.code) indexes.push("code");
   if (parsed.values.descriptions) indexes.push("descriptions");
   if (parsed.values.md) indexes.push("markdown");
   return indexes.length > 0 ? indexes : undefined;
-}
-
-function printJson(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
-
-function printHelp(): void {
-  process.stdout.write(`Usage: slopdex <command> [arguments] [options]
-
-Commands:
-  models [opencode|opencode-go]        List current published OpenCode models
-  config                              Interactively configure all settings
-  config model <model|provider/model>  Validate and save an OpenCode description model
-  config fallback-model <model>        Validate and save a same-provider fallback model
-  config descriptions <enable|disable> Save description state without opening an index
-  config parallelism <count>           Save the concurrent provider request limit (default: 10)
-  config reranker <provider|disable>    Save Cohere, Jina, or OpenAI reranking settings
-  status                              Show index metadata
-  index-errors                        List persisted file and function indexing failures
-  update-files <path...>              Index specific working-tree files
-  reindex-files                       Regenerate stale file descriptions
-  delete-files <path...>              Remove specific files from the index
-  update-git                          Index a Git snapshot plus working-tree changes
-  search <query>                      Search code, descriptions, and Markdown
-  search-code <query>                 Search function code only
-  search-descriptions <query>         Search function descriptions only
-  search-md <query>                   Search heading-aware Markdown chunks only
-  describe <query>                    Explain relevant existing code for a task
-  descriptions <enable|disable>       Enable or disable automatic purpose descriptions
-  cross-search                        Find nearest functions for each source function
-
-Examples:
-  Search code:
-    slopdex search "validate an authenticated session"
-
-    slopdex search "keep the repository index synchronized"
-    0.4284  tests/languages.test.ts :: refresh
-    0.4200  src/cli.ts :: refreshIndex
-    0.4113  src/code-index.ts :: CodeIndex.updateFromGit
-    ...
-
-  Search Markdown documentation:
-    slopdex search-md "configure the embedding provider"
-
-  Search only callable source:
-    slopdex search-code "keep the repository index synchronized"
-
-  Enable descriptions, then search by their meaning:
-    slopdex descriptions enable
-    slopdex search-descriptions "keep the repository index synchronized"
-
-    slopdex models opencode-go
-    slopdex config model opencode-go/gpt-5.6-luna
-    slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
-
-  Explain existing code for a task:
-    slopdex describe "I want to implement a new rpc endpoint"
-
-    Relevant vector-search matches are sent to the configured description model
-    together with file descriptions, callable descriptions, and callable source.
-    Files scoring above --describe-full-file-threshold (default 0.8) are included
-    in full. The output explains what exists and how it fits together for the
-    task without proposing an implementation.
-
-  Find duplicate code:
-    Compare functions across files, exclude short wrappers, and group matches into clusters:
-      slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
-
-      Cluster 1 (3 functions, similarity 0.9124-0.9568)
-        src/auth/session.ts:18:1 :: validateSession
-        src/http/middleware.ts:42:1 :: authenticate
-        src/users/user-service.ts:27:3 :: UserService.authenticate
-
-      This found three substantial authentication functions in separate files with very
-      high similarity. Review them for repeated validation or session logic that could be shared.
-      Middleware and service locations may be intentional architectural layers, so this is
-      evidence to inspect rather than proof they should merge. Connected components may use
-      transitive links, so every function need not directly match every other function.
-
-    Using --cross-file-only is useful to exclude similar code in the same file.
-
-    Review adjacent bands with threshold ranges:
-      slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
-      slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
-
-  Restrict functions used in cross-search:
-    Only use uncommitted working-tree functions as sources:
-      slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9
-
-    Only use functions changed since origin/main as sources:
-      slopdex cross-search --changed-since origin/main --threshold 0.9
-
-    Only use matching symbols under src/services as sources:
-      slopdex cross-search --source-path src/services -e '^UserService\\.' --threshold 0.9
-
-  Find related code stored far apart:
-    --cohesion orders matches from farthest to nearest, which can highlight similar code
-    that could be made more cohesive through an abstraction:
-      slopdex cross-search --cross-file-only --cohesion --threshold 0.8
-
-      src/auth/session.ts :: validateSession
-        0.9400  packages/http/middleware.ts :: authenticate  [distance 4]
-        0.9300  src/auth/token.ts :: validateToken  [distance 1]
-
-      --cohesion keeps cross-search's semantic matches but orders each source's matches
-      from greatest to least path distance. Similarity breaks distance ties. This highlights
-      related functions stored far apart without introducing a separate analysis command.
-
-  Use with agents:
-    slopdex search "..." --threshold 0.5
-    slopdex cross-search --uncommitted --threshold 0.8
-
-  Reranking (second-stage reranker for query searches):
-    slopdex config reranker cohere
-    slopdex config reranker jina
-    slopdex config reranker openai
-
-  Compare repositories:
-    slopdex cross-search --target-root /path/to/other/repo --target-index /path/to/other/repo/.slopdex/index.sqlite --threshold 0.9
-
-  Inspect index health:
-    slopdex status
-    slopdex index-errors --format summary
-    slopdex --version
-
-Options:
-  --version                           Show the package version
-  --root <path>                       Repository root (default: current directory)
-  --config <path>                     Config file (default: .slopdex/config.json)
-  --index <path>                      SQLite index path
-  --provider <openai|jina>            Embedding provider
-  --model <name>                      Embedding model
-  --description-provider <name>       Description provider: openai, opencode, or opencode-go
-  --description-model <name>          Description model (provider default: gpt-5.6-luna or muse-spark-1.3-contributor)
-  --description-fallback-model <name> Fallback description model on the same provider
-  --reranker-candidates <number>       Candidates sent to the OpenAI LLM reranker (default: 10)
-  --dimensions <number>               Embedding dimensions
-  --target <ref>                      Target ref for update-git (default: HEAD)
-  --rebuild-on-divergence             Rebuild after a rebase or branch change (requires confirmation)
-  --force-reindex                     Rebuild an incompatible existing index (requires confirmation)
-  --yes-really-rebuild-the-index      Confirm a destructive index rebuild
-  --no-reindex                        Skip worktree overlays or reuse a non-Git index
-  --callables                         With reindex-files, also regenerate callable descriptions
-  --code                              With search, include only the code index unless combined
-  --descriptions                      With search, include only descriptions unless combined
-  --md                                With search, include only the Markdown index unless combined
-  --ignore-errors                     Silence warnings about persisted indexing errors
-  --verbose                           Log every external model call instead of one per kind/model
-  --limit <number>                    Output limit (default: unlimited; capped by reranker maximum)
-  --matches <number>                  Cross-search matches per source function (default: 5)
-  --threshold <number|range>          Show similarities at/above a value or within a range (default: 0.3)
-  --describe-full-file-threshold <number> Include whole files scoring above this similarity for describe (default: 0.8)
-  --format <json|summary|clusters>    Output format (default: summary; cross-search: clusters)
-  --cohesion                          Re-rank cross-search matches by physical distance
-  --include-symmetric-duplicates      Show both directions of same-index matches
-  --cross-file-only                   Exclude matches from the source file
-  --min-lines <number>               Minimum callable length for cross-search (default: 2)
-  -e, --regexp <regex>               Filter qualified symbols (analysis: sources only)
-  --regex <regex>                    Alias for -e/--regexp
-  --changed-since <commit>            Search added, modified, or moved functions
-  --uncommitted                       Search functions from uncommitted files
-  --source-path <path>                Restrict cross-search sources to a file or directory
-  --target-root <path>                Root of a second indexed codebase
-  --target-index <path>               SQLite path of a second index
-  --target-config <path>              Config file for a second indexed codebase
-
-Other Examples:
-  Save description state and parallelism without opening an index:
-    slopdex config descriptions enable
-    slopdex config parallelism 10
-
-  Index specific working-tree files:
-    slopdex update-files src/service.ts src/model.ts
-
-  Regenerate stale file descriptions, optionally continuing through callable descriptions:
-    slopdex reindex-files
-    slopdex reindex-files --callables
-
-  Remove deleted files from the index:
-    slopdex delete-files src/removed.ts
-
-  Index HEAD and overlay uncommitted working-tree changes:
-    slopdex update-git --target HEAD
-
-  Combine source restrictions (all must match):
-    slopdex cross-search -e 'validate' --source-path src --changed-since origin/main --uncommitted
-
-  Filter semantic search results by qualified symbol before applying the limit:
-    slopdex search "validate session" -e '^Session\\.' --limit 10
-`);
 }

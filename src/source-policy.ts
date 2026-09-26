@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import { languageForPath } from "./parser/callable-parser.js";
+import { languageForPath } from "./parser/languages.js";
 import { isMarkdownPath } from "./parser/markdown.js";
 
 const DEFAULT_EXCLUDED_SEGMENTS = new Set([

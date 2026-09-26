@@ -6,8 +6,12 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 
-import { CodeIndexError } from "./errors.js";
-import { reportModelCall } from "./model-call-notice.js";
+import { CodeIndexError } from "../errors.js";
+import { reportModelCall } from "../model-call-notice.js";
+import {
+  DESCRIPTION_PROVIDER_DEFAULTS,
+  type DescriptionProviderName,
+} from "./provider-registry.js";
 import type {
   DescribeContext,
   DescriptionFileInput,
@@ -15,8 +19,11 @@ import type {
   DescriptionInput,
   DescriptionProvider,
   ParsedCallable,
-} from "./types.js";
-import { DEFAULT_PARALLELISM, throwIfAborted } from "./utils.js";
+} from "../types.js";
+import { DEFAULT_PARALLELISM, throwIfAborted } from "../utils.js";
+
+export { descriptionProviderBaseUrl, isDescriptionProviderName } from "./provider-registry.js";
+export type { DescriptionProviderName } from "./provider-registry.js";
 
 export interface OpenAIDescriptionProviderOptions {
   apiKey?: string;
@@ -28,23 +35,6 @@ export interface OpenAIDescriptionProviderOptions {
   retryDelayMs?: number;
   parallelism?: number;
 }
-
-const DESCRIPTION_PROVIDER_NAMES = ["openai", "opencode", "opencode-go"] as const;
-export type DescriptionProviderName = typeof DESCRIPTION_PROVIDER_NAMES[number];
-
-export function isDescriptionProviderName(value: string): value is DescriptionProviderName {
-  return DESCRIPTION_PROVIDER_NAMES.includes(value as DescriptionProviderName);
-}
-
-export function descriptionProviderBaseUrl(provider: DescriptionProviderName): string {
-  return PROVIDERS[provider].baseUrl;
-}
-
-const PROVIDERS: Record<DescriptionProviderName, { apiKey: string; baseUrl: string; model: string }> = {
-  openai: { apiKey: "OPENAI_API_KEY", baseUrl: "https://api.openai.com/v1", model: "gpt-5.6-luna" },
-  opencode: { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/v1", model: "muse-spark-1.3-contributor" },
-  "opencode-go": { apiKey: "OPENCODE_API_KEY", baseUrl: "https://opencode.ai/zen/go/v1", model: "muse-spark-1.3-contributor" },
-};
 
 const EMPTY_DESCRIPTION_MESSAGE = "Description provider returned an empty description.";
 const EMPTY_DESCRIPTION_RETRIES = 5;
@@ -106,7 +96,7 @@ export class OpenAIDescriptionProvider implements DescriptionProvider {
 
   public constructor(options: OpenAIDescriptionProviderOptions = {}) {
     const provider = options.provider ?? "openai";
-    const defaults = PROVIDERS[provider];
+    const defaults = DESCRIPTION_PROVIDER_DEFAULTS[provider];
     this.#apiKeyName = defaults.apiKey;
     this.#apiKey = options.apiKey
       || process.env[this.#apiKeyName]

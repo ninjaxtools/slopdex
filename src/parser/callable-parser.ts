@@ -1,5 +1,3 @@
-import path from "node:path";
-
 import Parser from "tree-sitter";
 import C from "tree-sitter-c";
 import Go from "tree-sitter-go";
@@ -15,40 +13,12 @@ import { sha256 } from "../utils.js";
 import type { CallableCandidate } from "./candidate.js";
 import { collectNativeCallables } from "./native-callables.js";
 import { parseDiagnostics } from "./diagnostics.js";
+import { languageForPath } from "./languages.js";
+
+export { languageForPath } from "./languages.js";
 
 const parsers = new Map<SupportedLanguage, Parser>();
 export const CALLABLE_PARSER_CACHE_VERSION = "callable-parser-v1";
-
-export function languageForPath(filePath: string): SupportedLanguage | null {
-  switch (path.extname(filePath).toLowerCase()) {
-    case ".ts":
-    case ".mts":
-    case ".cts":
-      return "typescript";
-    case ".tsx":
-      return "tsx";
-    case ".js":
-    case ".mjs":
-    case ".cjs":
-      return "javascript";
-    case ".jsx":
-      return "jsx";
-    case ".py":
-    case ".pyw":
-      return "python";
-    case ".rs":
-      return "rust";
-    case ".go":
-      return "go";
-    case ".java":
-      return "java";
-    case ".c":
-    case ".h":
-      return "c";
-    default:
-      return null;
-  }
-}
 
 function getParser(language: SupportedLanguage): Parser {
   const existing = parsers.get(language);

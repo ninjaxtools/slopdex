@@ -2,7 +2,7 @@ import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { IncompatibleIndexError } from "../errors.js";
-import { cohesionLocation } from "../cohesion.js";
+import { cohesionLocation } from "../analysis/location.js";
 import type { CrossSearchOptions, CrossSearchResult } from "../types.js";
 import { assertPositiveInteger, compileNameRegex, throwIfAborted } from "../utils.js";
 import { analysisSimilarity, similarityCacheFloor } from "./similarity.js";

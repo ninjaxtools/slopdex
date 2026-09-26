@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { analyzeCohesion, cohesionLocation } from "../src/cohesion.js";
+import { analyzeCohesion } from "../src/analysis/cohesion.js";
+import { cohesionLocation } from "../src/analysis/location.js";
 import { CodeIndex } from "../src/code-index.js";
 import { formatCohesionSummary } from "../src/format.js";
 import type { EmbeddingProvider } from "../src/types.js";

@@ -1,10 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-import type { DescriptionProviderName } from "./openai-description.js";
+import { isDescriptionProviderName, type DescriptionProviderName } from "./descriptions/provider-registry.js";
 import type { CodeIndexOptions } from "./types.js";
 import { CodeIndexError } from "./errors.js";
 import { assertPositiveInteger, DEFAULT_PARALLELISM } from "./utils.js";
+
+export { isDescriptionProviderName };
 
 export interface FileConfig {
   provider?: "openai" | "jina";
@@ -37,11 +39,6 @@ export interface PublishedModel {
 export const RERANKER_DEFAULT_MODELS = {
   cohere: "rerank-v4.0-pro", jina: "jina-reranker-v3.5", openai: "gpt-5.6-luna",
 } as const;
-
-// Keep configuration and CLI startup independent of the provider SDKs.
-export function isDescriptionProviderName(value: unknown): value is DescriptionProviderName {
-  return value === "openai" || value === "opencode" || value === "opencode-go";
-}
 
 export interface ConfigOverrides {
   provider?: string | undefined;

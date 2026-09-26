@@ -3,9 +3,10 @@ import path from "node:path";
 
 import { describe, expect, it, onTestFinished } from "vitest";
 
-import { analyzeCohesion } from "../src/cohesion.js";
+import { analyzeCohesion } from "../src/analysis/cohesion.js";
 import { CodeIndex } from "../src/code-index.js";
-import { languageForPath, parseCallables } from "../src/parser/callable-parser.js";
+import { parseCallables } from "../src/parser/callable-parser.js";
+import { languageForPath } from "../src/parser/languages.js";
 import { crossSearch } from "../src/search/cross-search.js";
 import { SourcePolicy } from "../src/source-policy.js";
 import type { CallableKind, DescriptionInput, SupportedLanguage } from "../src/types.js";
