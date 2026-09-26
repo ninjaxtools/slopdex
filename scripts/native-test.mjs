@@ -5,7 +5,9 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { binaryPaths, packageRoot, platformKey } from "./native-common.mjs";
+import { binaryPaths, packageRoot, packageVersion, platformKey } from "./native-common.mjs";
+
+const versionOutput = `slopdex ${packageVersion()}`;
 
 test("platform keys distinguish libc and CPU without assuming host defaults", () => {
   assert.equal(platformKey("linux", "x64", { header: { glibcVersionRuntime: "2.31" } }), "linux-x64-gnu");
@@ -32,7 +34,7 @@ function fixture(t) {
   mkdirSync(path.join(root, "src"));
   writeFileSync(path.join(root, "src", "main.rs"), "fn main() {}\n");
   const executable = `#!${process.execPath}
-if (process.argv[2] === '--version') { console.log('slopdex 0.19.0'); }
+if (process.argv[2] === '--version') { console.log(${JSON.stringify(versionOutput)}); }
 else if (process.argv[2] === 'wait') {
   console.log('ready'); setInterval(() => {}, 1000);
 } else {
@@ -72,7 +74,7 @@ nativeTest("installer uses bundled prebuilt, repairs executable permissions, and
   assert.equal(result.status, 0, result.stderr);
   assert.ok(existsSync(f.built));
   assert.ok(!existsSync(path.join(f.root, "cargo-call.json")));
-  assert.equal(f.run("native-launcher.mjs", ["--version"]).stdout.trim(), "slopdex 0.19.0");
+  assert.equal(f.run("native-launcher.mjs", ["--version"]).stdout.trim(), versionOutput);
 });
 
 nativeTest("source fallback builds locked release from package root and ignores cross-target environment", (t) => {
@@ -93,7 +95,7 @@ nativeTest("an incompatible prebuilt falls back to source; launcher selects the 
   const result = f.run("native-install.mjs");
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stderr, /cannot use/);
-  assert.equal(f.run("native-launcher.mjs", ["--version"]).stdout.trim(), "slopdex 0.19.0");
+  assert.equal(f.run("native-launcher.mjs", ["--version"]).stdout.trim(), versionOutput);
 });
 
 nativeTest("stale source binary is replaced by matching prebuilt", (t) => {
@@ -101,7 +103,7 @@ nativeTest("stale source binary is replaced by matching prebuilt", (t) => {
   f.writeExecutable(f.built, "#!/bin/sh\nprintf 'slopdex 0.18.0\\n'\n");
   f.writeExecutable(f.prebuilt);
   assert.equal(f.run("native-install.mjs").status, 0);
-  assert.equal(f.run("native-launcher.mjs", ["--version"]).stdout.trim(), "slopdex 0.19.0");
+  assert.equal(f.run("native-launcher.mjs", ["--version"]).stdout.trim(), versionOutput);
 });
 
 nativeTest("compiler failure is actionable and installation fails", (t) => {
@@ -190,6 +192,6 @@ for (const prebuilt of [true, false]) {
     const installed = path.join(prefix, "lib", "node_modules", "@ninjaxtools", "slopdex");
     assert.equal(existsSync(path.join(installed, "cargo-call.json")), !prebuilt);
     const output = execFileSync(path.join(prefix, "bin", "slopdex"), ["--version"], { cwd: tmpdir(), encoding: "utf8" });
-    assert.equal(output.trim(), "slopdex 0.19.0");
+    assert.equal(output.trim(), versionOutput);
   });
 }

@@ -28,6 +28,7 @@ the [command reference](reference.md) for CLI documentation. Use
 | `scripts/smoke.mjs` | Offline checks of the real native CLI's version and help from outside the package directory. |
 | `.github/workflows/rust.yml` | Rust/npm checks on Linux, macOS and Windows for main-branch pushes, pull requests and manual runs. |
 | `dist-workspace.toml` | cargo-dist version, release targets, native runners, GitHub hosting and npm publication configuration. |
+| `release.toml` | cargo-release version synchronization, pre-release checks, commit and tag naming. |
 | `.github/workflows/release.yml` | Generated cargo-dist workflow: release planning, platform archives/checksums, GitHub Releases and npm publication. |
 | `.github/workflows/publish-npm.yml` | Reusable npm trusted-publishing job, called by the generated release workflow with OIDC permissions. |
 
@@ -412,13 +413,40 @@ The custom publisher is registered through `publish-jobs` and
 `github-custom-job-permissions` in `dist-workspace.toml`, so `dist generate`
 preserves this setup. See [npm's trusted publishing guide](https://docs.npmjs.com/trusted-publishers).
 
-Release procedure:
+### One-command releases
 
-1. Choose an unused version and update the Cargo/npm manifests and lockfiles.
-2. Run `npm run check`, `dist generate --check`, and `dist plan`.
-3. Commit the release changes, including the generated workflow and dist config.
-4. Create and push the matching `v<version>` tag. The **Release** workflow handles
-   binary uploads and npm publication; a separate `npm publish` is unnecessary.
+Install cargo-release once (configuration verified with 1.1.5), along with the
+pinned cargo-dist version above:
+
+```bash
+cargo install cargo-release --locked --version 1.1.5
+```
+
+Commit your implementation/configuration changes first and start with a clean
+working tree. Preview the release, then execute it:
+
+```bash
+cargo release patch --no-publish
+cargo release patch --no-publish --execute
+```
+
+For example, `patch` advances `0.19.0` to `0.19.1`; use `minor` for `0.20.0`,
+or specify an exact version. `release.toml` makes cargo-release:
+
+1. Update `Cargo.toml` and `Cargo.lock`.
+2. Synchronize `package.json` and both root-package version fields in
+   `package-lock.json` (including prerelease versions).
+3. Run `npm run release:check`: the full application/packaging checks, generated
+   workflow consistency check, and release plan.
+4. Create the release commit and annotated `v<version>` tag, then push to `origin`.
+
+The pushed tag triggers the **Release** workflow, which uploads binaries and
+publishes to npm using trusted publishing. `--no-publish` disables publishing to
+**crates.io**; it does not disable GitHub/npm publication triggered by that tag.
+It is also the repository default. No separate `npm publish` is necessary.
+The dry run executes the verification hook but does not bump versions, commit,
+tag, or push. A dirty working tree or other failed preflight check must be fixed
+before executing a release.
 
 To verify a native archive locally without publishing:
 

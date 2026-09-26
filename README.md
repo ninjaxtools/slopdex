@@ -215,6 +215,12 @@ $ slopdex --version
 - [qmd](https://github.com/tobi/qmd)
 - [treepeat](https://github.com/dsummersl/treepeat)
 
+## Publishing
+
+```console
+$ cargo release minor --no-publish --execute
+```
+
 ## Commands
 
 See [Command reference](docs/reference.md).

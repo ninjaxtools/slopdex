@@ -39,6 +39,7 @@
     "test:npm": "node --test scripts/native-test.mjs",
     "smoke": "node scripts/smoke.mjs",
     "install:local": "npm run build && npm install -g .",
+    "release:check": "npm run check && dist generate --check && dist plan",
     "prepack": "npm run build && npm run smoke",
     "check": "npm run fmt:check && npm run typecheck && npm run clippy && npm run test:run && npm run test:npm && npm run build && npm run smoke"
   }
