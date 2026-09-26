@@ -1,6 +1,6 @@
 import { confirm, input, number, search, select } from "@inquirer/prompts";
 
-import type { DescriptionProviderName } from "./descriptions/openai.js";
+import type { DescriptionProviderName } from "./openai-description.js";
 import { RERANKER_DEFAULT_MODELS, type FileConfig, type OpenCodeDescriptionProvider, type PublishedModel } from "./config.js";
 import { DEFAULT_PARALLELISM } from "./utils.js";
 

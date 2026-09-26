@@ -6,8 +6,8 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 
-import { CodeIndexError } from "../errors.js";
-import { reportModelCall } from "../model-call-notice.js";
+import { CodeIndexError } from "./errors.js";
+import { reportModelCall } from "./model-call-notice.js";
 import type {
   DescribeContext,
   DescriptionFileInput,
@@ -15,8 +15,8 @@ import type {
   DescriptionInput,
   DescriptionProvider,
   ParsedCallable,
-} from "../types.js";
-import { DEFAULT_PARALLELISM, throwIfAborted } from "../utils.js";
+} from "./types.js";
+import { DEFAULT_PARALLELISM, throwIfAborted } from "./utils.js";
 
 export interface OpenAIDescriptionProviderOptions {
   apiKey?: string;

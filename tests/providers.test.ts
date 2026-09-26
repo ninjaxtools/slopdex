@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { JinaEmbeddingProvider } from "../src/embeddings/jina.js";
 import { OpenAIEmbeddingProvider } from "../src/embeddings/openai.js";
-import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
+import { OpenAIDescriptionProvider } from "../src/openai-description.js";
 import { parseCallables } from "../src/parser/callable-parser.js";
 import { CohereReranker, JinaReranker } from "../src/rerankers/hosted.js";
 import { OpenAILLMReranker } from "../src/rerankers/openai.js";

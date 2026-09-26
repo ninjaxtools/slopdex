@@ -3,7 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import { CodeIndexError, GitDivergenceError } from "./errors.js";
-import { GitRepository, type GitChange, type GitTreeEntry } from "./git/repository.js";
+import { GitRepository, type GitChange, type GitTreeEntry } from "./repository.js";
 import { GitignoreRules } from "./gitignore.js";
 import { CALLABLE_PARSER_CACHE_VERSION, languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
 import { chunkMarkdown, isMarkdownPath } from "./parser/markdown.js";
@@ -17,8 +17,8 @@ import {
   type SimilarityCacheReaderOptions,
 } from "./search/similarity-cache.js";
 import { SourcePolicy } from "./source-policy.js";
-import { IndexDatabase, type IndexedFileState, type PreparedCallable, type PreparedDescription, type PreparedFile, type PreparedMarkdownChunk } from "./storage/database.js";
-import { isDescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
+import { IndexDatabase, type IndexedFileState, type PreparedCallable, type PreparedDescription, type PreparedFile, type PreparedMarkdownChunk } from "./database.js";
+import { isDescriptionProviderName, OpenAIDescriptionProvider } from "./openai-description.js";
 import type {
   CodeIndexOptions,
   CrossSearchSourceFilter,

@@ -3,8 +3,8 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
-import { OpenAIDescriptionProvider } from "../src/descriptions/openai.js";
-import { resetIndexState } from "../src/storage/database.js";
+import { OpenAIDescriptionProvider } from "../src/openai-description.js";
+import { resetIndexState } from "../src/database.js";
 import type { DescriptionFileInput, DescriptionInput, DescriptionProvider, EmbeddingProvider, IndexProgress } from "../src/types.js";
 import { FakeEmbeddingProvider, commitAll, git, initGit, temporaryRoot, write } from "./helpers.js";
 

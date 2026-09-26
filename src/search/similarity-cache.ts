@@ -1,4 +1,4 @@
-import type { IndexDatabase } from "../storage/database.js";
+import type { IndexDatabase } from "../database.js";
 import type { IndexProgress, IndexStatus, IndexedFunction, SimilarityResult } from "../types.js";
 import { compileNameRegex, throwIfAborted } from "../utils.js";
 import { analysisSimilarity } from "./similarity.js";

@@ -1,6 +1,6 @@
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { analyzeCohesion } from "../src/analysis/cohesion.js";
+import { analyzeCohesion } from "../src/cohesion.js";
 import { CodeIndex } from "../src/code-index.js";
 import { crossSearch } from "../src/search/cross-search.js";
 import type { CrossSearchOptions, CrossSearchResult, EmbeddingProvider } from "../src/types.js";

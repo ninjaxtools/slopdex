@@ -15,7 +15,7 @@ import {
   type EffectiveConfig, type OpenCodeDescriptionProvider, type PublishedModel,
 } from "./config.js";
 import type { CodeIndex } from "./code-index.js";
-import type { DescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
+import type { DescriptionProviderName, OpenAIDescriptionProvider } from "./openai-description.js";
 import type {
   CodeIndexOptions,
   CrossSearchOptions,
@@ -170,7 +170,7 @@ async function main(): Promise<void> {
   const config = loadConfig(rootDir, parsed.values.config, parsed.values);
   if (command === "index-errors") {
     const indexPath = config.indexPath;
-    const { readIndexErrors } = await import("./storage/database.js");
+    const { readIndexErrors } = await import("./database.js");
     const errors = existsSync(indexPath) ? readIndexErrors(indexPath) : [];
     if (outputFormat("summary") === "summary") {
       process.stdout.write(errors.length === 0 ? "No indexing errors.\n" : `${errors.map((error) =>
@@ -471,7 +471,7 @@ async function ensureIndexUpdated(
     const indexPath = resolveIndexPath(options);
     const descriptionProfile = descriptionProfileForRebuild(indexPath, options.rootDir);
     try {
-      const { resetIndexState } = await import("./storage/database.js");
+      const { resetIndexState } = await import("./database.js");
       resetIndexState(indexPath, options.rootDir, options.provider.profile);
     } catch (resetError) {
       if (!(resetError instanceof IncompatibleIndexError)) throw resetError;
@@ -622,7 +622,7 @@ async function createDescriptionProvider(config: EffectiveConfig): Promise<OpenA
       model = stored.model;
     }
   }
-  const { OpenAIDescriptionProvider: Provider } = await import("./descriptions/openai.js");
+  const { OpenAIDescriptionProvider: Provider } = await import("./openai-description.js");
   return new Provider({
     ...(provider ? { provider } : {}),
     ...(model ? { model } : {}),
@@ -786,7 +786,7 @@ async function resolveConfiguredModel(
 }
 
 async function fetchPublishedModels(provider: OpenCodeDescriptionProvider): Promise<PublishedModel[]> {
-  const { descriptionProviderBaseUrl } = await import("./descriptions/openai.js");
+  const { descriptionProviderBaseUrl } = await import("./openai-description.js");
   const url = `${descriptionProviderBaseUrl(provider)}/models`;
   let response: Response;
   try {

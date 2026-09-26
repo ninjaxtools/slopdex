@@ -1,10 +1,10 @@
 export { CodeIndex } from "./code-index.js";
-export { readIndexErrors } from "./storage/database.js";
-export { analyzeCohesion, cohesionLocation } from "./analysis/cohesion.js";
+export { readIndexErrors } from "./database.js";
+export { analyzeCohesion, cohesionLocation } from "./cohesion.js";
 export { crossSearch } from "./search/cross-search.js";
 export { OpenAIEmbeddingProvider } from "./embeddings/openai.js";
-export { OpenAIDescriptionProvider } from "./descriptions/openai.js";
-export type { DescriptionProviderName, OpenAIDescriptionProviderOptions } from "./descriptions/openai.js";
+export { OpenAIDescriptionProvider } from "./openai-description.js";
+export type { DescriptionProviderName, OpenAIDescriptionProviderOptions } from "./openai-description.js";
 export type { OpenAIEmbeddingProviderOptions } from "./embeddings/openai.js";
 export { JinaEmbeddingProvider } from "./embeddings/jina.js";
 export type { JinaEmbeddingProviderOptions } from "./embeddings/jina.js";
@@ -17,7 +17,7 @@ export { CodeIndexError, GitDivergenceError, GitUnavailableError, IncompatibleIn
 export type * from "./types.js";
 
 import { CodeIndex } from "./code-index.js";
-import { analyzeCohesion } from "./analysis/cohesion.js";
+import { analyzeCohesion } from "./cohesion.js";
 import { crossSearch } from "./search/cross-search.js";
 import type {
   CodeIndexOptions,

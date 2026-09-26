@@ -10,11 +10,11 @@ For installation, see the [operator README](../README.md). For command examples,
 | `src/code-index.ts` | Index lifecycle, file preparation, Git/working-tree reconciliation, embedding/description caching, and search facade. |
 | `src/parser/` | Language dispatch, native Tree-sitter extraction, callable identity, Markdown chunking, and recoverable diagnostics. |
 | `src/source-policy.ts`, `src/gitignore.ts` | Supported paths, built-in/config exclusions, nested ignore rules. |
-| `src/git/repository.ts` | Git commits, trees, blobs, diffs, ancestry, and working-tree changes. |
-| `src/embeddings/`, `src/descriptions/`, `src/rerankers/` | Provider requests and provider profiles. |
-| `src/storage/database.ts` | SQLite schema, durable artifact caches, transactions, metadata, and vector queries. |
+| `src/repository.ts` | Git commits, trees, blobs, diffs, ancestry, and working-tree changes. |
+| `src/embeddings/`, `src/openai-description.ts`, `src/rerankers/` | Provider requests and provider profiles. |
+| `src/database.ts` | SQLite schema, durable artifact caches, transactions, metadata, and vector queries. |
 | `src/search/` | Analysis scoring selection and cross-index neighbor discovery. |
-| `src/analysis/cohesion.ts` | Physical distance, gap scores, aggregate affinity, and groups. |
+| `src/cohesion.ts` | Physical distance, gap scores, aggregate affinity, and groups. |
 | `src/format.ts` | Human-readable search and cluster output, plus library cohesion-report formatting. |
 | `src/index.ts`, `src/types.ts` | Public exports and data contracts. |
 

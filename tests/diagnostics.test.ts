@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { CodeIndex } from "../src/code-index.js";
 import { parseFileCallables } from "../src/parser/callable-parser.js";
-import { readIndexErrors } from "../src/storage/database.js";
+import { readIndexErrors } from "../src/database.js";
 import { FakeEmbeddingProvider, commitAll, initGit, temporaryRoot, write } from "./helpers.js";
 
 afterEach(() => vi.restoreAllMocks());

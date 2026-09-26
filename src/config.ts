@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-import type { DescriptionProviderName } from "./descriptions/openai.js";
+import type { DescriptionProviderName } from "./openai-description.js";
 import type { CodeIndexOptions } from "./types.js";
 import { CodeIndexError } from "./errors.js";
 import { assertPositiveInteger, DEFAULT_PARALLELISM } from "./utils.js";

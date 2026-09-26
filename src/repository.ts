@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
 
-import { CodeIndexError, GitUnavailableError } from "../errors.js";
+import { CodeIndexError, GitUnavailableError } from "./errors.js";
 
 export type GitChange =
   | { status: "A" | "M" | "D" | "T"; path: string }

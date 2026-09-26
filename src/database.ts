@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import * as sqliteVec from "sqlite-vec";
 
-import { CodeIndexError, IncompatibleIndexError } from "../errors.js";
+import { CodeIndexError, IncompatibleIndexError } from "./errors.js";
 import type {
   EmbeddingProfile,
   IndexStatus,
@@ -18,7 +18,7 @@ import type {
   SimilarityResult,
   DescriptionProfile,
   UpdateStats,
-} from "../types.js";
+} from "./types.js";
 
 const SCHEMA_VERSION = "11";
 const KNN_TIE_OVERFETCH = 32;

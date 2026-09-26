@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { describe, expect, it, onTestFinished } from "vitest";
 
-import { analyzeCohesion } from "../src/analysis/cohesion.js";
+import { analyzeCohesion } from "../src/cohesion.js";
 import { CodeIndex } from "../src/code-index.js";
 import { languageForPath, parseCallables } from "../src/parser/callable-parser.js";
 import { crossSearch } from "../src/search/cross-search.js";

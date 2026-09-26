@@ -3,7 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it, onTestFinished } from "vitest";
 
-import { analyzeCohesion } from "../src/analysis/cohesion.js";
+import { analyzeCohesion } from "../src/cohesion.js";
 import { CodeIndex } from "../src/code-index.js";
 import { formatCohesionSummary, formatSimilarityClusters, formatSimilaritySummary } from "../src/format.js";
 import { crossSearch } from "../src/search/cross-search.js";

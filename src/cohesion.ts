@@ -1,7 +1,7 @@
 import path from "node:path";
 
-import { CodeIndexError } from "../errors.js";
-import { analysisSimilarity, similarityCacheFloor } from "../search/similarity.js";
+import { CodeIndexError } from "./errors.js";
+import { analysisSimilarity, similarityCacheFloor } from "./search/similarity.js";
 import type {
   CohesionAnalysisOptions,
   CohesionFileReport,
@@ -12,8 +12,8 @@ import type {
   IndexedFunction,
   SimilarityResult,
   SimilarityScores,
-} from "../types.js";
-import { assertPositiveInteger, compileNameRegex, throwIfAborted } from "../utils.js";
+} from "./types.js";
+import { assertPositiveInteger, compileNameRegex, throwIfAborted } from "./utils.js";
 
 interface CandidateEdge extends SimilarityScores {
   left: IndexedFunction;
