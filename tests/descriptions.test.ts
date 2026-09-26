@@ -28,6 +28,90 @@ class FakeDescriptionProvider implements DescriptionProvider {
 }
 
 describe("purpose descriptions", () => {
+  it("no-ops described filesystem refreshes and settles after disabling descriptions", async () => {
+    const root = temporaryRoot();
+    write(root, "a.ts", "export function one() { return 1; }\n");
+    write(root, "b.ts", "export function two() { return 2; }\n");
+    class ContextDescriptions extends FakeDescriptionProvider {
+      public override async describe(input: DescriptionInput): Promise<string> {
+        return `${await super.describe(input)} Context: ${input.fileSource}`;
+      }
+    }
+    const descriptions = new ContextDescriptions();
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider(), descriptionProvider: descriptions });
+    await index.updateFromWorkingTree();
+    await index.useDescriptions();
+    await index.refreshSimilarityCache({ width: 10 });
+    const before = index.allFunctions();
+    const status = index.status();
+    const db = new DatabaseSync(index.indexPath);
+    try {
+      const pairs = db.prepare("SELECT * FROM similarity_cache ORDER BY source_id, target_id, similarity_mode").all();
+      const states = db.prepare("SELECT * FROM similarity_cache_state ORDER BY function_id, similarity_mode").all();
+      expect(pairs.length).toBeGreaterThan(0);
+      descriptions.fail = true;
+      expect(await index.updateFromWorkingTree()).toEqual({
+        filesUpdated: 0, filesDeleted: 0, functionsAdded: 0, functionsUpdated: 0,
+        functionsDeleted: 0, embeddingsCreated: 0, checkpoint: null,
+      });
+      expect(index.status()).toEqual(status);
+      expect(index.allFunctions()).toEqual(before);
+      expect(descriptions.inputs).toHaveLength(2);
+      expect(descriptions.fileInputs).toHaveLength(2);
+      expect(db.prepare("SELECT * FROM similarity_cache ORDER BY source_id, target_id, similarity_mode").all()).toEqual(pairs);
+      expect(db.prepare("SELECT * FROM similarity_cache_state ORDER BY function_id, similarity_mode").all()).toEqual(states);
+
+      descriptions.fail = false;
+      write(root, "a.ts", "const context = 2;\nexport function one() { return 1; }\n");
+      await index.updateFromWorkingTree();
+      expect(index.status().staleFileDescriptionCount).toBe(1);
+      const one = index.allFunctions().find((value) => value.name === "one")!;
+      const originalOne = before.find((value) => value.name === "one")!;
+      expect(one.id).toBe(originalOne.id);
+      expect(one.embeddingId).toBe(originalOne.embeddingId);
+      expect(one.descriptionEmbeddingId).not.toBe(originalOne.descriptionEmbeddingId);
+      expect(index.allFunctions().find((value) => value.name === "two")).toEqual(before.find((value) => value.name === "two"));
+      expect(db.prepare("SELECT * FROM similarity_cache ORDER BY source_id, target_id, similarity_mode").all()).toEqual(pairs);
+      const staleGeneration = index.status().generation;
+      descriptions.fail = true;
+      expect((await index.updateFromWorkingTree()).filesUpdated).toBe(0);
+      expect(index.status().generation).toBe(staleGeneration);
+
+      index.disableDescriptions();
+      const disabledGeneration = index.status().generation;
+      expect((await index.updateFromWorkingTree()).filesUpdated).toBe(2);
+      expect(index.status()).toMatchObject({ descriptionCount: 0, fileDescriptionCount: 2, generation: disabledGeneration + 1 });
+      expect(index.allFunctions().every((value) => value.descriptionEmbeddingId === null)).toBe(true);
+      expect(index.allFunctions().map((value) => value.id)).toEqual(before.map((value) => value.id));
+      expect((await index.updateFromWorkingTree()).filesUpdated).toBe(0);
+      expect(index.status().generation).toBe(disabledGeneration + 1);
+    } finally {
+      db.close();
+      index.close();
+    }
+  });
+
+  it("rejects a no-op refresh if description settings change while preparing it", async () => {
+    const root = temporaryRoot();
+    write(root, "broken.ts", "function broken( {\n");
+    let disableDuringRefresh = false;
+    const index = new CodeIndex({
+      rootDir: root,
+      provider: new FakeEmbeddingProvider(),
+      descriptionProvider: new FakeDescriptionProvider(),
+      onWarning: () => { if (disableDuringRefresh) index.disableDescriptions(); },
+    });
+    await index.updateFromWorkingTree();
+    await index.useDescriptions();
+    expect(index.allFunctions()).toEqual([]);
+    const generation = index.status().generation;
+    disableDuringRefresh = true;
+    await expect(index.updateFromWorkingTree()).rejects.toThrow("Index changed while the update was being prepared");
+    expect(index.status()).toMatchObject({ descriptionsEnabled: false, generation: generation + 1 });
+    expect((await index.updateFromWorkingTree()).filesUpdated).toBe(0);
+    index.close();
+  });
+
   it("is optional, backfills every callable, persists, and reuses unchanged descriptions", async () => {
     const root = temporaryRoot();
     const source = `import { send } from './transport';

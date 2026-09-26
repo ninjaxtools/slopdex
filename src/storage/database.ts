@@ -92,6 +92,21 @@ export interface IndexedFileState {
   fileDescriptionContentHash: string | null;
 }
 
+interface FileRow {
+  path: string;
+  content_hash: string;
+  blob_oid: string | null;
+  source_mode: SourceMode;
+  indexed_commit: string | null;
+  previous_path: string | null;
+  language: string;
+  byte_size: number;
+  file_description_path: string | null;
+  file_description_content_hash: string | null;
+  file_description: string | null;
+  file_description_embedding_id: number | null;
+}
+
 interface FunctionRow {
   id: number;
   path: string;
@@ -675,23 +690,11 @@ export class IndexDatabase {
   #replaceFile(file: PreparedFile, stats: UpdateStats): void {
     const sourcePath = file.replacePath ?? file.previousPath ?? file.path;
     const oldRows = this.#rowsForPath(sourcePath);
-    const existingFile = this.#db.prepare(`
-      SELECT previous_path, file_description_path, file_description_content_hash,
-        file_description, file_description_embedding_id
-      FROM files WHERE path = ?
-    `).get(sourcePath) as
-      | {
-        previous_path: string | null;
-        file_description_path: string | null;
-        file_description_content_hash: string | null;
-        file_description: string | null;
-        file_description_embedding_id: number | null;
-      }
-      | undefined;
+    const existingFile = this.#db.prepare("SELECT * FROM files WHERE path = ?").get(sourcePath) as unknown as FileRow | undefined;
     const oldMatches = reconcileFunctions(file.callables, oldRows);
-    const preserveFileDescription = !file.unavailable && file.language !== "markdown";
+    const renamed = sourcePath !== file.path;
 
-    if (sourcePath !== file.path) {
+    if (renamed) {
       const displacedRows = this.#rowsForPath(file.path);
       const displaced = this.#db.prepare("DELETE FROM files WHERE path = ?").run(file.path);
       if (displaced.changes > 0) {
@@ -699,111 +702,164 @@ export class IndexDatabase {
         stats.functionsDeleted += displacedRows.length;
       }
       this.#db.prepare("DELETE FROM files WHERE path = ?").run(sourcePath);
-    } else {
-      this.#db.prepare("DELETE FROM files WHERE path = ?").run(file.path);
     }
-    this.#db.prepare(`
-      INSERT INTO files(
-        path, content_hash, blob_oid, source_mode, indexed_commit, previous_path, language, byte_size,
-        file_description_path, file_description_content_hash, file_description, file_description_embedding_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      file.path,
-      file.contentHash,
-      file.blobOid,
-      file.sourceMode,
-      file.indexedCommit,
-      file.sourceMode === "working-tree" ? file.previousPath ?? existingFile?.previous_path ?? null : null,
-      file.language,
-      file.byteSize,
-      file.fileDescription?.path ?? (preserveFileDescription ? existingFile?.file_description_path : null) ?? null,
-      file.fileDescription?.contentHash ?? (preserveFileDescription ? existingFile?.file_description_content_hash : null) ?? null,
-      file.fileDescription?.value.description ?? (preserveFileDescription ? existingFile?.file_description : null) ?? null,
-      file.fileDescription
-        ? this.#embeddingId(file.fileDescription.value.key, file.fileDescription.value.vector)
-        : preserveFileDescription ? existingFile?.file_description_embedding_id ?? null : null,
-    );
-    const insertError = this.#db.prepare("INSERT INTO indexing_errors(path, diagnostic) VALUES (?, ?)");
-    for (const error of file.errors) insertError.run(file.path, JSON.stringify(error));
-
-    const insertMarkdownChunk = this.#db.prepare(`
-      INSERT INTO markdown_chunks(path, heading_path, start_line, end_line, content, source_hash, embedding_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    for (const chunk of file.markdownChunks) {
-      if (chunk.vector) this.storeEmbedding(chunk.embeddingKey, chunk.vector);
-      const embedding = this.#db.prepare("SELECT id FROM embeddings WHERE embedding_key = ?").get(chunk.embeddingKey) as { id: number } | undefined;
-      if (!embedding) throw new CodeIndexError(`Missing embedding for markdown chunk in ${file.path}.`);
-      insertMarkdownChunk.run(
-        file.path,
-        JSON.stringify(chunk.headingPath),
-        chunk.startLine,
-        chunk.endLine,
-        chunk.content,
-        chunk.sourceHash,
-        embedding.id,
-      );
+    if (file.fileDescription?.value.vector) this.storeEmbedding(file.fileDescription.value.key, file.fileDescription.value.vector);
+    this.#writeRow("files", "path", this.#fileValues(file, existingFile), renamed ? undefined : existingFile);
+    if (!this.#errorsMatch(file)) {
+      this.#db.prepare("DELETE FROM indexing_errors WHERE path = ?").run(file.path);
+      const insertError = this.#db.prepare("INSERT INTO indexing_errors(path, diagnostic) VALUES (?, ?)");
+      for (const error of file.errors) insertError.run(file.path, JSON.stringify(error));
     }
 
-    const usedIds = new Set<number>();
+    if (!this.#markdownChunksMatch(file)) {
+      this.#db.prepare("DELETE FROM markdown_chunks WHERE path = ?").run(file.path);
+      const insertMarkdownChunk = this.#db.prepare(`
+        INSERT INTO markdown_chunks(path, heading_path, start_line, end_line, content, source_hash, embedding_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const chunk of file.markdownChunks) {
+        if (chunk.vector) this.storeEmbedding(chunk.embeddingKey, chunk.vector);
+        const embedding = this.#db.prepare("SELECT id FROM embeddings WHERE embedding_key = ?").get(chunk.embeddingKey) as { id: number } | undefined;
+        if (!embedding) throw new CodeIndexError(`Missing embedding for markdown chunk in ${file.path}.`);
+        insertMarkdownChunk.run(
+          file.path,
+          JSON.stringify(chunk.headingPath),
+          chunk.startLine,
+          chunk.endLine,
+          chunk.content,
+          chunk.sourceHash,
+          embedding.id,
+        );
+      }
+    }
+
+    const usedIds = new Set([...oldMatches.values()].map((old) => old.id));
+    if (!renamed) {
+      for (const old of oldRows) {
+        if (!usedIds.has(old.id)) this.#db.prepare("DELETE FROM functions WHERE id = ?").run(old.id);
+      }
+      // Duplicate declarations can exchange occurrence-based identity keys.
+      // Vacate only changing keys before assigning their final values, retaining
+      // the function IDs and their dependent cache rows throughout the transaction.
+      for (const [callable, old] of oldMatches) {
+        if (old.identity_key === callable.identityKey) continue;
+        const temporaryKey = `reconcile:${old.id}`;
+        this.#db.prepare("UPDATE functions SET identity_key = ? WHERE id = ?").run(temporaryKey, old.id);
+        old.identity_key = temporaryKey;
+      }
+    }
     const orderedCallables = [
       ...file.callables.filter((callable) => oldMatches.has(callable)),
       ...file.callables.filter((callable) => !oldMatches.has(callable)),
     ];
     for (const callable of orderedCallables) {
-      if (callable.vector) {
-        this.storeEmbedding(callable.embeddingKey, callable.vector);
-      }
-      const embedding = this.#db.prepare("SELECT id FROM embeddings WHERE embedding_key = ?").get(callable.embeddingKey) as { id: number } | undefined;
-      if (!embedding) throw new CodeIndexError(`Missing embedding for ${callable.qualifiedName}.`);
-
+      if (callable.vector) this.storeEmbedding(callable.embeddingKey, callable.vector);
+      if (callable.description?.vector) this.storeEmbedding(callable.description.key, callable.description.vector);
       const old = oldMatches.get(callable);
       if (this.descriptionsEnabled() && !callable.description) throw new CodeIndexError(`Missing description for ${callable.qualifiedName}.`);
-      const descriptionId = callable.description ? this.#embeddingId(callable.description.key, callable.description.vector) : null;
-      if (old) usedIds.add(old.id);
-      const remembered = this.#db.prepare(`
-        SELECT first_seen_commit FROM callable_provenance WHERE identity_key = ? AND source_hash = ?
-      `).get(callable.identityKey, callable.sourceHash) as { first_seen_commit: string } | undefined;
-      const firstSeenCommit = old?.first_seen_commit ?? remembered?.first_seen_commit ?? file.indexedCommit;
-      this.#db.prepare(`
-        INSERT INTO functions(
-          id, path, language, kind, name, qualified_name, signature, identity_key,
-          start_line, start_column, end_line, end_column, line_count, source, source_hash,
-          embedding_input, first_seen_commit, last_seen_commit, source_mode, embedding_id, description, description_embedding_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        old?.id ?? null,
-        file.path,
-        callable.language,
-        callable.kind,
-        callable.name,
-        callable.qualifiedName,
-        callable.signature,
-        callable.identityKey,
-        callable.startLine,
-        callable.startColumn,
-        callable.endLine,
-        callable.endColumn,
-        callable.lineCount,
-        callable.source,
-        callable.sourceHash,
-        callable.embeddingInput,
-        firstSeenCommit,
-        file.indexedCommit,
-        file.sourceMode,
-        embedding.id,
-        callable.description?.description ?? null,
-        descriptionId,
-      );
+      const values = this.#functionValues(file, callable, old);
+      this.#writeRow("functions", "id", { id: old?.id ?? null, ...values }, renamed ? undefined : old);
       if (old) stats.functionsUpdated += 1;
       else stats.functionsAdded += 1;
-      if (firstSeenCommit) {
+      if (values.first_seen_commit) {
         this.#db.prepare(`
           INSERT OR IGNORE INTO callable_provenance(identity_key, source_hash, first_seen_commit) VALUES (?, ?, ?)
-        `).run(callable.identityKey, callable.sourceHash, firstSeenCommit);
+        `).run(callable.identityKey, callable.sourceHash, values.first_seen_commit);
       }
     }
     stats.functionsDeleted += oldRows.length - usedIds.size;
+  }
+
+  #fileValues(file: PreparedFile, existing?: FileRow): FileRow {
+    const preserveDescription = !file.unavailable && file.language !== "markdown";
+    return {
+      path: file.path,
+      content_hash: file.contentHash,
+      blob_oid: file.blobOid,
+      source_mode: file.sourceMode,
+      indexed_commit: file.indexedCommit,
+      previous_path: file.sourceMode === "working-tree" ? file.previousPath ?? existing?.previous_path ?? null : null,
+      language: file.language,
+      byte_size: file.byteSize,
+      file_description_path: file.fileDescription?.path ?? (preserveDescription ? existing?.file_description_path : null) ?? null,
+      file_description_content_hash: file.fileDescription?.contentHash ?? (preserveDescription ? existing?.file_description_content_hash : null) ?? null,
+      file_description: file.fileDescription?.value.description ?? (preserveDescription ? existing?.file_description : null) ?? null,
+      file_description_embedding_id: file.fileDescription
+        ? this.#embeddingId(file.fileDescription.value.key)
+        : preserveDescription ? existing?.file_description_embedding_id ?? null : null,
+    };
+  }
+
+  #functionValues(file: PreparedFile, callable: PreparedCallable, old?: FunctionRow): Omit<FunctionRow, "id"> {
+    const remembered = old?.first_seen_commit ? undefined : this.#db.prepare(`
+      SELECT first_seen_commit FROM callable_provenance WHERE identity_key = ? AND source_hash = ?
+    `).get(callable.identityKey, callable.sourceHash) as { first_seen_commit: string } | undefined;
+    return {
+      path: file.path,
+      language: callable.language,
+      kind: callable.kind,
+      name: callable.name,
+      qualified_name: callable.qualifiedName,
+      signature: callable.signature,
+      identity_key: callable.identityKey,
+      start_line: callable.startLine,
+      start_column: callable.startColumn,
+      end_line: callable.endLine,
+      end_column: callable.endColumn,
+      line_count: callable.lineCount,
+      source: callable.source,
+      source_hash: callable.sourceHash,
+      embedding_input: callable.embeddingInput,
+      first_seen_commit: old?.first_seen_commit ?? remembered?.first_seen_commit ?? file.indexedCommit,
+      last_seen_commit: file.indexedCommit,
+      source_mode: file.sourceMode,
+      embedding_id: this.#embeddingId(callable.embeddingKey),
+      description: callable.description?.description ?? null,
+      description_embedding_id: callable.description ? this.#embeddingId(callable.description.key) : null,
+    };
+  }
+
+  #writeRow(table: "files" | "functions", key: "path" | "id", values: object, previous?: object): void {
+    const entries = Object.entries(values) as Array<[string, string | number | null]>;
+    if (!previous) {
+      this.#db.prepare(`INSERT INTO ${table} (${entries.map(([column]) => column).join(", ")}) VALUES (${entries.map(() => "?").join(", ")})`)
+        .run(...entries.map(([, value]) => value));
+      return;
+    }
+    const changes = changedEntries(values, previous);
+    if (changes.length === 0) return;
+    this.#db.prepare(`UPDATE ${table} SET ${changes.map(([column]) => `${column} = ?`).join(", ")} WHERE ${key} = ?`)
+      .run(...changes.map(([, value]) => value), (previous as Record<string, string | number>)[key]!);
+  }
+
+  #errorsMatch(file: PreparedFile): boolean {
+    const errors = this.#db.prepare("SELECT diagnostic FROM indexing_errors WHERE path = ? ORDER BY id")
+      .all(file.path) as Array<{ diagnostic: string }>;
+    return JSON.stringify(errors.map((row) => row.diagnostic)) === JSON.stringify(file.errors.map((error) => JSON.stringify(error)));
+  }
+
+  public matchesPreparedFile(file: PreparedFile): boolean {
+    const existing = this.#db.prepare("SELECT * FROM files WHERE path = ?").get(file.path) as unknown as FileRow | undefined;
+    if (!existing || changedEntries(this.#fileValues(file, existing), existing).length > 0 || !this.#errorsMatch(file)) return false;
+    const rows = this.#rowsForPath(file.path);
+    if (rows.length !== file.callables.length) return false;
+    const byIdentity = new Map(rows.map((row) => [row.identity_key, row]));
+    for (const callable of file.callables) {
+      const old = byIdentity.get(callable.identityKey);
+      if (!old || changedEntries(this.#functionValues(file, callable, old), old).length > 0) return false;
+    }
+    return this.#markdownChunksMatch(file);
+  }
+
+  #markdownChunksMatch(file: PreparedFile): boolean {
+    const chunks = this.#db.prepare(`
+      SELECT m.*, e.embedding_key FROM markdown_chunks m
+      JOIN embeddings e ON e.id = m.embedding_id WHERE m.path = ? ORDER BY m.id
+    `).all(file.path);
+    return chunks.length === file.markdownChunks.length && file.markdownChunks.every((chunk, index) => changedEntries({
+      heading_path: JSON.stringify(chunk.headingPath), start_line: chunk.startLine, end_line: chunk.endLine,
+      content: chunk.content, source_hash: chunk.sourceHash, embedding_key: chunk.embeddingKey,
+    }, chunks[index]!).length === 0);
   }
 
   #rowsForPath(filePath: string): FunctionRow[] {
@@ -1498,6 +1554,11 @@ function toMarkdownChunk(row: MarkdownChunkRow): MarkdownChunk {
     sourceMode: row.source_mode,
     embeddingId: row.embedding_id,
   };
+}
+
+function changedEntries(values: object, previous: object): Array<[string, string | number | null]> {
+  return (Object.entries(values) as Array<[string, string | number | null]>)
+    .filter(([column, value]) => (previous as Record<string, unknown>)[column] !== value);
 }
 
 function reconcileFunctions(

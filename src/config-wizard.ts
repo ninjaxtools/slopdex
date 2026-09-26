@@ -1,34 +1,10 @@
 import { confirm, input, number, search, select } from "@inquirer/prompts";
 
 import type { DescriptionProviderName } from "./descriptions/openai.js";
+import { RERANKER_DEFAULT_MODELS, type FileConfig, type OpenCodeDescriptionProvider, type PublishedModel } from "./config.js";
+import { DEFAULT_PARALLELISM } from "./utils.js";
 
-export interface FileConfig {
-  provider?: "openai" | "jina";
-  model?: string;
-  dimensions?: number;
-  indexPath?: string;
-  include?: string[];
-  exclude?: string[];
-  maxFileSize?: number;
-  embeddingBatchSize?: number;
-  parallelism?: number;
-  descriptionProvider?: DescriptionProviderName;
-  descriptionModel?: string;
-  descriptionFallbackModel?: string;
-  descriptionsEnabled?: boolean;
-  rerankerProvider?: "cohere" | "jina" | "openai";
-  rerankerModel?: string;
-  rerankerCandidates?: number;
-  rerankingEnabled?: boolean;
-  verbose?: boolean;
-}
-
-export type OpenCodeDescriptionProvider = Exclude<DescriptionProviderName, "openai">;
-
-export interface PublishedModel {
-  provider: OpenCodeDescriptionProvider;
-  model: string;
-}
+export type { FileConfig, OpenCodeDescriptionProvider, PublishedModel } from "./config.js";
 
 export interface InteractivePrompts {
   confirm: typeof confirm;
@@ -110,11 +86,10 @@ export async function configureInteractively(
       ],
       default: existing.rerankerProvider ?? "cohere",
     });
-    const defaults = { cohere: "rerank-v4.0-pro", jina: "jina-reranker-v3.5", openai: "gpt-5.6-luna" } as const;
     config.rerankerProvider = provider;
     config.rerankerModel = await prompts.input({
       message: "Reranker model",
-      default: existing.rerankerProvider === provider ? existing.rerankerModel : defaults[provider],
+      default: existing.rerankerProvider === provider ? existing.rerankerModel : RERANKER_DEFAULT_MODELS[provider],
       required: true,
     });
     if (provider === "openai") {
@@ -184,7 +159,7 @@ export async function configureInteractively(
   })) as number;
   config.parallelism = (await prompts.number({
     message: "Concurrent provider request limit",
-    default: existing.parallelism ?? 10,
+    default: existing.parallelism ?? DEFAULT_PARALLELISM,
     min: 1,
     required: true,
     validate: positiveInteger,

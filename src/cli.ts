@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parseArgs } from "node:util";
@@ -8,10 +8,14 @@ import { parseArgs } from "node:util";
 import { CodeIndexError, GitUnavailableError, IncompatibleIndexError } from "./errors.js";
 import { formatSimilarityClusters, formatSimilaritySummary } from "./format.js";
 import { clearProgress, TerminalProgress } from "./progress.js";
-import { compileNameRegex, DEFAULT_PARALLELISM } from "./utils.js";
+import { compileNameRegex } from "./utils.js";
+import {
+  configFilePath, indexConfigOptions, isDescriptionProviderName, loadConfig,
+  readConfigFile, RERANKER_DEFAULT_MODELS, resolveConfig, validateConfig, writeConfigFile,
+  type EffectiveConfig, type OpenCodeDescriptionProvider, type PublishedModel,
+} from "./config.js";
 import type { CodeIndex } from "./code-index.js";
 import type { DescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
-import type { FileConfig, OpenCodeDescriptionProvider, PublishedModel } from "./config-wizard.js";
 import type {
   CodeIndexOptions,
   CrossSearchOptions,
@@ -27,14 +31,6 @@ import type {
   DescriptionProfile,
   UpdateStats,
 } from "./types.js";
-
-// Lightweight copies kept in sync with src/descriptions/openai.ts so --help,
-// --version, and config validation do not need to load the heavy `ai` SDK.
-const DESCRIPTION_PROVIDER_NAMES = ["openai", "opencode", "opencode-go"] as const;
-
-function isDescriptionProviderName(value: string): value is DescriptionProviderName {
-  return (DESCRIPTION_PROVIDER_NAMES as readonly string[]).includes(value);
-}
 
 declare const __SLOPDEX_VERSION__: string;
 
@@ -135,8 +131,8 @@ process.on("exit", () => {
   if (parsed.values["ignore-errors"]) return;
   try {
     const rootDir = path.resolve(parsed.values.root!);
-    const config = loadConfig(rootDir, parsed.values.config);
-    diagnosticIndexes.add(path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex/index.sqlite")));
+    const config = loadConfig(rootDir, parsed.values.config, parsed.values);
+    diagnosticIndexes.add(config.indexPath);
     if (parsed.values["target-index"]) diagnosticIndexes.add(path.resolve(parsed.values["target-index"]));
   } catch {
     // Invalid configuration is reported by main; diagnostics must not mask it.
@@ -171,9 +167,9 @@ async function main(): Promise<void> {
     await runConfig(rootDir);
     return;
   }
-  const config = loadConfig(rootDir, parsed.values.config);
+  const config = loadConfig(rootDir, parsed.values.config, parsed.values);
   if (command === "index-errors") {
-    const indexPath = path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex/index.sqlite"));
+    const indexPath = config.indexPath;
     const { readIndexErrors } = await import("./storage/database.js");
     const errors = existsSync(indexPath) ? readIndexErrors(indexPath) : [];
     if (outputFormat("summary") === "summary") {
@@ -190,19 +186,12 @@ async function main(): Promise<void> {
   const descriptionProvider = await createDescriptionProvider(config);
   const progress = new TerminalProgress();
   const indexOptions: CodeIndexOptions = {
-    rootDir,
+    ...indexConfigOptions(config),
     provider,
-    parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
     onProgress: (value) => progress.update(value),
     ...(reranker ? { reranker } : {}),
     ...(descriptionProvider ? { descriptionProvider } : {}),
     onWarning: () => {}, // Persisted diagnostics are reported once per index at exit.
-    ...(parsed.values.index || config.indexPath ? { indexPath: parsed.values.index ?? config.indexPath } : {}),
-    ...(config.include ? { include: config.include } : {}),
-    ...(config.exclude ? { exclude: config.exclude } : {}),
-    ...(config.maxFileSize ? { maxFileSize: config.maxFileSize } : {}),
-    ...(config.embeddingBatchSize ? { embeddingBatchSize: config.embeddingBatchSize } : {}),
-    ...(config.verbose ? { verbose: true } : {}),
   };
   const updateTarget = command === "update-git" ? parsed.values.target ?? "HEAD" : "HEAD";
   const updateStats = await ensureIndexUpdated(
@@ -377,21 +366,15 @@ async function runCrossSearch(
   const resolvedTargetPath = targetPath ? path.resolve(targetPath) : undefined;
   const usesSourceAsTarget = targetRootDir === source.rootDir && resolvedTargetPath === source.indexPath;
   const targetConfig = targetRootDir && !usesSourceAsTarget
-    ? loadConfig(targetRootDir, parsed.values["target-config"])
+    ? loadConfig(targetRootDir, parsed.values["target-config"], { ...parsed.values, index: targetPath })
     : undefined;
   const targetDescriptionProvider = targetConfig ? await createDescriptionProvider(targetConfig) : undefined;
-  const targetOptions: CodeIndexOptions | undefined = targetRootDir && resolvedTargetPath && !usesSourceAsTarget ? {
-    rootDir: targetRootDir,
-    indexPath: resolvedTargetPath,
+  const targetOptions: CodeIndexOptions | undefined = targetConfig ? {
+    ...indexConfigOptions(targetConfig),
     provider,
     ...(sourceOptions.parallelism !== undefined ? { parallelism: sourceOptions.parallelism } : {}),
     ...(sourceOptions.onProgress ? { onProgress: sourceOptions.onProgress } : {}),
     ...(sourceOptions.onWarning ? { onWarning: sourceOptions.onWarning } : {}),
-    ...(targetConfig?.include ? { include: targetConfig.include } : {}),
-    ...(targetConfig?.exclude ? { exclude: targetConfig.exclude } : {}),
-    ...(targetConfig?.maxFileSize ? { maxFileSize: targetConfig.maxFileSize } : {}),
-    ...(targetConfig?.embeddingBatchSize ? { embeddingBatchSize: targetConfig.embeddingBatchSize } : {}),
-    ...(targetConfig?.verbose ? { verbose: true } : {}),
     ...(targetDescriptionProvider ? { descriptionProvider: targetDescriptionProvider } : {}),
   } : undefined;
   if (targetOptions) {
@@ -525,12 +508,13 @@ async function initializeIndex(
 ): Promise<UpdateStats> {
   const { CodeIndex } = await import("./code-index.js");
   const rebuiltDescriptionProvider = descriptionProfile && !options.descriptionProvider
-    ? await createDescriptionProvider({
-      descriptionProvider: descriptionProfile.provider as DescriptionProviderName,
+    ? await createDescriptionProvider(resolveConfig(options.rootDir, {
+      indexPath,
+      descriptionProvider: descriptionProfile.provider,
       descriptionModel: descriptionProfile.model,
-      parallelism: options.parallelism ?? DEFAULT_PARALLELISM,
+      parallelism: options.parallelism,
       ...(options.verbose ? { verbose: true } : {}),
-    })
+    }))
     : undefined;
   const index = new CodeIndex({
     ...options, indexPath,
@@ -627,78 +611,12 @@ function removeIndexArtifacts(indexPath: string): void {
   for (const suffix of ["", "-shm", "-wal", "-journal"]) rmSync(`${indexPath}${suffix}`, { force: true });
 }
 
-function loadConfig(rootDir: string, configuredPath?: string): FileConfig {
-  const configPath = path.resolve(configuredPath ?? path.join(rootDir, ".slopdex", "config.json"));
-  if (!existsSync(configPath)) return commandLineConfig({});
-  const value = JSON.parse(readFileSync(configPath, "utf8")) as FileConfig;
-  return commandLineConfig(value);
-}
-
-function commandLineConfig(config: FileConfig): FileConfig {
-  const dimensions = parsed.values.dimensions
-    ? numberOption(parsed.values.dimensions, 0, "dimensions")
-    : config.dimensions;
-  const providerValue = parsed.values.provider ?? config.provider;
-  if (providerValue !== undefined && providerValue !== "openai" && providerValue !== "jina") {
-    throw new CodeIndexError(`Unsupported provider: ${providerValue}`);
-  }
-  const provider: FileConfig["provider"] = providerValue === "openai" || providerValue === "jina"
-    ? providerValue
-    : undefined;
-  const descriptionProviderValue = parsed.values["description-provider"] ?? config.descriptionProvider;
-  if (descriptionProviderValue !== undefined && !isDescriptionProviderName(descriptionProviderValue)) {
-    throw new CodeIndexError(`Unsupported description provider: ${descriptionProviderValue}`);
-  }
-  const descriptionFallbackModel = parsed.values["description-fallback-model"] ?? config.descriptionFallbackModel;
-  if (descriptionFallbackModel !== undefined
-    && (typeof descriptionFallbackModel !== "string" || !descriptionFallbackModel.trim())) {
-    throw new CodeIndexError("descriptionFallbackModel must be a non-empty string.");
-  }
-  if (config.rerankingEnabled !== undefined && typeof config.rerankingEnabled !== "boolean") {
-    throw new CodeIndexError("rerankingEnabled must be a boolean.");
-  }
-  if (config.parallelism !== undefined && (!Number.isInteger(config.parallelism) || config.parallelism < 1)) {
-    throw new CodeIndexError("parallelism must be a positive integer.");
-  }
-  if (config.verbose !== undefined && typeof config.verbose !== "boolean") {
-    throw new CodeIndexError("verbose must be a boolean.");
-  }
-  if (config.rerankingEnabled === true) {
-    if (config.rerankerProvider !== "cohere" && config.rerankerProvider !== "jina" && config.rerankerProvider !== "openai") {
-      throw new CodeIndexError(`Unsupported reranker provider: ${String(config.rerankerProvider)}`);
-    }
-    if (config.rerankerModel !== undefined
-      && (typeof config.rerankerModel !== "string" || !config.rerankerModel.trim())) {
-      throw new CodeIndexError("rerankerModel must be a non-empty string.");
-    }
-    if (config.rerankerProvider === "openai" && config.rerankerCandidates !== undefined
-      && (typeof config.rerankerCandidates !== "number" || !Number.isInteger(config.rerankerCandidates) || config.rerankerCandidates < 1)) {
-      throw new CodeIndexError("rerankerCandidates must be a positive integer.");
-    }
-    if (config.rerankerProvider === "openai" && typeof config.rerankerCandidates === "number" && config.rerankerCandidates > 100) {
-      throw new CodeIndexError("rerankerCandidates must not exceed 100.");
-    }
-  }
-  return {
-    ...config,
-    ...(provider ? { provider } : {}),
-    ...(parsed.values.model ? { model: parsed.values.model } : {}),
-    ...(descriptionProviderValue ? { descriptionProvider: descriptionProviderValue } : {}),
-    ...(parsed.values["description-model"] ? { descriptionModel: parsed.values["description-model"] } : {}),
-    ...(descriptionFallbackModel ? { descriptionFallbackModel } : {}),
-    ...(dimensions ? { dimensions } : {}),
-    ...(parsed.values.verbose ? { verbose: true } : {}),
-  };
-}
-
-async function createDescriptionProvider(config: FileConfig): Promise<OpenAIDescriptionProvider | undefined> {
+async function createDescriptionProvider(config: EffectiveConfig): Promise<OpenAIDescriptionProvider | undefined> {
   if (command !== "describe" && !config.descriptionProvider && !config.descriptionModel && !config.descriptionFallbackModel) return undefined;
   let provider = config.descriptionProvider;
   let model = config.descriptionModel;
   if (command === "describe" && !provider && !model) {
-    const rootDir = path.resolve(parsed.values.root!);
-    const indexPath = path.resolve(parsed.values.index ?? config.indexPath ?? path.join(rootDir, ".slopdex", "index.sqlite"));
-    const stored = storedDescriptionProfile(indexPath, rootDir);
+    const stored = storedDescriptionProfile(config.indexPath, config.rootDir);
     if (stored) {
       provider = stored.provider as DescriptionProviderName;
       model = stored.model;
@@ -709,12 +627,12 @@ async function createDescriptionProvider(config: FileConfig): Promise<OpenAIDesc
     ...(provider ? { provider } : {}),
     ...(model ? { model } : {}),
     ...(config.descriptionFallbackModel ? { fallbackModel: config.descriptionFallbackModel } : {}),
-    parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
+    parallelism: config.parallelism,
     ...(config.verbose ? { verbose: true } : {}),
   });
 }
 
-function descriptionRefresh(config: FileConfig): DescriptionRefreshHooks | undefined {
+function descriptionRefresh(config: EffectiveConfig): DescriptionRefreshHooks | undefined {
   if (command === "descriptions") {
     return descriptionsAction === "disable"
       ? { beforeRefresh: (index) => { index.disableDescriptions(); } }
@@ -750,7 +668,7 @@ async function runModels(): Promise<void> {
 }
 
 async function runConfig(rootDir: string): Promise<void> {
-  const configPath = path.resolve(parsed.values.config ?? path.join(rootDir, ".slopdex", "config.json"));
+  const configPath = configFilePath(rootDir, parsed.values.config);
   let config = readConfigFile(configPath);
   const action = positionals[0];
   let result: Record<string, unknown>;
@@ -759,7 +677,7 @@ async function runConfig(rootDir: string): Promise<void> {
       throw new CodeIndexError("config without an action requires an interactive terminal.");
     }
     const { configureInteractively } = await import("./config-wizard.js");
-    config = await configureInteractively(config, fetchPublishedModels);
+    config = { ...await configureInteractively(validateConfig(config), fetchPublishedModels) };
     result = { ...config };
   } else if (action === "descriptions") {
     config.descriptionsEnabled = positionals[1] === "enable";
@@ -771,7 +689,8 @@ async function runConfig(rootDir: string): Promise<void> {
     result = { descriptionProvider: selected.provider, descriptionModel: selected.model };
   } else if (action === "fallback-model") {
     const selected = await resolveConfiguredModel(
-      positionals[1], parsed.values["description-fallback-model"], "config fallback-model", config.descriptionProvider,
+      positionals[1], parsed.values["description-fallback-model"], "config fallback-model",
+      isDescriptionProviderName(config.descriptionProvider) ? config.descriptionProvider : undefined,
     );
     if (config.descriptionProvider && config.descriptionProvider !== selected.provider) {
       throw new CodeIndexError("Fallback model provider must match the configured description provider.");
@@ -790,9 +709,7 @@ async function runConfig(rootDir: string): Promise<void> {
       result = { rerankingEnabled: false };
     } else {
       const sameProvider = config.rerankerProvider === provider;
-      const defaultModel = provider === "cohere"
-        ? "rerank-v4.0-pro"
-        : provider === "jina" ? "jina-reranker-v3.5" : "gpt-5.6-luna";
+      const defaultModel = RERANKER_DEFAULT_MODELS[provider];
       const model = positionals[2]
         ?? (sameProvider && typeof config.rerankerModel === "string" && config.rerankerModel.trim() ? config.rerankerModel : defaultModel);
       config.rerankerProvider = provider;
@@ -896,29 +813,13 @@ function isOpenCodeDescriptionProvider(value: string): value is OpenCodeDescript
   return value === "opencode" || value === "opencode-go";
 }
 
-function readConfigFile(configPath: string): FileConfig {
-  if (!existsSync(configPath)) return {};
-  const value = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new CodeIndexError(`Config must contain a JSON object: ${configPath}`);
-  }
-  return value as FileConfig;
-}
-
-function writeConfigFile(configPath: string, config: FileConfig): void {
-  mkdirSync(path.dirname(configPath), { recursive: true });
-  const temporaryPath = `${configPath}.tmp-${process.pid}`;
-  writeFileSync(temporaryPath, `${JSON.stringify(config, null, 2)}\n`);
-  renameSync(temporaryPath, configPath);
-}
-
-async function createProvider(config: FileConfig): Promise<EmbeddingProvider> {
-  if ((config.provider ?? "openai") === "jina") {
+async function createProvider(config: EffectiveConfig): Promise<EmbeddingProvider> {
+  if (config.provider === "jina") {
     const { JinaEmbeddingProvider } = await import("./embeddings/jina.js");
     return new JinaEmbeddingProvider({
       ...(config.model ? { model: config.model } : {}),
       ...(config.dimensions ? { dimensions: config.dimensions } : {}),
-      parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
+      parallelism: config.parallelism,
       ...(config.verbose ? { verbose: true } : {}),
     });
   }
@@ -926,12 +827,12 @@ async function createProvider(config: FileConfig): Promise<EmbeddingProvider> {
   return new OpenAIEmbeddingProvider({
     ...(config.model ? { model: config.model } : {}),
     ...(config.dimensions ? { dimensions: config.dimensions } : {}),
-    parallelism: config.parallelism ?? DEFAULT_PARALLELISM,
+    parallelism: config.parallelism,
     ...(config.verbose ? { verbose: true } : {}),
   });
 }
 
-async function createReranker(config: FileConfig): Promise<Reranker | undefined> {
+async function createReranker(config: EffectiveConfig): Promise<Reranker | undefined> {
   if (config.rerankingEnabled !== true) return undefined;
   if (config.rerankerProvider === "cohere" || config.rerankerProvider === "jina") {
     const { CohereReranker, JinaReranker } = await import("./rerankers/hosted.js");

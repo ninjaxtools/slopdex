@@ -66,6 +66,34 @@ After the example.
     });
   });
 
+  describe.each(["```", "~~~"])("with %s fences", (fence) => {
+    it.each([
+      ["complete single-line", "<!-- literal comment -->"],
+      ["complete multiline", "<!--\n# Literal comment heading\n-->"],
+      ["unclosed", "<!--\n# Literal comment heading"],
+    ])("preserves %s comments in fenced examples and subsequent sections", (_kind, comment) => {
+      const example = `${fence}html\n${comment}\n${fence}`;
+      const chunks = chunkMarkdown(`# Example\n\n${example}\n\nAfter the example.\n\n## Next\n\nNext body.\n`);
+
+      expect(chunks.map((chunk) => ({ headingPath: chunk.headingPath, content: chunk.content }))).toEqual([
+        { headingPath: ["Example"], content: `# Example\n\n${example}\n\nAfter the example.` },
+        { headingPath: ["Example", "Next"], content: "# Example\n## Next\n\nNext body." },
+      ]);
+    });
+
+    it("ignores fence text inside actual HTML comments", () => {
+      const chunks = chunkMarkdown(`<!--\n${fence}md\n# Hidden\n-->\n<!-- Also hidden -->\n# Visible\n\nVisible body.\n`);
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toMatchObject({
+        headingPath: ["Visible"],
+        startLine: 6,
+        endLine: 8,
+        content: "# Visible\n\nVisible body.",
+      });
+    });
+  });
+
   it("ignores headings inside HTML comments and parses empty closing headings", () => {
     const chunks = chunkMarkdown(`<!--
 # Hidden

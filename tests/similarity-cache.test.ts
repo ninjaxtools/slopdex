@@ -1,12 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
 import * as sqliteVec from "sqlite-vec";
 
 import { CodeIndex } from "../src/code-index.js";
 import { crossSearch } from "../src/search/cross-search.js";
 import { similarityCacheFloor, SIMILARITY_CACHE_FLOOR_ANCHOR } from "../src/search/similarity.js";
-import type { IndexProgress } from "../src/types.js";
+import type { EmbeddingProvider, IndexProgress } from "../src/types.js";
 import { FakeEmbeddingProvider, temporaryRoot, write } from "./helpers.js";
 
 function seed(root: string): void {
@@ -165,6 +165,130 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     index.close();
   });
 
+  it.each([1, 50])("refills a truncated top-%i list when a cached neighbor becomes less similar", async (width) => {
+    const root = temporaryRoot();
+    const provider: EmbeddingProvider = {
+      profile: { provider: "test", model: "changing-neighbors", dimensions: 2 },
+      embedDocuments: async (inputs) => inputs.map((input) => input.includes("return -1")
+        ? [0.4, Math.sqrt(0.84)] : input.includes("function third") ? [0.8, 0.6] : [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    for (const name of ["anchor", "nearest", "third"]) {
+      write(root, `${name}.ts`, `export function ${name}() {\n  return 1;\n}`);
+    }
+    write(root, "fillers.ts", Array.from({ length: width - 1 }, (_, i) =>
+      `export function filler${i}() { return 1; }`).join("\n"));
+    const index = new CodeIndex({ rootDir: root, provider });
+    onTestFinished(() => index.close());
+    await index.updateFiles({ upsert: ["anchor.ts", "nearest.ts", "third.ts", "fillers.ts"] });
+    await index.refreshSimilarityCache({ width, minSimilarity: 0.3 });
+
+    const anchor = index.allFunctions().find((callable) => callable.name === "anchor")!;
+    const query = { limit: 1, minSimilarity: 0.3, minLines: 2 };
+    expect(index.cachedSimilarToFunction(anchor.id, query)[0]!.function.name).toBe("nearest");
+    write(root, "nearest.ts", "export function nearest() {\n  return -1;\n}");
+    await index.updateFiles({ upsert: ["nearest.ts"] });
+    await index.refreshSimilarityCache({ width, minSimilarity: 0.3 });
+
+    const live = index.similarToFunction(anchor.id, query);
+    expect(live[0]!.function.name).toBe("third");
+    expect(index.cachedSimilarToFunction(anchor.id, query)).toEqual(live);
+    expect((await index.refreshSimilarityCache({ width, minSimilarity: 0.3 })).sourcesRefreshed).toBe(0);
+  });
+
+  it("detects missing neighbors even when another function is added in the same update", async () => {
+    const root = temporaryRoot();
+    const provider: EmbeddingProvider = {
+      profile: { provider: "test", model: "deleted-neighbors", dimensions: 2 },
+      embedDocuments: async (inputs) => inputs.map((input) => input.includes("function added")
+        ? [0.4, Math.sqrt(0.84)] : input.includes("function third") ? [0.8, 0.6] : [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    for (const name of ["anchor", "nearest", "third", "added"]) {
+      write(root, `${name}.ts`, `export function ${name}() { return 1; }`);
+    }
+    const index = new CodeIndex({ rootDir: root, provider });
+    onTestFinished(() => index.close());
+    await index.updateFiles({ upsert: ["anchor.ts", "nearest.ts", "third.ts"] });
+    await index.refreshSimilarityCache({ width: 1 });
+    await index.updateFiles({ delete: ["nearest.ts"], upsert: ["added.ts"] });
+    await index.refreshSimilarityCache({ width: 1 });
+    const anchor = index.allFunctions().find((callable) => callable.name === "anchor")!;
+    const query = { limit: 1, minSimilarity: -1 };
+    expect(index.similarToFunction(anchor.id, query)[0]!.function.name).toBe("third");
+    expect(index.cachedSimilarToFunction(anchor.id, query)).toEqual(index.similarToFunction(anchor.id, query));
+  });
+
+  it("reuses cached scores after an update that only shifts source locations", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    onTestFinished(() => index.close());
+    await index.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await index.refreshSimilarityCache({ width: 10 });
+    write(root, "beta.ts", `// A comment moves both functions without changing their embeddings.
+
+export function authenticateUser(user: string) { return user.trim(); }
+export function multiplyNumbers(a: number, b: number) { return a * b; }
+`);
+    await index.updateFiles({ upsert: ["beta.ts"] });
+    const callable = index.allFunctions()[0]!;
+    const query = { limit: 4, minSimilarity: -1 };
+    const expected = index.similarToFunction(callable.id, query);
+    const live = vi.spyOn(index, "similarToFunction");
+    expect((await index.refreshSimilarityCache({ width: 10 })).sourcesRefreshed).toBe(0);
+    expect(index.cachedSimilarToFunction(callable.id, query)).toEqual(expected);
+    expect(live).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("finishes an interrupted incremental refresh (intervening metadata update: %s)", async (interveningUpdate) => {
+    const root = temporaryRoot();
+    for (const name of ["anchor", "nearest", "third"]) {
+      write(root, `${name}.ts`, `export function ${name}() { return 1; }`);
+    }
+    const provider: EmbeddingProvider = {
+      profile: { provider: "test", model: "interrupted-neighbors", dimensions: 2 },
+      embedDocuments: async (inputs) => inputs.map((input) => input.includes("return -1")
+        ? [0.4, Math.sqrt(0.84)] : input.includes("function third") ? [0.8, 0.6] : [1, 0]),
+      embedQuery: async () => [1, 0],
+    };
+    const index = new CodeIndex({ rootDir: root, provider });
+    onTestFinished(() => index.close());
+    await index.updateFiles({ upsert: ["anchor.ts", "nearest.ts", "third.ts"] });
+    await index.refreshSimilarityCache({ width: 1 });
+    write(root, "nearest.ts", "export function nearest() { return -1; }");
+    await index.updateFiles({ upsert: ["nearest.ts"] });
+    const controller = new AbortController();
+    await expect(index.refreshSimilarityCache({
+      width: 1,
+      signal: controller.signal,
+      onProgress: ({ completed }) => { if (completed === 1) controller.abort(); },
+    })).rejects.toThrow();
+
+    if (interveningUpdate) {
+      write(root, "anchor.ts", "// Move the source without changing its embedding.\nexport function anchor() { return 1; }");
+      await index.updateFiles({ upsert: ["anchor.ts"] });
+    }
+    await index.refreshSimilarityCache({ width: 1 });
+    for (const callable of index.allFunctions()) {
+      const query = { limit: 1, minSimilarity: -1 };
+      expect(index.cachedSimilarToFunction(callable.id, query)).toEqual(index.similarToFunction(callable.id, query));
+    }
+    expect((await index.refreshSimilarityCache({ width: 1 })).sourcesRefreshed).toBe(0);
+  });
+
+  it("can cache and repair an index containing only one function", async () => {
+    const root = temporaryRoot();
+    write(root, "only.ts", "export function only() { return 1; }");
+    const index = new CodeIndex({ rootDir: root, provider: new FakeEmbeddingProvider() });
+    onTestFinished(() => index.close());
+    await index.updateFiles({ upsert: ["only.ts"] });
+    const callable = index.allFunctions()[0]!;
+    expect(index.cachedSimilarToFunction(callable.id, { limit: 1, minSimilarity: -1 })).toEqual([]);
+    expect((await index.refreshSimilarityCache()).sourcesRefreshed).toBe(0);
+    expect(index.similarityCacheInfo()).toEqual({ cachedSources: 1, cachedPairs: 0 });
+  });
+
   it("drops deleted functions from the cache", async () => {
     const root = temporaryRoot();
     seed(root);
@@ -259,6 +383,32 @@ export function subtractNumbers(a: number, b: number) { return a - b; }
     for await (const result of crossSearch({ source: index, minLines: 1 })) results.push(result);
     expect(results.length).toBeGreaterThan(0);
     index.close();
+  });
+
+  it("returns all requested neighbors from a narrow read-only cache without modifying it", async () => {
+    const root = temporaryRoot();
+    seed(root);
+    const provider = new FakeEmbeddingProvider();
+    const writable = new CodeIndex({ rootDir: root, provider });
+    await writable.updateFiles({ upsert: ["alpha.ts", "beta.ts"] });
+    await writable.refreshSimilarityCache({ width: 1 });
+    const before = writable.similarityCacheInfo();
+    writable.close();
+
+    const index = new CodeIndex({ rootDir: root, provider, readOnly: true });
+    onTestFinished(() => index.close());
+    const reader = index.cachedSimilarityReader();
+    for (const callable of index.allFunctions()) {
+      for (const query of [
+        { limit: 4, minSimilarity: -1 },
+        { limit: 4, minSimilarity: -1, nameRegex: "Numbers$" },
+        { limit: 4, minSimilarity: -1, excludePaths: [callable.path] },
+      ]) {
+        expect(reader.similarToFunction(callable.id, query)).toEqual(index.similarToFunction(callable.id, query));
+        expect(index.cachedSimilarToFunction(callable.id, query)).toEqual(index.similarToFunction(callable.id, query));
+      }
+    }
+    expect(index.similarityCacheInfo()).toEqual(before);
   });
 
   it("reports similarity-cache fill progress like vector generation", async () => {

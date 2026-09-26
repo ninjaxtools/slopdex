@@ -7,7 +7,15 @@ import { GitRepository, type GitChange, type GitTreeEntry } from "./git/reposito
 import { GitignoreRules } from "./gitignore.js";
 import { CALLABLE_PARSER_CACHE_VERSION, languageForPath, parseCallables, parseFileCallables } from "./parser/callable-parser.js";
 import { chunkMarkdown, isMarkdownPath } from "./parser/markdown.js";
-import { analysisSimilarity } from "./search/similarity.js";
+import {
+  SimilarityCache,
+  type RefreshSimilarityCacheOptions,
+  type RefreshSimilarityCacheResult,
+  type SimilarityCacheInfo,
+  type SimilarityCacheQuery,
+  type SimilarityCacheReader,
+  type SimilarityCacheReaderOptions,
+} from "./search/similarity-cache.js";
 import { SourcePolicy } from "./source-policy.js";
 import { IndexDatabase, type IndexedFileState, type PreparedCallable, type PreparedDescription, type PreparedFile, type PreparedMarkdownChunk } from "./storage/database.js";
 import { isDescriptionProviderName, OpenAIDescriptionProvider } from "./descriptions/openai.js";
@@ -55,8 +63,6 @@ import {
 const DEFAULT_MAX_FILE_SIZE = 1024 * 1024;
 const DEFAULT_BATCH_SIZE = 32;
 const RERANK_CANDIDATE_MULTIPLIER = 5;
-const DEFAULT_SIMILARITY_CACHE_WIDTH = 50;
-const MAX_SIMILARITY_CACHE_WIDTH = 200;
 
 export class CodeIndex {
   public readonly rootDir: string;
@@ -65,6 +71,7 @@ export class CodeIndex {
   public readonly reranker;
   public readonly descriptionProvider: DescriptionProvider;
   readonly #database: IndexDatabase;
+  readonly #similarityCache: SimilarityCache;
   readonly #policy: SourcePolicy;
   readonly #maxFileSize: number;
   readonly #embeddingBatchSize: number;
@@ -93,6 +100,7 @@ export class CodeIndex {
     this.#parallelism = options.parallelism ?? DEFAULT_PARALLELISM;
     assertPositiveInteger(this.#parallelism, "parallelism");
     this.#onProgress = options.onProgress;
+    this.#similarityCache = new SimilarityCache(this.#database, this, this.#onProgress);
     const storedDescriptionProfile = this.#database.descriptionProfile();
     this.descriptionProvider = options.descriptionProvider ?? new OpenAIDescriptionProvider({
       ...(storedDescriptionProfile && isDescriptionProviderName(storedDescriptionProfile.provider)
@@ -240,6 +248,9 @@ export class CodeIndex {
     }
 
     await gitignore.assertUnchanged(options.signal);
+    if (this.#database.getGeneration() !== generation) {
+      throw new CodeIndexError("Index changed while the update was being prepared; retry the update.");
+    }
     if (this.#isWorkingTreeClean(indexedFiles, prepared)) {
       return emptyStats(this.#database.getCheckpoint());
     }
@@ -255,22 +266,14 @@ export class CodeIndex {
 
   /**
    * Whether a working-tree refresh changed nothing: same file set, same
-   * content, same language, and still working-tree rows, with no checkout to
-   * clear. Recorded indexing errors never force a refresh on their own; a
-   * file with errors is retried only when its content changes or via an
-   * explicit updateFiles upsert. Skipping the write avoids a generation
-   * bump and, via foreign-key cascades, needlessly invalidating the
-   * similarity cache for unchanged files. Description state must already be
-   * quiescent: a refresh is what lazily clears stored descriptions after
-   * disableDescriptions, so a stale description count must fall through to
-   * the rewrite, and enabled indexes keep the legacy behavior.
+   * content and prepared rows, with no checkout or pending scans to clear.
+   * Compare effective descriptions and diagnostics too: identical source
+   * alone does not imply identical indexing results or size eligibility.
    */
   #isWorkingTreeClean(indexedFiles: IndexedFileState[], prepared: PreparedFile[]): boolean {
     if (this.#database.getCheckpoint() !== null) return false;
-    if (this.#database.descriptionsEnabled()) return false;
+    if (this.#database.needsDiagnosticsScan() || this.#database.needsMarkdownScan()) return false;
     if (indexedFiles.length !== prepared.length) return false;
-    const status = this.status();
-    if (status.descriptionCount > 0 || status.fileDescriptionCount > 0) return false;
     const indexedByPath = new Map(indexedFiles.map((file) => [file.path, file]));
     return prepared.every((file) => {
       const indexed = indexedByPath.get(file.path);
@@ -278,7 +281,8 @@ export class CodeIndex {
         && indexed.sourceMode === "working-tree"
         && indexed.blobOid === file.blobOid
         && indexed.language === file.language
-        && indexed.contentHash === file.contentHash;
+        && indexed.contentHash === file.contentHash
+        && this.#database.matchesPreparedFile(file);
     });
   }
 
@@ -1382,216 +1386,21 @@ export class CodeIndex {
     return this.#database.isReadOnly;
   }
 
-  public similarityCacheInfo(): { cachedSources: number; cachedPairs: number } {
-    return this.#database.similarityCacheInfo();
+  public similarityCacheInfo(): SimilarityCacheInfo {
+    return this.#similarityCache.similarityCacheInfo();
   }
 
   /**
    * Incrementally refresh the persisted pairwise-similarity cache for same-index
-   * analysis. Only pairs scoring at or above `minSimilarity` (the caller's
-   * effective threshold) are stored; queries below the cached floor fall back to
-   * live vector search. Only functions whose embeddings changed (plus a merge
-   * pass over the remaining functions when the changed set is small) are
-   * re-queried; unchanged pairs are reused. Lowering the floor below what is
-   * cached re-queries every function, since the missing band cannot be rebuilt
-   * incrementally; raising it reuses the cache for free. A per-function state
-   * row records the embedding triple, floor, row count, and a completeness flag,
-   * so a sparse row set is never mistaken for an unfinished computation. Call
-   * before cross-search/cohesion, then read through
-   * {@link cachedSimilarToFunction}. Best-effort under concurrent writers: a
-   * later refresh repairs any rows raced by an overlapping update.
+   * analysis. Reuses unchanged scores, rescanning changed sources and truncated
+   * neighbor lists whose ranking is affected. Cached bands are only widened;
+   * queries outside them fall back to live search. Call before cross-search or
+   * cohesion, then read through {@link cachedSimilarToFunction} or a shared
+   * {@link cachedSimilarityReader}. Best-effort under concurrent writers: a
+   * later refresh repairs rows raced by an overlapping update.
    */
-  public async refreshSimilarityCache(options: {
-    width?: number;
-    /** Minimum similarity stored; pairs below it are never cached. Defaults to -1 (cache everything). */
-    minSimilarity?: number;
-    signal?: AbortSignal;
-    /** Overrides the index-level onProgress for the cache-fill bar. */
-    onProgress?: (progress: IndexProgress) => void;
-  } = {}): Promise<{
-    similarityMode: string;
-    width: number;
-    minSimilarity: number;
-    sourcesRefreshed: number;
-    pairsStored: number;
-    skipped: boolean;
-  }> {
-    const width = Math.min(
-      MAX_SIMILARITY_CACHE_WIDTH,
-      Math.max(1, Math.floor(options.width ?? DEFAULT_SIMILARITY_CACHE_WIDTH)),
-    );
-    const floor = options.minSimilarity ?? -1;
-    const mode = analysisSimilarity(this.status()).similarityMode;
-    const includeDescriptions = mode !== "code";
-    if (this.#database.isReadOnly) {
-      return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed: 0, pairsStored: 0, skipped: true };
-    }
-    throwIfAborted(options.signal);
-    const generation = this.#database.getGeneration();
-    const triples = this.#database.similarityCacheTriples();
-    if (triples.length <= 1) {
-      return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed: 0, pairsStored: 0, skipped: false };
-    }
-    const states = this.#database.similarityCacheStates(mode);
-    const tripleById = new Map(triples.map((triple) => [triple.functionId, triple]));
-    const dirty = new Set<number>();
-    let expanding = false;
-    for (const triple of triples) {
-      throwIfAborted(options.signal);
-      const state = states.get(triple.functionId);
-      if (!state
-        || state.codeEmbeddingId !== triple.codeEmbeddingId
-        || state.descriptionEmbeddingId !== triple.descriptionEmbeddingId
-        || state.fileDescriptionEmbeddingId !== triple.fileDescriptionEmbeddingId
-        || (state.cachedWidth < width && !state.complete)) {
-        dirty.add(triple.functionId);
-      } else if (state.floor > floor) {
-        expanding = true;
-        dirty.add(triple.functionId);
-      }
-    }
-    if (dirty.size === 0 && !expanding) {
-      const counts = this.#database.similarityCacheCounts(mode);
-      for (const triple of triples) {
-        if ((counts.get(triple.functionId) ?? 0) < (states.get(triple.functionId)?.storedCount ?? 0)) {
-          dirty.add(triple.functionId);
-        }
-      }
-    }
-    let sourcesRefreshed = 0;
-    let pairsStored = 0;
-    if (dirty.size === 0) {
-      return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed, pairsStored, skipped: false };
-    }
-    const report = options.onProgress ?? this.#onProgress;
-    const total = triples.length;
-    let completed = 0;
-    report?.({ phase: "similarity-cache", completed, total });
-    const fullRefresh = states.size === 0 || expanding || dirty.size > Math.max(8, Math.ceil(triples.length * 0.25));
-    if (fullRefresh) {
-      for (const triple of triples) {
-        throwIfAborted(options.signal);
-        const scanned = this.similarToFunction(triple.functionId, {
-          ...(includeDescriptions ? { includeDescriptions: true } : {}),
-          limit: Math.min(width + 1, triples.length - 1),
-          minSimilarity: floor,
-        });
-        const neighbors = scanned.slice(0, width);
-        this.#database.storeSimilarityNeighbors(triple.functionId, mode, neighbors, {
-          codeEmbeddingId: triple.codeEmbeddingId,
-          descriptionEmbeddingId: triple.descriptionEmbeddingId,
-          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-          cachedWidth: width,
-          generation,
-          floor,
-          complete: scanned.length <= width,
-        });
-        sourcesRefreshed += 1;
-        pairsStored += neighbors.length;
-        completed += 1;
-        report?.({ phase: "similarity-cache", completed, total });
-      }
-      return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed, pairsStored, skipped: false };
-    }
-    const functionsById = new Map(this.allFunctions().map((callable) => [callable.id, callable]));
-    const lean = new Map<number, Map<number, SimilarityResult>>();
-    // Dirty scans must cover the widest band any clean row keeps, or merged
-    // rows would silently lose pairs below the request floor.
-    let scanFloor = floor;
-    for (const state of states.values()) scanFloor = Math.min(scanFloor, state.floor);
-    for (const dirtyId of dirty) {
-      throwIfAborted(options.signal);
-      const prior = states.get(dirtyId);
-      const keepWidth = Math.max(width, prior?.cachedWidth ?? width);
-      const full = this.similarToFunction(dirtyId, {
-        ...(includeDescriptions ? { includeDescriptions: true } : {}),
-        limit: triples.length - 1,
-        minSimilarity: scanFloor,
-      });
-      const byTarget = new Map<number, SimilarityResult>();
-      for (const match of full) byTarget.set(match.function.id, match);
-      lean.set(dirtyId, byTarget);
-      const triple = tripleById.get(dirtyId)!;
-      const top = full.slice(0, keepWidth);
-      this.#database.storeSimilarityNeighbors(dirtyId, mode, top, {
-        codeEmbeddingId: triple.codeEmbeddingId,
-        descriptionEmbeddingId: triple.descriptionEmbeddingId,
-        fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-        cachedWidth: keepWidth,
-        generation,
-        floor: scanFloor,
-        complete: full.length <= keepWidth,
-      });
-      sourcesRefreshed += 1;
-      pairsStored += top.length;
-      completed += 1;
-      report?.({ phase: "similarity-cache", completed, total });
-    }
-    for (const triple of triples) {
-      throwIfAborted(options.signal);
-      if (dirty.has(triple.functionId)) continue;
-      // Never narrow a row the read-repair path widened: keep the lowest
-      // floor served and the widest entry stored, or every refresh demotes
-      // repaired rows and every analysis run re-repairs them with full scans.
-      const prior = states.get(triple.functionId);
-      const keepFloor = Math.min(floor, prior?.floor ?? floor);
-      const keepWidth = Math.max(width, prior?.cachedWidth ?? width);
-      const cached = this.#database.cachedSimilarityNeighbors(triple.functionId, mode);
-      const kept = cached.filter((match) => match.similarity >= keepFloor
-        && !dirty.has(match.function.id) && functionsById.has(match.function.id));
-      const added: SimilarityResult[] = [];
-      for (const [dirtyId, byTarget] of lean) {
-        if (dirtyId === triple.functionId) continue;
-        const match = byTarget.get(triple.functionId);
-        const dirtyFunction = functionsById.get(dirtyId);
-        if (match && match.similarity >= keepFloor && dirtyFunction) {
-          const { function: _function, ...scores } = match;
-          added.push({ ...scores, function: dirtyFunction });
-        }
-      }
-      const plusOne = [...kept, ...added]
-        .sort((left, right) => right.similarity - left.similarity || left.function.id - right.function.id)
-        .slice(0, keepWidth + 1);
-      const merged = plusOne.slice(0, keepWidth);
-      // Completeness is per-row: the merge reuses this row's own pairs and
-      // exact dirty scans covering its whole band, so it stays complete
-      // exactly when it was complete and nothing was truncated. A global
-      // check here would let one incomplete row flip the entire index to
-      // incomplete on every refresh, and every later lookup would re-scan.
-      const complete = plusOne.length <= keepWidth && (prior?.complete ?? false);
-      const unchanged = merged.length === cached.length
-        && merged.every((match, index) => match.function.id === cached[index]!.function.id
-          && match.similarity === cached[index]!.similarity);
-      if (unchanged) {
-        // Rows are untouched: record the preserved floor and width without
-        // rewriting the neighbor rows.
-        this.#database.touchSimilarityCacheState(triple.functionId, mode, {
-          codeEmbeddingId: triple.codeEmbeddingId,
-          descriptionEmbeddingId: triple.descriptionEmbeddingId,
-          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-          cachedWidth: keepWidth,
-          generation,
-          floor: keepFloor,
-          storedCount: merged.length,
-          complete,
-        });
-      } else {
-        this.#database.storeSimilarityNeighbors(triple.functionId, mode, merged, {
-          codeEmbeddingId: triple.codeEmbeddingId,
-          descriptionEmbeddingId: triple.descriptionEmbeddingId,
-          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-          cachedWidth: keepWidth,
-          generation,
-          floor: keepFloor,
-          complete,
-        });
-        pairsStored += merged.length;
-      }
-      sourcesRefreshed += 1;
-      completed += 1;
-      report?.({ phase: "similarity-cache", completed, total });
-    }
-    return { similarityMode: mode, width, minSimilarity: floor, sourcesRefreshed, pairsStored, skipped: false };
+  public async refreshSimilarityCache(options: RefreshSimilarityCacheOptions = {}): Promise<RefreshSimilarityCacheResult> {
+    return this.#similarityCache.refreshSimilarityCache(options);
   }
 
   /**
@@ -1605,15 +1414,7 @@ export class CodeIndex {
    * Prefer {@link cachedSimilarityReader} inside per-function loops: it loads
    * the validity snapshot once instead of re-reading it for every function.
    */
-  public cachedSimilarToFunction(functionId: number, options: {
-    includeDescriptions?: boolean;
-    limit: number;
-    minSimilarity: number;
-    maxSimilarity?: number;
-    excludePaths?: readonly string[];
-    minLines?: number;
-    nameRegex?: string;
-  }): SimilarityResult[] {
+  public cachedSimilarToFunction(functionId: number, options: SimilarityCacheQuery): SimilarityResult[] {
     return this.cachedSimilarityReader({
       ...(options.includeDescriptions ? { includeDescriptions: true } : {}),
     }).similarToFunction(functionId, options);
@@ -1633,104 +1434,8 @@ export class CodeIndex {
    * Stale entries are left for the refresh, dense-at-max-width entries cannot
    * be improved, and read-only indexes never write.
    */
-  public cachedSimilarityReader(options: {
-    includeDescriptions?: boolean;
-  } = {}): {
-    similarToFunction: (functionId: number, query: {
-      includeDescriptions?: boolean;
-      limit: number;
-      minSimilarity: number;
-      maxSimilarity?: number;
-      excludePaths?: readonly string[];
-      minLines?: number;
-      nameRegex?: string;
-    }) => SimilarityResult[];
-  } {
-    const mode = options.includeDescriptions ? "code-description-file-average" : "code";
-    const states = this.#database.similarityCacheStates(mode);
-    const triples = this.#database.similarityCacheTriples();
-    const tripleById = new Map(triples.map((triple) => [triple.functionId, triple]));
-    const generation = this.#database.getGeneration();
-    const readFiltered = (functionId: number, query: {
-      limit: number;
-      minSimilarity: number;
-      maxSimilarity?: number;
-      excludePaths?: readonly string[];
-      minLines?: number;
-      nameRegex?: string;
-    }): SimilarityResult[] => this.#database.cachedSimilarityNeighbors(functionId, mode, {
-      limit: query.limit,
-      minSimilarity: query.minSimilarity,
-      ...(query.maxSimilarity !== undefined ? { maxSimilarity: query.maxSimilarity } : {}),
-      ...(query.minLines !== undefined ? { minLines: query.minLines } : {}),
-      ...(query.nameRegex !== undefined ? { nameRegex: query.nameRegex } : {}),
-      ...(query.excludePaths !== undefined ? { excludePaths: query.excludePaths } : {}),
-    });
-    return {
-      similarToFunction: (functionId, query) => {
-        const live = (): SimilarityResult[] => this.similarToFunction(functionId, query);
-        // The reader is fixed to one scoring mode; a mismatched query cannot be
-        // served from this snapshot and falls back to a live query.
-        if ((query.includeDescriptions === true) !== (mode !== "code")) {
-          return live();
-        }
-        compileNameRegex(query.nameRegex);
-        const triple = tripleById.get(functionId);
-        if (!triple) {
-          return live();
-        }
-        const state = states.get(functionId);
-        const tripleMatches = !!state
-          && triple.codeEmbeddingId === state.codeEmbeddingId
-          && triple.descriptionEmbeddingId === state.descriptionEmbeddingId
-          && triple.fileDescriptionEmbeddingId === state.fileDescriptionEmbeddingId;
-        if (state && (!tripleMatches || state.generation !== generation)) {
-          return live();
-        }
-        if (state && state.floor <= query.minSimilarity) {
-          const cached = readFiltered(functionId, query);
-          if (cached.length >= query.limit) return cached;
-          if (state.complete) return cached;
-          if (state.storedCount >= MAX_SIMILARITY_CACHE_WIDTH) return live();
-        } else if (this.#database.isReadOnly || this.#database.getGeneration() !== generation) {
-          return live();
-        }
-        // Repair never narrows: entries keep the lowest floor they have served,
-        // so alternating thresholds cannot thrash the cache.
-        const repairFloor = Math.min(query.minSimilarity, state?.floor ?? query.minSimilarity);
-        const width = MAX_SIMILARITY_CACHE_WIDTH;
-        const scanned = this.similarToFunction(functionId, {
-          ...(mode !== "code" ? { includeDescriptions: true } : {}),
-          limit: Math.min(width + 1, tripleById.size - 1),
-          minSimilarity: repairFloor,
-        });
-        const neighbors = scanned.slice(0, width);
-        const complete = scanned.length <= width;
-        this.#database.storeSimilarityNeighbors(functionId, mode, neighbors, {
-          codeEmbeddingId: triple.codeEmbeddingId,
-          descriptionEmbeddingId: triple.descriptionEmbeddingId,
-          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-          cachedWidth: width,
-          generation,
-          floor: repairFloor,
-          complete,
-        });
-        states.set(functionId, {
-          codeEmbeddingId: triple.codeEmbeddingId,
-          descriptionEmbeddingId: triple.descriptionEmbeddingId,
-          fileDescriptionEmbeddingId: triple.fileDescriptionEmbeddingId,
-          cachedWidth: width,
-          generation,
-          floor: repairFloor,
-          storedCount: neighbors.length,
-          complete,
-        });
-        const cached = readFiltered(functionId, query);
-        if (cached.length >= query.limit) return cached;
-        if (complete) return cached;
-        return live();
-      },
-    };
+  public cachedSimilarityReader(options: SimilarityCacheReaderOptions = {}): SimilarityCacheReader {
+    return this.#similarityCache.cachedSimilarityReader(options);
   }
 
   public vectorForFile(filePath: string): number[] {

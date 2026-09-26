@@ -50,6 +50,11 @@ export function chunkMarkdown(content: string): ParsedMarkdownChunk[] {
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!;
+    if (fence) {
+      const closingFence = line.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+      if (closingFence && closingFence[1]![0] === fence.marker && closingFence[1]!.length >= fence.length) fence = undefined;
+      continue;
+    }
     if (htmlComment) {
       visibleLines[index] = "";
       if (line.includes("-->")) htmlComment = false;
@@ -58,11 +63,6 @@ export function chunkMarkdown(content: string): ParsedMarkdownChunk[] {
     if (/^ {0,3}<!--/.test(line)) {
       visibleLines[index] = "";
       htmlComment = !line.includes("-->");
-      continue;
-    }
-    if (fence) {
-      const closingFence = line.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
-      if (closingFence && closingFence[1]![0] === fence.marker && closingFence[1]!.length >= fence.length) fence = undefined;
       continue;
     }
     const openingFence = line.match(/^ {0,3}(`{3,}|~{3,})/);
