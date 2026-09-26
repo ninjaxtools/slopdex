@@ -4,7 +4,10 @@ This readme is written by a human.
 
 # slopdex
 
-<img src="sloppy-dexter.png" width="280" align="right" alt="Dexter, the sloppy slime" />
+<picture>
+  <source media="(max-width: 600px)" srcset="sloppy-dexter.png" width="600" />
+  <img src="sloppy-dexter.png" width="280" align="right" alt="Dexter, the sloppy slime" />
+</picture>
 
 Slopdex helps with doing analysis on codebases that contain a lot of AI generated ~~slop~~ slime.
 
