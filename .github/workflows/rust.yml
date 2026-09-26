@@ -1,0 +1,40 @@
+name: Rust and npm checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64-gnu
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64-gnu
+          - os: macos-15-intel
+            platform: darwin-x64
+          - os: macos-15
+            platform: darwin-arm64
+          - os: windows-2022
+            platform: win32-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts
+      - run: npm run check

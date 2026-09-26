@@ -1,0 +1,26 @@
+[workspace]
+members = ["cargo:."]
+
+# Keep the release setup aligned with ../treesitter-index.
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["npm"]
+npm-scope = "@ninjaxtools"
+publish-jobs = ["npm"]
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+hosting = "github"
+
+# Use native hosts for USearch's C++ core and the Tree-sitter C grammars.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+x86_64-apple-darwin = "macos-15-intel"
+x86_64-unknown-linux-gnu = "ubuntu-22.04"
+x86_64-pc-windows-msvc = "windows-2022"

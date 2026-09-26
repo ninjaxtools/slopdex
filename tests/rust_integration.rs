@@ -1,0 +1,2337 @@
+//! End-to-end coverage of the native engine and binary. All model traffic goes to
+//! a per-test loopback server; credentials are explicit, inert fixture values.
+
+use anyhow::{Context, Result, ensure};
+use rusqlite::Connection;
+use serde_json::{Value, json};
+use slopdex::engine::Engine;
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    process::{Command, Output},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use tempfile::TempDir;
+
+const TEST_KEY: &str = "local-integration-placeholder";
+
+#[derive(Clone, Debug)]
+struct Request {
+    path: String,
+    body: Value,
+}
+
+#[derive(Default)]
+struct MockState {
+    requests: Vec<Request>,
+    fail_embedding_containing: Option<String>,
+    errors: Vec<String>,
+    concurrent: Option<Arc<ConcurrentRequests>>,
+}
+
+struct Mock {
+    base: String,
+    state: Arc<Mutex<MockState>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Mock {
+    fn start() -> Result<Self> {
+        Self::start_with(None)
+    }
+
+    fn start_with(concurrent: Option<Arc<ConcurrentRequests>>) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let base = format!("http://{}/v1", listener.local_addr()?);
+        listener.set_nonblocking(true)?;
+        let threaded = concurrent.is_some();
+        let state = Arc::new(Mutex::new(MockState {
+            concurrent,
+            ..MockState::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_state = state.clone();
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !worker_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let state = worker_state.clone();
+                        let handle = move || {
+                            if let Err(error) = serve(stream, &state) {
+                                state.lock().unwrap().errors.push(error.to_string());
+                            }
+                        };
+                        if threaded {
+                            handlers.push(thread::spawn(handle));
+                        } else {
+                            handle();
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => {
+                        worker_state.lock().unwrap().errors.push(error.to_string());
+                        break;
+                    }
+                }
+            }
+            for handler in handlers {
+                if handler.join().is_err() {
+                    worker_state
+                        .lock()
+                        .unwrap()
+                        .errors
+                        .push("request handler panicked".into());
+                }
+            }
+        });
+        Ok(Self {
+            base,
+            state,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    fn config(&self) -> Value {
+        json!({
+            "embeddingProvider": "openai", "embeddingModel": "integration-embedding",
+            "embeddingDimensions": 4, "embeddingBatchSize": 8,
+            "descriptionProvider": "openai", "descriptionModel": "integration-description",
+            "rerankerProvider": "cohere", "rerankerModel": "integration-reranker",
+            "embeddingBaseUrl": self.base, "descriptionBaseUrl": self.base,
+            "rerankerBaseUrl": self.base,
+            "embeddingApiKey": TEST_KEY, "descriptionApiKey": TEST_KEY,
+            "rerankerApiKey": TEST_KEY,
+            "providerMaxRetries": 0, "retryDelayMs": 0, "providerTimeoutMs": 5000
+        })
+    }
+
+    fn requests(&self, suffix: &str) -> Vec<Request> {
+        let state = self.state.lock().unwrap();
+        assert!(
+            state.errors.is_empty(),
+            "mock server errors: {:?}",
+            state.errors
+        );
+        state
+            .requests
+            .iter()
+            .filter(|r| r.path.ends_with(suffix))
+            .cloned()
+            .collect()
+    }
+
+    fn count(&self) -> usize {
+        self.requests("").len()
+    }
+
+    fn embedding_inputs(&self) -> Vec<String> {
+        self.requests("/embeddings")
+            .iter()
+            .flat_map(|r| {
+                r.body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.as_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    fn fail_on(&self, marker: Option<&str>) {
+        self.state.lock().unwrap().fail_embedding_containing = marker.map(str::to_owned);
+    }
+}
+
+impl Drop for Mock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let joined = worker.join();
+            if !thread::panicking() {
+                assert!(joined.is_ok(), "mock server thread panicked");
+                assert!(
+                    self.state.lock().unwrap().errors.is_empty(),
+                    "mock protocol failure"
+                );
+            }
+        }
+    }
+}
+
+fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut reader = BufReader::new(&mut stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    ensure!(parts.next() == Some("POST"), "expected a local POST");
+    let path = parts.next().context("missing request path")?.to_owned();
+    let mut length = None;
+    let mut authorized = false;
+    loop {
+        line.clear();
+        ensure!(reader.read_line(&mut line)? > 0, "truncated HTTP headers");
+        if line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = Some(value.trim().parse::<usize>()?);
+            }
+            if name.eq_ignore_ascii_case("authorization") {
+                authorized = value.trim() == format!("Bearer {TEST_KEY}");
+            }
+        }
+    }
+    // Never include received headers in diagnostics (even if a caller is broken).
+    ensure!(
+        authorized,
+        "request did not use the explicit fixture credential"
+    );
+    let length = length.context("missing content length")?;
+    ensure!(length <= 2_000_000, "unexpectedly large fixture request");
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes)?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    let mut state = state.lock().unwrap();
+    state.requests.push(Request {
+        path: path.clone(),
+        body: body.clone(),
+    });
+    let (status, response) = match path.as_str() {
+        "/v1/embeddings" => {
+            ensure!(body["dimensions"] == 4, "unexpected embedding dimensions");
+            let inputs = body["input"]
+                .as_array()
+                .context("missing embedding inputs")?;
+            if state
+                .fail_embedding_containing
+                .as_ref()
+                .is_some_and(|marker| inputs.iter().any(|s| s.as_str().unwrap().contains(marker)))
+            {
+                // Deliberately echo the inert key to verify provider error redaction.
+                (503, json!({"error": format!("fixture failure {TEST_KEY}")}))
+            } else {
+                // Reverse wire order to exercise the real provider's index mapping.
+                let data: Vec<_> = inputs.iter().enumerate().rev().map(|(index, text)| {
+                    json!({"index": index, "embedding": embedding(text.as_str().unwrap())})
+                }).collect();
+                (200, json!({"data": data}))
+            }
+        }
+        "/v1/responses" => {
+            let prompt = body["input"][0]["content"][0]["text"]
+                .as_str()
+                .context("missing prompt")?;
+            let prefix = if prompt.starts_with("Describe the purpose") {
+                "file-summary"
+            } else if prompt.starts_with("Describe what") {
+                "callable-summary"
+            } else {
+                "answer grounded in indexed context"
+            };
+            (
+                200,
+                json!({"output_text": format!("{prefix}: {}", slopdex::hash(prompt))}),
+            )
+        }
+        "/v1/rerank" => {
+            let documents = body["documents"]
+                .as_array()
+                .context("missing rerank documents")?;
+            let mut ranking: Vec<_> = documents
+                .iter()
+                .enumerate()
+                .map(|(index, doc)| {
+                    let score = if doc.as_str().unwrap().contains("rerank_winner") {
+                        0.99
+                    } else {
+                        0.1
+                    };
+                    json!({"index": index, "relevance_score": score})
+                })
+                .collect();
+            ranking.sort_by(|a, b| {
+                b["relevance_score"]
+                    .as_f64()
+                    .unwrap()
+                    .total_cmp(&a["relevance_score"].as_f64().unwrap())
+            });
+            (200, json!({"results": ranking}))
+        }
+        _ => anyhow::bail!("unexpected local endpoint"),
+    };
+    let concurrent = state.concurrent.clone();
+    drop(state);
+    let request = Request { path, body };
+    if let Some(concurrent) = concurrent
+        && concurrent.work.matches(&request)
+    {
+        return concurrent.respond(&mut stream, request, response);
+    }
+    write_response(&mut stream, status, &response)
+}
+
+fn write_response(stream: &mut TcpStream, status: u16, response: &Value) -> Result<()> {
+    let bytes = serde_json::to_vec(&response)?;
+    write!(
+        stream,
+        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    )?;
+    stream.write_all(&bytes)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConcurrentWork {
+    Embeddings,
+    Callables,
+}
+
+impl ConcurrentWork {
+    fn matches(self, request: &Request) -> bool {
+        match self {
+            Self::Embeddings => request.path.ends_with("/embeddings"),
+            Self::Callables => {
+                request.path.ends_with("/responses")
+                    && request.body["input"][0]["content"][0]["text"]
+                        .as_str()
+                        .is_some_and(|prompt| prompt.starts_with("Describe what"))
+            }
+        }
+    }
+
+    fn inputs(self, request: &Request) -> Vec<String> {
+        match self {
+            Self::Embeddings => request.body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|input| input.as_str().unwrap().to_owned())
+                .collect(),
+            Self::Callables => vec![
+                request.body["input"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ],
+        }
+    }
+
+    fn paid_count(self, db: &Connection) -> Result<usize> {
+        let sql = match self {
+            Self::Embeddings => "SELECT count(*) FROM rust_embeddings",
+            Self::Callables => {
+                "SELECT count(*) FROM rust_cache WHERE kind='description' AND value LIKE 'callable-summary:%'"
+            }
+        };
+        let count: i64 = db.query_row(sql, [], |row| row.get(0))?;
+        Ok(usize::try_from(count)?)
+    }
+}
+
+#[derive(Default)]
+struct ConcurrentProgress {
+    arrived: usize,
+    active: usize,
+    maximum: usize,
+    completed: Vec<(Request, u16)>,
+}
+
+/// Opt-in HTTP scheduling; the ordinary mock keeps its sequential accept loop.
+/// Every wait is bounded so a serial/deferred-persistence regression fails rather
+/// than deadlocking the test suite.
+struct ConcurrentRequests {
+    work: ConcurrentWork,
+    limit: usize,
+    fail_first: AtomicBool,
+    index: PathBuf,
+    progress: Mutex<ConcurrentProgress>,
+    changed: Condvar,
+}
+
+impl ConcurrentRequests {
+    fn new(work: ConcurrentWork, limit: usize, index: PathBuf, fail: bool) -> Arc<Self> {
+        Arc::new(Self {
+            work,
+            limit,
+            fail_first: AtomicBool::new(fail),
+            index,
+            progress: Mutex::new(ConcurrentProgress::default()),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn respond(&self, stream: &mut TcpStream, request: Request, response: Value) -> Result<()> {
+        let mut progress = self.progress.lock().unwrap();
+        let ordinal = progress.arrived;
+        progress.arrived += 1;
+        progress.active += 1;
+        progress.maximum = progress.maximum.max(progress.active);
+        self.changed.notify_all();
+        // Hold the first window until all configured workers have reached HTTP.
+        let (progress_after_wait, timeout) = self
+            .changed
+            .wait_timeout_while(progress, Duration::from_secs(3), |p| p.arrived < self.limit)
+            .unwrap();
+        progress = progress_after_wait;
+        ensure!(
+            !timeout.timed_out(),
+            "configured HTTP workers did not overlap"
+        );
+        let fail = self.fail_first.load(Ordering::Relaxed);
+        if fail && ordinal > 0 {
+            let (next, timeout) = self
+                .changed
+                .wait_timeout_while(progress, Duration::from_secs(3), |p| {
+                    !p.completed.iter().any(|(_, status)| *status == 503)
+                })
+                .unwrap();
+            progress = next;
+            ensure!(!timeout.timed_out(), "peer failure was not sent");
+        }
+        drop(progress);
+        if fail && ordinal == 2 {
+            // Keep one paid request outstanding until an earlier success is
+            // visible through a separate SQLite connection. This also catches
+            // collecting the whole window before persisting any of its results.
+            let db = Connection::open(&self.index)?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while self.work.paid_count(&db)? == 0 {
+                ensure!(
+                    Instant::now() < deadline,
+                    "successful peer was not persisted while HTTP work remained in flight"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            // Give every launched worker time to arrive, including excess ones
+            // if the engine accidentally ignores the configured bound.
+            thread::sleep(Duration::from_millis(50));
+        }
+        let (status, response) = if fail && ordinal == 0 {
+            (503, json!({"error": "concurrent fixture failure"}))
+        } else {
+            (200, response)
+        };
+        let mut progress = self.progress.lock().unwrap();
+        write_response(stream, status, &response)?;
+        progress.active -= 1;
+        progress.completed.push((request, status));
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+// Independent, hand-selected unit vectors give exact ranking expectations. In
+// particular, descriptions disagree with code, so averaging cannot pass by accident.
+fn embedding(text: &str) -> [f32; 4] {
+    if text.starts_with("file-summary:") {
+        [0.6, 0.0, 0.8, 0.0]
+    } else if text.starts_with("callable-summary:") {
+        [0.0, 1.0, 0.0, 0.0]
+    } else if text.contains("VECTOR_MID") {
+        [0.8, 0.6, 0.0, 0.0]
+    } else if text.contains("VECTOR_NORTH") {
+        [0.0, 1.0, 0.0, 0.0]
+    } else if text.contains("VECTOR_WEST") {
+        [-1.0, 0.0, 0.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0, 0.0]
+    }
+}
+
+struct Repo {
+    _temp: TempDir,
+    root: PathBuf,
+    index: PathBuf,
+    home: PathBuf,
+}
+
+impl Repo {
+    fn new() -> Result<Self> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        let home = temp.path().join("home");
+        fs::create_dir(&root)?;
+        fs::create_dir(&home)?;
+        let index = temp.path().join("index.sqlite");
+        Ok(Self {
+            _temp: temp,
+            root,
+            index,
+            home,
+        })
+    }
+
+    fn write(&self, path: &str, text: &str) -> Result<()> {
+        let path = self.root.join(path);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(path, text)?;
+        Ok(())
+    }
+
+    fn open(&self, config: &Value) -> Result<Engine> {
+        // Concurrent tests launch Git/CLI children. A fork can briefly inherit a
+        // just-dropped flock until exec closes CLOEXEC descriptors. Retry only
+        // this lock-contention error; persistent contention still fails the test.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match Engine::open(&self.root, &self.index, config.clone()) {
+                Err(error)
+                    if error.to_string().starts_with("Index is in use")
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn db(&self) -> Result<Connection> {
+        Ok(Connection::open(&self.index)?)
+    }
+
+    fn child(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut command = Command::new(program);
+        command
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", &self.home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("NO_PROXY", "*");
+        command
+    }
+
+    fn git(&self, args: &[&str]) -> Result<String> {
+        let output = self
+            .child("git")
+            .args([
+                "-c",
+                "user.name=Integration Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    fn cli(&self, args: &[&str]) -> Result<Output> {
+        let output = self
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&self.root)
+            .arg("--index")
+            .arg(&self.index)
+            .args(["--format", "json"])
+            .args(args)
+            .output()?;
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains(TEST_KEY),
+            "CLI leaked a credential to stdout"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains(TEST_KEY),
+            "CLI leaked a credential to stderr"
+        );
+        Ok(output)
+    }
+
+    fn cli_json(&self, args: &[&str]) -> Result<Value> {
+        let output = self.cli(args)?;
+        ensure!(
+            output.status.success(),
+            "CLI {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+}
+
+fn function(name: &str, marker: &str) -> String {
+    format!("fn {name}() -> i32 {{\n    // {marker}\n    42\n}}\n")
+}
+
+fn all() -> Value {
+    json!({"minSimilarity": -1.0})
+}
+
+fn names(rows: &[Value]) -> BTreeSet<String> {
+    rows.iter()
+        .map(|r| r["function"]["qualifiedName"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn sources(rows: &[Value]) -> BTreeSet<String> {
+    rows.iter()
+        .map(|r| r["source"]["qualifiedName"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn strings(values: &[&str]) -> BTreeSet<String> {
+    values.iter().map(|s| (*s).into()).collect()
+}
+
+fn row<'a>(rows: &'a [Value], name: &str) -> &'a Value {
+    rows.iter()
+        .find(|r| r["function"]["qualifiedName"] == name)
+        .unwrap_or_else(|| panic!("missing {name}"))
+}
+
+fn near(actual: &Value, expected: f64) {
+    let actual = actual.as_f64().expect("numeric similarity");
+    assert!(
+        (actual - expected).abs() < 0.002,
+        "expected {expected}, got {actual}"
+    );
+}
+
+fn file_record(repo: &Repo, path: &str) -> Result<Value> {
+    let text: String =
+        repo.db()?
+            .query_row("SELECT data FROM rust_files WHERE path=?", [path], |r| {
+                r.get(0)
+            })?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn artifact_counts(repo: &Repo) -> Result<(i64, i64, i64)> {
+    let db = repo.db()?;
+    Ok((
+        db.query_row("SELECT count(*) FROM rust_embeddings", [], |r| r.get(0))?,
+        db.query_row(
+            "SELECT count(*) FROM rust_cache WHERE kind='parse'",
+            [],
+            |r| r.get(0),
+        )?,
+        db.query_row(
+            "SELECT count(*) FROM rust_cache WHERE kind='description'",
+            [],
+            |r| r.get(0),
+        )?,
+    ))
+}
+
+fn concurrency_fixture(
+    repo: &Repo,
+    mock: &Mock,
+    work: ConcurrentWork,
+    limit: usize,
+) -> Result<Value> {
+    // One file keeps all callable/batch jobs in the same engine scheduling pass.
+    let source: String = (0..10)
+        .map(|i| function(&format!("concurrent_{i}"), "VECTOR_EAST"))
+        .collect();
+    repo.write("concurrent.rs", &source)?;
+    let mut config = mock.config();
+    config["parallelism"] = json!(limit);
+    config["embeddingBatchSize"] = json!(2);
+    config["descriptionsEnabled"] = json!(matches!(work, ConcurrentWork::Callables));
+    config["providerMaxRetries"] = json!(0);
+    Ok(config)
+}
+
+fn assert_bounded_concurrency(work: ConcurrentWork) -> Result<()> {
+    for limit in [1, 2, 3] {
+        let repo = Repo::new()?;
+        let concurrent = ConcurrentRequests::new(work, limit, repo.index.clone(), false);
+        let mock = Mock::start_with(Some(concurrent.clone()))?;
+        let config = concurrency_fixture(&repo, &mock, work, limit)?;
+        let mut engine = repo.open(&config)?;
+        engine.refresh()?;
+        assert_eq!(engine.status()?["functionCount"], 10);
+        let requests: Vec<_> = mock
+            .requests("")
+            .into_iter()
+            .filter(|r| work.matches(r))
+            .collect();
+        let expected_requests = match work {
+            ConcurrentWork::Embeddings => 5,
+            ConcurrentWork::Callables => 10,
+        };
+        assert_eq!(requests.len(), expected_requests, "{work:?}, limit {limit}");
+        let inputs: Vec<_> = requests.iter().flat_map(|r| work.inputs(r)).collect();
+        assert_eq!(inputs.len(), 10);
+        assert_eq!(inputs.iter().collect::<BTreeSet<_>>().len(), 10);
+        if matches!(work, ConcurrentWork::Embeddings) {
+            assert!(requests.iter().all(|r| work.inputs(r).len() == 2));
+        }
+        {
+            let progress = concurrent.progress.lock().unwrap();
+            assert_eq!(progress.active, 0, "refresh must join every HTTP worker");
+            assert_eq!(progress.completed.len(), expected_requests);
+            assert!(
+                progress.maximum <= limit,
+                "{work:?}: {} active requests exceeded limit {limit}",
+                progress.maximum
+            );
+            if limit > 1 {
+                assert!(progress.maximum > 1, "{work:?} unexpectedly ran serially");
+            } else {
+                assert_eq!(progress.maximum, 1);
+            }
+        }
+        let calls = mock.count();
+        assert_eq!(engine.refresh()?["filesUpdated"], 0);
+        assert_eq!(
+            mock.count(),
+            calls,
+            "completed concurrent work must be reusable"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn concurrency_embedding_batches_respect_configured_parallelism() -> Result<()> {
+    assert_bounded_concurrency(ConcurrentWork::Embeddings)
+}
+
+#[test]
+fn concurrency_callable_descriptions_respect_configured_parallelism() -> Result<()> {
+    assert_bounded_concurrency(ConcurrentWork::Callables)
+}
+
+fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<()> {
+    let repo = Repo::new()?;
+    let limit = 3;
+    let concurrent = ConcurrentRequests::new(work, limit, repo.index.clone(), true);
+    let mock = Mock::start_with(Some(concurrent.clone()))?;
+    let config = concurrency_fixture(&repo, &mock, work, limit)?;
+    let mut engine = repo.open(&config)?;
+    let before = engine.status()?;
+    let error = engine
+        .refresh()
+        .expect_err("one request in the first window must fail");
+    assert!(format!("{error:#}").contains("HTTP 503"));
+    mock.requests(""); // Surface any timeout/protocol failure in the scheduling harness.
+    assert_eq!(
+        engine.status()?,
+        before,
+        "failed refresh must not publish a partial file"
+    );
+    let completed = {
+        let progress = concurrent.progress.lock().unwrap();
+        assert_eq!(
+            progress.active, 0,
+            "failure must still join successful peers"
+        );
+        assert!(progress.maximum > 1 && progress.maximum <= limit);
+        assert_eq!(
+            progress.arrived, limit,
+            "no new window or retry may start after failure"
+        );
+        assert_eq!(progress.completed.len(), limit);
+        progress.completed.clone()
+    };
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|(_, status)| *status == 503)
+            .count(),
+        1
+    );
+    let paid: BTreeSet<_> = completed
+        .iter()
+        .filter(|(_, status)| *status == 200)
+        .flat_map(|(request, _)| work.inputs(request))
+        .collect();
+    let preserved = match work {
+        ConcurrentWork::Embeddings => 4, // Two successful two-input batches.
+        ConcurrentWork::Callables => 2,
+    };
+    assert_eq!(paid.len(), preserved);
+    assert_eq!(
+        work.paid_count(&repo.db()?)?,
+        preserved,
+        "both successes sent after the 503 must be durable, including the last peer"
+    );
+    drop(engine);
+
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?, before);
+    assert_eq!(work.paid_count(&repo.db()?)?, preserved);
+    concurrent.fail_first.store(false, Ordering::Relaxed);
+    let offset = mock.count();
+    assert_eq!(engine.refresh()?["filesUpdated"], 1);
+    assert_eq!(engine.status()?["functionCount"], 10);
+    let retry_inputs: Vec<_> = mock.requests("")[offset..]
+        .iter()
+        .filter(|r| work.matches(r))
+        .flat_map(|r| work.inputs(r))
+        .collect();
+    assert_eq!(
+        retry_inputs.len(),
+        10 - preserved,
+        "restart should pay only for missing artifacts"
+    );
+    let retry_set: BTreeSet<_> = retry_inputs.into_iter().collect();
+    assert_eq!(retry_set.len(), 10 - preserved);
+    assert!(
+        paid.is_disjoint(&retry_set),
+        "successful peers must never be paid for again"
+    );
+    for (request, status) in &completed {
+        if *status == 503 {
+            assert!(
+                work.inputs(request)
+                    .iter()
+                    .all(|input| retry_set.contains(input)),
+                "the failed request must be retried on the next refresh"
+            );
+        }
+    }
+    let calls = mock.count();
+    assert_eq!(engine.refresh()?["filesUpdated"], 0);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn concurrency_embedding_successes_after_peer_failure_are_persisted_and_reused() -> Result<()> {
+    assert_concurrent_paid_work_survives_failure(ConcurrentWork::Embeddings)
+}
+
+#[test]
+fn concurrency_callable_successes_after_peer_failure_are_persisted_and_reused() -> Result<()> {
+    assert_concurrent_paid_work_survives_failure(ConcurrentWork::Callables)
+}
+
+#[test]
+fn incremental_refresh_reuses_artifacts_and_reconciles_edits_deletes_and_renames() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    let alpha = function("alpha", "VECTOR_EAST");
+    repo.write("alpha.rs", &alpha)?;
+    repo.write("beta.rs", &function("beta", "VECTOR_MID"))?;
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?["functionCount"], 0);
+    let initial = engine.refresh()?;
+    assert_eq!(initial["filesUpdated"], 2);
+    assert_eq!(initial["generation"], 1);
+    let before = engine.search("east", "search-code", &all())?;
+    assert_eq!(names(&before), strings(&["alpha", "beta"]));
+    let alpha_id = row(&before, "alpha")["function"]["id"].clone();
+    let calls = mock.count();
+    assert_eq!(engine.search("east", "search-code", &all())?, before);
+    let noop = engine.refresh()?;
+    assert_eq!(noop["filesUpdated"], 0);
+    assert_eq!(noop["generation"], initial["generation"]);
+    assert_eq!(mock.count(), calls);
+
+    repo.write("alpha.rs", &format!("\n\n{alpha}"))?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 1);
+    let shifted = engine.search("east", "search-code", &all())?;
+    assert_eq!(row(&shifted, "alpha")["function"]["id"], alpha_id);
+    assert_eq!(row(&shifted, "alpha")["function"]["startLine"], 3);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "line shifts must reuse document and query embeddings"
+    );
+
+    repo.write("alpha.rs", &function("alpha", "VECTOR_NORTH"))?;
+    repo.write("new.rs", &function("newcomer", "VECTOR_WEST"))?;
+    fs::remove_file(repo.root.join("beta.rs"))?;
+    let updated = engine.refresh()?;
+    assert_eq!(updated["filesUpdated"], 2);
+    assert_eq!(updated["filesDeleted"], 1);
+    let edited = engine.search("east", "search-code", &all())?;
+    assert_eq!(names(&edited), strings(&["alpha", "newcomer"]));
+    assert_eq!(row(&edited, "alpha")["function"]["id"], alpha_id);
+    near(&row(&edited, "alpha")["similarity"], 0.0);
+    assert_eq!(
+        mock.embedding_inputs().len(),
+        5,
+        "two original documents, one query, two new documents"
+    );
+
+    let calls = mock.count();
+    fs::rename(repo.root.join("alpha.rs"), repo.root.join("renamed.rs"))?;
+    let renamed = engine.refresh()?;
+    assert_eq!(renamed["filesUpdated"], 1);
+    assert_eq!(renamed["filesDeleted"], 1);
+    let rows = engine.search("east", "search-code", &all())?;
+    assert_eq!(row(&rows, "alpha")["function"]["path"], "renamed.rs");
+    assert_eq!(
+        mock.count(),
+        calls,
+        "a path-only rename reuses callable embeddings"
+    );
+    assert_eq!(engine.status()?["fileCount"], 2);
+    Ok(())
+}
+
+#[test]
+fn nested_gitignores_apply_without_git_and_changes_remove_indexed_files() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".gitignore", "root_ignored.rs\nignored_dir/\n")?;
+    repo.write("nested/.gitignore", "*.rs\n!keep.rs\n")?;
+    for (path, name) in [
+        ("visible.rs", "visible"),
+        ("root_ignored.rs", "root_ignored"),
+        ("ignored_dir/hidden.rs", "hidden"),
+        ("nested/skip.rs", "skip"),
+        ("nested/keep.rs", "keep"),
+        ("target/build.rs", "build_output"),
+        (".hidden/visible.rs", "hidden_directory_visible"),
+    ] {
+        repo.write(path, &function(name, "VECTOR_EAST"))?;
+    }
+    assert!(!repo.root.join(".git").exists());
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["visible", "keep", "hidden_directory_visible"])
+    );
+    assert_eq!(engine.status()?["gitCheckpoint"], Value::Null);
+    assert_eq!(mock.embedding_inputs().len(), 4);
+    let calls = mock.count();
+    repo.write("nested/.gitignore", "*.rs\n")?;
+    assert_eq!(engine.refresh()?["filesDeleted"], 1);
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["visible", "hidden_directory_visible"])
+    );
+    assert_eq!(mock.count(), calls);
+    repo.write("nested/.gitignore", "*.rs\n!keep.rs\n")?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 1);
+    assert_eq!(engine.status()?["functionCount"], 3);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "unignoring a known file reuses artifacts"
+    );
+    Ok(())
+}
+
+#[test]
+fn restrictive_query_filters_and_threshold_ranges_backfill_past_nearest_neighbors() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut source = (0..48)
+        .map(|i| function(&format!("distractor_{i}"), "VECTOR_EAST"))
+        .collect::<String>();
+    source.push_str(&function("selected_mid", "VECTOR_MID"));
+    source.push_str(&function("selected_north", "VECTOR_NORTH"));
+    repo.write("functions.rs", &source)?;
+    repo.write("guide.md", "# Guide\n\nVECTOR_EAST documentation.\n")?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let options = json!({"regexp": "^selected_north$", "limit": 1, "minSimilarity": -1});
+    let selected = engine.search("east", "search-code", &options)?;
+    assert_eq!(names(&selected), strings(&["selected_north"]));
+    near(&selected[0]["similarity"], 0.0);
+    let range = engine.search(
+        "east",
+        "search-code",
+        &json!({"limit": 1, "minSimilarity": 0.7, "maxSimilarity": 0.9}),
+    )?;
+    assert_eq!(names(&range), strings(&["selected_mid"]));
+    near(&range[0]["similarity"], 0.8);
+    let boundary = engine.search(
+        "east",
+        "search-code",
+        &json!({"minSimilarity": 0.0, "maxSimilarity": 1.0}),
+    )?;
+    assert_eq!(
+        names(&boundary),
+        strings(&["selected_mid", "selected_north"]),
+        "inclusive minimum, exclusive maximum"
+    );
+    assert!(
+        engine
+            .search(
+                "east",
+                "search-code",
+                &json!({"regexp": "^absent$", "limit": 1})
+            )?
+            .is_empty()
+    );
+    assert!(
+        engine
+            .search("east", "search-code", &json!({"regexp": "["}))
+            .is_err()
+    );
+    let mixed = engine.search("east", "search", &all())?;
+    assert_eq!(mixed.len(), 51);
+    assert_eq!(mixed.iter().filter(|r| r["type"] == "markdown").count(), 1);
+    let md = engine.search("east", "search", &json!({"md": true, "minSimilarity": -1}))?;
+    assert_eq!(md.len(), 1);
+    assert_eq!(md[0]["chunk"]["headingPath"], json!(["Guide"]));
+    assert_eq!(engine.search("east", "search-md", &all())?, md);
+    assert_eq!(
+        mock.embedding_inputs()
+            .iter()
+            .filter(|s| s.as_str() == "east")
+            .count(),
+        1,
+        "changing filters must reuse the query embedding"
+    );
+    Ok(())
+}
+
+#[test]
+fn cross_search_applies_candidate_filters_before_limit_and_deduplicates_pairs() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut same_file = function("source", "VECTOR_EAST");
+    for i in 0..40 {
+        same_file.push_str(&function(&format!("same_file_{i}"), "VECTOR_EAST"));
+    }
+    repo.write("src/source.rs", &same_file)?;
+    let short = (0..40)
+        .map(|i| format!("fn short_{i}() -> i32 {{ 42 }}\n"))
+        .collect::<String>();
+    repo.write("other/short.rs", &short)?;
+    repo.write("other/long.rs", &function("eligible", "VECTOR_MID"))?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let calls = mock.count();
+    let options = json!({"regexp": "^source$", "sourcePath": "src", "minLines": 3,
+        "crossFileOnly": true, "matches": 1, "minSimilarity": 0.7, "maxSimilarity": 0.9});
+    let rows = engine.cross_search(None, &options)?;
+    assert_eq!(sources(&rows), strings(&["source"]));
+    assert_eq!(rows[0]["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        rows[0]["matches"][0]["function"]["qualifiedName"],
+        "eligible"
+    );
+    near(&rows[0]["matches"][0]["similarity"], 0.8);
+    assert_eq!(engine.cross_search(None, &options)?, rows);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "cross-search should only use indexed embeddings"
+    );
+    let mut none = options.clone();
+    none["minLines"] = json!(5);
+    assert!(engine.cross_search(None, &none)?.is_empty());
+    none = options.clone();
+    none["sourcePath"] = json!("sr");
+    assert!(
+        engine.cross_search(None, &none)?.is_empty(),
+        "directory filters respect component boundaries"
+    );
+    none["sourcePath"] = json!("../outside");
+    assert!(engine.cross_search(None, &none).is_err());
+    none = options.clone();
+    none["sourcePath"] = json!(repo.root.join("src/source.rs"));
+    assert_eq!(engine.cross_search(None, &none)?, rows);
+
+    let pairs = engine.cross_search(
+        None,
+        &json!({"minLines": 3, "crossFileOnly": true,
+        "matches": 100, "minSimilarity": -1}),
+    )?;
+    let mut seen = BTreeSet::new();
+    for source in &pairs {
+        let a = source["source"]["id"].as_u64().unwrap();
+        for target in source["matches"].as_array().unwrap() {
+            let b = target["function"]["id"].as_u64().unwrap();
+            assert_ne!(a, b);
+            assert_ne!(source["source"]["path"], target["function"]["path"]);
+            assert!(
+                seen.insert((a.min(b), a.max(b))),
+                "duplicate symmetric pair"
+            );
+        }
+    }
+    assert_eq!(seen.len(), 41);
+    let symmetric = engine.cross_search(
+        None,
+        &json!({"minLines": 3, "crossFileOnly": true,
+        "matches": 100, "minSimilarity": -1, "includeSymmetricDuplicates": true}),
+    )?;
+    assert_eq!(
+        symmetric
+            .iter()
+            .map(|r| r["matches"].as_array().unwrap().len())
+            .sum::<usize>(),
+        82
+    );
+    Ok(())
+}
+
+#[test]
+fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_calls() -> Result<()>
+{
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    repo.write("a.rs", &function("east", "VECTOR_EAST"))?;
+    repo.write("b.rs", &function("mid", "VECTOR_MID"))?;
+    repo.write("guide.md", "# Guide\n\nVECTOR_EAST docs.\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let expected = engine.search("east", "search", &all())?;
+    let expected_status = engine.status()?;
+    let calls = mock.count();
+    drop(engine);
+    let sidecars: Vec<PathBuf> = ["code", "markdown", "descriptions", "combined"]
+        .iter()
+        .flat_map(|kind| {
+            let path = format!("{}.{kind}.usearch", repo.index.display());
+            [
+                PathBuf::from(&path),
+                PathBuf::from(format!("{path}.manifest.json")),
+            ]
+        })
+        .collect();
+    for round in 0..3 {
+        for path in &sidecars {
+            assert!(path.is_file());
+            match round {
+                0 => fs::remove_file(path)?,
+                1 if path.extension().is_some_and(|e| e == "usearch") => {
+                    // Leave the valid manifest in place: its binary hash must
+                    // reject the corrupt binary before USearch tries to load it.
+                    fs::write(path, b"not a valid binary")?;
+                }
+                2 if path.extension().is_some_and(|e| e == "json") => {
+                    fs::write(path, b"not a valid manifest")?;
+                }
+                _ => {}
+            }
+        }
+        let engine = repo.open(&config)?;
+        assert_eq!(engine.status()?, expected_status);
+        assert_eq!(
+            engine.search("east", "search", &all())?,
+            expected,
+            "persisted result cache survives restart"
+        );
+        // Different options bypass the result cache, proving rebuilt ANN indexes work.
+        let options = json!({"minSimilarity": -1, "limit": 20 + round});
+        assert_eq!(engine.search("east", "search", &options)?, expected);
+        assert_eq!(engine.search("east", "search-code", &options)?.len(), 2);
+        assert_eq!(
+            engine
+                .search("east", "search-descriptions", &options)?
+                .len(),
+            2
+        );
+        assert_eq!(engine.search("east", "search-md", &options)?.len(), 1);
+        for path in &sidecars {
+            assert!(fs::metadata(path)?.len() > 20);
+        }
+        assert_eq!(
+            mock.count(),
+            calls,
+            "SQLite artifacts must suffice for recovery"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn description_lifecycle_fuses_scores_preserves_stale_files_and_reindexes_on_request() -> Result<()>
+{
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write("a.rs", &function("alpha", "VECTOR_EAST"))?;
+    repo.write("b.rs", &function("beta", "VECTOR_MID"))?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    assert!(
+        engine
+            .search("east", "search-descriptions", &all())
+            .is_err()
+    );
+    assert!(engine.reindex_files(false).is_err());
+    let enabled = engine.set_descriptions(true)?;
+    assert_eq!(enabled["descriptionCount"], 2);
+    assert_eq!(enabled["fileDescriptionCount"], 2);
+    assert_eq!(enabled["staleFileDescriptionCount"], 0);
+    assert_eq!(mock.requests("/responses").len(), 4);
+    let fused = engine.search("east", "search", &all())?;
+    let alpha = row(&fused, "alpha");
+    near(&alpha["codeSimilarity"], 1.0);
+    near(&alpha["descriptionSimilarity"], 0.0);
+    near(&alpha["fileDescriptionSimilarity"], 0.6);
+    near(&alpha["similarity"], 1.6 / 3.0);
+    near(&row(&fused, "beta")["similarity"], 1.4 / 3.0);
+    let descriptions = engine.search("east", "search-descriptions", &all())?;
+    near(&descriptions[0]["similarity"], 0.3);
+    assert!(descriptions[0].get("codeSimilarity").is_none());
+    let cross = engine.cross_search(None, &json!({"minSimilarity": -1, "regexp": "^alpha$"}))?;
+    assert_eq!(
+        cross[0]["scoring"]["similarityMode"],
+        "code-description-file-average"
+    );
+    near(&cross[0]["matches"][0]["similarity"], 2.8 / 3.0);
+    let old_file = file_record(&repo, "a.rs")?;
+    let old_callable = alpha["function"]["description"].clone();
+    repo.write("a.rs", &function("alpha", "VECTOR_NORTH"))?;
+    engine.refresh()?;
+    assert_eq!(engine.status()?["staleFileDescriptionCount"], 1);
+    assert_eq!(
+        file_record(&repo, "a.rs")?["description"],
+        old_file["description"]
+    );
+    assert_eq!(
+        mock.requests("/responses").len(),
+        5,
+        "only the changed callable is redescribed"
+    );
+    let changed = engine.search("east", "search", &all())?;
+    assert_ne!(
+        row(&changed, "alpha")["function"]["description"],
+        old_callable
+    );
+    let callable = row(&changed, "alpha")["function"]["description"].clone();
+    near(&row(&changed, "alpha")["similarity"], 0.2);
+    assert_eq!(engine.reindex_files(false)?["filesReindexed"], 1);
+    assert_eq!(engine.status()?["staleFileDescriptionCount"], 0);
+    assert_ne!(
+        file_record(&repo, "a.rs")?["description"],
+        old_file["description"]
+    );
+    assert_eq!(mock.requests("/responses").len(), 6);
+    let refreshed = engine.search("east", "search", &all())?;
+    assert_eq!(
+        row(&refreshed, "alpha")["function"]["description"],
+        callable
+    );
+
+    // A file-only edit makes its context stale while callable source stays identical.
+    repo.write(
+        "a.rs",
+        &format!(
+            "{}\nconst EXTRA: i32 = 7;\n",
+            function("alpha", "VECTOR_NORTH")
+        ),
+    )?;
+    engine.refresh()?;
+    assert_eq!(mock.requests("/responses").len(), 6);
+    assert_eq!(engine.reindex_files(true)?["filesReindexed"], 1);
+    assert_eq!(
+        mock.requests("/responses").len(),
+        8,
+        "--callables regenerates against the new file context"
+    );
+    let regenerated = engine.search("east", "search", &all())?;
+    assert_ne!(
+        row(&regenerated, "alpha")["function"]["description"],
+        callable
+    );
+    let calls = mock.count();
+    assert_eq!(engine.reindex_files(true)?["filesReindexed"], 0);
+    assert_eq!(
+        engine.set_descriptions(false)?["descriptionsEnabled"],
+        false
+    );
+    let code_only = engine.search("east", "search", &all())?;
+    assert!(
+        code_only
+            .iter()
+            .all(|r| r.get("descriptionSimilarity").is_none())
+    );
+    assert!(
+        engine
+            .search("east", "search-descriptions", &all())
+            .is_err()
+    );
+    assert_eq!(engine.set_descriptions(true)?["descriptionCount"], 2);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "toggle preserves reusable descriptions"
+    );
+    drop(engine);
+    // The caller omitted descriptionsEnabled: the persisted setting must win.
+    let reopened = repo.open(&config)?;
+    assert_eq!(reopened.status()?["descriptionsEnabled"], true);
+    assert_eq!(reopened.search("east", "search", &all())?, regenerated);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn describe_sends_thresholded_indexed_context_and_returns_compact_provenance() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let original = format!(
+        "const FILE_CONTEXT_SENTINEL: i32 = 9;\n{}",
+        function("alpha", "VECTOR_EAST")
+    );
+    repo.write("a.rs", &original)?;
+    repo.write("unrelated.rs", &function("other", "VECTOR_WEST"))?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    // describe must use its indexed snapshot, not a fresh read of the working tree.
+    repo.write("a.rs", "fn not_indexed_yet() {}\n")?;
+    for (threshold, includes_file) in [(0.9, true), (1.0, false)] {
+        let answer = engine.describe(
+            "east",
+            &json!({"minSimilarity": 0.9,
+            "describeFullFileThreshold": threshold}),
+        )?;
+        assert!(
+            answer["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("answer grounded")
+        );
+        assert_eq!(answer["query"], "east");
+        assert_eq!(answer["files"].as_array().unwrap().len(), 1);
+        assert_eq!(answer["files"][0]["path"], "a.rs");
+        assert!(answer["files"][0].get("content").is_none());
+        assert_eq!(answer["functions"][0]["qualifiedName"], "alpha");
+        assert!(answer["functions"][0].get("source").is_none());
+        assert!(answer["functions"][0].get("embeddingInput").is_none());
+        let requests = mock.requests("/responses");
+        let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let context: Value = serde_json::from_str(prompt)?;
+        assert_eq!(context["files"][0].get("content").is_some(), includes_file);
+        if includes_file {
+            assert_eq!(context["files"][0]["content"], original);
+        }
+        assert!(!prompt.contains("not_indexed_yet"));
+        assert_eq!(context["matches"].as_array().unwrap().len(), 1);
+        assert!(
+            context["matches"][0]["function"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("fn alpha")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn failed_provider_keeps_live_snapshot_atomic_and_partial_artifacts_survive_restart() -> Result<()>
+{
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    repo.write("baseline.rs", &function("baseline", "VECTOR_EAST"))?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let before = engine.search("east", "search", &all())?;
+    let status = engine.status()?;
+    let counts = artifact_counts(&repo)?;
+    fs::remove_file(repo.root.join("baseline.rs"))?;
+    repo.write("a_completed.rs", &function("completed", "VECTOR_MID"))?;
+    repo.write(
+        "z_failing.rs",
+        &function("failing", "BROKEN_EMBED VECTOR_NORTH"),
+    )?;
+    mock.fail_on(Some("BROKEN_EMBED"));
+    let error = engine
+        .refresh()
+        .expect_err("injected provider failure must abort refresh");
+    let error = format!("{error:#}");
+    assert!(error.contains("HTTP 503"));
+    assert!(!error.contains(TEST_KEY));
+    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.search("east", "search", &all())?, before);
+    assert_eq!(
+        file_record(&repo, "baseline.rs")?["source"],
+        function("baseline", "VECTOR_EAST")
+    );
+    let partial = artifact_counts(&repo)?;
+    assert!(
+        partial.0 > counts.0 && partial.1 > counts.1 && partial.2 > counts.2,
+        "successful embeddings, parses, and descriptions survive the failure"
+    );
+    drop(engine);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.search("east", "search", &all())?, before);
+    let request_offset = mock.count();
+    mock.fail_on(None);
+    let retried = engine.refresh()?;
+    assert_eq!(retried["filesUpdated"], 2);
+    assert_eq!(retried["filesDeleted"], 1);
+    assert_eq!(
+        retried["generation"].as_u64().unwrap(),
+        status["generation"].as_u64().unwrap() + 1
+    );
+    assert_eq!(
+        names(&engine.search("east", "search", &all())?),
+        strings(&["completed", "failing"])
+    );
+    let retry_requests = &mock.requests("")[request_offset..];
+    assert!(
+        retry_requests
+            .iter()
+            .all(|r| !r.body.to_string().contains("symbol: completed"))
+    );
+    assert!(
+        retry_requests
+            .iter()
+            .filter(|r| r.path.ends_with("/responses"))
+            .all(|r| r.body["input"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Describe what")),
+        "completed file descriptions must not be regenerated"
+    );
+    assert_eq!(
+        mock.requests("/responses").len(),
+        6,
+        "baseline, completed, and failing each described exactly twice"
+    );
+    Ok(())
+}
+
+#[test]
+fn sqlite_publication_failure_rolls_back_deletes_and_updates_but_reuses_completed_embeddings()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write("old.rs", &function("old", "VECTOR_EAST"))?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let before = engine.search("east", "search-code", &all())?;
+    let status = engine.status()?;
+    let db = repo.db()?;
+    db.execute_batch(
+        "CREATE TRIGGER integration_abort BEFORE INSERT ON rust_items
+        WHEN NEW.path='z_abort.rs' BEGIN SELECT RAISE(ABORT, 'fixture publication failure'); END;",
+    )?;
+    fs::remove_file(repo.root.join("old.rs"))?;
+    repo.write("a_new.rs", &function("new_a", "VECTOR_MID"))?;
+    repo.write("z_abort.rs", &function("new_z", "VECTOR_NORTH"))?;
+    let error = engine
+        .refresh()
+        .expect_err("publication trigger should abort");
+    assert!(error.to_string().contains("fixture publication failure"));
+    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.search("east", "search-code", &all())?, before);
+    let live_paths: Vec<String> = db
+        .prepare("SELECT path FROM rust_files ORDER BY path")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(live_paths, ["old.rs"]);
+    let calls = mock.count();
+    db.execute_batch("DROP TRIGGER integration_abort")?;
+    drop(engine);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?, status);
+    engine.refresh()?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["new_a", "new_z"])
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "retry must use already committed artifact caches"
+    );
+    Ok(())
+}
+
+#[test]
+fn cross_repository_search_tracks_target_generation_and_rejects_incompatible_profiles() -> Result<()>
+{
+    let mock = Mock::start()?;
+    let source_repo = Repo::new()?;
+    let target_repo = Repo::new()?;
+    source_repo.write("same.rs", &function("source", "VECTOR_EAST"))?;
+    target_repo.write("same.rs", &function("target", "VECTOR_MID"))?;
+    let mut source = source_repo.open(&mock.config())?;
+    let mut target = target_repo.open(&mock.config())?;
+    source.refresh()?;
+    target.refresh()?;
+    let options = json!({"crossFileOnly": true, "minSimilarity": -1, "matches": 1});
+    let first = source.cross_search(Some(&target), &options)?;
+    assert_eq!(
+        first.len(),
+        1,
+        "equal relative paths in different repositories are different physical files"
+    );
+    near(&first[0]["matches"][0]["similarity"], 0.8);
+    assert_eq!(
+        first[0]["matches"][0]["function"]["qualifiedName"],
+        "target"
+    );
+    target_repo.write("same.rs", &function("target", "VECTOR_NORTH"))?;
+    target.refresh()?;
+    let changed = source.cross_search(Some(&target), &options)?;
+    near(&changed[0]["matches"][0]["similarity"], 0.0);
+    let other_repo = Repo::new()?;
+    let mut incompatible = mock.config();
+    incompatible["embeddingModel"] = json!("another-model");
+    let other = other_repo.open(&incompatible)?;
+    let error = source.cross_search(Some(&other), &options).unwrap_err();
+    assert!(error.to_string().contains("identical embedding profiles"));
+    Ok(())
+}
+
+#[test]
+fn reranking_uses_local_provider_preserves_cosine_and_caches_results() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(
+        "code.rs",
+        &(function("cosine_winner", "VECTOR_EAST") + &function("rerank_winner", "VECTOR_NORTH")),
+    )?;
+    let mut config = mock.config();
+    config["rerankingEnabled"] = json!(true);
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let options = json!({"minSimilarity": -1, "limit": 1});
+    let ranked = engine.search("east", "search-code", &options)?;
+    assert_eq!(names(&ranked), strings(&["rerank_winner"]));
+    near(&ranked[0]["similarity"], 0.0);
+    near(&ranked[0]["rerankScore"], 0.99);
+    let requests = mock.requests("/rerank");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body["documents"].as_array().unwrap().len(), 2);
+    let calls = mock.count();
+    assert_eq!(engine.search("east", "search-code", &options)?, ranked);
+    drop(engine);
+    let engine = repo.open(&config)?;
+    assert_eq!(engine.search("east", "search-code", &options)?, ranked);
+    assert_eq!(mock.count(), calls);
+    let filtered = engine.search(
+        "east",
+        "search-code",
+        &json!({"minSimilarity": 0.9, "limit": 1}),
+    )?;
+    assert_eq!(
+        names(&filtered),
+        strings(&["cosine_winner"]),
+        "reranking cannot restore a threshold-excluded candidate"
+    );
+    Ok(())
+}
+
+#[test]
+fn git_changed_since_filters_symbols_while_uncommitted_includes_staged_and_untracked_files()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.git(&["init", "--quiet"])?;
+    repo.write(
+        "tracked.rs",
+        &(function("changed", "VECTOR_EAST") + &function("untouched", "VECTOR_MID")),
+    )?;
+    repo.write("peer.rs", &function("peer", "VECTOR_EAST"))?;
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "--quiet", "-m", "base"])?;
+    let base = repo.git(&["rev-parse", "HEAD"])?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    assert_eq!(engine.status()?["gitCheckpoint"], base);
+    let options = json!({"minSimilarity": -1, "matches": 20, "includeSymmetricDuplicates": true, "uncommitted": true});
+    assert!(engine.cross_search(None, &options)?.is_empty());
+    repo.write(
+        "tracked.rs",
+        &(function("changed", "VECTOR_NORTH") + &function("untouched", "VECTOR_MID")),
+    )?;
+    repo.git(&["add", "tracked.rs"])?;
+    repo.git(&["commit", "--quiet", "-m", "change one callable"])?;
+    let head = repo.git(&["rev-parse", "HEAD"])?;
+    engine.refresh()?;
+    assert_eq!(engine.status()?["gitCheckpoint"], head);
+    let changed_options = json!({"minSimilarity": -1, "matches": 20, "includeSymmetricDuplicates": true, "changedSince": base});
+    assert_eq!(
+        sources(&engine.cross_search(None, &changed_options)?),
+        strings(&["changed"])
+    );
+    assert!(engine.cross_search(None, &options)?.is_empty());
+    repo.write(
+        "tracked.rs",
+        &(function("changed", "VECTOR_NORTH") + &function("untouched", "VECTOR_WEST")),
+    )?;
+    repo.git(&["add", "tracked.rs"])?;
+    repo.write("peer.rs", &function("peer", "VECTOR_MID"))?;
+    repo.write("untracked.rs", &function("new_untracked", "VECTOR_EAST"))?;
+    engine.refresh()?;
+    assert_eq!(
+        sources(&engine.cross_search(None, &options)?),
+        strings(&["changed", "untouched", "peer", "new_untracked"])
+    );
+    let since_head = json!({"minSimilarity": -1, "matches": 20, "includeSymmetricDuplicates": true, "changedSince": head});
+    assert_eq!(
+        sources(&engine.cross_search(None, &since_head)?),
+        strings(&["untouched", "peer", "new_untracked"])
+    );
+    assert!(
+        engine
+            .cross_search(None, &json!({"changedSince": "missing-fixture-ref"}))
+            .is_err()
+    );
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "--quiet", "-m", "commit working tree"])?;
+    let calls = mock.count();
+    engine.refresh()?;
+    assert!(
+        engine.cross_search(None, &options)?.is_empty(),
+        "source-mode changes invalidate cached cross-search"
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "committing changes only metadata, not embedding inputs"
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_refresh_search_no_reindex_jsonl_and_provider_failure_are_end_to_end() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write(
+        "code.rs",
+        &(function("alpha", "VECTOR_EAST") + &function("beta", "VECTOR_MID")),
+    )?;
+    let status = repo.cli_json(&["status"])?;
+    assert_eq!(status["functionCount"], 2);
+    assert_eq!(status["storageBackend"], "sqlite");
+    assert_eq!(status["vectorBackend"], "usearch");
+    let range = repo.cli_json(&[
+        "search-code",
+        "east",
+        "--threshold",
+        "0.7-0.9",
+        "--limit",
+        "1",
+    ])?;
+    assert_eq!(names(range.as_array().unwrap()), strings(&["beta"]));
+    let calls = mock.count();
+    assert_eq!(
+        repo.cli_json(&[
+            "search-code",
+            "east",
+            "--threshold",
+            "0.7-0.9",
+            "--limit",
+            "1"
+        ])?,
+        range
+    );
+    assert_eq!(mock.count(), calls);
+    repo.write("new.rs", &function("new_one", "VECTOR_NORTH"))?;
+    assert_eq!(
+        repo.cli_json(&["--no-reindex", "status"])?["functionCount"],
+        2
+    );
+    assert_eq!(mock.count(), calls);
+    assert_eq!(repo.cli_json(&["status"])?["functionCount"], 3);
+    let output = repo.cli(&[
+        "cross-search",
+        "--regexp",
+        "^alpha$",
+        "--threshold",
+        "-1",
+        "--matches",
+        "2",
+    ])?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<Value> = String::from_utf8(output.stdout)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<serde_json::Result<_>>()?;
+    assert_eq!(sources(&lines), strings(&["alpha"]));
+    assert_eq!(lines[0]["matches"].as_array().unwrap().len(), 2);
+    let calls = mock.count();
+    let bad = repo.cli(&["search-code", "east", "--threshold", "0.9-0.1"])?;
+    assert!(!bad.status.success());
+    assert_eq!(
+        mock.count(),
+        calls,
+        "argument validation must precede provider requests"
+    );
+    repo.write("z_failure.rs", &function("failure", "BROKEN_EMBED"))?;
+    mock.fail_on(Some("BROKEN_EMBED"));
+    let failed = repo.cli(&["status"])?;
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("HTTP 503"));
+    assert_eq!(
+        repo.cli_json(&["--no-reindex", "status"])?["functionCount"],
+        3
+    );
+    Ok(())
+}
+
+#[test]
+fn read_errors_are_persisted_and_clear_when_the_source_is_repaired() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("good.rs", &function("good", "VECTOR_EAST"))?;
+    fs::write(repo.root.join("invalid.rs"), [0xff, 0xfe])?;
+    let mut config = mock.config();
+    config["ignoreErrors"] = json!(true);
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    assert_eq!(engine.status()?["fileCount"], 2);
+    assert_eq!(engine.status()?["functionCount"], 1);
+    assert_eq!(engine.status()?["failedFileCount"], 1);
+    let errors = engine.errors()?;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["path"], "invalid.rs");
+    assert_eq!(errors[0]["code"], "read-error");
+    drop(engine);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.errors()?, errors);
+    repo.write("invalid.rs", &function("repaired", "VECTOR_MID"))?;
+    engine.refresh()?;
+    assert!(engine.errors()?.is_empty());
+    assert_eq!(engine.status()?["failedFileCount"], 0);
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["good", "repaired"])
+    );
+    Ok(())
+}
+
+#[test]
+fn open_enforces_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write("code.rs", &function("indexed", "VECTOR_EAST"))?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let expected = engine.search("east", "search-code", &all())?;
+    let status = engine.status()?;
+    let second = Engine::open(&repo.root, &repo.index, config.clone());
+    let error = match second {
+        Ok(_) => panic!("a live engine must retain exclusive index ownership"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("Index is in use"));
+    #[cfg(unix)]
+    {
+        let alias = repo.index.with_file_name("alias.sqlite");
+        std::os::unix::fs::symlink(&repo.index, &alias)?;
+        let error = match Engine::open(&repo.root, &alias, config.clone()) {
+            Ok(_) => panic!("a symlink must share the canonical index lock"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Index is in use"));
+    }
+    drop(engine);
+
+    let mut offline_config = config.clone();
+    offline_config["noReindex"] = json!(true);
+    repo.write("code.rs", &function("not_indexed", "VECTOR_NORTH"))?;
+    let calls = mock.count();
+    let mut offline = repo.open(&offline_config)?;
+    let refresh = offline.refresh()?;
+    assert_eq!(refresh["skipped"], true);
+    assert_eq!(refresh["generation"], status["generation"]);
+    assert_eq!(offline.status()?, status);
+    assert_eq!(offline.search("east", "search-code", &all())?, expected);
+    assert_eq!(mock.count(), calls);
+    drop(offline);
+
+    let mut mismatched = config.clone();
+    mismatched["embeddingModel"] = json!("incompatible-fixture-model");
+    let error = match repo.open(&mismatched) {
+        Ok(_) => panic!("opening with an incompatible profile must require a rebuild"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("Incompatible index root or embedding profile")
+    );
+    let mut resumed = repo.open(&config)?;
+    assert_eq!(
+        resumed.status()?,
+        status,
+        "failed open must preserve the old index"
+    );
+    resumed.refresh()?;
+    assert_eq!(
+        names(&resumed.search("east", "search-code", &all())?),
+        strings(&["not_indexed"])
+    );
+    Ok(())
+}
+
+#[test]
+fn edits_while_descriptions_are_disabled_invalidate_only_changed_callable_descriptions()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(
+        "code.rs",
+        &(function("edited", "VECTOR_EAST") + &function("untouched", "VECTOR_MID")),
+    )?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.set_descriptions(true)?;
+    let before = engine.search("east", "search", &all())?;
+    let saved_file = file_record(&repo, "code.rs")?;
+    assert_eq!(mock.requests("/responses").len(), 3);
+    engine.set_descriptions(false)?;
+    repo.write(
+        "code.rs",
+        &(function("edited", "VECTOR_NORTH") + &function("untouched", "VECTOR_MID")),
+    )?;
+    engine.refresh()?;
+    let disabled = engine.search("east", "search-code", &all())?;
+    assert_eq!(
+        row(&disabled, "edited")["function"]["description"],
+        Value::Null
+    );
+    assert_eq!(
+        row(&disabled, "untouched")["function"]["description"],
+        row(&before, "untouched")["function"]["description"]
+    );
+    assert_eq!(engine.status()?["descriptionCount"], 1);
+    assert_eq!(engine.status()?["staleFileDescriptionCount"], 1);
+    assert_eq!(mock.requests("/responses").len(), 3);
+    engine.set_descriptions(true)?;
+    assert_eq!(engine.status()?["descriptionCount"], 2);
+    assert_eq!(mock.requests("/responses").len(), 4);
+    assert_eq!(
+        file_record(&repo, "code.rs")?["description"],
+        saved_file["description"]
+    );
+    let enabled = engine.search("east", "search", &all())?;
+    assert_ne!(
+        row(&enabled, "edited")["function"]["description"],
+        row(&before, "edited")["function"]["description"]
+    );
+    near(&row(&enabled, "edited")["similarity"], 0.2);
+    Ok(())
+}
+
+#[test]
+fn regression_descriptions_with_markdown_refresh_is_noop_and_keeps_query_caches() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    config["rerankingEnabled"] = json!(true);
+    repo.write("code.rs", &function("alpha", "VECTOR_EAST"))?;
+    repo.write("guide.md", "# Guide\n\nVECTOR_MID documentation.\n")?;
+    let mut engine = repo.open(&config)?;
+    let initial = engine.refresh()?;
+    assert_eq!(initial["filesUpdated"], 2);
+    assert_eq!(mock.requests("/responses").len(), 2);
+    let mut expected = Vec::new();
+    for kind in ["search", "search-code", "search-descriptions", "search-md"] {
+        let rows = engine.search("east", kind, &all())?;
+        assert!(!rows.is_empty());
+        expected.push((kind, rows));
+    }
+    assert_eq!(mock.requests("/rerank").len(), 4);
+    let status = engine.status()?;
+    let markdown = file_record(&repo, "guide.md")?;
+    assert_eq!(markdown["description"], Value::Null);
+    let artifacts = artifact_counts(&repo)?;
+    let calls = mock.count();
+    // A cache miss would try to write the recomputed result, even for a query
+    // whose embedding is already cached. Make that observable independently of reranking.
+    repo.db()?.execute_batch(
+        "CREATE TRIGGER regression_cache_miss BEFORE INSERT ON rust_search_cache
+         BEGIN SELECT RAISE(ABORT, 'unexpected query cache miss'); END;",
+    )?;
+    for _ in 0..2 {
+        let noop = engine.refresh()?;
+        assert_eq!(noop["filesUpdated"], 0);
+        assert_eq!(noop["filesDeleted"], 0);
+        assert_eq!(noop["generation"], initial["generation"]);
+        assert_eq!(engine.status()?, status);
+        assert_eq!(file_record(&repo, "guide.md")?, markdown);
+        for (kind, rows) in &expected {
+            assert_eq!(engine.search("east", kind, &all())?, *rows);
+        }
+        assert_eq!(artifact_counts(&repo)?, artifacts);
+        assert_eq!(mock.count(), calls);
+        drop(engine);
+        engine = repo.open(&config)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn regression_description_model_change_retains_unchanged_and_regenerates_only_edited_callable()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    let untouched = function("untouched", "VECTOR_MID");
+    repo.write("code.rs", &(function("edited", "VECTOR_EAST") + &untouched))?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let before = engine.search("east", "search", &all())?;
+    let saved_file = file_record(&repo, "code.rs")?;
+    let generation = engine.status()?["generation"].clone();
+    let calls = mock.count();
+    assert_eq!(mock.requests("/responses").len(), 3);
+    drop(engine);
+
+    config["descriptionModel"] = json!("replacement-description-model");
+    let mut engine = repo.open(&config)?;
+    let noop = engine.refresh()?;
+    assert_eq!(noop["filesUpdated"], 0);
+    assert_eq!(noop["generation"], generation);
+    assert_eq!(
+        engine.status()?["descriptionProfile"]["model"],
+        config["descriptionModel"]
+    );
+    assert_eq!(engine.search("east", "search", &all())?, before);
+    assert_eq!(mock.count(), calls);
+
+    // Both callables are reparsed together, including a line shift for the
+    // untouched one, so retaining it cannot rely only on skipping its file.
+    repo.write(
+        "code.rs",
+        &(function("edited", "VECTOR_NORTH") + "\n\n" + &untouched),
+    )?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 1);
+    let after = engine.search("east", "search", &all())?;
+    assert_eq!(names(&after), strings(&["edited", "untouched"]));
+    for name in ["edited", "untouched"] {
+        assert_eq!(
+            row(&after, name)["function"]["id"],
+            row(&before, name)["function"]["id"]
+        );
+    }
+    assert_eq!(
+        row(&after, "untouched")["function"]["description"],
+        row(&before, "untouched")["function"]["description"]
+    );
+    assert_ne!(
+        row(&after, "untouched")["function"]["startLine"],
+        row(&before, "untouched")["function"]["startLine"]
+    );
+    assert_ne!(
+        row(&after, "edited")["function"]["description"],
+        row(&before, "edited")["function"]["description"]
+    );
+    let requests = mock.requests("/responses");
+    assert_eq!(
+        requests.len(),
+        4,
+        "only the edited callable needs a new description"
+    );
+    assert_eq!(requests[3].body["model"], config["descriptionModel"]);
+    let prompt = requests[3].body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt.starts_with("Describe what"));
+    assert!(prompt.contains("Symbol: edited\n"));
+    assert!(!prompt.contains("Symbol: untouched"));
+    let file = file_record(&repo, "code.rs")?;
+    assert_eq!(file["description"], saved_file["description"]);
+    assert_eq!(file["description_hash"], saved_file["description_hash"]);
+    assert_eq!(engine.status()?["staleFileDescriptionCount"], 1);
+    let calls = mock.count();
+    drop(engine);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 0);
+    assert_eq!(engine.search("east", "search", &all())?, after);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn regression_schema11_engine_migration_reuses_descriptions_and_preserves_settings_and_hashes()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let db = repo.db()?;
+    // Ordinary schema-11 tables suffice; the native engine must not need vec0.
+    db.execute_batch(
+        "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+         CREATE TABLE embeddings(id INTEGER PRIMARY KEY,embedding_key TEXT UNIQUE,vector BLOB NOT NULL);
+         CREATE TABLE files(path TEXT PRIMARY KEY,file_description TEXT,file_description_content_hash TEXT,file_description_embedding_id INTEGER);
+         CREATE TABLE functions(path TEXT,qualified_name TEXT,source_hash TEXT,embedding_input TEXT,embedding_id INTEGER,description TEXT,description_embedding_id INTEGER);
+         CREATE TABLE markdown_chunks(path TEXT,heading_path TEXT,content TEXT,embedding_id INTEGER);
+         CREATE TABLE description_cache(description_key TEXT PRIMARY KEY,description TEXT NOT NULL);",
+    )?;
+    let legacy_profile = json!({"provider": "openai", "model": "legacy-description-model", "strategyVersion": "legacy-purpose"});
+    for (key, value) in [
+        ("schema_version", "11".to_owned()),
+        ("descriptions_enabled", "true".to_owned()),
+        ("description_profile", legacy_profile.to_string()),
+        ("embedding_profile", json!({"provider": "openai", "model": "integration-embedding", "dimensions": 4, "strategyVersion": "callable-v2"}).to_string()),
+    ] {
+        db.execute("INSERT INTO metadata VALUES(?,?)", [key, &value])?;
+    }
+    let mut fixtures = Vec::new();
+    for (ordinal, name) in ["fresh", "stale"].iter().enumerate() {
+        let path = format!("{name}.rs");
+        let source = function(name, "VECTOR_EAST");
+        repo.write(&path, &source)?;
+        let callable = slopdex::parser::parse(&path, &source)?.callables.remove(0);
+        let file_description = format!("file-summary: legacy {name}");
+        let description = format!("callable-summary: legacy {name}");
+        let description_hash = slopdex::hash(if ordinal == 0 {
+            &source
+        } else {
+            "older file contents"
+        });
+        let id = (ordinal * 3 + 1) as i64;
+        for (offset, input) in [&callable.embedding_input, &file_description, &description]
+            .iter()
+            .enumerate()
+        {
+            let bytes: Vec<u8> = embedding(input)
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            db.execute(
+                "INSERT INTO embeddings VALUES(?,?,?)",
+                rusqlite::params![
+                    id + offset as i64,
+                    format!("legacy-{ordinal}-{offset}"),
+                    bytes
+                ],
+            )?;
+        }
+        db.execute(
+            "INSERT INTO files VALUES(?,?,?,?)",
+            rusqlite::params![path, file_description, description_hash, id + 1],
+        )?;
+        db.execute(
+            "INSERT INTO functions VALUES(?,?,?,?,?,?,?)",
+            rusqlite::params![
+                path,
+                name,
+                callable.source_hash,
+                callable.embedding_input,
+                id,
+                description,
+                id + 2
+            ],
+        )?;
+        fixtures.push((
+            path,
+            *name,
+            source,
+            description_hash,
+            file_description,
+            description,
+        ));
+    }
+    drop(db);
+    let mut config = mock.config();
+    config
+        .as_object_mut()
+        .unwrap()
+        .remove("descriptionProvider");
+    config.as_object_mut().unwrap().remove("descriptionModel");
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?["descriptionsEnabled"], true);
+    assert_eq!(
+        engine.status()?["descriptionProfile"]["provider"],
+        legacy_profile["provider"]
+    );
+    assert_eq!(
+        engine.status()?["descriptionProfile"]["model"],
+        legacy_profile["model"]
+    );
+    let imported_profile: String = repo.db()?.query_row(
+        "SELECT value FROM rust_metadata WHERE key='description_profile'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&imported_profile)?,
+        legacy_profile
+    );
+    assert_eq!(engine.refresh()?["filesUpdated"], 2);
+    assert_eq!(
+        mock.count(),
+        0,
+        "migration must reuse all seeded document artifacts"
+    );
+    let rows = engine.search("east", "search-descriptions", &all())?;
+    assert_eq!(names(&rows), strings(&["fresh", "stale"]));
+    for (path, name, source, description_hash, file_description, description) in &fixtures {
+        let file = file_record(&repo, path)?;
+        assert_eq!(file["description"], *file_description);
+        assert_eq!(file["description_hash"], *description_hash);
+        assert_eq!(file["hash"], slopdex::hash(source));
+        assert_eq!(row(&rows, name)["function"]["description"], *description);
+        near(&row(&rows, name)["similarity"], 0.3);
+    }
+    let status = engine.status()?;
+    assert_eq!(status["descriptionCount"], 2);
+    assert_eq!(status["fileDescriptionCount"], 2);
+    assert_eq!(status["staleFileDescriptionCount"], 1);
+    assert_eq!(mock.embedding_inputs(), ["east"]);
+    assert!(mock.requests("/responses").is_empty());
+    let calls = mock.count();
+    drop(engine);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.refresh()?["filesUpdated"], 0);
+    assert_eq!(engine.search("east", "search-descriptions", &all())?, rows);
+    assert_eq!(engine.status()?, status);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn regression_changed_since_moving_branch_invalidates_cross_cache_and_rechecks_ancestry()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.git(&["init", "--quiet"])?;
+    repo.write(
+        "code.rs",
+        &(function("changed", "VECTOR_EAST") + &function("peer", "VECTOR_MID")),
+    )?;
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "--quiet", "-m", "base"])?;
+    let base = repo.git(&["rev-parse", "HEAD"])?;
+    repo.git(&["branch", "comparison", &base])?;
+    repo.write(
+        "code.rs",
+        &(function("changed", "VECTOR_NORTH") + &function("peer", "VECTOR_MID")),
+    )?;
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "--quiet", "-m", "indexed change"])?;
+    let indexed = repo.git(&["rev-parse", "HEAD"])?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let status = engine.status()?;
+    let calls = mock.count();
+    let options = json!({"changedSince": "comparison", "minSimilarity": -1, "includeSymmetricDuplicates": true});
+    let changed = engine.cross_search(None, &options)?;
+    assert_eq!(sources(&changed), strings(&["changed"]));
+    assert_eq!(engine.cross_search(None, &options)?, changed);
+    repo.git(&["branch", "-f", "comparison", &indexed])?;
+    assert!(
+        engine.cross_search(None, &options)?.is_empty(),
+        "moving the same symbolic ref must bypass cached results without a refresh"
+    );
+    repo.git(&["branch", "-f", "comparison", &base])?;
+    assert_eq!(engine.cross_search(None, &options)?, changed);
+
+    // A descendant of the indexed checkpoint is an ancestor of live HEAD, but
+    // is still invalid for the persisted snapshot being queried.
+    repo.git(&[
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "future checkpoint",
+    ])?;
+    let future = repo.git(&["rev-parse", "HEAD"])?;
+    repo.git(&["branch", "-f", "comparison", &future])?;
+    let error = engine
+        .cross_search(None, &options)
+        .expect_err("cached branch must still validate ancestry");
+    assert!(error.to_string().contains("ancestor of the indexed commit"));
+    repo.git(&["checkout", "--quiet", "--detach", &base])?;
+    repo.git(&[
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "divergent checkpoint",
+    ])?;
+    let divergent = repo.git(&["rev-parse", "HEAD"])?;
+    repo.git(&["branch", "-f", "comparison", &divergent])?;
+    let error = engine
+        .cross_search(None, &options)
+        .expect_err("divergent branch is not an ancestor");
+    assert!(error.to_string().contains("ancestor of the indexed commit"));
+    repo.git(&["branch", "-D", "comparison"])?;
+    let error = engine
+        .cross_search(None, &options)
+        .expect_err("deleted cached branch must be resolved again");
+    assert!(
+        error
+            .to_string()
+            .contains("Cannot resolve --changed-since commit")
+    );
+    assert_eq!(engine.status()?, status);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn regression_git_subdirectory_root_scopes_uncommitted_and_changed_since_paths() -> Result<()> {
+    let mock = Mock::start()?;
+    let mut repo = Repo::new()?;
+    repo.git(&["init", "--quiet"])?;
+    repo.write(
+        "workspace/pkg/tracked.rs",
+        &(function("edited", "VECTOR_EAST") + &function("untouched", "VECTOR_MID")),
+    )?;
+    repo.write("workspace/pkg/peer.rs", &function("peer", "VECTOR_EAST"))?;
+    // Same relative filename outside the indexed root catches missing Git prefixes.
+    repo.write("tracked.rs", &function("outside", "VECTOR_NORTH"))?;
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "--quiet", "-m", "base"])?;
+    let base = repo.git(&["rev-parse", "HEAD"])?;
+    repo.root = repo.root.join("workspace/pkg");
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let dirty = json!({"uncommitted": true, "minSimilarity": -1, "matches": 20, "includeSymmetricDuplicates": true});
+    let since = json!({"changedSince": base, "minSimilarity": -1, "matches": 20, "includeSymmetricDuplicates": true});
+    assert!(engine.cross_search(None, &dirty)?.is_empty());
+    assert!(engine.cross_search(None, &since)?.is_empty());
+    repo.write("../../tracked.rs", &function("outside", "VECTOR_WEST"))?;
+    repo.write(
+        "../../outside_new.rs",
+        &function("outside_new", "VECTOR_EAST"),
+    )?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 0);
+    assert!(engine.cross_search(None, &dirty)?.is_empty());
+    repo.write(
+        "tracked.rs",
+        &(function("edited", "VECTOR_NORTH") + &function("untouched", "VECTOR_MID")),
+    )?;
+    repo.git(&["add", "tracked.rs"])?;
+    repo.write("peer.rs", &function("peer", "VECTOR_MID"))?;
+    repo.write("nested/new.rs", &function("untracked", "VECTOR_EAST"))?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 3);
+    assert_eq!(
+        sources(&engine.cross_search(None, &dirty)?),
+        strings(&["edited", "untouched", "peer", "untracked"])
+    );
+    let changed = engine.cross_search(None, &since)?;
+    assert_eq!(sources(&changed), strings(&["edited", "peer", "untracked"]));
+    assert_eq!(engine.status()?["fileCount"], 3);
+    for row in &changed {
+        assert_eq!(row["source"]["sourceMode"], "working-tree");
+        assert!(matches!(
+            row["source"]["path"].as_str(),
+            Some("tracked.rs" | "peer.rs" | "nested/new.rs")
+        ));
+    }
+    let calls = mock.count();
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "--quiet", "-m", "commit package changes"])?;
+    let head = repo.git(&["rev-parse", "HEAD"])?;
+    engine.refresh()?;
+    assert_eq!(engine.status()?["gitCheckpoint"], head);
+    assert!(
+        engine.cross_search(None, &dirty)?.is_empty(),
+        "outside-root dirty paths do not mark package files uncommitted"
+    );
+    let committed = engine.cross_search(None, &since)?;
+    assert_eq!(
+        sources(&committed),
+        strings(&["edited", "peer", "untracked"])
+    );
+    assert!(committed.iter().all(|r| r["source"]["sourceMode"] == "git"));
+    let mut since_head = since.clone();
+    since_head["changedSince"] = json!(head);
+    assert!(engine.cross_search(None, &since_head)?.is_empty());
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after_generation_change()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    let source = function("alpha", "VECTOR_EAST") + &function("beta", "VECTOR_MID");
+    repo.write("code.rs", &source)?;
+    repo.write("guide.md", "# Guide\n\nOriginal context.\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let before = engine.search("east", "search", &all())?;
+    repo.write("code.rs", &(source + "\nconst NEW_CONTEXT: i32 = 7;\n"))?;
+    engine.refresh()?;
+    let status = engine.status()?;
+    let stale_file = file_record(&repo, "code.rs")?;
+    assert_eq!(status["staleFileDescriptionCount"], 1);
+    assert_eq!(mock.requests("/responses").len(), 3);
+    repo.db()?.execute_batch(
+        "CREATE TRIGGER regression_reindex_abort BEFORE INSERT ON rust_items
+         WHEN NEW.path='code.rs' BEGIN SELECT RAISE(ABORT, 'fixture forced reindex failure'); END;",
+    )?;
+    drop(engine);
+    let failed = repo.cli(&["--no-reindex", "reindex-files", "--callables"])?;
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("fixture forced reindex failure"));
+    assert_eq!(
+        mock.requests("/responses").len(),
+        6,
+        "file and both forced callable descriptions completed before publication failed"
+    );
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?, status);
+    assert_eq!(file_record(&repo, "code.rs")?, stale_file);
+    assert_eq!(engine.search("east", "search", &all())?, before);
+    repo.db()?
+        .execute_batch("DROP TRIGGER regression_reindex_abort")?;
+    // Move generation independently of the failed file's source. A force cache
+    // key tied to generation instead of source would repeat the completed calls.
+    repo.write("guide.md", "# Guide\n\nUpdated context.\n")?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 1);
+    assert!(
+        engine.status()?["generation"].as_u64().unwrap() > status["generation"].as_u64().unwrap()
+    );
+    assert_eq!(engine.status()?["staleFileDescriptionCount"], 1);
+    let calls = mock.count();
+    drop(engine);
+    assert_eq!(
+        repo.cli_json(&["--no-reindex", "reindex-files", "--callables"])?["filesReindexed"],
+        1
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "rerun must reuse completed forced descriptions and embeddings"
+    );
+    let engine = repo.open(&config)?;
+    assert_eq!(engine.status()?["staleFileDescriptionCount"], 0);
+    let file = file_record(&repo, "code.rs")?;
+    assert_eq!(file["description_hash"], file["hash"]);
+    assert_ne!(file["description"], stale_file["description"]);
+    let after = engine.search("east", "search", &all())?;
+    for name in ["alpha", "beta"] {
+        assert_ne!(
+            row(&after, name)["function"]["description"],
+            row(&before, name)["function"]["description"]
+        );
+    }
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}

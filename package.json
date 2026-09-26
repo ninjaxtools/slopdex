@@ -8,65 +8,38 @@
     "url": "https://github.com/ninjaxtools/slopdex.git"
   },
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
-  },
   "bin": {
-    "slopdex": "dist/cli.js"
+    "slopdex": "scripts/native-launcher.mjs"
   },
   "files": [
-    ".agents/skills/slopdex/SKILL.md",
-    "dist",
+    "Cargo.toml",
+    "Cargo.lock",
+    "src/",
+    "native/*/slopdex",
+    "native/*/slopdex.exe",
     "docs/implementation.md",
     "docs/reference.md",
     "README.md",
-    "scripts/install-opencode-skill.mjs"
+    "scripts/native-*.mjs",
+    "scripts/smoke.mjs"
   ],
   "engines": {
     "node": ">=24.0.0"
   },
   "scripts": {
-    "build": "tsup",
-    "dev": "tsx src/cli.ts",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest",
-    "test:run": "vitest run",
+    "install": "node scripts/native-install.mjs",
+    "build": "cargo build --locked --release --bin slopdex",
+    "dev": "cargo run --locked --bin slopdex --",
+    "fmt": "cargo fmt --all",
+    "fmt:check": "cargo fmt --all -- --check",
+    "typecheck": "cargo check --locked --all-targets",
+    "clippy": "cargo clippy --locked --all-targets -- -D warnings",
+    "test": "cargo test --locked",
+    "test:run": "cargo test --locked",
+    "test:npm": "node --test scripts/native-test.mjs",
     "smoke": "node scripts/smoke.mjs",
     "install:local": "npm run build && npm install -g .",
-    "publish:minor": "npm version minor && npm publish --access public",
     "prepack": "npm run build && npm run smoke",
-    "check": "npm run typecheck && npm run test:run && npm run build && npm run smoke"
-  },
-  "dependencies": {
-    "@ai-sdk/anthropic": "^4.0.53",
-    "@ai-sdk/google": "^4.0.69",
-    "@ai-sdk/openai": "^4.0.66",
-    "@ai-sdk/openai-compatible": "^3.0.48",
-    "@inquirer/prompts": "^8.7.2",
-    "ai": "^7.0.99",
-    "ignore": "^7.0.9",
-    "install": "^0.13.0",
-    "js-tiktoken": "^1.0.21",
-    "sqlite-vec": "^0.1.9",
-    "tree-sitter": "^0.21.1",
-    "tree-sitter-c": "0.21.4",
-    "tree-sitter-go": "0.23.4",
-    "tree-sitter-java": "0.23.5",
-    "tree-sitter-javascript": "^0.23.1",
-    "tree-sitter-python": "0.23.2",
-    "tree-sitter-rust": "0.21.0",
-    "tree-sitter-typescript": "^0.23.2"
-  },
-  "devDependencies": {
-    "@types/node": "^24.0.0",
-    "tsup": "^8.5.0",
-    "tsx": "^4.20.0",
-    "typescript": "^5.9.0",
-    "vitest": "^3.2.0"
+    "check": "npm run fmt:check && npm run typecheck && npm run clippy && npm run test:run && npm run test:npm && npm run build && npm run smoke"
   }
 }

@@ -1,67 +1,23 @@
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { packageRoot, packageVersion } from "./native-common.mjs";
 
-const library = await import("../dist/index.js");
-if (typeof library.openCodeIndex !== "function"
-  || typeof library.crossSearch !== "function"
-  || typeof library.analyzeCohesion !== "function"
-  || typeof library.CohereReranker !== "function"
-  || typeof library.JinaReranker !== "function"
-  || typeof library.OpenAILLMReranker !== "function") {
-  throw new Error("Built library exports are incomplete.");
-}
-
-execFileSync(process.execPath, ["dist/cli.js", "--help"], { stdio: "ignore" });
-const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-const cliVersion = execFileSync(process.execPath, ["dist/cli.js", "--version"], { encoding: "utf8" }).trim();
-if (cliVersion !== version) throw new Error(`Built CLI reported version ${cliVersion} instead of ${version}.`);
-
-// Exercise the native grammars through the built library, with no network calls.
-const sources = [
-  ["python", "sample.py", "def run():\n    return 1\n"],
-  ["javascript", "sample.js", "function run() { return 1; }"],
-  ["jsx", "sample.jsx", "const run = () => <div />;"],
-  ["typescript", "sample.ts", "function run(): number { return 1; }"],
-  ["tsx", "sample.tsx", "const run = (): JSX.Element => <div />;"],
-  ["rust", "sample.rs", "fn run() -> i32 { 1 }"],
-  ["go", "sample.go", "package sample\nfunc run() int { return 1 }"],
-  ["java", "Sample.java", "class Sample { int run() { return 1; } }"],
-  ["c", "sample.c", "int run(void) { return 1; }"],
-  ["c", "sample.h", "static inline int run(void) { return 1; }"],
-];
-const root = mkdtempSync(path.join(tmpdir(), "slopdex-smoke-"));
-let index;
-const warnings = [];
+// No credentials or network calls: run from outside the package to catch
+// accidental cwd-relative resolution in globally installed npm launchers.
+const cwd = mkdtempSync(path.join(tmpdir(), "slopdex-smoke-"));
 try {
-  for (const [, file, source] of sources) writeFileSync(path.join(root, file), source);
-  writeFileSync(path.join(root, ".gitignore"), "ignored.py\n");
-  writeFileSync(path.join(root, "ignored.py"), "def ignored():\n    return 1\n");
-  index = library.openCodeIndex({
-    rootDir: root,
-    provider: {
-      profile: { provider: "smoke", model: "local", dimensions: 2 },
-      embedDocuments: async (inputs) => inputs.map(() => [1, 0]),
-      embedQuery: async () => [1, 0],
-    },
-    onWarning: (message) => { warnings.push(message); },
-  });
-  await index.updateFromWorkingTree();
-  const functions = index.allFunctions();
-  if (warnings.length > 0) throw new Error(warnings.join("\n"));
-  if (functions.length !== sources.length) throw new Error("Built library did not index all language fixtures.");
-  for (const [language, file] of sources) {
-    if (!functions.some((item) => item.path === file && item.language === language && item.name === "run")) {
-      throw new Error(`Built library failed to parse ${file}.`);
-    }
+  const launcher = path.join(packageRoot, "scripts", "native-launcher.mjs");
+  const run = (...args) => execFileSync(process.execPath, [launcher, ...args], { cwd, encoding: "utf8" });
+  const version = run("--version").trim();
+  assert.ok([packageVersion(), `slopdex ${packageVersion()}`].includes(version), `Unexpected CLI version: ${version}`);
+  const help = run("--help");
+  for (const command of ["search", "cross-search", "describe"]) {
+    assert.ok(help.includes(command), `CLI help does not list ${command}`);
   }
-  writeFileSync(path.join(root, "broken.py"), "def broken(\n");
-  await index.updateFiles({ upsert: ["broken.py"] });
-  if (index.indexErrors().length === 0 || library.readIndexErrors(index.indexPath).length === 0) {
-    throw new Error("Built library did not persist indexing diagnostics.");
-  }
+  console.log("Native CLI smoke passed (version and help, outside package directory).");
 } finally {
-  index?.close();
-  rmSync(root, { recursive: true, force: true });
+  rmSync(cwd, { recursive: true, force: true });
 }

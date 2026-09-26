@@ -1,211 +1,400 @@
 # Command reference
 
-## Commands
+This reference describes the native Rust CLI and engine. **The installed
+executable's `slopdex --help` and `slopdex <command> --help` govern accepted
+commands, options, defaults, and argument combinations.** The workflows in the
+[README](../README.md) use this CLI.
 
-Usage: `slopdex <command> [arguments] [options]`.
+## Installation and command surface
 
-| Command | Purpose | Output |
+`npm install -g @ninjaxtools/slopdex` installs a small Node launcher and downloads
+the matching native Rust executable from its GitHub Release. Release binaries
+cover Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64. Local checkout
+installs can instead build from source, requiring Rust/Cargo, a C/C++ compiler,
+and platform build tools. See [implementation and distribution](implementation.md).
+
+Usage: `slopdex [global options] <command> [arguments] [options]`. Global options
+can also follow the command. Quote multiword queries.
+
+| Command | Actual operation | Default output |
 | --- | --- | --- |
-| `models [opencode\|opencode-go]` | Fetch valid models from the current published Zen and/or Go catalogs. | Qualified `provider/model` lines; optional JSON array |
-| `config model <model\|provider/model>` | Validate a published OpenCode model and persist its provider/model selection without opening an index. Bare IDs auto-resolve only when unambiguous. | Updated setting summary; optional JSON |
-| `config fallback-model <model\|provider/model>` | Validate and persist an optional fallback description model on the same provider. | Updated setting summary; optional JSON |
-| `config descriptions <enable\|disable>` | Persist whether the next index-using command should enable or disable descriptions. Does not open an index. | Updated setting summary; optional JSON |
-| `config reranker <cohere\|jina\|openai\|disable> [model]` | Enable a hosted or OpenAI LLM query reranker, optionally selecting a model, or disable it. OpenAI accepts `--reranker-candidates <number>` from 1 to 100 and defaults to 10. Does not open an index. | Updated setting summary; optional JSON |
-| `search <query>` | Search code, available descriptions, and heading-aware Markdown together. Quote multiword queries. | Mixed summary; optional discriminated JSON array |
-| `search-code <query>` | Search function code only. | Summary; optional JSON array |
-| `search-descriptions <query>` | Search purpose descriptions after enabling them. | Summary including description text; optional JSON array |
-| `search-md <query>` | Search heading-aware chunks from `.md` and `.markdown` files only. | Summary with chunk text; optional JSON array |
-| `describe <query>` | Gather relevant existing code and have the configured description model explain how it fits together for the query. Never proposes an implementation. | Generated explanation; optional JSON object |
-| `descriptions <enable\|disable>` | Enable or disable automatic purpose descriptions. Re-enabling with unchanged inputs reuses cached descriptions. | JSON statistics |
-| `cross-search` | Find neighbors for each selected function in this or another index. | `clusters` by default; optional `summary` or JSONL |
-| `status` | Refresh and show index metadata, counts, and profiles. | JSON object |
-| `index-errors` | Read saved file/function indexing failures. | Summary; optional JSON array |
-| `update-git` | Explicitly refresh a Git snapshot, with current working-tree changes when targeting HEAD. | JSON update statistics |
-| `update-files <path...>` | After automatic refresh, explicitly reparse selected working-tree files. Paths are repository-relative or absolute within the root. | JSON update statistics |
-| `reindex-files [--callables]` | Regenerate descriptions for files changed since their stored file description. By default stops after each file description; `--callables` also regenerates its callable descriptions. | JSON description statistics |
-| `delete-files <path...>` | After automatic refresh, remove paths from the index; source files are not deleted. A later refresh can restore eligible files. | JSON update statistics |
+| `search <query>` | Search callable code, complete enabled descriptions, and Markdown together. | Summary |
+| `search-code <query>` | Search callable code. | Summary |
+| `search-descriptions <query>` | Search callable/file description fusion; descriptions must be enabled and complete. Alias: `search-description`. | Summary with callable descriptions |
+| `search-md <query>` | Search heading-aware `.md`/`.markdown` chunks. | Summary with chunk text |
+| `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
+| `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
+| `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
+| `index-errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
+| `update-git` | Explicitly refresh the current working tree and Git HEAD, when available. Alias: `refresh`; `--target` accepts only `HEAD`. | JSON refresh statistics |
+| `descriptions <enable\|disable>` | Apply description state to the index and save it in config; retain reusable caches. | JSON status |
+| `reindex-files [--callables]` | Regenerate stale file descriptions from indexed source; optionally regenerate their callable descriptions too. Requires enabled descriptions. | JSON statistics |
+| `models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
+| `config [action]` | Edit root-selected configuration without opening an index; no action starts interactive setup. | Updated-setting summary |
 
-Manual maintenance examples:
+Configuration actions:
 
 ```bash
-slopdex update-git
-slopdex update-files src/service.ts src/model.ts
-slopdex reindex-files
+slopdex config
+slopdex models opencode-go
+slopdex config model opencode-go/gpt-5.6-luna
+slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
+slopdex config descriptions enable
+slopdex config reranker cohere
+slopdex config reranker jina
+slopdex config reranker openai --reranker-candidates 10
+slopdex config reranker disable
+slopdex config parallelism 10
+```
+
+`config model` and `config fallback-model` validate against published OpenCode
+catalogs. Bare IDs must resolve unambiguously; the fallback must use the configured
+description provider. `config model` changes description settings, whereas the
+global `--model` selects the embedding model. `config reranker <provider> [model]`
+accepts an optional model. `config descriptions` defers index work until the next
+index command. Interactive configuration requires terminal stdin/stdout; it asks
+about descriptions, reranking, embeddings, paths, filters, and common settings.
+OpenCode model prompts accept exact IDs or text to display a filtered list.
+Advanced endpoint/HTTP settings are edited in JSON.
+
+Help, version, configuration, and model-catalog commands do not refresh the index.
+Other commands open it and normally refresh before doing their work.
+
+## Search and analysis options
+
+Common query/cross-search filters:
+
+- `--threshold <number|min-max>`: default `0.3`; finite endpoints in `[-1,1]`,
+  inclusive minimum and exclusive maximum. A range requires minimum < maximum.
+- `--limit <positive integer>`: default unlimited. Caps query results (including
+  Markdown), or the context matches for `describe`. For cross-search it caps
+  emitted clusters or matched-source rows **after all selected sources are
+  searched**.
+- `-e`, `--regexp`, or `--regex`: case-sensitive **Rust regex** over qualified
+  callable names. Applied before query result limits; Markdown is unaffected.
+  For cross-search it filters sources only. Look-around and backreferences are
+  unsupported by this regex engine.
+
+`search` accepts `--code`, `--descriptions`, and `--md`. With no selector, it
+searches all available kinds; any selector makes selection explicit. Explicit
+description search requires complete enabled descriptions.
+
+Cross-search options:
+
+| Option | Behavior |
+| --- | --- |
+| `--matches <number>` | Maximum neighbors retrieved per source, default `5`. Symmetric-pair suppression can reduce the emitted count. |
+| `--min-lines <number>` | Minimum line count for both sources and candidates, default `2`; use `1` for one-line callables. |
+| `--source-path <path>` | Source file or recursive directory, root-relative or absolute within the root. |
+| `--changed-since <commit>` | Source callables differing from this ancestor of the indexed Git checkpoint; details below. |
+| `--uncommitted` | Source callables whose indexed file has working-tree provenance. |
+| `--cross-file-only` | Exclude candidates with the same root-qualified file path as the source. |
+| `--include-symmetric-duplicates` | Keep both directions of same-index pairs. By default each unordered observed pair is emitted once. |
+| `--cohesion` | Sort each source's selected matches by descending filesystem distance, then similarity. Defaults to summary; incompatible with clusters. |
+| `--target-root <path> --target-index <path>` | Compare to another index; both are required together. Embedding profiles must match. |
+| `--target-config <path>` | Config for the second root; defaults to `<target-root>/.slopdex/config.json`. Requires both target options. |
+
+Examples:
+
+```bash
+slopdex search "keep the repository index synchronized"
+slopdex search-code "configure the embedding provider"
+slopdex search-md "configure the embedding provider"
+slopdex descriptions enable --description-provider opencode-go
+slopdex search-descriptions "keep the repository index synchronized"
+slopdex describe "I want to implement a new rpc endpoint"
 slopdex reindex-files --callables
-slopdex delete-files src/removed.ts
-slopdex update-git --target HEAD --rebuild-on-divergence --yes-really-rebuild-the-index
-slopdex update-git --force-reindex --yes-really-rebuild-the-index
+slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
+slopdex cross-search --uncommitted --cross-file-only --threshold 0.9
+slopdex cross-search --changed-since origin/main --threshold 0.9
+slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 0.9
+slopdex cross-search --cross-file-only --cohesion --threshold 0.8
+slopdex cross-search --target-root /path/to/other/repo \
+  --target-index /path/to/other/repo/.slopdex/index.sqlite --threshold 0.9
 ```
 
-### Location, providers, and diagnostics
+### Git source selection
 
-| Argument | Meaning / default |
-| --- | --- |
-| `--root <path>` | Repository root; current directory by default. |
-| `--config <path>` | Config file; `<root>/.slopdex/config.json` by default. |
-| `--index <path>` | Index file; `<root>/.slopdex/index.sqlite` by default. Overrides `indexPath` in config. |
-| `--provider <openai\|jina>` | Embedding provider; `openai` by default. |
-| `--model <name>` | Embedding model; `text-embedding-3-large` for OpenAI, `jina-embeddings-v4` for Jina. |
-| `--dimensions <number>` | Positive embedding dimension count; OpenAI `3072`, Jina `1024`. Must be supported by the model. |
-| `--description-provider <openai\|opencode\|opencode-go>` | Description provider; OpenAI by default. OpenCode values use Zen or Go with `OPENCODE_API_KEY` or `~/.local/share/opencode/auth.json`. |
-| `--description-model <name>` | Description model; `gpt-5.6-luna` for OpenAI and `muse-spark-1.3-contributor` for Zen/Go, then the persisted model unless overridden. Published OpenCode models use their documented protocol. |
-| `--description-fallback-model <name>` | Optional same-provider model that becomes active when the primary fails; the primary becomes active again if the fallback fails. Failover retries use exponential backoff. |
-| `--ignore-errors` | Silence warnings about saved indexing errors; records remain available. |
-| `--verbose` | Write one stderr notice for every external model call instead of one per call kind/provider/model. |
-| `-h`, `--help` | Show CLI usage without refreshing. |
-| `--version` | Print the package version and exit. |
+Refresh reads the **current filesystem**, including staged, unstaged, and eligible
+untracked files. Git supplies HEAD as the checkpoint and dirty-file provenance;
+there is no separate committed-tree overlay or arbitrary-ref indexing mode.
+Files reported by `git diff HEAD` or untracked-file discovery are marked
+`sourceMode: "working-tree"`; clean files are marked `"git"`. Without a resolvable
+HEAD, every indexed file uses working-tree provenance.
 
-Explicit relative config and index paths resolve from the current directory, not `--root`.
+`--uncommitted` selects **all callables in those working-tree files**, including
+unchanged siblings. `--changed-since` (engine option `changedSince`) resolves the
+reference to a commit and requires it to be an ancestor of the saved checkpoint.
+It parses each current callable's path at that commit and compares the pair
+`(qualifiedName, sourceHash)`. New paths, renamed symbols, and edited callable
+source are selected; line-number-only shifts are not. Missing/unreadable base
+paths count as having no matching symbols. Removed callables cannot be sources
+because they are absent from the current index. Combined source filters intersect.
+With `--no-reindex`, these filters use saved provenance/content; changed-since
+still needs the local Git history.
 
-### Search and analysis
+### Scores, fusion, and ANN recall
 
-| Argument | Applies to | Meaning / default |
-| --- | --- | --- |
-| `--limit <number>` | Query searches, describe, cross-search | Positive integer output limit; unlimited unless passed or capped by a reranker's advertised maximum. Query matches, or cross-search output entries (clusters for `clusters`, matched sources for `summary`/JSONL). Threshold filters results; scans all sources and only truncates emitted output. In describe, it caps the matching callables used as context. |
-| `--matches <number>` | Cross-search | Positive integer matches kept per source function; default `5`. |
-| `--threshold <number\|min-max>` | Query searches, describe, cross-search | Minimum similarity, or range with inclusive minimum and exclusive maximum. Default `0.3`. |
-| `--code` | `search` | Select the callable-code index. If any index selector is present, unselected indexes are omitted. |
-| `--descriptions` | `search` | Select callable and file descriptions. Requires descriptions to be enabled. |
-| `--md` | `search` | Select heading-aware Markdown chunks. |
-| `--describe-full-file-threshold <number>` | Describe | Include a file's complete indexed source when its highest result similarity is strictly above this value; default `0.8`. Files at or below it contribute only their description. |
-| `--format <json\|summary\|clusters>` | Query searches, describe, cross-search, index-errors | Output format; see the commands table. `clusters` is only for ordinary cross-search. |
-| `-e <regex>`, `--regexp <regex>`, `--regex <regex>` | Function query searches, combined search, describe, cross-search | Equivalent case-sensitive JavaScript regex options over qualified names. Query searches and describe filter function results before limiting; Markdown results in combined search are unaffected. Cross-search filters sources only. |
-| `--min-lines <number>` | Cross-search | Minimum source and candidate callable length; positive integer, default `2`. Use `1` to include one-line wrappers. |
-| `--source-path <path>` | Cross-search | Select sources in a file or recursive directory, relative to the repository root (or absolute within it). |
-| `--changed-since <commit>` | Cross-search | Select added, modified, or moved functions relative to an ancestor of the indexed Git checkpoint, including working-tree changes. Requires Git. |
-| `--uncommitted` | Cross-search | Select functions indexed from working-tree files: staged, unstaged, or untracked changes in Git; all working-tree functions without Git. |
-| `--cross-file-only` | Cross-search | Exclude matches from the same physical file. |
-| `--include-symmetric-duplicates` | Cross-search | Allow both directions of same-index matches; otherwise each unordered pair is emitted once. |
-| `--cohesion` | Cross-search | Add `physicalDistance` and re-rank each source's matches by descending distance, with similarity as the tie-breaker. Defaults to summary output; incompatible with clusters. |
-| `--target-root <path>` | Cross-search | Second repository root; requires `--target-index`. |
-| `--target-index <path>` | Cross-search | Second index file; requires `--target-root`. |
-| `--target-config <path>` | Cross-search | Target config; defaults to `<target-root>/.slopdex/config.json`. Requires both target options. |
+SQLite stores the authoritative embeddings; USearch performs filtered F32 cosine
+HNSW search. Code and Markdown have separate indexes. Complete descriptions add
+two callable indexes: description fusion and code/description fusion.
 
-### Refresh and recovery
-
-| Argument | Meaning |
-| --- | --- |
-| `--target <ref>` | Git snapshot for `update-git`; default `HEAD`. Non-HEAD targets exclude working-tree changes. Later commands normally refresh back to HEAD. |
-| `--rebuild-on-divergence` | Allow reconciliation when the saved checkpoint is not an ancestor of the target, such as after a rebase or branch switch. Requires `--yes-really-rebuild-the-index`. |
-| `--force-reindex` | Recreate an **incompatible** index (repository, provider, model, dimensions, strategy, or schema mismatch). A compatible index still follows normal refresh behavior. Requires `--yes-really-rebuild-the-index`. |
-| `--yes-really-rebuild-the-index` | Confirm the destructive rebuild requested by `--rebuild-on-divergence` or `--force-reindex`. |
-| `--no-reindex` | With Git, still reconcile the committed snapshot but skip working-tree overlays. Without Git, reuse a non-empty index; missing/empty indexes are still populated. Not a general offline switch. |
-
-## Reading results
-
-### Similarity and duplicate clusters
-
-Similarity is a model-dependent score, not a probability of duplication. Higher scores mean greater semantic resemblance. Query summaries show `score  path :: qualifiedName`; cross-search summaries group those lines beneath each source. Functions without matches are omitted from cross-search output.
-
-With reranking enabled, query summaries show `rerankScore rerank (similarity similarity)`. JSON retains `similarity` and adds `rerankScore`. The similarity threshold first filters embedding candidates. With an explicit `--limit`, Cohere and Jina receive up to five times the requested limit; without `--limit` they rerank all threshold-passing candidates. The OpenAI LLM receives the configured number of top embedding results, 10 by default, or the requested result limit when it is larger; without `--limit`, candidates and output are capped at its 100-candidate maximum. Candidates include function descriptions when available and function metadata/source code. Cross-search and cohesion analysis are not sent to rerankers.
+Each component vector is normalized independently before concatenation. For unit
+vectors `c` (code), `d` (callable description), and `f` (file description):
 
 ```text
-Cluster 1 (3 functions, similarity 0.9124-0.9568)
-  src/auth/session.ts:18:1 :: validateSession
-  src/http/middleware.ts:42:1 :: authenticate
-  src/users/user-service.ts:27:3 :: UserService.authenticate
+cos([c₁, d₁, f₁], [c₂, d₂, f₂])
+  = (cos(c₁, c₂) + cos(d₁, d₂) + cos(f₁, f₂)) / 3
 ```
 
-- A cluster groups functions connected by matches. Its range covers observed links; not every pair necessarily matches directly.
-- Clusters sort by member count, then name. Cluster number is not severity.
-- Locations identify where to inspect behavior, callers, and architectural roles. Wrappers, adapters, tests, and separate interface implementations can legitimately resemble one another.
+This is **exact averaged-cosine fusion mathematically**, subject to F32 rounding,
+rather than merging independent top-k lists. Query searches repeat the unit query
+vector in each component slot. `search-code` uses code alone;
+`search-descriptions` averages callable and file description similarities;
+`search` with code and descriptions averages all three. Markdown keeps its own
+chunk score and joins the final ranked result list.
 
-### Task descriptions
+Descriptions are complete only when every indexed callable has both callable and
+file-description embeddings and descriptions are enabled. Cross-search uses the
+three-way average only when both indexes are complete and their configured
+description profiles match; otherwise the entire comparison uses code alone.
+JSON exposes the applicable `codeSimilarity`, `descriptionSimilarity`, and
+`fileDescriptionSimilarity`; cross-search rows include scoring mode and weights.
 
-`describe` runs the same natural-language vector search as `search`, preserves any second-stage reranker order and scores, groups the results by file, and sends file descriptions, callable descriptions, matching callable source, locations, and relevance scores to the configured description model. The model explains what exists and how those locations fit together. It is instructed to describe existing code only and not to propose an implementation. `--description-provider`/`--description-model` (or the config file) select the model; without an explicit selection, the index's stored description profile is reused, falling back to the provider default.
+**Neighbor retrieval remains approximate.** Filters run inside USearch graph
+traversal, not on an unfiltered top-k list. Threshold ranges can trigger wider
+retrieval, but neither exact fusion nor an unlimited output limit guarantees
+exhaustive recall or exact top-k membership. There is no exhaustive scan fallback.
+Similarity is model-dependent, not a probability of duplication.
 
-A file's complete indexed source is sent only when its highest result similarity is above `--describe-full-file-threshold` (default `0.8`); files at or below it are represented by their description alone. Working-tree source must still be a regular file and match its indexed content hash. `--threshold` (default `0.3`) selects which callables are included. If validating or reading a whole file fails, the error is reported on stderr and every whole-file source is dropped before the request. If the model request itself fails after whole files were included, the error is reported and the request is retried with file descriptions, callable descriptions, and callable source only.
+### Reranking, clusters, and output
 
-The default output is the explanation text. With `--format json`, stdout is an object with `query`, `description`, and metadata-only `files` and `functions` arrays (paths, qualified names, line numbers, similarities, optional reranker scores, descriptions).
+Reranking applies to query commands, including the search inside `describe`, not
+cross-search. Embedding thresholds are applied first. Cohere/Jina receive up to
+five times an explicit result limit, or all retrieved threshold-passing candidates
+without a limit. OpenAI receives up to
+`min(100, max(limit or 100, rerankerCandidates))`; the configured candidate count
+defaults to `10`. Without an explicit limit the OpenAI retrieval cap is **100**.
+Query JSON retains `similarity` and adds `rerankScore`.
 
-### Physical cohesion
+Clusters are connected components of observed callable matches, sorted by member
+count and then name. The displayed similarity range covers observed links;
+members need not all match one another directly. Cross-search compares callables,
+not Markdown chunks. Sources with no surviving matches are omitted.
 
-```text
-src/auth/session.ts :: validateSession
-  0.9400  packages/http/middleware.ts :: authenticate  [distance 4]
-  0.9300  src/auth/token.ts :: validateToken  [distance 1]
-```
+Cohesion changes the order of each source's selected semantic matches. Distance
+is `0` in one file, `1` between files in one directory, and `1` plus directory-tree
+hops otherwise. It does not alter similarity or the neighbor selection score.
 
-Run cross-search with `--cohesion` to put physically distant matches first. Distance is `0` within one file, `1` between files in one folder, and `1` plus directory-tree hops across folders. The option only changes the order of each source's selected semantic matches; it does not change similarity scores or establish that distant code belongs together.
+`--format json` produces query/diagnostic/model arrays, configuration/status
+objects, and **JSONL for cross-search** (one object per matched source).
+`--format clusters` is valid only for cross-search without cohesion. Results go
+to stdout and warnings/errors to stderr. Clap argument errors exit with `2`;
+runtime/configuration/domain failures exit with `1`; success/help/version exit
+with `0`.
 
-For automation, pass `--format json`: query searches and diagnostics return JSON arrays; cross-search returns **JSONL**, one row per matched source. With `--cohesion`, each match includes `physicalDistance`. Results go to stdout; notices and warnings go to stderr.
+### Task explanations
 
-## System behavior
+`describe` sends its query, ranked search matches (including callable source and
+Markdown content), and per-file descriptions to the configured description
+provider. Any match strictly above `--describe-full-file-threshold` (default `0.8`)
+also includes that file's complete **indexed** source from SQLite. The instruction
+asks for an explanation of existing code/docs with paths and symbols, not an
+implementation proposal.
 
-### Descriptions and scoring
+The engine does not reread live files for this context or retry with whole-file
+content removed. Provider retries/failover still apply. JSON output contains
+`query`, `description`, `files`, and `functions`; full source and embedding input
+are stripped from returned function metadata. Reranker order informs the prompt,
+but `rerankScore` is not copied to the returned `functions` array. The generated
+task explanation itself is not cached.
 
-Descriptions are optional and disabled initially. `descriptions enable` persists the selected provider and model and keeps callable descriptions current on later updates. Use `slopdex descriptions enable --description-provider opencode-go` for OpenCode Go, or combine `--description-provider` and `--description-model` to change both. `slopdex descriptions disable` stops automatic updates and description-based searching/scoring while retaining cached descriptions. `status` exposes callable/file description counts, stale file-description count, enabled state, and profile.
+## Index lifecycle and persistence
 
-Descriptions are generated in source order through one conversation per file. Instructions and complete file source form a stable prefix; Slopdex asks for the overall file description first, then each callable request and answer extends that conversation. This allows supported providers to reuse their prompt cache instead of receiving a separate duplicated file context for every callable.
+### SQLite authority and USearch sidecars
 
-Ordinary updates preserve an existing file description even when its source changes, while still refreshing callable descriptions. `slopdex reindex-files` explicitly regenerates stale file descriptions and their embeddings; add `--callables` to continue through and replace every callable description in those files.
+The default database is `<root>/.slopdex/index.sqlite`. SQLite is authoritative
+for file snapshots, callable/chunk records, provenance, diagnostics, descriptions,
+document/query vectors, reusable artifacts, metadata, and cached search results.
+Parse results and successful description/embedding artifacts are committed before
+the final live-record transaction, so interrupted indexing can reuse completed
+work. Live changes update the generation and invalidate cached search results.
 
-Tree-sitter extraction, generated descriptions, and document/query vectors are content-addressed in the same SQLite database. Each validated result is committed immediately, independently of the final logical index update. If indexing is interrupted or a later provider call fails, rerunning reuses every completed result whose profile, operation, input, and source context hash still match.
+Persistent derived indexes sit beside the database:
+`<index>.code.usearch`, `<index>.markdown.usearch`, and, when descriptions are
+complete, `<index>.descriptions.usearch` and `<index>.combined.usearch`. Each has
+a `.manifest.json` sidecar. Valid caches are reconciled incrementally by stable
+item ID and vector hash; unchanged vectors retain their graph entries. Missing,
+corrupt, or incompatible sidecars are rebuilt from SQLite without model calls.
+F32 vectors are loaded into owned memory, not memory-mapped.
 
-When Slopdex makes external vector, description, or reranking model calls, stderr identifies the call kind, provider, and model. By default each combination is reported once per process regardless of request count. Pass `--verbose`, or set `"verbose": true` in config, to report every request. Cache hits do not produce notices because they do not call a model.
+An exclusive `<index>.lock` is held for the engine's lifetime. A competing command
+fails promptly with an index-in-use error; retry after it finishes. SQLite uses
+WAL and a 30-second busy timeout. See [architecture](implementation.md#architecture-and-code-map)
+for transaction and sidecar publication details.
 
-With complete descriptions, function results from `search` average **one-third code similarity + one-third callable-description similarity + one-third file-description similarity**. `search-descriptions` averages callable and file descriptions without code, while `search-code` uses code only. Markdown results retain their own chunk similarity and are ranked in the same candidate set as function results. Cross-repository analysis needs complete descriptions on both sides; otherwise the entire analysis uses code-only scores. Stale file descriptions remain searchable until explicitly reindexed. Thresholds and limits apply to the selected score.
+### Descriptions
 
-Text output labels combined scores. JSON exposes `codeSimilarity`, `descriptionSimilarity`, `fileDescriptionSimilarity`, and cross-search scoring mode/weights. Compare runs only with matching scoring mode, weights, embedding and description-generator profiles, threshold, and source/candidate filters.
+Descriptions are disabled initially. `descriptions enable` generates missing
+file/callable descriptions and saves the enabled setting; disabling stops their
+automatic generation and use in scoring while preserving reusable artifacts.
+Unchanged callable descriptions are reused. Ordinary edits refresh changed
+callables but retain existing file descriptions, which can become stale.
+`reindex-files` refreshes stale file descriptions; `--callables` also regenerates
+callable descriptions in those files. Matching cached regeneration artifacts can
+still be reused. Merely changing the configured description model does not
+regenerate all existing descriptions.
 
-### Exclusions
+File descriptions use the complete file source. Each callable request is a
+separate request containing its source, symbol, path, and file-description
+context. There is no continuing per-file chat conversation. `status` reports
+enabled state, profiles, description counts, and stale-file-description count.
 
-Root and nested `.gitignore` rules apply even to tracked files and without Git. Working-tree refreshes use current rules; committed-only snapshots use the target commit's rules. Refresh removes newly excluded files and discovers newly eligible ones. Explicit `update-files` rejects ignored files.
+### Native offline reuse and recovery
 
-Built-in exclusions: `.git`, `.slopdex`, `node_modules`, `dist`, `build`, `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`, `.mypy_cache`, `.pytest_cache`, and `target`. Config `include`/`exclude` globs narrow coverage; they cannot override built-in exclusions. Ignore exceptions cannot re-include files beneath an excluded parent directory. Files over 1 MiB are skipped unless `maxFileSize` is raised.
+`--no-reindex` (engine config `noReindex`) skips refresh completely, with or
+without Git, even for an empty index. It supports offline inspection and
+cross-search of an existing native index; missing derived USearch files can still
+be reconstructed locally. It does not make the database read-only or disable all
+network operations: uncached query vectors/reranking, `describe`, and explicit
+description regeneration still require their providers. Cached queries can run
+offline when the matching artifacts/results exist. Catalog commands still fetch
+their catalogs. Use the CLI flag: the CLI overwrites a JSON `noReindex` value with
+the flag's value on every invocation.
 
-### Failures and recovery
+Native index identity includes canonical root, native schema, and embedding
+profile (provider/model/dimensions/strategy). An incompatible identity requires
+`--force-reindex --yes-really-rebuild-the-index`. This clears native live records,
+metadata, and search results while retaining artifact/vector caches. A compatible
+index follows normal refresh even with that flag. It conflicts with
+`--no-reindex`. `--rebuild-on-divergence` is accepted with the same confirmation,
+but the current engine refreshes the working tree without a divergence gate;
+the flag adds no engine behavior.
 
-Parse, extraction, read, and file-size failures are saved while healthy callables remain searchable. Inspect them with `slopdex index-errors --format summary`. JSON includes paths, locations, recoverable names, messages, available source, and snapshot provenance. `status` reports `indexingErrorCount` and `failedFileCount`; `functionCount` counts searchable callables.
+### Legacy schema 11 import
 
-Saved failures trigger stderr warnings, including on cached runs, help, and cross-search targets. `--ignore-errors` silences warnings without clearing records. Updates retry failed files; successful indexing, deletion, or exclusion clears their diagnostics. Version output bypasses diagnostics.
+Opening a database with legacy TypeScript **schema 11** imports description
+enabled/profile settings and, when provider/model/dimensions match, reusable
+document embeddings and file/callable descriptions into the native namespace.
+Original tables are retained intact; `vec0` is neither loaded nor mutated.
+This is artifact reuse, not a direct conversion of the legacy live snapshot:
+normal refresh reparses current files and populates native live records/USearch.
+A legacy-only database opened with `--no-reindex` therefore has no imported live
+callables to search.
 
-Use the recovery flag named in the error: `--rebuild-on-divergence` for Git history changes, `--force-reindex` for incompatible indexes. Both require `--yes-really-rebuild-the-index`. Schema versions 6 and 7 migrate in place; earlier schemas require `--force-reindex`, with compatible rebuilds preserving reusable artifact caches. For provider/authentication failures, fix the reported configuration and rerun. For source-change-during-indexing errors, rerun after edits settle. Exit status is `0` on success, `2` for argument/domain errors, and `1` for other failures (or invocation without a command).
+Imported vectors must have valid F32 storage and matching dimensions. OpenAI
+document vectors are reused only for inputs at most 8191 bytes (the native
+truncation policy); Jina uses compatible passage/truncation semantics. Missing or
+non-equivalent vectors are recomputed when needed. The import marker and artifacts
+commit together so a failed import can be retried. Other nonempty legacy schemas
+are rejected; there is no schema-6/7 migration path or force bypass for them.
 
-## Configuration
+### Coverage and failures
 
-Optional file: `<root>/.slopdex/config.json`. Example using Jina embeddings, OpenAI LLM reranking, and OpenCode Go descriptions (requires `JINA_API_KEY`, `OPENAI_API_KEY` for query searches, plus `OPENCODE_API_KEY` or the `opencode-go` entry in `~/.local/share/opencode/auth.json` when descriptions are enabled):
+Supported extensions: TS/TSX (`ts`, `mts`, `cts`, `tsx`), JS/JSX (`js`, `mjs`,
+`cjs`, `jsx`), Python (`py`, `pyw`), Rust, Go, Java, C (`c`, `h`), and Markdown
+(`md`, `markdown`). Only recognized callables are code-search entries; Markdown
+uses bounded heading-aware chunks.
 
-Run `slopdex config` without arguments to configure every option interactively. Description generation is asked first; declining it skips all LLM provider and model prompts. OpenCode Zen and Go model choices are fetched from the selected provider and support type-to-filter selection.
+The ignore walker uses current root/nested `.gitignore`, Git exclude/global
+rules, and ignore-file rules, including without a Git repository. Config
+`include`/`exclude` globs further narrow repository-relative paths. Built-in
+excluded directories are `.git`, `.slopdex`, `node_modules`, `dist`, `build`,
+`coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`,
+`.mypy_cache`, `.pytest_cache`, and `target`. Inclusion globs cannot reopen these
+pruned directories. Refresh removes deleted/newly excluded entries.
+
+Read/UTF-8/size failures and parser diagnostics are saved; healthy callable
+siblings remain searchable where parsing permits. `maxFileSize` defaults to
+1 MiB. `index-errors` reports path, message, source mode, and available line
+locations. `status` reports `indexingErrorCount` and `failedFileCount`.
+Index-using commands warn about saved errors, including with `--no-reindex` and
+for separate cross-search targets. `--ignore-errors` silences warnings without
+clearing records. Help/version do not inspect diagnostics.
+
+Provider failures abort refresh before live publication; completed artifacts
+remain reusable. Refresh checks that HEAD and prepared file hashes have not
+changed before committing. Rerun after edits settle or provider problems are
+resolved. This check is not an atomic filesystem snapshot.
+
+## Root configuration and provider overrides
+
+The root defaults to the current directory; select another with `--root`. There
+is no automatic climb to a Git/project root. The default config is
+`<root>/.slopdex/config.json`, a JSON object; a missing file means defaults.
+`--config` selects another file. `--index` overrides `indexPath`, otherwise the
+index defaults to `<root>/.slopdex/index.sqlite`. Explicit relative config/index
+paths and relative JSON `indexPath` resolve from **the process working directory**,
+not the root or config's directory.
+
+Command-line provider/model/dimension settings override JSON. Target repositories
+load their own root-selected config, then receive the same global overrides.
+When neither description provider nor model is specified, the index's saved
+description profile supplies both. `descriptionsEnabled` in JSON overrides the
+saved index state; omission retains it. Config writes preserve unknown properties
+and replace the JSON file through a synced temporary file.
+
+Example `.slopdex/config.json`:
 
 ```json
 {
   "provider": "jina",
   "model": "jina-embeddings-v4",
   "dimensions": 1024,
+  "descriptionsEnabled": true,
+  "descriptionProvider": "opencode-go",
+  "descriptionModel": "gpt-5.6-luna",
+  "descriptionFallbackModel": "muse-spark-1.3-contributor",
   "rerankingEnabled": true,
   "rerankerProvider": "openai",
   "rerankerModel": "gpt-5.6-luna",
   "rerankerCandidates": 10,
-  "descriptionProvider": "opencode-go",
-  "descriptionModel": "gpt-5.6-luna",
-  "descriptionFallbackModel": "muse-spark-1.3-contributor",
-  "verbose": true,
   "exclude": ["**/fixtures/**"]
 }
 ```
 
-| Property | Purpose / default |
+| JSON settings | Native behavior/default |
 | --- | --- |
-| `provider`, `model`, `dimensions` | Embedding settings; defaults are listed in the CLI table. |
-| `descriptionProvider` | Description provider: `openai`, `opencode` (Zen), or `opencode-go`; defaults to `openai`. |
-| `descriptionModel` | Description model; provider default unless explicitly set. |
-| `descriptionFallbackModel` | Optional fallback description model on the same provider. A failure switches the active model, and failover retries use exponential backoff. |
-| `descriptionsEnabled` | When true or false, the next index-using command applies that enabled state during its normal refresh. Unset leaves persisted index state unchanged. |
-| `rerankingEnabled` | Enables second-stage ranking for query searches; disabled/unset by default. Prefer changing it through `config reranker`. |
-| `rerankerProvider` | Reranker: `cohere`, `jina`, or `openai`. OpenAI uses an LLM rather than a dedicated reranking endpoint. |
-| `rerankerModel` | Provider model; defaults to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, or OpenAI `gpt-5.6-luna`. |
-| `rerankerCandidates` | Embedding-ranked candidates sent to the OpenAI LLM; integer from `1` to `100`, default `10`. The requested result limit takes precedence when larger, up to 100. |
-| `indexPath` | Index location; `<root>/.slopdex/index.sqlite`. |
-| `include` | Repository-relative glob array; empty/unset includes all supported eligible files. |
-| `exclude` | Additional repository-relative exclusion globs. |
-| `maxFileSize` | Maximum source-file size in bytes; positive integer, default `1048576`. |
-| `embeddingBatchSize` | Embedding inputs per batch; positive integer, default `32`. |
-| `parallelism` | Concurrent external provider requests; positive integer, default `10`. |
-| `verbose` | When true, report every external model request on stderr; false/unset reports each call kind/provider/model once per process. |
+| `provider`, `model`, `dimensions` | OpenAI / `text-embedding-3-large` / `3072`; Jina defaults to `jina-embeddings-v4` / `1024`. OpenAI small/ada models default to `1536`. CLI: `--provider`, `--model`, `--dimensions`. |
+| `descriptionProvider`, `descriptionModel` | OpenAI / `gpt-5.6-luna`; OpenCode Zen (`opencode`) and Go (`opencode-go`) default to `muse-spark-1.3-contributor`. Corresponding `--description-*` options override them. |
+| `descriptionFallbackModel` | Optional same-provider fallback; CLI `--description-fallback-model`. Successful fallback stays active within that provider instance until it fails. |
+| `descriptionsEnabled` | Explicit enabled state, otherwise saved state/default false. |
+| `rerankingEnabled`, `rerankerProvider`, `rerankerModel` | Disabled by default; models default to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, OpenAI `gpt-5.6-luna`. |
+| `rerankerCandidates` | OpenAI candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
+| `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
+| `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`; larger configured values are capped. Interactive setup defaults to `32`. |
+| `embeddingBaseUrl`, `descriptionBaseUrl`, `rerankerBaseUrl` | Operation-specific HTTP(S) endpoint overrides; JSON only. Include the API version, e.g. `http://localhost:8080/v1`. |
+| `providerTimeoutMs` | Positive request timeout, default `60000`, capped at `300000`; connect timeout is 10 seconds. |
+| `providerMaxRetries` | Integer `0..5`, default `2`, for ordinary retryable HTTP failures. |
+| `retryDelayMs` | Nonnegative exponential-backoff base, default `250`; delays and numeric `Retry-After` are capped at 5 seconds. |
+| `parallelism` | Defaults to `10`; bounds concurrent embedding batches and callable descriptions within each file (also `config parallelism`). File descriptions run first, files are processed serially, and each successful HTTP result is cached immediately. |
+| `verbose` | External model-call notices go to stderr once per kind/provider/model per process by default; `true` (also `--verbose`) reports every outgoing attempt, including retries. Kinds are `vectors`, `descriptions`, and `reranking`; notices identify the actual model, including fallback, without credentials, URLs, or input. Construction and cache hits produce no model-call notices. |
 
-Keep keys in the environment (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`); OpenCode providers also fall back to `~/.local/share/opencode/auth.json`. Reranker settings do not change the stored index and do not require a rebuild. Changing the embedding profile requires rebuilding with `--force-reindex --yes-really-rebuild-the-index`.
+Aliases `embeddingProvider`, `embeddingModel`, `embeddingDimensions`, and
+`fallbackModel` normalize to their canonical properties; canonical values win.
+Embedding profiles include `strategyVersion: "rust-v1"`. Description profiles
+identify the configured primary with `strategyVersion: "callable-purpose-v2"`,
+even while fallback serves requests. Base URLs and credentials are not part of
+these profiles; changing an endpoint alone does not invalidate cached vectors.
 
-## Development
+Embedding URLs may already end in `/embeddings`; Cohere/Jina reranking URLs may
+end in `/rerank`. Description and OpenAI reranking bases receive the required
+protocol path. OpenAI descriptions use Responses; OpenCode protocol routing is
+model-dependent (Responses, Chat Completions, Messages, or Gemini). Overrides
+must serve the selected protocol. Live `models`/config catalog validation uses
+the public OpenCode endpoints, independently of these overrides.
 
-- [Implementation and library API](implementation.md)
+Credentials are resolved only when needed, in this order:
+
+1. Operation key: `embeddingApiKey`, `descriptionApiKey`, or `rerankerApiKey`.
+2. Provider key: `openaiApiKey`, `jinaApiKey`, `cohereApiKey`, or `opencodeApiKey`.
+3. Environment: `OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, or
+   `OPENCODE_API_KEY`.
+4. For OpenCode, the matching `opencode`/`opencode-go` entry's `key` in
+   `$XDG_DATA_HOME/opencode/auth.json`, or `~/.local/share/opencode/auth.json`.
+
+Prefer environment/stored credentials to committing keys in root config.
+Description failover and empty-output recovery allow at most six total attempts,
+without nested HTTP retries; invalid shared credentials (401) and redirects stop
+failover. See [implementation](implementation.md) for retry details and developer
+checks.
