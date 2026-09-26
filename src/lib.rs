@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod engine;
+pub mod git;
 pub mod models;
 pub mod parse;
 pub mod providers;

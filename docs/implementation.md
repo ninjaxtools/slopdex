@@ -167,8 +167,11 @@ complete descriptions and identical configured description profiles.
 
 USearch uses cosine HNSW, F32 storage, connectivity 16, insertion expansion 128,
 and search expansion 64. Data is copied into owned indexes, not memory-mapped.
-Eligibility predicates run inside graph traversal. The engine widens retrieval
-as needed for threshold ranges, then applies score bounds and result limits.
+Eligibility predicates run inside graph traversal. Returned candidates are rescored
+with F64 cosine arithmetic over the stored F32 vectors before threshold filtering,
+avoiding CPU-specific SIMD approximation errors at score boundaries. The engine
+widens retrieval as needed for threshold ranges, then applies score bounds and
+result limits.
 Exact fusion does not make HNSW exhaustive: neighbor membership/recall remain
 approximate, with no all-pairs/exact-scan fallback. Reranking consumes the
 retrieved query candidates; cross-search is never sent to a reranker.

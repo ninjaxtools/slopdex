@@ -20,7 +20,7 @@ const CONNECTIVITY: usize = 16;
 const EXPANSION_ADD: usize = 128;
 const EXPANSION_SEARCH: usize = 64;
 
-/// An owned, mutable-on-open F32 HNSW index. Searches use graph traversal only.
+/// An owned, mutable-on-open F32 HNSW index. Candidates come from graph traversal.
 pub struct VectorIndex {
     index: Index,
     dimensions: usize,
@@ -119,10 +119,11 @@ impl VectorIndex {
         Ok(Self { index, dimensions })
     }
 
-    /// Return up to `limit` allowed keys with cosine similarity (`1 - distance`).
+    /// Return up to `limit` allowed keys with cosine similarity.
     ///
     /// Filtering is applied inside USearch's graph traversal, not to an unfiltered
-    /// top-k list. Results are approximate and ordered by decreasing similarity.
+    /// top-k list. Candidate retrieval is approximate; returned candidates are
+    /// scored in F64 and ordered by decreasing similarity.
     /// Queries must have the configured dimensions, finite values and nonzero norm,
     /// including when the index, limit, or allowed set is empty.
     pub fn search(
@@ -153,12 +154,31 @@ impl VectorIndex {
             .index
             .filtered_search(&query, limit, allowed)
             .context("search vector index")?;
-        Ok(matches
-            .keys
-            .into_iter()
-            .zip(matches.distances)
-            .map(|(key, distance)| (key, 1.0 - f64::from(distance)))
-            .collect())
+        // Native SIMD cosine kernels use architecture-specific approximations,
+        // which can give identical vectors a similarity just below 1. Recompute
+        // only the returned candidates so strict threshold bounds are portable.
+        let query_norm: f64 = query.iter().map(|&v| f64::from(v).powi(2)).sum();
+        let mut stored = vec![0.0_f32; self.dimensions];
+        let mut results = Vec::with_capacity(matches.keys.len());
+        for key in matches.keys {
+            ensure!(
+                self.index
+                    .get(key, &mut stored)
+                    .context("read candidate vector")?
+                    == 1,
+                "missing candidate vector for key {key}"
+            );
+            let mut dot = 0.0;
+            let mut stored_norm = 0.0;
+            for (&a, &b) in query.iter().zip(&stored) {
+                dot += f64::from(a) * f64::from(b);
+                stored_norm += f64::from(b).powi(2);
+            }
+            let similarity = (dot / (query_norm * stored_norm).sqrt()).clamp(-1.0, 1.0);
+            results.push((key, similarity));
+        }
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Ok(results)
     }
 
     pub fn len(&self) -> usize {
@@ -676,6 +696,30 @@ mod tests {
         assert!(VectorIndex::open(&path, 2, 2, &[(u64::MAX, vec![1.0, 0.0])]).is_err());
         assert_eq!(fs::read(&path).unwrap(), binary);
         assert_eq!(fs::read(manifest_path(&path)).unwrap(), manifest);
+    }
+
+    #[test]
+    fn cosine_boundaries_preserve_identical_and_nearby_vectors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        let vectors = vec![
+            (1, vec![1.0, 0.0, 0.0, 0.0]),
+            (2, vec![1.0, 0.0001, 0.0, 0.0]),
+            (3, vec![0.0, 1.0, 0.0, 0.0]),
+            (4, vec![-1.0, 0.0, 0.0, 0.0]),
+        ];
+        for _ in 0..2 {
+            let index = VectorIndex::open(&path, 4, 1, &vectors).unwrap();
+            let results = index.search(&vectors[0].1, 4, &keys(&vectors)).unwrap();
+            assert_eq!(
+                results.iter().map(|r| r.0).collect::<Vec<_>>(),
+                [1, 2, 3, 4]
+            );
+            assert_eq!(results[0].1, 1.0);
+            assert!(results[1].1 > 0.99999999 && results[1].1 < 1.0);
+            assert_eq!(results[2].1, 0.0);
+            assert_eq!(results[3].1, -1.0);
+        }
     }
 
     #[test]

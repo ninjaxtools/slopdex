@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -12,7 +11,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::{
-    hash, parse,
+    git, hash, parse,
     providers::Providers,
     storage::{Database, File, Item},
     ui,
@@ -125,8 +124,8 @@ impl Engine {
             return Ok(json!({"skipped":true,"generation":self.db.generation()?}));
         }
         ui::progress("Scanning repository files");
-        let checkpoint = self.git_text(&["rev-parse", "--verify", "HEAD"]);
-        let dirty = self.dirty_paths()?;
+        let checkpoint = git::head(&self.root);
+        let dirty = git::dirty_paths(&self.root)?;
         let include = globs(&self.config["include"])?;
         let exclude = globs(&self.config["exclude"])?;
         let max_size = self.config["maxFileSize"].as_u64().unwrap_or(1_048_576);
@@ -229,7 +228,7 @@ impl Engine {
         // Never publish a mixture of snapshots if files changed while remote
         // providers were running. Their completed artifacts remain reusable.
         ensure!(
-            self.git_text(&["rev-parse", "--verify", "HEAD"]) == checkpoint,
+            git::head(&self.root) == checkpoint,
             "Git HEAD changed during indexing; rerun"
         );
         for (file, _) in &changed {
@@ -831,7 +830,13 @@ impl Engine {
         let kind = if combined { "combined" } else { "code" };
         let base = options["changedSince"]
             .as_str()
-            .map(|reference| self.resolve_base(reference))
+            .map(|reference| {
+                git::resolve_base(
+                    &self.root,
+                    reference,
+                    self.db.meta("checkpoint")?.as_deref(),
+                )
+            })
             .transpose()?;
         let key = hash(
             json!([
@@ -857,7 +862,7 @@ impl Engine {
             .transpose()?;
         let changed = base
             .as_deref()
-            .map(|reference| self.changed_identities(reference))
+            .map(|reference| git::changed_identities(&self.root, reference, &self.items))
             .transpose()?;
         let mut seen = HashSet::new();
         let mut results = Vec::new();
@@ -1045,102 +1050,13 @@ impl Engine {
         Ok(self.files.values().flat_map(|f| f.errors.clone()).collect())
     }
 
-    fn git_text(&self, args: &[&str]) -> Option<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(args)
-            .output()
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-    }
-
-    fn git_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(args)
-            .output()?;
-        ensure!(
-            output.status.success(),
-            "Git failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        Ok(output.stdout)
-    }
-
-    fn dirty_paths(&self) -> Result<HashSet<String>> {
-        if self.git_text(&["rev-parse", "--verify", "HEAD"]).is_none() {
-            return Ok(HashSet::new());
-        }
-        let mut bytes =
-            self.git_bytes(&["diff", "--relative", "--name-only", "-z", "HEAD", "--", "."])?;
-        bytes.extend(self.git_bytes(&["ls-files", "--others", "--exclude-standard", "-z"])?);
-        bytes
-            .split(|b| *b == 0)
-            .filter(|b| !b.is_empty())
-            .map(|b| Ok(String::from_utf8(b.to_vec())?))
-            .collect()
-    }
-
-    fn resolve_base(&self, reference: &str) -> Result<String> {
-        let resolved = self
-            .git_text(&[
-                "rev-parse",
-                "--verify",
-                "--end-of-options",
-                &format!("{reference}^{{commit}}"),
-            ])
-            .context("Cannot resolve --changed-since commit")?;
-        let head = self
-            .db
-            .meta("checkpoint")?
-            .context("--changed-since requires a Git checkpoint")?;
-        self.git_bytes(&["merge-base", "--is-ancestor", &resolved, &head])
-            .context("--changed-since must be an ancestor of the indexed commit")?;
-        Ok(resolved)
-    }
-
-    fn changed_identities(&self, resolved: &str) -> Result<HashSet<u64>> {
-        let prefix = self
-            .git_text(&["rev-parse", "--show-prefix"])
-            .unwrap_or_default();
-        let mut base = HashMap::<String, HashSet<(String, String)>>::new();
-        let mut changed = HashSet::new();
-        for item in self.items.iter().filter(|i| i.kind == "function") {
-            if !base.contains_key(&item.path) {
-                let source = self
-                    .git_bytes(&["show", &format!("{resolved}:{prefix}{}", item.path)])
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok());
-                let symbols = source
-                    .and_then(|s| parse::parse(&item.path, &s).ok())
-                    .map(|p| {
-                        p.callables
-                            .into_iter()
-                            .map(|c| (c.qualified_name, c.source_hash))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                base.insert(item.path.clone(), symbols);
-            }
-            if !base[&item.path].contains(&(
-                item.data["qualifiedName"].as_str().unwrap_or("").into(),
-                item.data["sourceHash"].as_str().unwrap_or("").into(),
-            )) {
-                changed.insert(item.id);
-            }
-        }
-        Ok(changed)
-    }
-
     fn normalize_path(&self, path: &str) -> Result<String> {
         let path = Path::new(path);
         if path.is_absolute() {
-            return relative(&self.root, path);
+            // Engine::open canonicalizes the root; resolve aliases here too
+            // before checking that an absolute source path is inside it.
+            let path = path.canonicalize().context("Cannot resolve source path")?;
+            return relative(&self.root, &path);
         }
         ensure!(
             !path
@@ -1261,4 +1177,42 @@ fn run_jobs<T: Sync, R: Send>(
         })?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn normalize_absolute_source_paths_through_symlinked_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        let alias = temp.path().join("alias");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/source.rs"), "fn source() {}")?;
+        fs::create_dir(&outside)?;
+        symlink(&root, &alias)?;
+        symlink(&outside, root.join("escape"))?;
+        let engine = Engine::open(&alias, &temp.path().join("index.sqlite"), json!({}))?;
+
+        // Both spellings must match the canonical root stored by Engine::open,
+        // including when a system temp directory itself is a symlink on macOS.
+        for base in [alias, root.canonicalize()?] {
+            for suffix in ["", "src", "src/source.rs"] {
+                assert_eq!(
+                    engine.normalize_path(base.join(suffix).to_str().unwrap())?,
+                    suffix
+                );
+            }
+        }
+        for path in [outside, root.join("escape"), root.join("../outside")] {
+            let error = engine.normalize_path(path.to_str().unwrap()).unwrap_err();
+            assert_eq!(error.to_string(), "Path is outside repository");
+        }
+        assert_eq!(engine.normalize_path("./src/source.rs")?, "src/source.rs");
+        assert!(engine.normalize_path("../outside").is_err());
+        Ok(())
+    }
 }
