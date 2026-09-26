@@ -887,16 +887,21 @@ fn run_config(
     let changed = match action {
         None => {
             ensure!(
-                io::stdin().is_terminal() && io::stdout().is_terminal(),
+                io::stdin().is_terminal() && io::stderr().is_terminal(),
                 "config without an action requires an interactive terminal"
             );
-            let stdin = io::stdin();
-            let stderr = io::stderr();
-            let mut prompts = Prompts {
-                input: stdin.lock(),
-                output: stderr.lock(),
-            };
-            configure_interactively(&mut config, &mut prompts)?;
+            cliclack::intro("slopdex configuration")?;
+            if let Err(error) = configure_interactively(&mut config, &mut CliclackPrompts) {
+                // cliclack 0.5.6 returns Interrupted for Esc/Ctrl-C; it does not exit.
+                if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                    matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof)
+                }) {
+                    cliclack::outro_cancel("Configuration cancelled; no settings saved")?;
+                    return Ok(());
+                }
+                cliclack::outro_cancel("Configuration failed; no settings saved")?;
+                return Err(error);
+            }
             config.clone()
         }
         Some(ConfigAction::Model { model }) => {
@@ -987,6 +992,24 @@ fn run_config(
         }
     };
     write_config(path, &config)?;
+    if action.is_none() {
+        let summary = [
+            "descriptionsEnabled", "descriptionProvider", "descriptionModel",
+            "descriptionFallbackModel", "rerankingEnabled", "rerankerProvider",
+            "rerankerModel", "rerankerCandidates", "provider", "model", "dimensions",
+            "indexPath", "include", "exclude", "maxFileSize", "embeddingBatchSize",
+            "parallelism", "verbose",
+        ]
+        .iter()
+        .filter_map(|key| config.get(*key).map(|value| format!("{key}: {value}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+        cliclack::note("Saved settings", summary)?;
+        cliclack::outro(format!("Updated {}", path.display()))?;
+        if global.format != Some(Format::Json) {
+            return Ok(());
+        }
+    }
     if global.format == Some(Format::Json) {
         let mut result = changed;
         result["configPath"] = json!(path);
@@ -1008,77 +1031,22 @@ fn run_config(
     }
 }
 
-struct Prompts<R, W> {
-    input: R,
-    output: W,
-}
-
-impl<R: BufRead, W: Write> Prompts<R, W> {
-    fn ask(&mut self, label: &str, default: &str) -> Result<String> {
-        write!(self.output, "{label} [{default}]: ")?;
-        self.output.flush()?;
-        let mut line = String::new();
-        ensure!(
-            self.input.read_line(&mut line)? > 0,
-            "interactive configuration cancelled (end of input); no settings saved"
-        );
-        let line = line.trim();
-        Ok(if line.is_empty() {
-            default.to_owned()
-        } else {
-            line.to_owned()
-        })
-    }
+trait Prompts {
+    fn ask(&mut self, label: &str, default: &str) -> Result<String>;
+    fn yes(&mut self, label: &str, default: bool) -> Result<bool>;
+    fn number(&mut self, label: &str, default: u64, max: Option<usize>) -> Result<usize>;
+    fn required(&mut self, label: &str, default: &str) -> Result<String>;
+    fn catalog(&mut self, provider: &str) -> Result<Value>;
+    fn select(
+        &mut self,
+        label: &str,
+        default: &str,
+        choices: &[&str],
+        searchable: bool,
+    ) -> Result<String>;
 
     fn choice(&mut self, label: &str, default: &str, choices: &[&str]) -> Result<String> {
-        loop {
-            let value = self.ask(&format!("{label} ({})", choices.join("/")), default)?;
-            if choices.contains(&value.as_str()) {
-                return Ok(value);
-            }
-            writeln!(self.output, "Choose one of: {}", choices.join(", "))?;
-        }
-    }
-
-    fn yes(&mut self, label: &str, default: bool) -> Result<bool> {
-        loop {
-            match self
-                .ask(label, if default { "yes" } else { "no" })?
-                .to_lowercase()
-                .as_str()
-            {
-                "y" | "yes" | "true" => return Ok(true),
-                "n" | "no" | "false" => return Ok(false),
-                _ => writeln!(self.output, "Enter yes or no.")?,
-            }
-        }
-    }
-
-    fn number(&mut self, label: &str, default: u64, max: Option<usize>) -> Result<usize> {
-        loop {
-            let value = self.ask(label, &default.to_string())?;
-            if let Ok(n) = positive(&value)
-                && max.is_none_or(|max| n <= max)
-            {
-                return Ok(n);
-            }
-            writeln!(
-                self.output,
-                "Enter a positive integer{}.",
-                max.map(|max| format!(" no greater than {max}"))
-                    .unwrap_or_default()
-            )?;
-        }
-    }
-
-    fn required(&mut self, label: &str, default: &str) -> Result<String> {
-        loop {
-            let value = self.ask(label, default)?;
-            if !value.is_empty() {
-                return Ok(value);
-            }
-            writeln!(self.output, "A value is required.")?;
-        }
+        self.select(label, default, choices, false)
     }
 
     fn published(
@@ -1093,7 +1061,7 @@ impl<R: BufRead, W: Write> Prompts<R, W> {
             .iter()
             .filter(|row| text(row, "provider") == provider)
             .map(|row| text(row, "model"))
-            .filter(|model| Some(*model) != excluded)
+            .filter(|model| !model.is_empty() && Some(*model) != excluded)
             .collect();
         ensure!(
             !models.is_empty(),
@@ -1102,44 +1070,82 @@ impl<R: BufRead, W: Write> Prompts<R, W> {
         let default = if models.contains(&current) {
             current
         } else {
-            ""
+            models[0]
         };
-        writeln!(
-            self.output,
-            "Available {provider} models:\n  {}",
-            models.join("\n  ")
-        )?;
-        loop {
-            let value = self.ask(&format!("{label} (model ID or filter text)"), default)?;
-            let value = value
-                .strip_prefix(&format!("{provider}/"))
-                .unwrap_or(&value);
-            if models.contains(&value) {
-                return Ok(value.to_owned());
-            }
-            let filtered: Vec<_> = models
-                .iter()
-                .filter(|model| model.to_lowercase().contains(&value.to_lowercase()))
-                .copied()
-                .collect();
-            writeln!(
-                self.output,
-                "Matching models:\n  {}",
-                if filtered.is_empty() {
-                    "(none)".into()
-                } else {
-                    filtered.join("\n  ")
-                }
-            )?;
-        }
+        self.select(label, default, &models, true)
     }
 }
 
-fn configure_interactively<R: BufRead, W: Write>(
-    config: &mut Value,
-    prompts: &mut Prompts<R, W>,
-) -> Result<()> {
-    normalize_config_aliases(config);
+struct CliclackPrompts;
+
+impl Prompts for CliclackPrompts {
+    fn ask(&mut self, label: &str, default: &str) -> Result<String> {
+        let value: String = cliclack::input(label)
+            .required(false)
+            .default_input(default)
+            .interact()?;
+        Ok(value.trim().to_owned())
+    }
+
+    fn select(
+        &mut self,
+        label: &str,
+        default: &str,
+        choices: &[&str],
+        searchable: bool,
+    ) -> Result<String> {
+        let mut prompt = cliclack::select(label).max_rows(10);
+        for choice in choices {
+            prompt = prompt.item(choice.to_string(), choice, "");
+        }
+        prompt = prompt.initial_value(default.to_owned());
+        if searchable {
+            prompt = prompt.filter_mode();
+        }
+        Ok(prompt.interact()?)
+    }
+
+    fn yes(&mut self, label: &str, default: bool) -> Result<bool> {
+        Ok(cliclack::confirm(label).initial_value(default).interact()?)
+    }
+
+    fn number(&mut self, label: &str, default: u64, max: Option<usize>) -> Result<usize> {
+        Ok(cliclack::input(label)
+            .default_input(&default.to_string())
+            .validate(move |value: &String| {
+                let n = positive(value)?;
+                if max.is_some_and(|max| n > max) {
+                    return Err(format!("Enter a positive integer no greater than {}", max.unwrap()));
+                }
+                Ok(())
+            })
+            .interact::<usize>()?)
+    }
+
+    fn required(&mut self, label: &str, default: &str) -> Result<String> {
+        let value: String = cliclack::input(label)
+            .default_input(default)
+            .validate(|value: &String| {
+                if value.trim().is_empty() {
+                    Err("A value is required")
+                } else {
+                    Ok(())
+                }
+            })
+            .interact()?;
+        Ok(value.trim().to_owned())
+    }
+
+    fn catalog(&mut self, provider: &str) -> Result<Value> {
+        crate::ui::spin("Fetching published models", || Providers::models(Some(provider)))
+    }
+}
+
+fn configure_interactively(saved: &mut Value, prompts: &mut impl Prompts) -> Result<()> {
+    // Stage even alias migration locally so cancellation and validation failures
+    // leave the caller's configuration untouched.
+    let mut config = saved.clone();
+    normalize_config_aliases(&mut config);
     let existing = config.clone();
     let enabled = prompts.yes(
         "Generate file and function descriptions with an LLM?",
@@ -1163,7 +1169,7 @@ fn configure_interactively<R: BufRead, W: Write>(
         let catalog = if provider == "openai" {
             None
         } else {
-            Some(Providers::models(Some(&provider))?)
+            Some(prompts.catalog(&provider)?)
         };
         let model = if let Some(catalog) = &catalog {
             prompts.published(catalog, &provider, "Description model", current, None)?
@@ -1309,7 +1315,9 @@ fn configure_interactively<R: BufRead, W: Write>(
         "Log every external model request?",
         existing["verbose"].as_bool().unwrap_or(false)
     )?);
-    validate_config(config)
+    validate_config(&config)?;
+    *saved = config;
+    Ok(())
 }
 
 fn warn_errors(engine: &Engine, index: &Path, ignore: bool) -> Result<()> {

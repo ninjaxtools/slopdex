@@ -283,8 +283,10 @@ fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
         "Invalid stored vector length"
     );
     let values: Vec<_> = bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     ensure!(
         values.iter().all(|v| v.is_finite()),
