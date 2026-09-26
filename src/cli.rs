@@ -2449,4 +2449,605 @@ mod tests {
             assert_eq!(read_config(&path).unwrap()["custom"], "keep");
         }
     }
+
+    #[test]
+    fn config_read_distinguishes_missing_files_from_invalid_or_unreadable_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        assert_eq!(read_config(&path).unwrap(), json!({}));
+        for bytes in [
+            b"".as_slice(),
+            b"{\"provider\":",
+            b"{} {}",
+            b"{\"model\":\"\xff\"}",
+            b"null",
+            b"[]",
+            b"true",
+            b"42",
+            b"\"openai\"",
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let error = read_config(&path).unwrap_err();
+            assert!(format!("{error:#}").contains(&path.display().to_string()));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        let error = read_config(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("read config"));
+    }
+
+    #[test]
+    fn invalid_config_settings_cannot_partially_persist_a_config_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        let cli = parse(&["config", "descriptions", "enable", "--format", "json"]);
+        let Command::Config { action } = cli.command else {
+            panic!()
+        };
+        let mut cases = Vec::new();
+        for key in ["provider", "descriptionProvider"] {
+            for value in [Value::Null, json!(false), json!("unsupported")] {
+                cases.push((key, value));
+            }
+        }
+        for key in [
+            "model",
+            "indexPath",
+            "descriptionModel",
+            "descriptionFallbackModel",
+        ] {
+            for value in [Value::Null, json!(42), json!(" \t\n")] {
+                cases.push((key, value));
+            }
+        }
+        for key in [
+            "dimensions",
+            "maxFileSize",
+            "embeddingBatchSize",
+            "parallelism",
+        ] {
+            for value in [json!(0), json!(-1), json!(1.5), json!("4"), Value::Null] {
+                cases.push((key, value));
+            }
+        }
+        for key in ["rerankingEnabled", "verbose"] {
+            for value in [json!("false"), json!(0), Value::Null] {
+                cases.push((key, value));
+            }
+        }
+        for key in ["include", "exclude"] {
+            for value in [json!("src/**"), json!(["src/**", 1]), json!(["["])] {
+                cases.push((key, value));
+            }
+        }
+        cases.extend([
+            ("rerankerProvider", json!("unknown")),
+            ("rerankerModel", json!("  ")),
+            ("rerankerCandidates", json!(0)),
+            ("rerankerCandidates", json!(101)),
+            ("rerankerCandidates", json!("10")),
+        ]);
+        for (key, value) in cases {
+            let mut config = json!({"rerankingEnabled": true, "rerankerProvider": "openai",
+                "custom": {"keep": [1, 2]}});
+            config[key] = value;
+            let original = serde_json::to_vec(&config).unwrap();
+            fs::write(&path, &original).unwrap();
+            let mut out = Vec::new();
+            let error = run_config(&cli.global, &path, action.as_ref(), &mut out).unwrap_err();
+            assert!(format!("{error:#}").contains(key), "{key}: {error:#}");
+            assert!(out.is_empty(), "reported success for invalid {key}");
+            assert_eq!(fs::read(&path).unwrap(), original, "modified invalid {key}");
+        }
+        let absent = temp.path().join("new/config.json");
+        assert!(write_config(&absent, &json!({"dimensions": 0})).is_err());
+        assert!(!absent.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn failed_config_replacement_preserves_destination_and_allows_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        // A nonempty directory forces failure after the temporary file is written.
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), b"original").unwrap();
+        let config = json!({"parallelism": 3});
+        let error = write_config(&path, &config).unwrap_err();
+        assert!(error.to_string().contains("save config"));
+        assert_eq!(fs::read(path.join("keep")).unwrap(), b"original");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+        fs::remove_file(path.join("keep")).unwrap();
+        fs::remove_dir(&path).unwrap();
+        write_config(&path, &config).unwrap();
+        assert_eq!(read_config(&path).unwrap(), config);
+        assert!(fs::read(&path).unwrap().ends_with(b"\n"));
+    }
+
+    fn config_action_json(path: &Path, args: &[&str]) -> Value {
+        let cli = parse(&[args, &["--format", "json"]].concat());
+        let Command::Config { action } = cli.command else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        run_config(&cli.global, path, action.as_ref(), &mut out).unwrap();
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn unrelated_config_edits_durably_normalize_aliases_without_saving_global_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(
+            &path,
+            json!({"provider": null, "embeddingProvider": "jina",
+            "model": "canonical", "embeddingModel": "obsolete", "dimensions": null,
+            "embeddingDimensions": 16, "descriptionFallbackModel": "backup", "fallbackModel": null,
+            "custom": {"nested": [null, "λ"]}})
+            .to_string(),
+        )
+        .unwrap();
+        let result = config_action_json(
+            &path,
+            &[
+                "config",
+                "parallelism",
+                "4",
+                "--provider",
+                "openai",
+                "--model",
+                "transient",
+                "--dimensions",
+                "8",
+                "--no-reindex",
+            ],
+        );
+        assert_eq!(result, json!({"configPath": path, "parallelism": 4}));
+        let expected = json!({"provider": "jina", "model": "canonical", "dimensions": 16,
+            "descriptionFallbackModel": "backup", "parallelism": 4,
+            "custom": {"nested": [null, "λ"]}});
+        // Inspect raw JSON: read_config would hide aliases accidentally left on disk.
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, expected);
+        config_action_json(&path, &["config", "parallelism", "4"]);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expected
+        );
+        let effective = effective_config(&parse(&["status"]).global, &path).unwrap();
+        assert_eq!(effective["provider"], "jina");
+        assert_eq!(effective["dimensions"], 16);
+        assert_eq!(effective["noReindex"], false);
+    }
+
+    #[test]
+    fn reranker_config_transitions_retain_same_provider_settings_and_reset_on_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        write_config(
+            &path,
+            &json!({"rerankingEnabled": true, "rerankerProvider": "openai",
+            "rerankerModel": "custom-model", "rerankerCandidates": 37, "custom": "keep"}),
+        )
+        .unwrap();
+        assert_eq!(
+            config_action_json(&path, &["config", "reranker", "disable"]),
+            json!({"configPath": path, "rerankingEnabled": false})
+        );
+        let disabled = read_config(&path).unwrap();
+        assert_eq!(disabled["rerankerModel"], "custom-model");
+        assert_eq!(disabled["rerankerCandidates"], 37);
+        let enabled = config_action_json(&path, &["config", "reranker", "openai"]);
+        assert_eq!(enabled["rerankingEnabled"], true);
+        assert_eq!(enabled["rerankerModel"], "custom-model");
+        assert_eq!(enabled["rerankerCandidates"], 37);
+        config_action_json(&path, &["config", "reranker", "jina"]);
+        let switched = read_config(&path).unwrap();
+        assert_eq!(switched["rerankerModel"], "jina-reranker-v3.5");
+        assert!(switched.get("rerankerCandidates").is_none());
+        config_action_json(&path, &["config", "reranker", "openai", "replacement"]);
+        let restored = read_config(&path).unwrap();
+        assert_eq!(restored["rerankerModel"], "replacement");
+        assert_eq!(restored["rerankerCandidates"], 10);
+        assert_eq!(restored["custom"], "keep");
+    }
+
+    #[test]
+    fn selected_root_does_not_rebase_explicit_config_or_saved_index_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo with spaces");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            config_path(&root, None).unwrap(),
+            root.join(".slopdex/config.json")
+        );
+        assert_eq!(
+            config_path(&root, Some(Path::new("settings/custom.json"))).unwrap(),
+            cwd.join("settings/custom.json")
+        );
+        let config_file = temp.path().join("elsewhere/config.json");
+        write_config(&config_file, &json!({"indexPath": "indexes/saved.sqlite"})).unwrap();
+        let config = read_config(&config_file).unwrap();
+        assert_eq!(
+            index_path(&root, None, &config).unwrap(),
+            cwd.join("indexes/saved.sqlite")
+        );
+        let explicit = temp.path().join("override.sqlite");
+        assert_eq!(
+            index_path(&root, Some(&explicit), &config).unwrap(),
+            explicit
+        );
+        assert_eq!(config_path(&root, Some(&config_file)).unwrap(), config_file);
+        let cli = parse(&["status", "--index", "relative/override.sqlite"]);
+        let effective = effective_config(&cli.global, &config_file).unwrap();
+        assert_eq!(
+            effective["indexPath"],
+            json!(cwd.join("relative/override.sqlite"))
+        );
+        assert_eq!(read_config(&config_file).unwrap(), config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_handles_hard_links_symlink_parents_and_resolution_failures() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("index.sqlite");
+        let hard_link = temp.path().join("hard.sqlite");
+        let different = temp.path().join("different.sqlite");
+        fs::write(&original, b"same bytes").unwrap();
+        fs::hard_link(&original, &hard_link).unwrap();
+        fs::write(&different, b"same bytes").unwrap();
+        assert!(same_path(&original, &hard_link).unwrap());
+        assert!(!same_path(&original, &different).unwrap());
+        let nested = temp.path().join("actual/nested");
+        fs::create_dir_all(&nested).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&nested, &alias).unwrap();
+        let via_parent = alias.join("../missing/index.sqlite");
+        assert!(
+            same_path(
+                &via_parent,
+                &temp.path().join("actual/missing/index.sqlite")
+            )
+            .unwrap()
+        );
+        assert!(!same_path(&via_parent, &temp.path().join("missing/index.sqlite")).unwrap());
+        assert!(same_path(&original.join("child"), &different).is_err());
+        let cycle = temp.path().join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        assert!(same_path(&cycle, &original).is_err());
+    }
+
+    #[test]
+    fn argument_errors_cover_global_constraints_and_conflicting_model_selections() {
+        for args in [
+            vec!["status", "--rebuild-on-divergence"],
+            vec![
+                "status",
+                "--no-reindex",
+                "--force-reindex",
+                "--yes-really-rebuild-the-index",
+            ],
+            vec!["refresh", "--target", "main"],
+            vec!["search", " \n\t"],
+            vec!["status", "--model", " "],
+            vec!["status", "--dimensions", "18446744073709551616"],
+            vec!["config", "parallelism", "0"],
+            vec![
+                "config",
+                "reranker",
+                "openai",
+                "--reranker-candidates",
+                "101",
+            ],
+            vec!["search-code", "query", "--regexp", "(?=lookahead)"],
+            vec!["search-code", "query", "--regexp", r"(a)\1"],
+        ] {
+            let error = Cli::try_parse_from(std::iter::once("slopdex").chain(args.iter().copied()))
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+        for (args, message) in [
+            (
+                vec![
+                    "models",
+                    "opencode",
+                    "--description-provider",
+                    "opencode-go",
+                ],
+                "must match",
+            ),
+            (
+                vec!["models", "--description-provider", "openai"],
+                "opencode or opencode-go",
+            ),
+            (
+                vec!["config", "model", "first", "--description-model", "second"],
+                "must match",
+            ),
+            (
+                vec![
+                    "config",
+                    "fallback-model",
+                    "first",
+                    "--description-fallback-model",
+                    "second",
+                ],
+                "must match",
+            ),
+            (vec!["config", "model", " \t"], "must not be empty"),
+            (
+                vec!["config", "reranker", "jina", "--reranker-candidates", "10"],
+                "requires config reranker openai",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("slopdex").chain(args.iter().copied()))
+                .unwrap();
+            assert!(
+                cli.validate().unwrap_err().to_string().contains(message),
+                "{args:?}"
+            );
+        }
+        parse(&["models", "opencode", "--description-provider", "opencode"]);
+        parse(&["config", "model", "same", "--description-model", "same"]);
+        parse(&[
+            "config",
+            "fallback-model",
+            "same",
+            "--description-fallback-model",
+            "same",
+        ]);
+        parse(&[
+            "refresh",
+            "--target",
+            "HEAD",
+            "--rebuild-on-divergence",
+            "--yes-really-rebuild-the-index",
+        ]);
+        let cli = parse(&["search-description", "--", "--literal query"]);
+        let Command::SearchDescriptions(args) = cli.command else {
+            panic!()
+        };
+        assert_eq!(args.query, "--literal query");
+    }
+
+    #[test]
+    fn search_outputs_preserve_json_metadata_and_explain_summary_scores_and_content() {
+        let rows = vec![
+            json!({"type": "code", "function": {"path": "src/λ.rs", "name": "fallback",
+                "qualifiedName": "Service.run", "description": "Purpose\nsecond line"},
+                "similarity": 0.6, "rerankScore": 0.95, "codeSimilarity": 0.3,
+                "descriptionSimilarity": 0.6, "fileDescriptionSimilarity": 0.9,
+                "custom": {"escaped": "\"quoted\"\n"}}),
+            json!({"type": "markdown", "similarity": 0.7, "chunk": {"path": "guide.md",
+                "startLine": 12, "headingPath": ["Setup", "Credentials"], "content": "Use `KEY`.\nNext step."}}),
+            json!({"type": "description", "similarity": 0.4, "descriptionSimilarity": 0.2,
+                "fileDescriptionSimilarity": 0.6, "function": {"path": "other.rs", "name": "fallback"}}),
+        ];
+        let mut out = Vec::new();
+        print_search(&mut out, &rows, Format::Json, true).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!(rows));
+        assert!(out.ends_with(b"\n"));
+        out.clear();
+        print_search(&mut out, &rows, Format::Summary, true).unwrap();
+        let summary = String::from_utf8(out).unwrap();
+        assert_eq!(
+            summary,
+            concat!(
+                "0.9500 rerank (0.6000 similarity)  src/λ.rs :: Service.run  [combined thirds; code 0.3000, description 0.6000, file 0.9000]\n",
+                "Purpose\nsecond line\n",
+                "0.7000  guide.md:12 :: Setup > Credentials\nUse `KEY`.\nNext step.\n",
+                "0.4000  other.rs :: fallback  [combined 50/50; description 0.2000, file 0.6000]\n"
+            )
+        );
+        let mut out = Vec::new();
+        print_search(&mut out, &rows, Format::Summary, false).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            summary.replace("Purpose\nsecond line\n", "")
+        );
+    }
+
+    #[test]
+    fn empty_results_obey_array_jsonl_and_plain_output_contracts() {
+        let mut out = Vec::new();
+        print_search(&mut out, &[], Format::Json, false).unwrap();
+        assert_eq!(out, b"[]\n");
+        out.clear();
+        print_errors(&mut out, &[], Format::Json).unwrap();
+        assert_eq!(out, b"[]\n");
+        out.clear();
+        print_search(&mut out, &[], Format::Summary, false).unwrap();
+        assert_eq!(out, b"No matches.\n");
+        out.clear();
+        print_errors(&mut out, &[], Format::Summary).unwrap();
+        assert_eq!(out, b"No indexing errors.\n");
+        for (format, expected) in [
+            (Format::Json, ""),
+            (Format::Summary, "No matches.\n"),
+            (Format::Clusters, "No clusters.\n"),
+        ] {
+            out.clear();
+            print_cross(
+                &mut out,
+                vec![json!({"source": function("a"), "matches": []})],
+                format,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(out, expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn indexing_error_output_retains_diagnostics_and_uses_available_locations() {
+        let errors = vec![
+            json!({"path": "src/a.rs", "filePath": "old.rs", "startLine": 7, "startColumn": 3,
+                "qualifiedName": "Service.run", "name": "run", "message": "unexpected token",
+                "sourceMode": "working-tree", "extra": ["kept"]}),
+            json!({"filePath": "src/b.rs", "startLine": 2, "name": "fallback", "message": "bad UTF-8"}),
+            json!({"message": "read failed\ncaused by: missing file"}),
+        ];
+        let mut out = Vec::new();
+        print_errors(&mut out, &errors, Format::Json).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap(),
+            json!(errors)
+        );
+        out.clear();
+        print_errors(&mut out, &errors, Format::Summary).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "src/a.rs:7:3 :: Service.run  unexpected token\n",
+                "src/b.rs:2 :: fallback  bad UTF-8\n",
+                "(unknown file)  read failed\ncaused by: missing file\n"
+            )
+        );
+    }
+
+    #[test]
+    fn cross_jsonl_limits_matched_sources_without_truncating_edges_or_metadata() {
+        let mut first = edge("a", "b", 0.8);
+        first["source"]["description"] = json!("line one\n\"line two\" λ");
+        first["scoring"] = json!({"mode": "combined", "weights": [1, 1, 1]});
+        first["matches"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"function": function("c"),
+            "similarity": 0.9, "descriptionSimilarity": 0.8, "fileDescriptionSimilarity": 1.0}));
+        let rows = vec![
+            json!({"source": function("empty"), "matches": []}),
+            first.clone(),
+            edge("x", "y", 0.7),
+        ];
+        let mut out = Vec::new();
+        print_cross(&mut out, rows.clone(), Format::Json, false, false, Some(1)).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.ends_with('\n'));
+        assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), first);
+        let mut out = Vec::new();
+        print_cross(&mut out, rows, Format::Summary, false, false, Some(1)).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.starts_with("src/a.rs :: a\n"));
+        assert!(output.contains("src/b.rs :: b"));
+        assert!(output.contains("src/c.rs :: c"));
+        assert!(!output.contains("src/x.rs"));
+    }
+
+    #[test]
+    fn cross_repository_clusters_do_not_merge_swapped_or_identical_node_ids() {
+        let rows = vec![edge("a", "b", 0.8), edge("b", "a", 0.9)];
+        let grouped = clusters(&rows, false);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(
+            grouped[0].members,
+            ["[source] src/a.rs:1:1 :: a", "[target] src/b.rs:1:1 :: b"]
+        );
+        assert_eq!(
+            grouped[1].members,
+            ["[source] src/b.rs:1:1 :: b", "[target] src/a.rs:1:1 :: a"]
+        );
+        assert_eq!((grouped[0].min, grouped[0].max), (0.8, 0.8));
+        assert_eq!((grouped[1].min, grouped[1].max), (0.9, 0.9));
+        assert_eq!(clusters(&rows, true).len(), 1);
+        let mut same_id = edge("a", "a", 0.7);
+        same_id["source"]["id"] = json!(0);
+        same_id["matches"][0]["function"]["id"] = json!(0);
+        let mut out = Vec::new();
+        print_cross(
+            &mut out,
+            vec![same_id],
+            Format::Clusters,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "Cluster 1 (2 functions, similarity 0.7000)\n",
+                "  [source] src/a.rs:1:1 :: a\n",
+                "  [target] src/a.rs:1:1 :: a\n"
+            )
+        );
+    }
+
+    #[test]
+    fn clusters_distinguish_missing_id_locations_and_ignore_self_edges() {
+        let a = json!({"path": "same.rs", "name": "overload", "startLine": 4, "startColumn": 1});
+        let b = json!({"id": null, "path": "same.rs", "name": "overload", "startLine": 4, "startColumn": 9});
+        let c = json!({"path": "same.rs", "name": "overload", "startLine": 8, "startColumn": 1});
+        let rows = vec![
+            json!({"source": a, "matches": [
+                {"function": a, "similarity": 1.0}, {"function": b, "similarity": 0.6}]}),
+            json!({"source": b, "matches": [
+                {"function": a, "similarity": 0.6}, {"function": c, "similarity": 0.8, "descriptionSimilarity": 0.7}]}),
+            edge("orphan", "orphan", 1.0),
+        ];
+        let grouped = clusters(&rows, true);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(
+            grouped[0].members,
+            [
+                "same.rs:4:1 :: overload",
+                "same.rs:4:9 :: overload",
+                "same.rs:8:1 :: overload"
+            ]
+        );
+        assert_eq!((grouped[0].min, grouped[0].max), (0.6, 0.8));
+        let mut expected = Vec::new();
+        print_cross(
+            &mut expected,
+            rows.clone(),
+            Format::Clusters,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&expected)
+                .contains("combined code + callable description + file description")
+        );
+        let mut reversed = rows;
+        reversed.reverse();
+        let mut actual = Vec::new();
+        print_cross(&mut actual, reversed, Format::Clusters, true, false, None).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn output_failures_are_returned_for_json_summary_and_cluster_writers() {
+        struct BrokenPipe;
+        impl Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let rows = vec![edge("a", "b", 0.9)];
+        for format in [Format::Json, Format::Summary] {
+            assert!(
+                print_search(
+                    &mut BrokenPipe,
+                    &[json!({"function": function("a")})],
+                    format,
+                    false
+                )
+                .is_err()
+            );
+            assert!(
+                print_errors(&mut BrokenPipe, &[json!({"message": "failure"})], format).is_err()
+            );
+            assert!(print_cross(&mut BrokenPipe, rows.clone(), format, true, false, None).is_err());
+        }
+        assert!(print_cross(&mut BrokenPipe, rows, Format::Clusters, true, false, None).is_err());
+    }
 }

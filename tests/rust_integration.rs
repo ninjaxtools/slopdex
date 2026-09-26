@@ -35,6 +35,7 @@ struct MockState {
     fail_embedding_containing: Option<String>,
     errors: Vec<String>,
     concurrent: Option<Arc<ConcurrentRequests>>,
+    on_next_request: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
 }
 
 struct Mock {
@@ -153,6 +154,10 @@ impl Mock {
 
     fn fail_on(&self, marker: Option<&str>) {
         self.state.lock().unwrap().fail_embedding_containing = marker.map(str::to_owned);
+    }
+
+    fn on_next_request(&self, action: impl FnOnce() -> Result<()> + Send + 'static) {
+        self.state.lock().unwrap().on_next_request = Some(Box::new(action));
     }
 }
 
@@ -277,7 +282,11 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
         _ => anyhow::bail!("unexpected local endpoint"),
     };
     let concurrent = state.concurrent.clone();
+    let on_request = state.on_next_request.take();
     drop(state);
+    if let Some(action) = on_request {
+        action()?;
+    }
     let request = Request { path, body };
     if let Some(concurrent) = concurrent
         && concurrent.work.matches(&request)
@@ -821,6 +830,523 @@ fn concurrency_embedding_successes_after_peer_failure_are_persisted_and_reused()
 #[test]
 fn concurrency_callable_successes_after_peer_failure_are_persisted_and_reused() -> Result<()> {
     assert_concurrent_paid_work_survives_failure(ConcurrentWork::Callables)
+}
+
+#[test]
+fn query_threshold_endpoints_apply_to_code_and_markdown_and_survive_restart() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    for (name, marker) in [
+        ("east", "VECTOR_EAST"),
+        ("mid", "VECTOR_MID"),
+        ("north", "VECTOR_NORTH"),
+        ("west", "VECTOR_WEST"),
+    ] {
+        repo.write(&format!("{name}.rs"), &function(name, marker))?;
+        repo.write(&format!("{name}.md"), &format!("# {name}\n\n{marker}\n"))?;
+    }
+    let config = mock.config();
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let mut saved = Vec::new();
+    for (options, expected) in [
+        (json!({"minSimilarity": 1.0}), vec!["east"]),
+        (
+            json!({"minSimilarity": 0.0, "maxSimilarity": 1.0}),
+            vec!["mid", "north"],
+        ),
+        (
+            json!({"minSimilarity": -1.0, "maxSimilarity": 0.0}),
+            vec!["west"],
+        ),
+        (
+            json!({"minSimilarity": -1.0, "maxSimilarity": -0.5}),
+            vec!["west"],
+        ),
+        (json!({"minSimilarity": 0.9, "maxSimilarity": 1.0}), vec![]),
+    ] {
+        for kind in ["search-code", "search-md"] {
+            let rows = engine.search("east", kind, &options)?;
+            let actual: Vec<_> = rows
+                .iter()
+                .map(|r| {
+                    if kind == "search-code" {
+                        r["function"]["qualifiedName"].as_str().unwrap()
+                    } else {
+                        r["chunk"]["headingPath"][0].as_str().unwrap()
+                    }
+                })
+                .collect();
+            assert_eq!(actual, expected, "{kind}: {options}");
+            assert_eq!(engine.search("east", kind, &options)?, rows);
+            saved.push((kind, options.clone(), rows));
+        }
+    }
+    let calls = mock.count();
+    drop(engine);
+    let engine = repo.open(&config)?;
+    for (kind, options, expected) in saved {
+        assert_eq!(engine.search("east", kind, &options)?, expected);
+    }
+    assert_eq!(mock.count(), calls);
+    assert_eq!(
+        mock.embedding_inputs()
+            .iter()
+            .filter(|s| *s == "east")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn cross_search_threshold_endpoints_exclude_self_and_use_only_indexed_vectors() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    for (name, marker) in [
+        ("source", "VECTOR_EAST"),
+        ("twin", "VECTOR_EAST"),
+        ("north", "VECTOR_NORTH"),
+        ("west", "VECTOR_WEST"),
+    ] {
+        repo.write(&format!("{name}.rs"), &function(name, marker))?;
+    }
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let calls = mock.count();
+    for (minimum, maximum, expected, score) in [
+        (1.0, None, "twin", 1.0),
+        (0.0, Some(1.0), "north", 0.0),
+        (-1.0, Some(0.0), "west", -1.0),
+    ] {
+        let options = json!({"regexp": "^source$", "matches": 1,
+            "minSimilarity": minimum, "maxSimilarity": maximum});
+        let rows = engine.cross_search(None, &options)?;
+        assert_eq!(sources(&rows), strings(&["source"]));
+        let matches = rows[0]["matches"].as_array().unwrap();
+        assert_eq!(names(matches), strings(&[expected]));
+        assert_eq!(matches[0]["similarity"], score);
+        assert_eq!(engine.cross_search(None, &options)?, rows);
+    }
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn mixed_search_limits_are_global_and_explicit_modes_select_only_requested_streams() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(
+        "code.rs",
+        &(function("east", "VECTOR_EAST") + &function("north", "VECTOR_NORTH")),
+    )?;
+    repo.write("mid.md", "# Mid\n\nVECTOR_MID\n")?;
+    repo.write("west.md", "# West\n\nVECTOR_WEST\n")?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let rows = engine.search("east", "search", &all())?;
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["function", "markdown", "function", "markdown"]
+    );
+    assert_eq!(rows[0]["function"]["qualifiedName"], "east");
+    assert_eq!(rows[1]["chunk"]["headingPath"], json!(["Mid"]));
+    for limit in [1, 2, 3, 4, 10] {
+        assert_eq!(
+            engine.search(
+                "east",
+                "search",
+                &json!({"limit": limit, "minSimilarity": -1})
+            )?,
+            rows[..limit.min(rows.len())]
+        );
+    }
+    for (flag, kind) in [("code", "search-code"), ("md", "search-md")] {
+        let mut options = all();
+        options[flag] = json!(true);
+        assert_eq!(
+            engine.search("east", "search", &options)?,
+            engine.search("east", kind, &all())?
+        );
+    }
+    assert_eq!(
+        engine.search(
+            "east",
+            "search",
+            &json!({"code": true, "md": true, "minSimilarity": -1})
+        )?,
+        rows
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_search_caches_are_invalidated_when_items_are_added_or_removed() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.refresh()?["generation"], 0);
+    assert!(engine.cross_search(None, &all())?.is_empty());
+    assert_eq!(mock.count(), 0);
+    for kind in ["search", "search-code", "search-md"] {
+        assert!(engine.search("east", kind, &all())?.is_empty());
+    }
+    assert_eq!(mock.embedding_inputs(), ["east"]);
+    repo.write("new.rs", &function("added", "VECTOR_EAST"))?;
+    assert_eq!(engine.refresh()?["generation"], 1);
+    assert_eq!(
+        names(&engine.search("east", "search", &all())?),
+        strings(&["added"])
+    );
+    fs::remove_file(repo.root.join("new.rs"))?;
+    assert_eq!(engine.refresh()?["generation"], 2);
+    assert!(engine.search("east", "search", &all())?.is_empty());
+    let calls = mock.count();
+    drop(engine);
+    let mut engine = repo.open(&config)?;
+    assert!(engine.search("east", "search", &all())?.is_empty());
+    repo.write("new.rs", &function("added", "VECTOR_EAST"))?;
+    engine.refresh()?;
+    assert_eq!(
+        names(&engine.search("east", "search", &all())?),
+        strings(&["added"])
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "reintroduced content and query reuse artifacts"
+    );
+    Ok(())
+}
+
+#[test]
+fn include_exclude_changes_reconcile_snapshots_and_invalid_globs_preserve_them() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    for (path, name) in [
+        ("src/keep.rs", "keep"),
+        ("src/skip.rs", "skip"),
+        ("other.rs", "other"),
+    ] {
+        repo.write(path, &function(name, "VECTOR_EAST"))?;
+    }
+    repo.write("guide.md", "# Guide\n\nVECTOR_EAST\n")?;
+    let mut config = mock.config();
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let all_rows = engine.search("east", "search", &all())?;
+    let calls = mock.count();
+    drop(engine);
+
+    config["include"] = json!(["src/**"]);
+    config["exclude"] = json!(["**/skip.rs"]);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.refresh()?["filesDeleted"], 3);
+    assert_eq!(
+        names(&engine.search("east", "search", &all())?),
+        strings(&["keep"])
+    );
+    let status = engine.status()?;
+    drop(engine);
+
+    config["include"] = json!(["["]);
+    let mut engine = repo.open(&config)?;
+    assert!(engine.refresh().is_err());
+    assert_eq!(engine.status()?, status);
+    drop(engine);
+
+    let mut engine = repo.open(&mock.config())?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 3);
+    let restored = engine.search("east", "search", &all())?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["keep", "skip", "other"])
+    );
+    assert_eq!(restored.len(), all_rows.len());
+    assert_eq!(mock.count(), calls, "filter changes only change membership");
+    Ok(())
+}
+
+#[test]
+fn max_file_size_is_inclusive_and_oversize_files_recover_without_losing_peers() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let source = function("boundary", "VECTOR_EAST");
+    repo.write("boundary.rs", &source)?;
+    repo.write("peer.rs", "fn peer() {}")?;
+    let mut config = mock.config();
+    config["maxFileSize"] = json!(source.len());
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    assert!(engine.errors()?.is_empty());
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["boundary", "peer"])
+    );
+    let calls = mock.count();
+    repo.write("boundary.rs", &format!("{source}\n"))?;
+    engine.refresh()?;
+    let errors = engine.errors()?;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["path"], "boundary.rs");
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds maxFileSize")
+    );
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["peer"])
+    );
+    repo.write("boundary.rs", &source)?;
+    engine.refresh()?;
+    assert!(engine.errors()?.is_empty());
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["boundary", "peer"])
+    );
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn source_change_during_embedding_aborts_publication_but_retains_paid_artifacts() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("old.rs", &function("old", "VECTOR_EAST"))?;
+    let config = mock.config();
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let before = engine.search("east", "search-code", &all())?;
+    let status = engine.status()?;
+    let source = function("added", "VECTOR_MID");
+    repo.write("new.rs", &source)?;
+    let path = repo.root.join("new.rs");
+    mock.on_next_request(move || {
+        fs::write(path, function("changed_again", "VECTOR_NORTH"))?;
+        Ok(())
+    });
+    assert!(
+        engine
+            .refresh()
+            .unwrap_err()
+            .to_string()
+            .contains("Source changed during indexing")
+    );
+    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.search("east", "search-code", &all())?, before);
+    let calls = mock.count();
+    drop(engine);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?, status);
+    repo.write("new.rs", &source)?;
+    engine.refresh()?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["old", "added"])
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "completed embedding survives rejected snapshot and restart"
+    );
+    Ok(())
+}
+
+#[test]
+fn git_head_change_during_embedding_aborts_publication_and_can_retry() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.git(&["init", "--quiet"])?;
+    repo.write("old.rs", &function("old", "VECTOR_EAST"))?;
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "--quiet", "-m", "initial"])?;
+    let config = mock.config();
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let status = engine.status()?;
+    repo.write("new.rs", &function("added", "VECTOR_MID"))?;
+    let mut commit = repo.child("git");
+    commit.args([
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "changed during request",
+    ]);
+    mock.on_next_request(move || {
+        ensure!(commit.output()?.status.success(), "fixture commit failed");
+        Ok(())
+    });
+    assert!(
+        engine
+            .refresh()
+            .unwrap_err()
+            .to_string()
+            .contains("Git HEAD changed during indexing")
+    );
+    assert_eq!(engine.status()?, status);
+    let calls = mock.count();
+    engine.refresh()?;
+    assert_eq!(engine.status()?["functionCount"], 2);
+    assert_eq!(
+        engine.status()?["gitCheckpoint"],
+        repo.git(&["rev-parse", "HEAD"])?
+    );
+    assert_ne!(engine.status()?["gitCheckpoint"], status["gitCheckpoint"]);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn force_rebuild_for_moved_root_reuses_code_markdown_and_description_artifacts() -> Result<()> {
+    let mock = Mock::start()?;
+    let mut repo = Repo::new()?;
+    repo.write("code.rs", &function("example", "VECTOR_EAST"))?;
+    repo.write("guide.md", "# Guide\n\nVECTOR_MID\n")?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let before = engine.search("east", "search", &all())?;
+    let artifacts = artifact_counts(&repo)?;
+    let calls = mock.count();
+    drop(engine);
+    let moved = repo.root.with_file_name("moved");
+    fs::rename(&repo.root, &moved)?;
+    repo.root = moved;
+    config["forceReindex"] = json!(true);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?["functionCount"], 0);
+    assert_eq!(engine.status()?["generation"], 0);
+    assert_eq!(artifact_counts(&repo)?, artifacts);
+    engine.refresh()?;
+    let after = engine.search("east", "search", &all())?;
+    // A rebuild may allocate fresh IDs; source content and scores must agree.
+    let without_ids = |rows: Vec<Value>| {
+        rows.into_iter()
+            .map(|mut r| {
+                let field = if r["type"] == "function" {
+                    "function"
+                } else {
+                    "chunk"
+                };
+                r[field].as_object_mut().unwrap().remove("id");
+                r
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(without_ids(after), without_ids(before));
+    assert_eq!(engine.status()?["descriptionCount"], 1);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn description_settings_are_restored_from_the_index_when_omitted_from_config() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("code.rs", &function("example", "VECTOR_EAST"))?;
+    let mut config = mock.config();
+    let mut engine = repo.open(&config)?;
+    engine.set_descriptions(true)?;
+    let expected = engine.search("east", "search-descriptions", &all())?;
+    let status = engine.status()?;
+    drop(engine);
+    for key in [
+        "descriptionsEnabled",
+        "descriptionProvider",
+        "descriptionModel",
+    ] {
+        config.as_object_mut().unwrap().remove(key);
+    }
+    let calls = mock.count();
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.refresh()?["filesUpdated"], 0);
+    assert_eq!(
+        engine.search("east", "search-descriptions", &all())?,
+        expected
+    );
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn source_path_filters_preserve_leading_dots_and_normalize_current_directory_components()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".hidden/source.rs", &function("source", "VECTOR_EAST"))?;
+    repo.write("peer.rs", &function("peer", "VECTOR_MID"))?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let expected =
+        engine.cross_search(None, &json!({"regexp": "^source$", "minSimilarity": -1}))?;
+    assert_eq!(expected.len(), 1);
+    for path in [
+        ".hidden",
+        "./.hidden",
+        ".hidden/./source.rs",
+        "./.hidden/source.rs",
+    ] {
+        assert_eq!(
+            engine.cross_search(None, &json!({"sourcePath": path, "minSimilarity": -1}))?,
+            expected,
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_scan_does_not_follow_symlink_files_or_directories() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let outside = tempfile::tempdir()?;
+    fs::write(
+        outside.path().join("outside.rs"),
+        function("outside", "VECTOR_EAST"),
+    )?;
+    repo.write("inside.rs", &function("inside", "VECTOR_MID"))?;
+    std::os::unix::fs::symlink(outside.path(), repo.root.join("linked"))?;
+    std::os::unix::fs::symlink(
+        outside.path().join("outside.rs"),
+        repo.root.join("linked.rs"),
+    )?;
+    std::os::unix::fs::symlink(repo.root.join("inside.rs"), repo.root.join("alias.rs"))?;
+    std::os::unix::fs::symlink(&repo.root, repo.root.join("cycle"))?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    assert_eq!(engine.status()?["fileCount"], 1);
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["inside"])
+    );
+    assert!(
+        mock.embedding_inputs()
+            .iter()
+            .all(|s| !s.contains("outside"))
+    );
+    assert!(
+        engine
+            .cross_search(None, &json!({"sourcePath": repo.root.join("linked")}))
+            .is_err()
+    );
+    Ok(())
 }
 
 #[test]

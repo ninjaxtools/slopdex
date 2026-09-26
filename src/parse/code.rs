@@ -578,8 +578,25 @@ fn python_docstring<'a>(source: &'a str, body: Node<'_>) -> Option<&'a str> {
     if statement.kind() != "expression_statement" {
         return None;
     }
-    let value = statement.named_child(0)?;
-    matches!(value.kind(), "string" | "concatenated_string").then(|| text(source, value))
+    let value = unwrap(statement.named_child(0)?);
+    let literals = match value.kind() {
+        "string" => vec![value],
+        "concatenated_string" => children(value),
+        _ => return None,
+    };
+    for literal in literals {
+        if literal.kind() == "comment" {
+            continue;
+        }
+        // Tree-sitter also labels bytes and formatted literals as strings.
+        // Only constant text (optionally raw or legacy Unicode) is a docstring.
+        let prefix = text(source, literal).split(['\'', '"']).next()?;
+        if literal.kind() != "string" || !prefix.chars().all(|c| matches!(c, 'r' | 'R' | 'u' | 'U'))
+        {
+            return None;
+        }
+    }
+    Some(text(source, value))
 }
 
 fn go_receiver<'a>(source: &'a str, node: Node<'_>) -> Option<&'a str> {
@@ -1279,5 +1296,303 @@ int fallback(void) { return 0; }
             hash("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn javascript_async_generators_accessors_and_private_methods() {
+        let parsed = clean(
+            "stream.js",
+            "async function* stream(limit) { yield limit; }\n\
+             const bound = async function* internal() { yield 1; };\n\
+             class Store {\n\
+               get value() { return 1; }\n\
+               set value(next) { this.current = next; }\n\
+               async *entries() { yield this.value; }\n\
+               #reset() {}\n\
+               #source = function* () { yield 2; };\n\
+             }",
+        );
+        assert_eq!(
+            symbols(&parsed),
+            [
+                ("stream", "generator"),
+                ("bound", "generator"),
+                ("Store.value", "method"),
+                ("Store.value", "method"),
+                ("Store.entries", "generator"),
+                ("Store.reset", "method"),
+                ("Store.source", "generator"),
+            ]
+        );
+        for (callable, signature) in parsed.callables.iter().zip([
+            "async *stream(limit)",
+            "async *bound()",
+            "value()",
+            "value(next)",
+            "async *entries()",
+            "reset()",
+            "*source()",
+        ]) {
+            assert_eq!(callable.signature.as_deref(), Some(signature));
+        }
+        assert!(parsed.callables[5].source.starts_with("#reset()"));
+        assert_ne!(
+            parsed.callables[2].source_hash,
+            parsed.callables[3].source_hash
+        );
+    }
+
+    #[test]
+    fn typescript_overload_signatures_do_not_duplicate_implementations() {
+        let parsed = clean(
+            "overloads.ts",
+            "function convert(value: string): string;\n\
+             function convert(value: number): number;\n\
+             function convert(value: string | number) { return value; }\n\
+             abstract class Store {\n\
+               abstract absent(): void;\n\
+               load(value: string): string;\n\
+               load(value: number): number;\n\
+               load(value: string | number) { return value; }\n\
+             }\n\
+             declare namespace External { function absent(): void; }",
+        );
+        assert_eq!(
+            symbols(&parsed),
+            [("convert", "function"), ("Store.load", "method")]
+        );
+        assert_eq!(parsed.callables[0].start_line, 3);
+        assert_eq!(parsed.callables[1].start_line, 8);
+        assert_eq!(
+            parsed.callables[1].signature.as_deref(),
+            Some("load(value: string | number)")
+        );
+    }
+
+    #[test]
+    fn native_bound_closures_keep_names_and_ignore_unbound_callbacks() {
+        for (path, source, expected) in [
+            (
+                "bindings.py",
+                "def outer():\n    (first := (lambda value: value))\n    obj.second = lambda: 2\n    invoke(lambda: 3)\n    first_tuple, second_tuple = (lambda: 4), (lambda: 5)\n",
+                vec![
+                    ("outer", "function"),
+                    ("outer.first", "function"),
+                    ("outer.obj.second", "function"),
+                ],
+            ),
+            (
+                "bindings.rs",
+                "fn outer() { let first = (move |value: i32| value); let mut second = || 2; invoke(|| 3); let (ignored,) = (|| 4,); }",
+                vec![
+                    ("outer", "function"),
+                    ("outer.first", "function"),
+                    ("outer.second", "function"),
+                ],
+            ),
+            (
+                "bindings.go",
+                "package bindings\nfunc outer() {\nvar first, second = func() int { return 1 }, func() int { return 2 }\nobj.run = func() {}\ninvoke(func() {})\n}\n",
+                vec![
+                    ("outer", "function"),
+                    ("outer.first", "function"),
+                    ("outer.second", "function"),
+                    ("outer.obj.run", "function"),
+                ],
+            ),
+            (
+                "Bindings.java",
+                "class Bindings { void outer() { Runnable first = (() -> {}), second = () -> {}; invoke(() -> {}); } }",
+                vec![
+                    ("Bindings.outer", "method"),
+                    ("Bindings.outer.first", "function"),
+                    ("Bindings.outer.second", "function"),
+                ],
+            ),
+        ] {
+            let parsed = clean(path, source);
+            assert_eq!(symbols(&parsed), expected, "{path}");
+            for callable in &parsed.callables[1..] {
+                assert!(
+                    callable
+                        .signature
+                        .as_deref()
+                        .unwrap()
+                        .starts_with(&format!("{} = ", callable.name)),
+                    "{path}: {callable:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn python_documentation_requires_a_leading_constant_string() {
+        // Python's lexical reference explicitly excludes f-strings, even without
+        // replacement fields; bytes literals likewise are not string docstrings.
+        for (statement, documentation) in [
+            ("\"plain café\"", Some("\"plain café\"")),
+            ("# comment\n    r\"raw\\text\"", Some("r\"raw\\text\"")),
+            ("u\"joined \" \"text\"", Some("u\"joined \" \"text\"")),
+            ("(\"parenthesized\")", Some("\"parenthesized\"")),
+            ("(U\"joined \" R\"text\")", Some("U\"joined \" R\"text\"")),
+            ("f\"not documentation\"", None),
+            ("f\"computed {1 + 1}\"", None),
+            ("RF\"not {1 + 1}\"", None),
+            ("\"plain \" f\"formatted\"", None),
+            ("b\"bytes\"", None),
+            ("BR\"bytes\"", None),
+            ("pass\n    \"too late\"", None),
+        ] {
+            let source = format!("def describe():\n    {statement}\n    return 1\n");
+            let parsed = clean("documentation.py", &source);
+            assert_eq!(symbols(&parsed), [("describe", "function")]);
+            let embedding = &parsed.callables[0].embedding_input;
+            if let Some(documentation) = documentation {
+                assert!(
+                    embedding.contains(&format!("\ndocumentation:\n{documentation}\nsource:\n")),
+                    "{statement}: {embedding}"
+                );
+            } else {
+                assert!(
+                    !embedding.contains("\ndocumentation:\n"),
+                    "{statement}: {embedding}"
+                );
+            }
+            assert!(embedding.ends_with(&parsed.callables[0].source));
+        }
+    }
+
+    #[test]
+    fn callable_hashes_track_source_not_path_position_or_enclosing_scope() {
+        let source = "function café() {\r\n  return '🚀';\r\n}";
+        let original = clean("original.js", source).callables.remove(0);
+        let relocated = clean(
+            "other/moved.js",
+            &format!("// moved\r\n\r\n{source}\r\n// trailing"),
+        )
+        .callables
+        .remove(0);
+        assert_eq!(original.source, source);
+        assert_eq!(
+            (
+                original.start_line,
+                original.start_column,
+                original.end_line,
+                original.end_column
+            ),
+            (1, 1, 3, 2)
+        );
+        assert_eq!((relocated.start_line, relocated.end_line), (3, 5));
+        assert_eq!(original.source_hash, relocated.source_hash);
+        assert_eq!(original.embedding_input, relocated.embedding_input);
+
+        let nested = clean("scoped.ts", &format!("namespace Example {{ {source} }}"))
+            .callables
+            .remove(0);
+        assert_eq!(nested.qualified_name, "Example.café");
+        assert_eq!(nested.source, original.source);
+        assert_eq!(nested.source_hash, original.source_hash);
+        assert_ne!(nested.embedding_input, original.embedding_input);
+        assert!(nested.embedding_input.contains("symbol: Example.café\n"));
+
+        for changed in [source.replace("🚀", "🌍"), source.replace("\r\n", "\n")] {
+            let changed = clean("original.js", &changed).callables.remove(0);
+            assert_ne!(changed.source_hash, original.source_hash);
+        }
+    }
+
+    #[test]
+    fn typescript_recovery_preserves_unicode_multiline_imports_and_literal_text() {
+        let source = "// café 🚀\r\nexport type * from './模型';\r\nasync function café(original: <T>() => Promise<T>) {\r\n  const literal = \"export type *; import('do not mask')\";\r\n  return await original<typeof import(\r\n    './模型'\r\n  )>();\r\n}\r\nfunction after() {}";
+        for path in ["recovery.ts", "recovery.tsx"] {
+            let parsed = clean(path, source);
+            assert_eq!(
+                symbols(&parsed),
+                [("café", "function"), ("after", "function")]
+            );
+            let recovered = &parsed.callables[0];
+            let expected = source
+                .split_once("async function")
+                .unwrap()
+                .1
+                .split_once("\r\nfunction after")
+                .unwrap()
+                .0;
+            assert_eq!(recovered.source, format!("async function{expected}"));
+            assert_eq!(
+                (
+                    recovered.start_line,
+                    recovered.end_line,
+                    recovered.end_column
+                ),
+                (3, 8, 2)
+            );
+            assert!(recovered.source.contains("import(\r\n    './模型'\r\n  )"));
+            assert!(recovered.embedding_input.ends_with(&recovered.source));
+            assert_eq!(
+                (
+                    parsed.callables[1].start_line,
+                    parsed.callables[1].start_column
+                ),
+                (9, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_outer_callable_keeps_healthy_nested_and_following_functions() {
+        let source = "function outer() {\n  function healthy() { return 'é'; }\n  const broken = ;\n}\nfunction after() {}";
+        let parsed = parse("nested.js", source).unwrap();
+        assert_eq!(
+            symbols(&parsed),
+            [("outer.healthy", "function"), ("after", "function")]
+        );
+        assert_eq!(
+            parsed.callables[0].source,
+            "function healthy() { return 'é'; }"
+        );
+        assert_eq!(
+            (
+                parsed.callables[0].start_line,
+                parsed.callables[0].start_column
+            ),
+            (2, 3)
+        );
+        assert_eq!(
+            parsed.callables[0].source_hash,
+            hash(&parsed.callables[0].source)
+        );
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].message.contains("callable outer;"));
+        assert_eq!(
+            (parsed.errors[0].start_line, parsed.errors[0].end_line),
+            (1, 4)
+        );
+    }
+
+    #[test]
+    fn missing_tokens_outside_callables_have_local_diagnostics() {
+        for path in ["missing.js", "missing.ts"] {
+            let parsed = parse(
+                path,
+                "function good() {}\nconst value = (1 + 2;\nfunction after() {}",
+            )
+            .unwrap();
+            assert_eq!(
+                symbols(&parsed),
+                [("good", "function"), ("after", "function")]
+            );
+            assert_eq!(parsed.errors.len(), 1, "{path}: {:?}", parsed.errors);
+            assert!(
+                parsed.errors[0].message.contains("expected )"),
+                "{path}: {:?}",
+                parsed.errors
+            );
+            assert_eq!(
+                (parsed.errors[0].start_line, parsed.errors[0].end_line),
+                (2, 2)
+            );
+            assert_eq!(parsed.callables[1].start_line, 3);
+        }
     }
 }

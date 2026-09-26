@@ -39,7 +39,7 @@ You can also download a binary from one of the releases: https://github.com/ninj
 Or you can build from source:
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
 ## Getting started

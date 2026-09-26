@@ -135,4 +135,31 @@ mod tests {
         }
         assert_eq!(language_for_path("C:\\src\\source.TS"), Some("typescript"));
     }
+
+    #[test]
+    fn empty_whitespace_and_comment_only_inputs_have_no_search_entries() {
+        for (path, comment) in [
+            ("empty.ts", "// function fake() {}"),
+            ("empty.tsx", "/* const Fake = () => <div />; */"),
+            ("empty.js", "/* function fake() {} */"),
+            ("empty.jsx", "// const Fake = () => <div />;"),
+            ("empty.py", "# def fake(): pass"),
+            ("empty.rs", "// fn fake() {}"),
+            ("empty.go", "// func fake() {}"),
+            ("empty.java", "/* class Fake { void fake() {} } */"),
+            ("empty.c", "/* int fake(void) { return 0; } */"),
+            ("empty.md", "<!--\n# Fake\n```\n-->"),
+        ] {
+            for source in ["", " \t\r\n\n", comment] {
+                let parsed = parse(path, source).unwrap();
+                assert!(parsed.callables.is_empty(), "{path}: {source:?}");
+                assert!(parsed.chunks.is_empty(), "{path}: {source:?}");
+                assert!(parsed.errors.is_empty(), "{path}: {:?}", parsed.errors);
+            }
+        }
+        let unsupported = parse("data.json", "\0💥 function broken(").unwrap();
+        assert!(unsupported.callables.is_empty());
+        assert!(unsupported.chunks.is_empty());
+        assert!(unsupported.errors.is_empty());
+    }
 }

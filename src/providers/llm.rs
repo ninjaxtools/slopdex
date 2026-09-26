@@ -66,7 +66,8 @@ impl Configured {
         }
         let base = string(config, &["descriptionBaseUrl"])?.unwrap_or(A::DEFAULT_BASE);
         validate_url(base)?;
-        let base = base.trim_end_matches('/').to_owned();
+        // Protocol builders normalize the path; trimming the whole URL can alter query values.
+        let base = base.to_owned();
         Ok(Self {
             context,
             models,

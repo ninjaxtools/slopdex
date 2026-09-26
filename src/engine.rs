@@ -1065,11 +1065,11 @@ impl Engine {
             "Source path must remain inside the repository"
         );
         Ok(path
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect::<PathBuf>()
             .to_string_lossy()
-            .replace('\\', "/")
-            .trim_start_matches("./")
-            .trim_end_matches('/')
-            .to_owned())
+            .replace('\\', "/"))
     }
 }
 

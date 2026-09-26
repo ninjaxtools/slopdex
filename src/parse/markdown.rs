@@ -358,4 +358,200 @@ mod tests {
         assert_eq!(chunks.last().unwrap().heading_path, ["Guide", "Next"]);
         assert!(chunks.iter().any(|c| c.content.contains("# Not a heading")));
     }
+
+    #[test]
+    fn markdown_line_limit_splits_exactly_without_losing_body_lines() {
+        for count in [119_usize, 120, 121, 240, 241] {
+            let body = (1..=count)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for heading in ["", "# Guide\n"] {
+                let chunks = parse("lines.md", &format!("{heading}{body}\n"))
+                    .unwrap()
+                    .chunks;
+                assert_eq!(
+                    chunks.len(),
+                    count.div_ceil(120),
+                    "{count} lines, {heading:?}"
+                );
+                let prefix = if heading.is_empty() {
+                    ""
+                } else {
+                    "# Guide\n\n"
+                };
+                let bodies: Vec<_> = chunks
+                    .iter()
+                    .map(|c| c.content.strip_prefix(prefix).unwrap())
+                    .collect();
+                assert_eq!(bodies.join("\n"), body);
+                for (index, (chunk, body)) in chunks.iter().zip(bodies).enumerate() {
+                    assert!(body.lines().count() <= 120);
+                    let offset = usize::from(!heading.is_empty());
+                    assert_eq!(
+                        chunk.start_line,
+                        if index == 0 {
+                            1
+                        } else {
+                            index * 120 + offset + 1
+                        }
+                    );
+                    assert_eq!(chunk.end_line, ((index + 1) * 120).min(count) + offset);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_byte_limit_accounts_for_heading_prefix_and_utf8_boundaries() {
+        for prefix in ["", "# Guide\n\n"] {
+            let budget = 8192 - prefix.len();
+            for body in [
+                "a".repeat(budget - 1),
+                "a".repeat(budget),
+                "a".repeat(budget + 1),
+                format!("{}🚀", "a".repeat(budget - 1)),
+            ] {
+                let chunks = parse("bytes.md", &format!("{prefix}{body}"))
+                    .unwrap()
+                    .chunks;
+                assert_eq!(chunks.len(), if body.len() <= budget { 1 } else { 2 });
+                assert_eq!(
+                    chunks
+                        .iter()
+                        .map(|c| c.content.strip_prefix(prefix).unwrap())
+                        .collect::<String>(),
+                    body
+                );
+                for (index, chunk) in chunks.iter().enumerate() {
+                    assert!(chunk.content.len() <= 8192);
+                    assert_eq!(chunk.source_hash, hash(&chunk.content));
+                    assert_eq!(chunk.embedding_input, chunk.content);
+                    let body_line = if prefix.is_empty() { 1 } else { 3 };
+                    assert_eq!(chunk.start_line, if index == 0 { 1 } else { body_line });
+                    assert_eq!(chunk.end_line, body_line);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_atx_heading_syntax_and_indentation() {
+        for (line, title) in [
+            ("# Plain", Some("Plain")),
+            ("   ##\tCafé 🚀 ### \t", Some("Café 🚀")),
+            ("###### C#", Some("C#")),
+            ("# C# ###", Some("C#")),
+            ("##", Some("")),
+            ("    # Indented code", None),
+            ("\t# Tab-indented code", None),
+            ("#No separator", None),
+            ("####### Too deep", None),
+            ("\\# Escaped", None),
+        ] {
+            let source = format!("{line}\nBody");
+            let chunks = parse("headings.md", &source).unwrap().chunks;
+            assert_eq!(chunks.len(), 1, "{line}");
+            let chunk = &chunks[0];
+            if let Some(title) = title {
+                assert_eq!(chunk.heading_path, [title], "{line}");
+                assert_eq!(
+                    chunk.content,
+                    format!("{}\n\nBody", line.trim_start_matches(' '))
+                );
+            } else {
+                assert!(chunk.heading_path.is_empty(), "{line}");
+                assert_eq!(chunk.content, source);
+            }
+            assert_eq!((chunk.start_line, chunk.end_line), (1, 2));
+        }
+    }
+
+    #[test]
+    fn markdown_fence_closers_require_matching_markers_and_no_info_string() {
+        for (opening, invalid, closing) in [
+            ("   ````rust", "```` trailing text\n```\n~~~~", "  `````\t"),
+            ("~~~text", "~~~ trailing text\n```\n    ~~~", "~~~~ "),
+        ] {
+            let example = format!("{opening}\n{invalid}\n## Hidden\n{closing}");
+            let source = format!("# Real\n{example}\n## Visible\nBody");
+            let chunks = parse("fences.md", &source).unwrap().chunks;
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(chunks[0].heading_path, ["Real"]);
+            assert_eq!(chunks[0].content, format!("# Real\n\n{example}"));
+            assert_eq!(chunks[1].heading_path, ["Real", "Visible"]);
+        }
+        // A backtick in an opening info string prevents it from opening a fence.
+        let chunks = parse("invalid-fence.md", "```bad`info\n# Visible\nBody")
+            .unwrap()
+            .chunks;
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!(chunks[1].heading_path, ["Visible"]);
+        let chunks = parse("unclosed.md", "# Real\n~~~\n## Hidden\nBody")
+            .unwrap()
+            .chunks;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, ["Real"]);
+        assert!(chunks[0].content.ends_with("~~~\n## Hidden\nBody"));
+    }
+
+    #[test]
+    fn markdown_comment_removal_preserves_locations_and_content_hashes() {
+        let source = "\r\n# Guide\r\n\r\nBefore\r\n<!-- hidden\r\n## Fake\r\n-->\r\nAfter\r\n\r\n";
+        let parsed = parse("comments.md", source).unwrap();
+        assert_eq!(parsed.chunks.len(), 1);
+        let chunk = &parsed.chunks[0];
+        assert_eq!(chunk.heading_path, ["Guide"]);
+        assert_eq!((chunk.start_line, chunk.end_line), (2, 8));
+        assert_eq!(chunk.content, "# Guide\n\nBefore\n\n\n\nAfter");
+        assert_eq!(chunk.source_hash, hash(&chunk.content));
+        assert_eq!(chunk.embedding_input, chunk.content);
+        let changed = parse(
+            "moved.markdown",
+            &source
+                .replace("hidden", "different hidden text")
+                .replace("\r\n", "\n"),
+        )
+        .unwrap();
+        assert_eq!(changed.chunks[0].source_hash, chunk.source_hash);
+        let unclosed = parse("unclosed.md", "# Guide\nBefore\n<!--\n# Hidden\nAfter").unwrap();
+        assert_eq!(unclosed.chunks.len(), 1);
+        assert_eq!(unclosed.chunks[0].content, "# Guide\n\nBefore");
+        assert_eq!(
+            (unclosed.chunks[0].start_line, unclosed.chunks[0].end_line),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn markdown_long_unicode_headings_preserve_full_paths_and_reset_ancestry() {
+        let title = "🚀é".repeat(500);
+        let body = "正文".repeat(2000);
+        let source = format!("# {title}\n### Child\n{body}\n## Sibling\nNext\n# New root\nLast");
+        let chunks = parse("headings.md", &source).unwrap().chunks;
+        assert_eq!(chunks.len(), 4);
+        let child_chunks = &chunks[..2];
+        assert_eq!(
+            child_chunks
+                .iter()
+                .map(|c| c.content.split_once("\n\n").unwrap().1)
+                .collect::<String>(),
+            body
+        );
+        for chunk in child_chunks {
+            assert_eq!(chunk.heading_path, [title.as_str(), "Child"]);
+            assert!(chunk.content.len() <= 8192);
+            let heading = chunk.content.split_once("\n\n").unwrap().0;
+            assert!(heading.len() <= 2048);
+            assert!(format!("# {title}").starts_with(heading));
+        }
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (2, 3));
+        assert_eq!((chunks[1].start_line, chunks[1].end_line), (3, 3));
+        assert_eq!(chunks[2].heading_path, [title.as_str(), "Sibling"]);
+        assert!(chunks[2].content.ends_with("\n\nNext"));
+        assert_eq!(chunks[3].heading_path, ["New root"]);
+        assert_eq!(chunks[3].content, "# New root\n\nLast");
+        assert_eq!((chunks[3].start_line, chunks[3].end_line), (6, 7));
+    }
 }

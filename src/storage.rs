@@ -97,7 +97,14 @@ impl Database {
     }
 
     pub fn reset(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM items; DELETE FROM files; DELETE FROM search_cache; DELETE FROM metadata; COMMIT;")?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        tx.execute_batch(
+            "DELETE FROM items; DELETE FROM files; DELETE FROM search_cache; DELETE FROM metadata;",
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -217,7 +224,10 @@ impl Database {
         if !dirty && old_checkpoint.as_deref() == checkpoint {
             return Ok(false);
         }
-        let generation = self.generation()? + u64::from(dirty);
+        let generation = self
+            .generation()?
+            .checked_add(u64::from(dirty))
+            .context("Index generation exhausted")?;
         let tx = self.conn.transaction()?;
         for path in removed {
             tx.execute("DELETE FROM files WHERE path=?", [path])?;
@@ -298,6 +308,394 @@ fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture() -> Result<(tempfile::TempDir, Database)> {
+        let dir = tempfile::tempdir()?;
+        let db = Database::open(
+            &dir.path().join("index.sqlite"),
+            dir.path(),
+            &json!({}),
+            false,
+        )?;
+        db.put_embedding("code", &[0.6, 0.8])?;
+        db.put_embedding("description", &[1.0, 0.0])?;
+        Ok((dir, db))
+    }
+
+    fn record(path: &str) -> (File, Vec<Item>) {
+        let file = File {
+            path: path.into(),
+            hash: "source-hash".into(),
+            source: "fn example() {}".into(),
+            language: "rust".into(),
+            source_mode: "working-tree".into(),
+            description: Some("A description".into()),
+            description_hash: Some("older-hash".into()),
+            description_embedding: Some("description".into()),
+            errors: vec![json!({"message": "recoverable", "startLine": 2})],
+        };
+        let item = Item {
+            id: 0,
+            path: path.into(),
+            identity: format!("{path}:example"),
+            kind: "function".into(),
+            data: json!({"qualifiedName": "example", "startLine": 1}),
+            embedding: "code".into(),
+            description_embedding: Some("description".into()),
+        };
+        (file, vec![item])
+    }
+
+    fn snapshot(db: &Database) -> Result<Value> {
+        Ok(json!({
+            "files": db.files()?,
+            "items": db.items()?.iter().map(|i| json!([
+                i.id, i.path, i.identity, i.kind, i.data, i.embedding, i.description_embedding
+            ])).collect::<Vec<_>>(),
+            "generation": db.generation()?,
+            "checkpoint": db.meta("checkpoint")?,
+            "identity": db.meta("identity")?,
+            "search": db.search_cache("query")?,
+        }))
+    }
+
+    #[test]
+    fn late_publication_failure_rolls_back_metadata_and_cache_deletion() -> Result<()> {
+        let (dir, mut db) = fixture()?;
+        db.apply(&[record("old.rs")], &[], Some("old-commit"))?;
+        db.put_search_cache("query", &[json!({"id": 1})])?;
+        let before = snapshot(&db)?;
+        // Fail after all live rows, generation and checkpoint have been written.
+        db.conn.execute_batch("CREATE TRIGGER abort_cache BEFORE DELETE ON search_cache BEGIN SELECT RAISE(ABORT, 'late failure'); END;")?;
+        db.cache_put("parse", "completed", "paid artifact")?;
+        db.put_embedding("completed", &[0.0, 1.0])?;
+        let error = db
+            .apply(&[record("new.rs")], &["old.rs".into()], Some("new-commit"))
+            .unwrap_err();
+        assert!(error.to_string().contains("late failure"));
+        assert!(db.conn.is_autocommit());
+        assert_eq!(snapshot(&db)?, before);
+        drop(db);
+        let mut db = Database::open(
+            &dir.path().join("index.sqlite"),
+            dir.path(),
+            &json!({}),
+            false,
+        )?;
+        assert_eq!(snapshot(&db)?, before);
+        assert_eq!(
+            db.cache("parse", "completed")?.as_deref(),
+            Some("paid artifact")
+        );
+        assert_eq!(db.embedding("completed")?, Some(vec![0.0, 1.0]));
+        db.conn.execute_batch("DROP TRIGGER abort_cache")?;
+        assert!(db.apply(&[record("new.rs")], &["old.rs".into()], Some("new-commit"))?);
+        assert_eq!(db.generation()?, 2);
+        assert_eq!(db.meta("checkpoint")?.as_deref(), Some("new-commit"));
+        assert!(db.search_cache("query")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_reset_rolls_back_and_leaves_connection_reusable() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        db.apply(&[record("old.rs")], &[], Some("commit"))?;
+        db.put_search_cache("query", &[json!("cached")])?;
+        let before = snapshot(&db)?;
+        db.conn.execute_batch("CREATE TRIGGER abort_reset BEFORE DELETE ON metadata BEGIN SELECT RAISE(ABORT, 'reset failure'); END;")?;
+        assert!(
+            db.reset()
+                .unwrap_err()
+                .to_string()
+                .contains("reset failure")
+        );
+        assert!(
+            db.conn.is_autocommit(),
+            "failed reset must release its transaction"
+        );
+        assert_eq!(snapshot(&db)?, before);
+        db.conn.execute_batch("DROP TRIGGER abort_reset")?;
+        db.reset()?;
+        assert!(db.files()?.is_empty());
+        assert!(db.items()?.is_empty());
+        assert!(db.meta("identity")?.is_none());
+        assert!(db.meta("checkpoint")?.is_none());
+        assert_eq!(db.generation()?, 0);
+        assert!(db.search_cache("query")?.is_none());
+        assert!(db.embedding("code")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn incompatible_identity_rejection_preserves_snapshot_and_force_resets_live_state() -> Result<()>
+    {
+        for change_root in [false, true] {
+            let (dir, mut db) = fixture()?;
+            db.apply(&[record("old.rs")], &[], Some("commit"))?;
+            db.cache_put("description", "paid", "retained")?;
+            db.put_search_cache("query", &[json!(1)])?;
+            let before = snapshot(&db)?;
+            let path = db.path.clone();
+            drop(db);
+            let root = if change_root {
+                dir.path().join("other")
+            } else {
+                dir.path().to_owned()
+            };
+            let profile = if change_root {
+                json!({})
+            } else {
+                json!({"model": "other"})
+            };
+            let error = Database::open(&path, &root, &profile, false)
+                .err()
+                .expect("identity mismatch");
+            assert!(error.to_string().contains("Incompatible index"));
+            let db = Database::open(&path, dir.path(), &json!({}), false)?;
+            assert_eq!(snapshot(&db)?, before);
+            drop(db);
+            let db = Database::open(&path, &root, &profile, true)?;
+            assert!(db.files()?.is_empty());
+            assert!(db.items()?.is_empty());
+            assert_eq!(db.generation()?, 0);
+            assert!(db.meta("checkpoint")?.is_none());
+            assert!(db.search_cache("query")?.is_none());
+            assert_eq!(
+                db.cache("description", "paid")?.as_deref(),
+                Some("retained")
+            );
+            assert_eq!(db.embedding("code")?, Some(vec![0.6, 0.8]));
+            let identity = db.meta("identity")?;
+            drop(db);
+            assert_eq!(
+                Database::open(&path, &root, &profile, false)?.meta("identity")?,
+                identity
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_only_updates_preserve_generation_and_search_cache() -> Result<()> {
+        let (dir, mut db) = fixture()?;
+        assert!(!db.apply(&[], &[], None)?);
+        assert!(db.meta("generation")?.is_none());
+        db.apply(&[record("code.rs")], &[], Some("first"))?;
+        db.put_search_cache("query", &[json!({"score": 0.75})])?;
+        let before = snapshot(&db)?;
+        for checkpoint in [Some("first"), Some("second"), None, None] {
+            assert!(!db.apply(&[], &[], checkpoint)?);
+            assert_eq!(db.generation()?, 1);
+            assert_eq!(db.meta("checkpoint")?.as_deref(), checkpoint);
+            let mut expected = before.clone();
+            expected["checkpoint"] = json!(checkpoint);
+            assert_eq!(snapshot(&db)?, expected);
+        }
+        drop(db);
+        let db = Database::open(
+            &dir.path().join("index.sqlite"),
+            dir.path(),
+            &json!({}),
+            false,
+        )?;
+        assert_eq!(db.generation()?, 1);
+        assert!(db.meta("checkpoint")?.is_none());
+        assert_eq!(
+            db.search_cache("query")?,
+            Some(vec![json!({"score": 0.75})])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generation_corruption_and_exhaustion_fail_without_publication() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        db.apply(&[record("old.rs")], &[], Some("old"))?;
+        db.put_search_cache("query", &[json!(1)])?;
+        for invalid in [
+            "not-a-number",
+            "-1",
+            "18446744073709551616",
+            "18446744073709551615",
+        ] {
+            db.set_meta("generation", invalid)?;
+            assert!(
+                db.apply(&[record("new.rs")], &["old.rs".into()], Some("new"))
+                    .is_err(),
+                "{invalid}"
+            );
+            assert!(db.conn.is_autocommit());
+            assert_eq!(db.files()?[0].path, "old.rs");
+            assert_eq!(db.items()?.len(), 1);
+            assert_eq!(db.meta("generation")?.as_deref(), Some(invalid));
+            assert_eq!(db.meta("checkpoint")?.as_deref(), Some("old"));
+            assert_eq!(db.search_cache("query")?, Some(vec![json!(1)]));
+        }
+        // Exhaustion does not prevent checkpoint-only updates.
+        assert!(!db.apply(&[], &[], Some("new"))?);
+        assert_eq!(db.generation()?, u64::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn embeddings_validate_before_writing_and_preserve_exact_first_value() -> Result<()> {
+        let (dir, db) = fixture()?;
+        let vector = [0.0, -0.0, f32::MIN_POSITIVE, f32::MAX, -3.25];
+        db.put_embedding("exact", &vector)?;
+        db.put_embedding("exact", &[9.0])?;
+        for invalid in [
+            vec![],
+            vec![f32::NAN],
+            vec![f32::INFINITY],
+            vec![f32::NEG_INFINITY],
+        ] {
+            assert!(db.put_embedding("invalid", &invalid).is_err());
+            assert!(db.put_embedding("exact", &invalid).is_err());
+            assert!(db.embedding("invalid")?.is_none());
+        }
+        drop(db);
+        let db = Database::open(
+            &dir.path().join("index.sqlite"),
+            dir.path(),
+            &json!({}),
+            false,
+        )?;
+        let stored = db.embedding("exact")?.unwrap();
+        assert_eq!(
+            stored.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vector.map(f32::to_bits)
+        );
+        assert!(db.embedding("missing")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_embedding_blobs_are_errors_not_cache_misses() -> Result<()> {
+        let (_dir, db) = fixture()?;
+        let cases = [
+            (vec![], "Invalid stored vector length"),
+            (vec![0, 0, 0], "Invalid stored vector length"),
+            (vec![0; 5], "Invalid stored vector length"),
+            (f32::NAN.to_le_bytes().to_vec(), "Non-finite stored vector"),
+            (
+                f32::INFINITY.to_le_bytes().to_vec(),
+                "Non-finite stored vector",
+            ),
+            (
+                f32::NEG_INFINITY.to_le_bytes().to_vec(),
+                "Non-finite stored vector",
+            ),
+        ];
+        for (blob, message) in cases {
+            db.conn.execute(
+                "INSERT OR REPLACE INTO embeddings VALUES('corrupt', ?)",
+                [blob],
+            )?;
+            assert_eq!(db.embedding("corrupt").unwrap_err().to_string(), message);
+            assert_eq!(db.embedding("code")?, Some(vec![0.6, 0.8]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_json_records_fail_reads_and_can_be_repaired() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        db.apply(&[record("code.rs")], &[], None)?;
+        for value in ["{", "null", "{}"] {
+            db.conn.execute("UPDATE files SET data=?", [value])?;
+            assert!(db.files().is_err(), "{value}");
+        }
+        db.apply(&[record("code.rs")], &[], None)?;
+        db.conn.execute("UPDATE items SET data='{'", [])?;
+        assert!(db.items().is_err());
+        for value in ["{", "null", "{}"] {
+            db.conn.execute(
+                "INSERT OR REPLACE INTO search_cache VALUES('query', ?)",
+                [value],
+            )?;
+            assert!(
+                db.search_cache("query")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Corrupt search cache")
+            );
+        }
+        db.apply(&[record("code.rs")], &[], None)?;
+        assert_eq!(db.files()?.len(), 1);
+        assert_eq!(db.items()?.len(), 1);
+        assert!(db.search_cache("query")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn artifacts_are_namespaced_and_reopen_with_complete_live_records() -> Result<()> {
+        let (dir, mut db) = fixture()?;
+        let record = record("space/é.rs");
+        db.apply(std::slice::from_ref(&record), &[], Some("commit"))?;
+        db.cache_put("parse", "same-key", "old")?;
+        db.cache_put("description", "same-key", "description")?;
+        db.cache_put("parse", "same-key", "new")?;
+        let before = snapshot(&db)?;
+        drop(db);
+        let db = Database::open(
+            &dir.path().join("index.sqlite"),
+            dir.path(),
+            &json!({}),
+            false,
+        )?;
+        assert_eq!(snapshot(&db)?, before);
+        assert_eq!(
+            serde_json::to_value(&db.files()?[0])?,
+            serde_json::to_value(record.0)?
+        );
+        assert_eq!(
+            db.items()?[0].description_embedding.as_deref(),
+            Some("description")
+        );
+        assert_eq!(db.cache("parse", "same-key")?.as_deref(), Some("new"));
+        assert_eq!(
+            db.cache("description", "same-key")?.as_deref(),
+            Some("description")
+        );
+        assert!(db.cache("other", "same-key")?.is_none());
+        let profile = json!({"model": "a", "dimensions": 2});
+        let document = Database::embedding_key(&profile, false, "input");
+        let keys = [
+            document.clone(),
+            Database::embedding_key(&profile, true, "input"),
+            Database::embedding_key(&json!({"model": "b", "dimensions": 2}), false, "input"),
+            Database::embedding_key(&profile, false, "input "),
+        ];
+        assert_eq!(
+            keys.iter().collect::<std::collections::HashSet<_>>().len(),
+            keys.len()
+        );
+        assert_eq!(document, Database::embedding_key(&profile, false, "input"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_embedding_foreign_keys_abort_publication_and_retry_cleanly() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        for description in [false, true] {
+            let mut record = record("code.rs");
+            if description {
+                record.1[0].description_embedding = Some("missing".into());
+            } else {
+                record.1[0].embedding = "missing".into();
+            }
+            assert!(db.apply(&[record], &[], Some("commit")).is_err());
+            assert!(db.files()?.is_empty());
+            assert!(db.items()?.is_empty());
+            assert_eq!(db.generation()?, 0);
+            assert!(db.meta("checkpoint")?.is_none());
+            assert!(db.conn.is_autocommit());
+        }
+        assert!(db.apply(&[record("code.rs")], &[], Some("commit"))?);
+        assert_eq!(db.generation()?, 1);
+        assert_eq!(db.items()?.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn unprefixed_schema_reopens_and_retains_artifacts_on_reset() -> Result<()> {

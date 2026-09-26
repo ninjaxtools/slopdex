@@ -738,4 +738,312 @@ mod tests {
         }
         assert_snapshot(&path, 1, &vectors);
     }
+
+    #[test]
+    fn non_axis_cosines_match_analytic_f64_scores_after_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        // Every vector has norm 3. Normalization preserves their component
+        // ratios exactly in F32, so these rational cosines need no F32 tolerance.
+        let vectors = vec![
+            (1, vec![1.0, 2.0, 2.0]),
+            (2, vec![-2.0, 1.0, 2.0]),
+            (3, vec![2.0, -2.0, 1.0]),
+            (4, vec![2.0, -1.0, -2.0]),
+            (5, vec![-1.0, -2.0, -2.0]),
+        ];
+        for _ in 0..2 {
+            let index = VectorIndex::open(&path, 3, 1, &vectors).unwrap();
+            let results = index.search(&vectors[0].1, 5, &keys(&vectors)).unwrap();
+            assert_eq!(
+                results.iter().map(|r| r.0).collect::<Vec<_>>(),
+                [1, 2, 3, 4, 5]
+            );
+            for ((_, actual), expected) in
+                results.iter().zip([1.0, 4.0 / 9.0, 0.0, -4.0 / 9.0, -1.0])
+            {
+                assert!((actual - expected).abs() < 1e-14, "{actual} != {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn fused_vectors_preserve_weighted_cosines_in_f64() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        // Concatenate two norm-3 embeddings, scaling the second by 2.
+        // Their cosine contributions consequently have weights 1/5 and 4/5.
+        let query = [1.0, 2.0, 2.0, 4.0, -2.0, 4.0];
+        let vectors = vec![
+            (1, query.to_vec()),
+            (2, vec![2.0, -1.0, 2.0, 2.0, 4.0, 4.0]),
+            (3, vec![1.0, 2.0, 2.0, -4.0, 2.0, -4.0]),
+            (4, query.iter().map(|v| -v).collect()),
+        ];
+        for _ in 0..2 {
+            let index = VectorIndex::open(&path, 6, 1, &vectors).unwrap();
+            let results = index.search(&query, 4, &keys(&vectors)).unwrap();
+            assert_eq!(
+                results.iter().map(|r| r.0).collect::<Vec<_>>(),
+                [1, 2, 3, 4]
+            );
+            for ((_, actual), expected) in results.iter().zip([1.0, 4.0 / 9.0, -0.6, -1.0]) {
+                assert!((actual - expected).abs() < 1e-14, "{actual} != {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn positive_scaling_preserves_scores_and_caller_query_bits() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        let vectors = vec![
+            (1, vec![1.0, 2.0, -2.0, 0.0]),
+            (2, vec![2.0, 1.0, 2.0, 0.0]),
+            (3, vec![-1.0, -2.0, 2.0, 0.0]),
+        ];
+        let query = [1.0, 2.0, -2.0, -0.0];
+        let expected = VectorIndex::open(&path, 4, 1, &vectors)
+            .unwrap()
+            .search(&query, 3, &keys(&vectors))
+            .unwrap();
+        // Powers of two change magnitude without perturbing component ratios;
+        // the extremes would underflow/overflow an F32 squared-norm calculation.
+        for exponent in [-80, 0, 80] {
+            let scale = 2.0_f32.powi(exponent);
+            let scaled: Vec<_> = vectors
+                .iter()
+                .map(|(key, vector)| (*key, vector.iter().map(|v| v * scale).collect()))
+                .collect();
+            let original = scaled.clone();
+            let index = VectorIndex::open(&path, 4, 1, &scaled).unwrap();
+            assert_eq!(scaled, original);
+            for query_exponent in [-80, 0, 80] {
+                let scaled_query = query.map(|v| v * 2.0_f32.powi(query_exponent));
+                let bits = scaled_query.map(f32::to_bits);
+                assert_eq!(
+                    index.search(&scaled_query, 3, &keys(&vectors)).unwrap(),
+                    expected
+                );
+                assert_eq!(scaled_query.map(f32::to_bits), bits);
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_filter_fills_limit_with_eligible_lower_scoring_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        let vectors = vec![
+            (10, vec![3.0, 4.0]),
+            (20, vec![4.0, 3.0]),
+            (30, vec![-4.0, 3.0]),
+            (40, vec![-3.0, -4.0]),
+        ];
+        for _ in 0..2 {
+            let index = VectorIndex::open(&path, 2, 1, &vectors).unwrap();
+            let cutoff = 30;
+            let results = index
+                .search_filtered(&[3.0, 4.0], 2, |key| key >= cutoff)
+                .unwrap();
+            assert_eq!(results.iter().map(|r| r.0).collect::<Vec<_>>(), [30, 40]);
+            assert!(results[0].1.abs() < 1e-14);
+            assert!((results[1].1 + 1.0).abs() < 1e-14);
+            assert_eq!(
+                results,
+                index
+                    .search(&[3.0, 4.0], 2, &HashSet::from([30, 40, 999]))
+                    .unwrap()
+            );
+            assert_eq!(
+                index
+                    .search_filtered(&[3.0, 4.0], 1, |key| key >= cutoff)
+                    .unwrap(),
+                results[..1]
+            );
+            assert!(
+                index
+                    .search_filtered(&[3.0, 4.0], usize::MAX, |_| false)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                index
+                    .search_filtered(&[3.0, 4.0], 0, |_| panic!("zero limit invoked predicate"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_key_reuse_and_replacement_survive_reopening() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        let snapshots = [
+            sample(),
+            vec![(42, vec![3.0, 4.0]), (7, vec![-4.0, 3.0])],
+            vec![
+                (0, vec![-3.0, 4.0]),
+                (42, vec![-4.0, -3.0]),
+                (u64::MAX - 1, vec![4.0, -3.0]),
+            ],
+            vec![(7, vec![4.0, 3.0])],
+        ];
+        let all_keys = HashSet::from([0, 7, 42, u64::MAX - 1]);
+        for generation in 0..12 {
+            let vectors = &snapshots[generation as usize % snapshots.len()];
+            for _ in 0..2 {
+                let index = VectorIndex::open(&path, 2, generation, vectors).unwrap();
+                assert_eq!(index.len(), vectors.len());
+                let results = index
+                    .search(&[3.0, 4.0], all_keys.len(), &all_keys)
+                    .unwrap();
+                assert_eq!(
+                    results.iter().map(|r| r.0).collect::<HashSet<_>>(),
+                    keys(vectors)
+                );
+                assert_eq!(results.len(), vectors.len());
+                assert!(results.windows(2).all(|pair| pair[0].1 >= pair[1].1));
+                for (key, actual) in results {
+                    let vector = &vectors.iter().find(|(k, _)| *k == key).unwrap().1;
+                    let x = f64::from(vector[0]);
+                    let y = f64::from(vector[1]);
+                    let expected = (3.0 * x + 4.0 * y) / (5.0 * x.hypot(y));
+                    assert!(
+                        (actual - expected).abs() < 1e-7,
+                        "generation {generation}, key {key}: {actual} != {expected}"
+                    );
+                }
+                assert_snapshot(&path, generation, vectors);
+            }
+        }
+    }
+
+    fn replace_native_sidecar(path: &Path, options: IndexOptions, vectors: &[(u64, Vec<f32>)]) {
+        let dimensions = options.dimensions;
+        let native = Index::new(&options).unwrap();
+        native.reserve(vectors.len()).unwrap();
+        for (key, vector) in vectors {
+            native
+                .add(*key, &normalized(vector, dimensions).unwrap())
+                .unwrap();
+        }
+        // Publish a valid native binary with a matching hash: rejection must
+        // come from semantic validation rather than corruption detection.
+        let mut manifest = read_manifest(path);
+        persist(path, &native, &mut manifest).unwrap();
+        assert_eq!(manifest.binary_hash, crate::hash(fs::read(path).unwrap()));
+        assert_eq!(
+            manifest.fingerprint,
+            manifest.compute_fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn valid_native_sidecars_with_wrong_metric_or_scalar_are_rebuilt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        let vectors = sample();
+        VectorIndex::open(&path, 2, 1, &vectors).unwrap();
+        for (metric, quantization) in [
+            (MetricKind::L2sq, ScalarKind::F32),
+            (MetricKind::Cos, ScalarKind::F16),
+        ] {
+            replace_native_sidecar(
+                &path,
+                IndexOptions {
+                    dimensions: 2,
+                    metric,
+                    quantization,
+                    connectivity: CONNECTIVITY,
+                    expansion_add: EXPANSION_ADD,
+                    expansion_search: EXPANSION_SEARCH,
+                    multi: false,
+                },
+                &vectors,
+            );
+            let error = load_cached(&path, 2).err().unwrap();
+            assert!(
+                error.to_string().contains("configuration/count mismatch"),
+                "{error:#}"
+            );
+            let recovered = VectorIndex::open(&path, 2, 1, &vectors).unwrap();
+            assert_eq!(recovered.index.metric_kind(), MetricKind::Cos);
+            assert_eq!(recovered.index.scalar_kind(), ScalarKind::F32);
+            assert_snapshot(&path, 1, &vectors);
+        }
+    }
+
+    #[test]
+    fn valid_native_sidecar_with_same_count_but_wrong_keys_is_rebuilt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        let vectors = sample();
+        VectorIndex::open(&path, 2, 1, &vectors).unwrap();
+        let mut wrong_keys = vectors.clone();
+        wrong_keys[0].0 = 7;
+        replace_native_sidecar(
+            &path,
+            IndexOptions {
+                dimensions: 2,
+                metric: MetricKind::Cos,
+                quantization: ScalarKind::F32,
+                connectivity: CONNECTIVITY,
+                expansion_add: EXPANSION_ADD,
+                expansion_search: EXPANSION_SEARCH,
+                multi: false,
+            },
+            &wrong_keys,
+        );
+        let error = load_cached(&path, 2).err().unwrap();
+        assert!(
+            error.to_string().contains("vector binary key mismatch"),
+            "{error:#}"
+        );
+        let recovered = VectorIndex::open(&path, 2, 1, &vectors).unwrap();
+        assert!(!recovered.index.contains(7));
+        assert_eq!(
+            recovered.search(&[1.0, 0.0], 1, &keys(&vectors)).unwrap(),
+            [(0, 1.0)]
+        );
+        assert_snapshot(&path, 1, &vectors);
+    }
+
+    #[test]
+    fn failed_manifest_publication_cleans_temporary_files_and_recovers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors");
+        VectorIndex::open(&path, 2, 1, &sample()).unwrap();
+        let old_binary = fs::read(&path).unwrap();
+        let old_manifest = fs::read(manifest_path(&path)).unwrap();
+        // A directory at the manifest destination reliably makes its rename
+        // fail, including when the test runs with elevated permissions.
+        fs::remove_file(manifest_path(&path)).unwrap();
+        fs::create_dir(manifest_path(&path)).unwrap();
+        let vectors = vec![(7, vec![3.0, 4.0])];
+        let error = VectorIndex::open(&path, 2, 2, &vectors).err().unwrap();
+        assert!(format!("{error:#}").contains("replace"), "{error:#}");
+        assert_ne!(fs::read(&path).unwrap(), old_binary);
+        let entries: HashSet<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries, HashSet::from([path.clone(), manifest_path(&path)]));
+        fs::remove_dir(manifest_path(&path)).unwrap();
+        fs::write(manifest_path(&path), old_manifest).unwrap();
+        let error = load_cached(&path, 2).err().unwrap();
+        assert!(
+            error.to_string().contains("vector binary hash mismatch"),
+            "{error:#}"
+        );
+        for _ in 0..2 {
+            let recovered = VectorIndex::open(&path, 2, 2, &vectors).unwrap();
+            assert_snapshot(&path, 2, &vectors);
+            assert_eq!(
+                recovered.search(&[3.0, 4.0], 1, &keys(&vectors)).unwrap(),
+                [(7, 1.0)]
+            );
+        }
+    }
 }
