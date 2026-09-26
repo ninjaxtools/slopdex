@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+cliclack = "0.5.6"
 dirs = "6"
 fs2 = "0.4"
 globset = "0.4"

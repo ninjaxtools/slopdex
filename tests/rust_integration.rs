@@ -1689,6 +1689,45 @@ fn cli_refresh_search_no_reindex_jsonl_and_provider_failure_are_end_to_end() -> 
 }
 
 #[test]
+fn cli_redirected_progress_preserves_json_plain_diagnostics_and_offline_mode() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write("code.rs", &function("alpha", "VECTOR_EAST"))?;
+    fs::write(repo.root.join("invalid.rs"), [0xff])?;
+
+    let output = repo.cli(&["status"])?;
+    assert!(output.status.success());
+    let status: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(status["functionCount"], 1);
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("slopdex: notice: external model call:"));
+    assert!(stderr.contains("saved indexing error(s)"));
+    assert!(!stderr.contains('\x1b'));
+    assert!(!stderr.contains("Refreshing index"));
+    assert!(!stderr.contains("Embedding batches"));
+
+    let requests = mock.count();
+    repo.write("new.rs", &function("beta", "VECTOR_NORTH"))?;
+    let output = repo.cli(&["--no-reindex", "--ignore-errors", "status"])?;
+    assert!(output.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&output.stdout)?, status);
+    assert!(output.stderr.is_empty());
+    assert_eq!(mock.count(), requests);
+
+    mock.fail_on(Some("VECTOR_NORTH"));
+    let output = repo.cli(&["status"])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("slopdex:"));
+    assert!(stderr.contains("HTTP 503"));
+    assert!(!stderr.contains('\x1b'));
+    assert!(!stderr.contains("Refreshing index"));
+    Ok(())
+}
+
+#[test]
 fn read_errors_are_persisted_and_clear_when_the_source_is_repaired() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;

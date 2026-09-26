@@ -1,13 +1,13 @@
 //! Command-line parsing, configuration, and presentation. Engine operations live in engine.rs.
 
-use crate::{engine::Engine, providers::Providers};
+use crate::{engine::Engine, providers::Providers, ui};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, IsTerminal, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -413,6 +413,11 @@ impl Cli {
     }
 }
 
+/// Report a runtime error on stderr, using terminal styling when available.
+pub fn report_error(error: &anyhow::Error) {
+    ui::error(format!("slopdex: {error:#}"));
+}
+
 /// Execute the CLI; main owns reporting runtime errors and selecting the failure exit code.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -420,7 +425,9 @@ pub fn run() -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     if let Command::Models { provider } = &cli.command {
-        let models = Providers::models(cli.models_provider(provider.as_deref())?)?;
+        let models = ui::spin("Fetching published models", || {
+            Providers::models(cli.models_provider(provider.as_deref())?)
+        })?;
         if cli.global.format == Some(Format::Json) {
             return print_json(&mut out, &models);
         }
@@ -440,11 +447,13 @@ pub fn run() -> Result<()> {
     if let Command::Descriptions { action } = &cli.command {
         config["descriptionsEnabled"] = json!(action.enabled());
     }
-    let mut engine = Engine::open(&root, &index, config.clone())?;
+    let mut engine = ui::spin("Opening index", || {
+        Engine::open(&root, &index, config.clone())
+    })?;
     let refreshed = if cli.global.no_reindex {
         None
     } else {
-        Some(engine.refresh()?)
+        Some(ui::spin("Refreshing index", || engine.refresh())?)
     };
     warn_errors(
         &engine,
@@ -460,7 +469,9 @@ pub fn run() -> Result<()> {
                 options["descriptions"] = json!(args.descriptions);
                 options["md"] = json!(args.md);
             }
-            let rows = engine.search(&args.query.query, "search", &options)?;
+            let rows = ui::spin("Searching index", || {
+                engine.search(&args.query.query, "search", &options)
+            })?;
             print_search(&mut out, &rows, format, false)?;
         }
         Command::SearchCode(args) | Command::SearchDescriptions(args) | Command::SearchMd(args) => {
@@ -469,13 +480,17 @@ pub fn run() -> Result<()> {
                 Command::SearchDescriptions(_) => "search-descriptions",
                 _ => "search-md",
             };
-            let rows = engine.search(&args.query, kind, &args.filters.options())?;
+            let rows = ui::spin("Searching index", || {
+                engine.search(&args.query, kind, &args.filters.options())
+            })?;
             print_search(&mut out, &rows, format, kind == "search-descriptions")?;
         }
         Command::Describe(args) => {
             let mut options = args.query.filters.options();
             options["describeFullFileThreshold"] = json!(args.describe_full_file_threshold);
-            let result = engine.describe(&args.query.query, &options)?;
+            let result = ui::spin("Generating explanation", || {
+                engine.describe(&args.query.query, &options)
+            })?;
             if format == Format::Json {
                 print_json(&mut out, &result)?;
             } else {
@@ -497,10 +512,11 @@ pub fn run() -> Result<()> {
                     let target_path = config_path(&target_root, args.target_config.as_deref())?;
                     let mut target_config = effective_config(&cli.global, &target_path)?;
                     target_config["indexPath"] = json!(target_index);
-                    let mut opened =
-                        Engine::open(&target_root, &target_index, target_config.clone())?;
+                    let mut opened = ui::spin("Opening target index", || {
+                        Engine::open(&target_root, &target_index, target_config.clone())
+                    })?;
                     if !cli.global.no_reindex {
-                        opened.refresh()?;
+                        ui::spin("Refreshing target index", || opened.refresh())?;
                     }
                     warn_errors(
                         &opened,
@@ -510,7 +526,9 @@ pub fn run() -> Result<()> {
                     target = Some(opened);
                 }
             }
-            let rows = engine.cross_search(target.as_ref(), &args.options())?;
+            let rows = ui::spin("Comparing indexed functions", || {
+                engine.cross_search(target.as_ref(), &args.options())
+            })?;
             let format = cli.global.format.unwrap_or(if args.cohesion {
                 Format::Summary
             } else {
@@ -532,7 +550,9 @@ pub fn run() -> Result<()> {
             &refreshed.unwrap_or(json!({"refreshed": false, "noReindex": true})),
         )?,
         Command::Descriptions { action } => {
-            let result = engine.set_descriptions(action.enabled())?;
+            let result = ui::spin("Updating descriptions", || {
+                engine.set_descriptions(action.enabled())
+            })?;
             let mut saved = read_config(&config_file)?;
             saved["descriptionsEnabled"] = json!(action.enabled());
             for key in [
@@ -548,7 +568,10 @@ pub fn run() -> Result<()> {
             print_json(&mut out, &result)?;
         }
         Command::ReindexFiles { callables } => {
-            print_json(&mut out, &engine.reindex_files(*callables)?)?
+            let result = ui::spin("Regenerating file descriptions", || {
+                engine.reindex_files(*callables)
+            })?;
+            print_json(&mut out, &result)?
         }
         Command::Config { .. } | Command::Models { .. } => unreachable!(),
     }
@@ -841,7 +864,7 @@ fn resolve_model(
         provider.is_none() || matches!(provider, Some("opencode" | "opencode-go")),
         "config model/fallback-model catalog provider must be opencode or opencode-go"
     );
-    let catalog = Providers::models(provider)?;
+    let catalog = ui::spin("Fetching published models", || Providers::models(provider))?;
     resolve_catalog_model(&catalog, provider, model)
 }
 
@@ -887,14 +910,17 @@ fn run_config(
     let changed = match action {
         None => {
             ensure!(
-                io::stdin().is_terminal() && io::stderr().is_terminal(),
+                io::stdin().is_terminal() && ui::terminal(),
                 "config without an action requires an interactive terminal"
             );
             cliclack::intro("slopdex configuration")?;
             if let Err(error) = configure_interactively(&mut config, &mut CliclackPrompts) {
                 // cliclack 0.5.6 returns Interrupted for Esc/Ctrl-C; it does not exit.
                 if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                    matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof)
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof
+                    )
                 }) {
                     cliclack::outro_cancel("Configuration cancelled; no settings saved")?;
                     return Ok(());
@@ -994,11 +1020,24 @@ fn run_config(
     write_config(path, &config)?;
     if action.is_none() {
         let summary = [
-            "descriptionsEnabled", "descriptionProvider", "descriptionModel",
-            "descriptionFallbackModel", "rerankingEnabled", "rerankerProvider",
-            "rerankerModel", "rerankerCandidates", "provider", "model", "dimensions",
-            "indexPath", "include", "exclude", "maxFileSize", "embeddingBatchSize",
-            "parallelism", "verbose",
+            "descriptionsEnabled",
+            "descriptionProvider",
+            "descriptionModel",
+            "descriptionFallbackModel",
+            "rerankingEnabled",
+            "rerankerProvider",
+            "rerankerModel",
+            "rerankerCandidates",
+            "provider",
+            "model",
+            "dimensions",
+            "indexPath",
+            "include",
+            "exclude",
+            "maxFileSize",
+            "embeddingBatchSize",
+            "parallelism",
+            "verbose",
         ]
         .iter()
         .filter_map(|key| config.get(*key).map(|value| format!("{key}: {value}")))
@@ -1015,18 +1054,25 @@ fn run_config(
         result["configPath"] = json!(path);
         print_json(out, &result)
     } else {
-        write!(out, "Updated {}:", path.display())?;
-        for (key, value) in changed.as_object().unwrap() {
-            write!(
-                out,
-                " {key}={}",
-                value
+        let settings = changed
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                let value = value
                     .as_str()
                     .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string())
-            )?;
+                    .unwrap_or_else(|| value.to_string());
+                format!("{key}={value}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let message = format!("Updated {}: {settings}", path.display());
+        if ui::terminal() && io::stdout().is_terminal() {
+            cliclack::log::success(message)?;
+        } else {
+            writeln!(out, "{message}")?;
         }
-        writeln!(out)?;
         Ok(())
     }
 }
@@ -1114,8 +1160,10 @@ impl Prompts for CliclackPrompts {
             .default_input(&default.to_string())
             .validate(move |value: &String| {
                 let n = positive(value)?;
-                if max.is_some_and(|max| n > max) {
-                    return Err(format!("Enter a positive integer no greater than {}", max.unwrap()));
+                if let Some(max) = max
+                    && n > max
+                {
+                    return Err(format!("Enter a positive integer no greater than {max}"));
                 }
                 Ok(())
             })
@@ -1137,7 +1185,9 @@ impl Prompts for CliclackPrompts {
     }
 
     fn catalog(&mut self, provider: &str) -> Result<Value> {
-        crate::ui::spin("Fetching published models", || Providers::models(Some(provider)))
+        crate::ui::spin("Fetching published models", || {
+            Providers::models(Some(provider))
+        })
     }
 }
 
@@ -1324,11 +1374,11 @@ fn warn_errors(engine: &Engine, index: &Path, ignore: bool) -> Result<()> {
     if !ignore {
         let errors = engine.errors()?;
         if !errors.is_empty() {
-            eprintln!(
+            ui::warning(format!(
                 "slopdex: {} saved indexing error(s) in {}; inspect with index-errors",
                 errors.len(),
                 index.display()
-            );
+            ));
         }
     }
     Ok(())
@@ -2100,18 +2150,112 @@ mod tests {
         }
     }
 
+    struct ScriptedSelection {
+        default: String,
+        choices: Vec<String>,
+        searchable: bool,
+    }
+
+    struct ScriptedPrompts {
+        input: io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        catalog: Value,
+        fetches: Vec<String>,
+        selections: Vec<ScriptedSelection>,
+    }
+
+    impl ScriptedPrompts {
+        fn new(answers: &str) -> Self {
+            Self {
+                input: io::Cursor::new(answers.as_bytes().to_vec()),
+                output: Vec::new(),
+                catalog: Value::Null,
+                fetches: Vec::new(),
+                selections: Vec::new(),
+            }
+        }
+    }
+
+    impl Prompts for ScriptedPrompts {
+        fn ask(&mut self, label: &str, default: &str) -> Result<String> {
+            use std::io::BufRead;
+
+            writeln!(self.output, "{label} [{default}]")?;
+            let mut line = String::new();
+            if self.input.read_line(&mut line)? == 0 {
+                return Err(io::Error::from(io::ErrorKind::Interrupted).into());
+            }
+            Ok(if line.trim().is_empty() {
+                default.to_owned()
+            } else {
+                line.trim().to_owned()
+            })
+        }
+
+        fn select(
+            &mut self,
+            label: &str,
+            default: &str,
+            choices: &[&str],
+            searchable: bool,
+        ) -> Result<String> {
+            self.selections.push(ScriptedSelection {
+                default: default.to_owned(),
+                choices: choices.iter().map(|choice| (*choice).to_owned()).collect(),
+                searchable,
+            });
+            let value = self.ask(label, default)?;
+            ensure!(
+                choices.contains(&value.as_str()),
+                "invalid scripted selection: {value}"
+            );
+            Ok(value)
+        }
+
+        fn yes(&mut self, label: &str, default: bool) -> Result<bool> {
+            match self
+                .ask(label, if default { "yes" } else { "no" })?
+                .as_str()
+            {
+                "yes" => Ok(true),
+                "no" => Ok(false),
+                value => anyhow::bail!("invalid scripted confirmation: {value}"),
+            }
+        }
+
+        fn number(&mut self, label: &str, default: u64, max: Option<usize>) -> Result<usize> {
+            let value = self.ask(label, &default.to_string())?;
+            let n = positive(&value).map_err(anyhow::Error::msg)?;
+            ensure!(
+                max.is_none_or(|max| n <= max),
+                "scripted number exceeds maximum"
+            );
+            Ok(n)
+        }
+
+        fn required(&mut self, label: &str, default: &str) -> Result<String> {
+            let value = self.ask(label, default)?;
+            ensure!(!value.is_empty(), "scripted value is required");
+            Ok(value)
+        }
+
+        fn catalog(&mut self, provider: &str) -> Result<Value> {
+            self.fetches.push(provider.to_owned());
+            ensure!(!self.catalog.is_null(), "no scripted catalog supplied");
+            Ok(self.catalog.clone())
+        }
+    }
+
     #[test]
     fn wizard_can_skip_llms_and_preserves_extensions() {
         let mut config = json!({"custom": "keep"});
-        let mut prompts = Prompts {
-            input: io::Cursor::new(b"no\nno\n\n\n\n\n\n\n\n\n\n\n"),
-            output: Vec::new(),
-        };
+        let mut prompts = ScriptedPrompts::new("no\nno\n\n\n\n\n\n\n\n\n\n\n");
         configure_interactively(&mut config, &mut prompts).unwrap();
         assert_eq!(config["descriptionsEnabled"], false);
         assert_eq!(config["model"], "text-embedding-3-large");
         assert_eq!(config["dimensions"], 3072);
         assert_eq!(config["custom"], "keep");
+        assert!(prompts.fetches.is_empty());
         let output = String::from_utf8(prompts.output).unwrap();
         assert!(!output.contains("Description provider"));
         assert!(!output.contains("Description model"));
@@ -2130,10 +2274,7 @@ mod tests {
         ] {
             let mut config = json!({"embeddingProvider": "jina", "embeddingModel": "custom-jina",
                 "embeddingDimensions": 16, "custom": "keep"});
-            let mut prompts = Prompts {
-                input: io::Cursor::new(answers),
-                output: Vec::new(),
-            };
+            let mut prompts = ScriptedPrompts::new(answers);
             configure_interactively(&mut config, &mut prompts).unwrap();
             for alias in ["embeddingProvider", "embeddingModel", "embeddingDimensions"] {
                 assert!(config.get(alias).is_none());
@@ -2156,10 +2297,7 @@ mod tests {
     fn wizard_removes_fallback_alias_when_fallback_is_disabled() {
         let mut config = json!({"descriptionProvider": "openai", "descriptionModel": "primary",
             "fallbackModel": "backup"});
-        let mut prompts = Prompts {
-            input: io::Cursor::new("yes\n\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n"),
-            output: Vec::new(),
-        };
+        let mut prompts = ScriptedPrompts::new("yes\n\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n");
         configure_interactively(&mut config, &mut prompts).unwrap();
         assert!(config.get("fallbackModel").is_none());
         assert!(config.get("descriptionFallbackModel").is_none());
@@ -2167,5 +2305,148 @@ mod tests {
             Providers::new(&config).unwrap().description_profile()["model"],
             "primary"
         );
+    }
+
+    #[test]
+    fn wizard_published_models_are_searchable_scoped_and_defaulted() {
+        let catalog = json!([
+            {"provider": "opencode-go", "model": "first"},
+            {"provider": "opencode-go", "model": "saved"},
+            {"provider": "opencode", "model": "other-provider"}
+        ]);
+        let mut prompts = ScriptedPrompts::new("\n\n\n");
+        assert_eq!(
+            prompts
+                .published(&catalog, "opencode-go", "Model", "saved", None)
+                .unwrap(),
+            "saved"
+        );
+        assert_eq!(
+            prompts
+                .published(&catalog, "opencode-go", "Fallback", "saved", Some("saved"))
+                .unwrap(),
+            "first"
+        );
+        assert_eq!(
+            prompts
+                .published(&catalog, "opencode-go", "Model", "retired", None)
+                .unwrap(),
+            "first"
+        );
+        assert!(
+            prompts
+                .selections
+                .iter()
+                .all(|selection| selection.searchable)
+        );
+        assert_eq!(prompts.selections[0].default, "saved");
+        assert_eq!(prompts.selections[0].choices, ["first", "saved"]);
+        assert_eq!(prompts.selections[1].choices, ["first"]);
+        assert!(
+            prompts
+                .published(&catalog, "missing", "Model", "", None)
+                .is_err()
+        );
+        assert!(
+            prompts
+                .published(&catalog, "opencode", "Fallback", "", Some("other-provider"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn wizard_fetches_one_catalog_and_reuses_it_for_fallback() {
+        let mut config = json!({"descriptionProvider": "opencode-go", "descriptionModel": "primary",
+            "descriptionFallbackModel": "backup", "descriptionsEnabled": true});
+        let mut prompts = ScriptedPrompts::new(&"\n".repeat(16));
+        prompts.catalog = json!([
+            {"provider": "opencode-go", "model": "primary"},
+            {"provider": "opencode-go", "model": "backup"}
+        ]);
+        configure_interactively(&mut config, &mut prompts).unwrap();
+        assert_eq!(prompts.fetches, ["opencode-go"]);
+        assert_eq!(config["descriptionModel"], "primary");
+        assert_eq!(config["descriptionFallbackModel"], "backup");
+    }
+
+    #[test]
+    fn wizard_cancellation_at_every_prompt_discards_all_changes() {
+        let original = json!({"embeddingProvider": "jina", "embeddingModel": "custom",
+            "embeddingDimensions": 16, "custom": "keep"});
+        let answers = [
+            "yes",
+            "openai",
+            "primary",
+            "yes",
+            "backup",
+            "yes",
+            "openai",
+            "reranker",
+            "100",
+            "openai",
+            "embedding",
+            "8",
+            "index.sqlite",
+            "src/**",
+            "-",
+            "1024",
+            "16",
+            "4",
+            "yes",
+        ];
+        for end in 0..answers.len() {
+            let input = answers[..end]
+                .iter()
+                .map(|answer| format!("{answer}\n"))
+                .collect::<String>();
+            let mut config = original.clone();
+            let error = configure_interactively(&mut config, &mut ScriptedPrompts::new(&input))
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::Interrupted
+            );
+            assert_eq!(config, original, "cancelled at prompt {end}");
+        }
+        let mut config = original;
+        let mut prompts = ScriptedPrompts::new(&(answers.join("\n") + "\n"));
+        configure_interactively(&mut config, &mut prompts).unwrap();
+        assert_eq!(config["rerankerCandidates"], 100);
+        assert_eq!(config["verbose"], true);
+        assert!(prompts.fetches.is_empty());
+    }
+
+    #[test]
+    fn wizard_catalog_and_validation_errors_discard_changes() {
+        for answers in ["yes\nopencode-go\n", "no\nno\n\n\n\n\n[\n\n\n\n\n\n"] {
+            let original = json!({"embeddingProvider": "jina", "custom": "keep"});
+            let mut config = original.clone();
+            assert!(
+                configure_interactively(&mut config, &mut ScriptedPrompts::new(answers)).is_err()
+            );
+            assert_eq!(config, original);
+        }
+    }
+
+    #[test]
+    fn config_subcommands_keep_json_stdout_machine_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        write_config(&path, &json!({"custom": "keep"})).unwrap();
+        for args in [
+            vec!["config", "descriptions", "enable", "--format", "json"],
+            vec!["config", "parallelism", "4", "--format", "json"],
+            vec!["config", "reranker", "openai", "--format", "json"],
+        ] {
+            let cli = parse(&args);
+            let Command::Config { action } = cli.command else {
+                panic!()
+            };
+            let mut out = Vec::new();
+            run_config(&cli.global, &path, action.as_ref(), &mut out).unwrap();
+            let result: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(result["configPath"], json!(path));
+            assert_eq!(read_config(&path).unwrap()["custom"], "keep");
+        }
     }
 }

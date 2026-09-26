@@ -68,13 +68,25 @@ catalogs. Bare IDs must resolve unambiguously; the fallback must use the configu
 description provider. `config model` changes description settings, whereas the
 global `--model` selects the embedding model. `config reranker <provider> [model]`
 accepts an optional model. `config descriptions` defers index work until the next
-index command. Interactive configuration requires terminal stdin/stdout; it asks
+index command. Interactive configuration requires terminal stdin/stderr; it asks
 about descriptions, reranking, embeddings, paths, filters, and common settings.
-OpenCode model prompts accept exact IDs or text to display a filtered list.
+Use arrow keys and Enter to select providers and models; typing in an OpenCode
+model menu filters the published catalog. Saved values are preselected, numeric
+inputs validate inline, and Esc/Ctrl-C cancels without saving partial changes.
+The wizard and its saved-settings summary render on stderr, so `--format json`
+can write the resulting configuration to redirected stdout.
 Advanced endpoint/HTTP settings are edited in JSON.
 
 Help, version, configuration, and model-catalog commands do not refresh the index.
 Other commands open it and normally refresh before doing their work.
+
+On terminal stderr, cliclack displays progress for catalog loading, opening and
+refreshing indexes, searches, explanations, and description regeneration.
+Indexing reports the current file and completed embedding batches/callable
+descriptions. Provider notices appear above the progress display. Warnings and
+runtime errors use the same terminal styling. Redirected stderr and `TERM=dumb`
+use plain diagnostics without animations; result data on stdout retains its
+summary/JSON/JSONL format.
 
 ## Search and analysis options
 

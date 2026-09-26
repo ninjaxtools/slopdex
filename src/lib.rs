@@ -4,6 +4,7 @@ pub mod models;
 pub mod parse;
 pub mod providers;
 pub mod storage;
+mod ui;
 pub mod vectors;
 
 pub fn hash(input: impl AsRef<[u8]>) -> String {

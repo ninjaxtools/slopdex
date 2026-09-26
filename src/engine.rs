@@ -15,6 +15,7 @@ use crate::{
     hash, parse,
     providers::Providers,
     storage::{Database, File, Item},
+    ui,
     vectors::VectorIndex,
 };
 
@@ -123,6 +124,7 @@ impl Engine {
         if flag(&self.config, "noReindex") {
             return Ok(json!({"skipped":true,"generation":self.db.generation()?}));
         }
+        ui::progress("Scanning repository files");
         let checkpoint = self.git_text(&["rev-parse", "--verify", "HEAD"]);
         let dirty = self.dirty_paths()?;
         let include = globs(&self.config["include"])?;
@@ -170,7 +172,12 @@ impl Engine {
             .filter(|i| i.kind == "function" && i.description_embedding.is_none())
             .map(|i| i.path.as_str())
             .collect();
-        for path in paths {
+        let total = paths.len();
+        for (position, path) in paths.into_iter().enumerate() {
+            ui::progress(format_args!(
+                "Indexing file {}/{total}: {path}",
+                position + 1
+            ));
             let source_mode = if checkpoint.is_none() || dirty.contains(&path) {
                 "working-tree"
             } else {
@@ -234,6 +241,7 @@ impl Engine {
                 );
             }
         }
+        ui::progress("Saving index snapshot");
         let dirty = self.db.apply(&changed, &removed, checkpoint.as_deref())?;
         self.db.set_meta(
             "descriptions_enabled",
@@ -371,6 +379,7 @@ impl Engine {
         let jobs: Vec<_> = description_jobs.into_iter().collect();
         let llm = self.providers.llm();
         run_jobs(
+            "Generating callable descriptions",
             &jobs,
             self.parallelism()?,
             |(_, prompt)| {
@@ -422,6 +431,7 @@ impl Engine {
         if let Some(cached) = self.db.cache("description", key)? {
             return Ok(cached);
         }
+        ui::progress("Generating file description");
         let description=self.providers.llm().describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)?;
         self.db.cache_put("description", key, &description)?;
         Ok(description)
@@ -441,6 +451,7 @@ impl Engine {
         let batch = vector.batch_limit();
         let batches: Vec<_> = pending.chunks(batch).collect();
         run_jobs(
+            "Embedding batches",
             &batches,
             self.parallelism()?,
             |entries| {
@@ -476,6 +487,7 @@ impl Engine {
     }
 
     fn load(&mut self) -> Result<()> {
+        ui::progress("Loading index records");
         self.items = self.db.items()?;
         self.files = self
             .db
@@ -540,6 +552,7 @@ impl Engine {
                 .collect::<Result<_>>()?;
             let mut path = self.db.path.as_os_str().to_os_string();
             path.push(format!(".{kind}.usearch"));
+            ui::progress(format_args!("Loading {kind} vector index"));
             let index = VectorIndex::open(
                 &PathBuf::from(path),
                 dimensions * parts,
@@ -967,6 +980,7 @@ impl Engine {
         }
         let context =
             json!({"query":query,"files":files.values().collect::<Vec<_>>(),"matches":matches});
+        ui::progress("Generating explanation from search results");
         let description=self.providers.llm().describe("Explain the existing code and documentation relevant to the user's task using only the supplied search context. Cite paths and symbols. Do not propose an implementation. If there is insufficient context, say so.",&context.to_string())?;
         let files: Vec<_> = files
             .into_values()
@@ -1209,11 +1223,16 @@ fn distance(left: &Path, right: &Path) -> usize {
 /// as it arrives, even if another in-flight request fails. Never launch more
 /// requests after a failed window, and join every worker before returning.
 fn run_jobs<T: Sync, R: Send>(
+    label: &str,
     jobs: &[T],
     parallelism: usize,
     work: impl Fn(&T) -> Result<R> + Sync,
     mut persist: impl FnMut(&T, R) -> Result<()>,
 ) -> Result<()> {
+    let mut completed = 0;
+    if !jobs.is_empty() {
+        ui::progress(format_args!("{label}: 0/{}", jobs.len()));
+    }
     for window in jobs.chunks(parallelism) {
         std::thread::scope(|scope| -> Result<()> {
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -1229,6 +1248,9 @@ fn run_jobs<T: Sync, R: Send>(
             for (job, result) in receiver {
                 if let Err(error) = result.and_then(|value| persist(job, value)) {
                     failure.get_or_insert(error);
+                } else {
+                    completed += 1;
+                    ui::progress(format_args!("{label}: {completed}/{}", jobs.len()));
                 }
             }
             if let Some(error) = failure {

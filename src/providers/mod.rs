@@ -176,11 +176,11 @@ impl Context {
             provider,
             model,
         ) {
-            eprintln!(
+            crate::ui::info(format!(
                 "slopdex: notice: external model call: kind={kind} provider={} model={}",
                 json!(provider),
                 json!(model),
-            );
+            ));
         }
     }
 }
