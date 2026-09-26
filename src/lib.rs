@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod engine;
+pub mod models;
 pub mod parser;
 pub mod providers;
 pub mod storage;

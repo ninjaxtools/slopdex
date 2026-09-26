@@ -85,10 +85,10 @@ impl Engine {
         let db = Database::open(
             &index,
             &root,
-            &providers.embedding_profile(),
+            &providers.vector().profile(),
             flag(&config, "forceReindex"),
         )?;
-        db.import_legacy(&providers.embedding_profile())?;
+        db.import_legacy(providers.vector())?;
         // Persisted description settings also apply when an index is moved to a
         // caller without a config file. Explicit settings still take precedence.
         if config.get("descriptionProvider").is_none()
@@ -243,7 +243,7 @@ impl Engine {
         if self.enabled {
             self.db.set_meta(
                 "description_profile",
-                &self.providers.description_profile().to_string(),
+                &self.providers.llm().profile().to_string(),
             )?;
         }
         if dirty || self.enabled != self.complete_descriptions {
@@ -294,13 +294,7 @@ impl Engine {
             && file.language != "markdown"
         {
             let key = hash(
-                json!([
-                    self.providers.description_profile(),
-                    "file",
-                    path,
-                    source_hash
-                ])
-                .to_string(),
+                json!([self.providers.llm().profile(), "file", path, source_hash]).to_string(),
             );
             let description=self.description(&key,&format!("Describe the purpose, responsibilities, and important relationships of this existing source file. Do not propose changes.\nFile: {path}\n\n{source}"))?;
             file.description_embedding = Some(self.embed_one(&description, false)?);
@@ -327,7 +321,7 @@ impl Engine {
             );
             *occurrence += 1;
             let embedding = Database::embedding_key(
-                &self.providers.embedding_profile(),
+                &self.providers.vector().profile(),
                 false,
                 &callable.embedding_input,
             );
@@ -368,7 +362,7 @@ impl Engine {
             {
                 let key = hash(
                     json!([
-                        self.providers.description_profile(),
+                        self.providers.llm().profile(),
                         "function",
                         path,
                         callable.qualified_name,
@@ -408,12 +402,12 @@ impl Engine {
             });
         }
         let jobs: Vec<_> = description_jobs.into_iter().collect();
-        let providers = &self.providers;
+        let llm = self.providers.llm();
         run_jobs(
             &jobs,
             self.parallelism()?,
             |(_, prompt)| {
-                providers.describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)
+                llm.describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)
             },
             |(key, _), description| self.db.cache_put("description", key, &description),
         )?;
@@ -428,7 +422,7 @@ impl Engine {
         self.ensure_embeddings(&descriptions, false)?;
         for ((index, _), description) in description_assignments.into_iter().zip(descriptions) {
             items[index].description_embedding = Some(Database::embedding_key(
-                &self.providers.embedding_profile(),
+                &self.providers.vector().profile(),
                 false,
                 &description,
             ));
@@ -436,7 +430,7 @@ impl Engine {
         }
         for (ordinal, chunk) in parsed.chunks.into_iter().enumerate() {
             let embedding = Database::embedding_key(
-                &self.providers.embedding_profile(),
+                &self.providers.vector().profile(),
                 false,
                 &chunk.embedding_input,
             );
@@ -461,13 +455,14 @@ impl Engine {
         if let Some(cached) = self.db.cache("description", key)? {
             return Ok(cached);
         }
-        let description=self.providers.describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)?;
+        let description=self.providers.llm().describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)?;
         self.db.cache_put("description", key, &description)?;
         Ok(description)
     }
 
     fn ensure_embeddings(&self, inputs: &[String], query: bool) -> Result<()> {
-        let profile = self.providers.embedding_profile();
+        let vector = self.providers.vector();
+        let profile = vector.profile();
         let mut pending = BTreeMap::new();
         for input in inputs {
             let key = Database::embedding_key(&profile, query, input);
@@ -476,15 +471,14 @@ impl Engine {
             }
         }
         let pending: Vec<_> = pending.into_iter().collect();
-        let batch = self.providers.embedding_batch_limit();
+        let batch = vector.batch_limit();
         let batches: Vec<_> = pending.chunks(batch).collect();
-        let providers = &self.providers;
         run_jobs(
             &batches,
             self.parallelism()?,
             |entries| {
                 let texts: Vec<_> = entries.iter().map(|(_, text)| text.clone()).collect();
-                providers.embed(&texts, query)
+                vector.embed(&texts, query)
             },
             |entries, vectors| {
                 ensure!(
@@ -508,7 +502,7 @@ impl Engine {
     fn embed_one(&self, input: &str, query: bool) -> Result<String> {
         self.ensure_embeddings(&[input.into()], query)?;
         Ok(Database::embedding_key(
-            &self.providers.embedding_profile(),
+            &self.providers.vector().profile(),
             query,
             input,
         ))
@@ -555,7 +549,7 @@ impl Engine {
             item.data["id"] = json!(item.id);
         }
         self.indexes.clear();
-        let dimensions = self.providers.dimensions();
+        let dimensions = self.providers.vector().dimensions();
         for (kind, parts) in [
             ("code", 1),
             ("markdown", 1),
@@ -665,12 +659,12 @@ impl Engine {
         let rerank = flag(&self.config, "rerankingEnabled");
         let limit = options["limit"].as_u64().map(|v| v as usize);
         let candidate_limit = if rerank {
-            if self.config["rerankerProvider"].as_str() == Some("openai") {
+            if let Some(maximum) = self.providers.reranker()?.candidate_limit() {
                 Some(
                     limit
-                        .unwrap_or(100)
+                        .unwrap_or(maximum)
                         .max(self.config["rerankerCandidates"].as_u64().unwrap_or(10) as usize)
-                        .min(100),
+                        .min(maximum),
                 )
             } else {
                 limit.map(|l| l.saturating_mul(5))
@@ -741,7 +735,7 @@ impl Engine {
         }
         if rerank && !results.is_empty() {
             let documents: Vec<_> = results.iter().map(Value::to_string).collect();
-            let ranking = self.providers.rerank(query, &documents)?;
+            let ranking = self.providers.reranker()?.rerank(query, &documents)?;
             results = ranking
                 .into_iter()
                 .map(|(index, score)| {
@@ -847,13 +841,13 @@ impl Engine {
     pub fn cross_search(&self, target: Option<&Engine>, options: &Value) -> Result<Vec<Value>> {
         let target = target.unwrap_or(self);
         ensure!(
-            self.providers.embedding_profile() == target.providers.embedding_profile(),
+            self.providers.vector().profile() == target.providers.vector().profile(),
             "Cross-search requires identical embedding profiles"
         );
         let same = self.db.path.canonicalize()? == target.db.path.canonicalize()?;
         let combined = self.complete_descriptions
             && target.complete_descriptions
-            && self.providers.description_profile() == target.providers.description_profile();
+            && self.providers.llm().profile() == target.providers.llm().profile();
         let kind = if combined { "combined" } else { "code" };
         let base = options["changedSince"]
             .as_str()
@@ -1006,7 +1000,7 @@ impl Engine {
         }
         let context =
             json!({"query":query,"files":files.values().collect::<Vec<_>>(),"matches":matches});
-        let description=self.providers.describe("Explain the existing code and documentation relevant to the user's task using only the supplied search context. Cite paths and symbols. Do not propose an implementation. If there is insufficient context, say so.",&context.to_string())?;
+        let description=self.providers.llm().describe("Explain the existing code and documentation relevant to the user's task using only the supplied search context. Cite paths and symbols. Do not propose an implementation. If there is insufficient context, say so.",&context.to_string())?;
         let files: Vec<_> = files
             .into_values()
             .map(|mut f| {
@@ -1062,7 +1056,7 @@ impl Engine {
     pub fn status(&self) -> Result<Value> {
         let errors = self.errors()?;
         Ok(
-            json!({"rootDir":self.root,"indexPath":self.db.path,"generation":self.db.generation()?,"gitCheckpoint":self.db.meta("checkpoint")?,"fileCount":self.files.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"markdownChunkCount":self.items.iter().filter(|i|i.kind=="markdown").count(),"embeddingProfile":self.providers.embedding_profile(),"descriptionProfile":if self.enabled {self.providers.description_profile()}else{Value::Null},"descriptionsEnabled":self.enabled,"descriptionCount":self.items.iter().filter(|i|i.description_embedding.is_some()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count(),"staleFileDescriptionCount":self.files.values().filter(|f|f.description.is_some() && f.description_hash.as_deref()!=Some(&f.hash)).count(),"indexingErrorCount":errors.len(),"failedFileCount":self.files.values().filter(|f|!f.errors.is_empty()).count(),"vectorBackend":"usearch","storageBackend":"sqlite"}),
+            json!({"rootDir":self.root,"indexPath":self.db.path,"generation":self.db.generation()?,"gitCheckpoint":self.db.meta("checkpoint")?,"fileCount":self.files.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"markdownChunkCount":self.items.iter().filter(|i|i.kind=="markdown").count(),"embeddingProfile":self.providers.vector().profile(),"descriptionProfile":if self.enabled {self.providers.llm().profile()}else{Value::Null},"descriptionsEnabled":self.enabled,"descriptionCount":self.items.iter().filter(|i|i.description_embedding.is_some()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count(),"staleFileDescriptionCount":self.files.values().filter(|f|f.description.is_some() && f.description_hash.as_deref()!=Some(&f.hash)).count(),"indexingErrorCount":errors.len(),"failedFileCount":self.files.values().filter(|f|!f.errors.is_empty()).count(),"vectorBackend":"usearch","storageBackend":"sqlite"}),
         )
     }
 

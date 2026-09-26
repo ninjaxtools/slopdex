@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::hash;
+use crate::{hash, models::Vector};
 
 /// SQLite is authoritative. USearch files are disposable materialized indexes.
 pub struct Database {
@@ -256,7 +256,7 @@ impl Database {
 
     /// Import description state and reusable document artifacts from TS schema 11.
     /// Original tables remain intact; vec0 is never loaded or mutated.
-    pub fn import_legacy(&self, profile: &Value) -> Result<()> {
+    pub fn import_legacy(&self, provider: &dyn Vector) -> Result<()> {
         if self.meta("legacy_imported")?.is_some() {
             return Ok(());
         }
@@ -306,6 +306,7 @@ impl Database {
             .map(|value| serde_json::from_str(&value))
             .transpose()
             .context("Invalid legacy embedding profile")?;
+        let profile = provider.profile();
         let compatible = previous.as_ref().is_some_and(|previous| {
             ["provider", "model", "dimensions"]
                 .iter()
@@ -319,7 +320,7 @@ impl Database {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
             })? {
                 let (input, bytes) = row?;
-                self.import_legacy_embedding(profile, &input, Some(&bytes))?;
+                self.import_legacy_embedding(provider, &profile, &input, Some(&bytes))?;
             }
 
             let mut stmt = self.conn.prepare("SELECT f.path,f.file_description,f.file_description_content_hash,e.vector FROM files f LEFT JOIN embeddings e ON e.id=f.file_description_embedding_id WHERE f.file_description IS NOT NULL")?;
@@ -332,8 +333,12 @@ impl Database {
                 ))
             })? {
                 let (path, description, description_hash, bytes) = row?;
-                let embedding =
-                    self.import_legacy_embedding(profile, &description, bytes.as_deref())?;
+                let embedding = self.import_legacy_embedding(
+                    provider,
+                    &profile,
+                    &description,
+                    bytes.as_deref(),
+                )?;
                 self.cache_put("legacy-file", &path, &json!({
                     "description": description, "descriptionHash": description_hash, "embeddingKey": embedding
                 }).to_string())?;
@@ -350,8 +355,12 @@ impl Database {
                 ))
             })? {
                 let (path, qualified_name, source_hash, description, bytes) = row?;
-                let embedding =
-                    self.import_legacy_embedding(profile, &description, bytes.as_deref())?;
+                let embedding = self.import_legacy_embedding(
+                    provider,
+                    &profile,
+                    &description,
+                    bytes.as_deref(),
+                )?;
                 let key = hash(json!([path, qualified_name, source_hash]).to_string());
                 self.cache_put(
                     "legacy-function",
@@ -370,22 +379,16 @@ impl Database {
 
     fn import_legacy_embedding(
         &self,
+        provider: &dyn Vector,
         profile: &Value,
         input: &str,
         bytes: Option<&[u8]>,
     ) -> Result<Option<String>> {
-        // TS OpenAI truncated at 8192 tokens; Rust truncates at 8191 bytes.
-        // Jina uses the same code.passage task and server-side truncate=true.
-        let equivalent = match profile["provider"].as_str() {
-            Some("openai") => input.len() <= 8191,
-            Some("jina") => true,
-            _ => false,
-        };
-        let Some(bytes) = bytes.filter(|_| equivalent) else {
+        let Some(bytes) = bytes.filter(|_| provider.supports_legacy_input(input)) else {
             return Ok(None);
         };
         let vector = decode(bytes)?;
-        if Some(vector.len() as u64) != profile["dimensions"].as_u64() {
+        if vector.len() != provider.dimensions() {
             return Ok(None);
         }
         let key = Self::embedding_key(profile, false, input);
@@ -413,6 +416,7 @@ fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::Providers;
 
     fn profile(provider: &str) -> Value {
         json!({"provider": provider, "model": "test-embedding", "dimensions": 2, "strategyVersion": "rust-v1"})
@@ -555,7 +559,8 @@ mod tests {
         markdown(&db, "README.md", content);
         let original = snapshot(&db, LEGACY_TABLES);
 
-        db.import_legacy(&profile).unwrap();
+        db.import_legacy(Providers::new(&profile).unwrap().vector())
+            .unwrap();
         assert_eq!(
             db.meta("descriptions_enabled").unwrap().as_deref(),
             Some("true")
@@ -620,7 +625,8 @@ mod tests {
         let imported = snapshot(&db, RUST_TABLES);
         drop(db);
         let db = Database::open(&path, dir.path(), &profile, false).unwrap();
-        db.import_legacy(&profile).unwrap();
+        db.import_legacy(Providers::new(&profile).unwrap().vector())
+            .unwrap();
         assert_eq!(snapshot(&db, RUST_TABLES), imported);
         assert_eq!(snapshot(&db, LEGACY_TABLES), original);
     }
@@ -646,7 +652,8 @@ mod tests {
                     Some(1),
                 );
                 markdown(&db, "README.md", &format!("{input}m"));
-                db.import_legacy(&profile).unwrap();
+                db.import_legacy(Providers::new(&profile).unwrap().vector())
+                    .unwrap();
                 for text in [
                     &input,
                     &format!("{input}c"),
@@ -707,7 +714,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.import_legacy(&profile).unwrap();
+        db.import_legacy(Providers::new(&profile).unwrap().vector())
+            .unwrap();
         for path in ["missing", "dangling", "wrong"] {
             let file = cache(&db, "legacy-file", path);
             assert_eq!(file["description"], "File text");
@@ -745,7 +753,8 @@ mod tests {
                 function(&db, "file", "code", "description", Some(1));
                 markdown(&db, "README.md", "markdown");
                 let original = snapshot(&db, LEGACY_TABLES);
-                db.import_legacy(&profile).unwrap();
+                db.import_legacy(Providers::new(&profile).unwrap().vector())
+                    .unwrap();
                 assert_eq!(
                     db.meta("descriptions_enabled").unwrap().as_deref(),
                     Some(enabled)
@@ -762,7 +771,8 @@ mod tests {
                         .all(Vec::is_empty)
                 );
                 let imported = snapshot(&db, RUST_TABLES);
-                db.import_legacy(&profile).unwrap();
+                db.import_legacy(Providers::new(&profile).unwrap().vector())
+                    .unwrap();
                 assert_eq!(snapshot(&db, RUST_TABLES), imported);
                 assert_eq!(snapshot(&db, LEGACY_TABLES), original);
             }
@@ -774,12 +784,14 @@ mod tests {
         let profile = profile("openai");
         let db = database(&profile);
         let original = snapshot(&db, RUST_TABLES);
-        db.import_legacy(&profile).unwrap();
+        db.import_legacy(Providers::new(&profile).unwrap().vector())
+            .unwrap();
         assert_eq!(snapshot(&db, RUST_TABLES), original);
         db.conn
             .execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
             .unwrap();
-        db.import_legacy(&profile).unwrap();
+        db.import_legacy(Providers::new(&profile).unwrap().vector())
+            .unwrap();
         assert_eq!(snapshot(&db, RUST_TABLES), original);
         legacy_meta(&db, "descriptions_enabled", "true");
         for schema in [None, Some("10"), Some("12")] {
@@ -787,7 +799,10 @@ mod tests {
                 legacy_meta(&db, "schema_version", schema);
             }
             let old = snapshot(&db, &["metadata"]);
-            let error = db.import_legacy(&profile).unwrap_err().to_string();
+            let error = db
+                .import_legacy(Providers::new(&profile).unwrap().vector())
+                .unwrap_err()
+                .to_string();
             assert!(error.contains(&format!(
                 "Unsupported legacy index schema version {}",
                 schema.unwrap_or("unknown")
@@ -797,7 +812,8 @@ mod tests {
         }
         // Schema 11 without an embedding profile can still preserve settings.
         legacy_meta(&db, "schema_version", "11");
-        db.import_legacy(&profile).unwrap();
+        db.import_legacy(Providers::new(&profile).unwrap().vector())
+            .unwrap();
         assert_eq!(
             db.meta("descriptions_enabled").unwrap().as_deref(),
             Some("true")
@@ -819,7 +835,7 @@ mod tests {
         let original = snapshot(&db, LEGACY_TABLES);
         let before = snapshot(&db, RUST_TABLES);
         assert!(
-            db.import_legacy(&profile)
+            db.import_legacy(Providers::new(&profile).unwrap().vector())
                 .unwrap_err()
                 .to_string()
                 .contains("Invalid stored vector length")
@@ -832,7 +848,8 @@ mod tests {
         db.set_meta("descriptions_enabled", "false").unwrap();
         db.set_meta("description_profile", "explicit rust profile")
             .unwrap();
-        db.import_legacy(&profile).unwrap();
+        db.import_legacy(Providers::new(&profile).unwrap().vector())
+            .unwrap();
         assert_eq!(
             db.meta("descriptions_enabled").unwrap().as_deref(),
             Some("false")

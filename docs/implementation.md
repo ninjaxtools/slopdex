@@ -19,7 +19,7 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, search/filtering/fusion/reranking, cross-search, and task explanation context. |
 | `src/parser.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery, heading-aware bounded Markdown chunks. |
 | `src/providers.rs` | Blocking hosted embeddings/descriptions/rerankers, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
-| `src/storage.rs` | Authoritative SQLite records, artifact/result caches, transactional live-state reconciliation, compatible legacy artifact import. |
+| `src/storage.rs` | Authoritative SQLite records, artifact/result caches, transactional live-state reconciliation, schema validation. |
 | `src/vectors.rs` | Persistent incremental filtered F32 cosine USearch HNSW indexes and validated sidecar publication/recovery. |
 | `tests/rust_integration.rs` | Engine/CLI integration coverage using temporary repositories, real SQLite/USearch, and local mock HTTP providers. |
 | `target/release/slopdex` | Locally built executable (`slopdex.exe` on Windows). |
@@ -57,20 +57,19 @@ requests; credentials are resolved only on a request. Saved description state
 and, when neither provider nor model is explicit, the saved description profile
 can supply engine defaults.
 
-### SQLite namespace and artifacts
+### SQLite schema and artifacts
 
-SQLite is the authority; native tables use the `rust_` namespace so they can
-coexist with original legacy tables. The native identity schema is **1**,
-independent of the legacy TypeScript schema **11**.
+SQLite is the authority. Native schema **2** uses six unprefixed tables and the
+`items_path` index on `items(path)`.
 
 | Table | Contents |
 | --- | --- |
-| `rust_metadata` | Identity (canonical root, schema, embedding profile), generation, Git checkpoint, description enabled/profile settings, legacy-import marker. |
-| `rust_files` | Path-keyed serialized file snapshots: source/hash/language, Git or working-tree provenance, file description/hash/vector key, diagnostics. |
-| `rust_items` | Callable/Markdown records, stable integer IDs, unique logical identities, metadata/source, code/chunk and optional callable-description vector references. |
-| `rust_embeddings` | Content-addressed document/query embeddings stored as little-endian F32 blobs. |
-| `rust_cache` | Parsed-file artifacts, generated descriptions, and imported legacy description artifacts, keyed by kind and cache key. |
-| `rust_search_cache` | Serialized query and cross-search result rows, separate from reusable model/parse artifacts. |
+| `metadata` | Identity (canonical root, schema, embedding profile), generation, Git checkpoint, description enabled/profile settings. |
+| `files` | Path-keyed serialized file snapshots: source/hash/language, Git or working-tree provenance, file description/hash/vector key, diagnostics. |
+| `items` | Callable/Markdown records, stable integer IDs, unique logical identities, metadata/source, code/chunk and optional callable-description vector references. |
+| `embeddings` | Content-addressed document/query embeddings stored as little-endian F32 blobs. |
+| `cache` | Parsed-file artifacts and generated descriptions, keyed by kind and cache key. |
+| `search_cache` | Serialized query and cross-search result rows, separate from reusable model/parse artifacts. |
 
 Callable identity hashes path, qualified name, kind, and same-name occurrence;
 Markdown identity hashes path and chunk ordinal. Reconciliation preserves item
@@ -93,14 +92,12 @@ target database path, scoring kind, resolved changed-since commit, saved checkpo
 and options. A moving Git branch is resolved before cache lookup and its ancestry
 is checked again. Dirty live publication clears the local search-result cache.
 
-Legacy import accepts nonempty `metadata` only at schema 11. It copies description
-settings independently of embedding compatibility. Matching provider/model/
-dimensions permit reuse of compatible document vectors and file/callable
-descriptions; OpenAI inputs over 8191 bytes are not vector-equivalent under the
-native truncation policy. Imported artifacts and the import marker commit in one
-transaction. Original tables remain intact and `vec0` is never loaded or mutated.
-Refresh builds native live records from current files; import alone does not
-populate a legacy live snapshot for offline searches.
+This is a clean schema break: databases with the old `rust_`-prefixed tables or
+TypeScript layouts are rejected. There is no legacy import or migration, and
+`--force-reindex` cannot bypass old-layout rejection. Remove the existing SQLite
+index and rebuild with `slopdex update-git`, or select a new database with
+`slopdex --index /path/to/new-index.sqlite update-git`. See the
+[rebuild instructions](reference.md#rebuilding-an-old-index) for the default path.
 
 ### Refresh snapshots and locking
 
@@ -138,18 +135,20 @@ uncommitted selection uses saved file provenance, including unchanged callables
 inside dirty files. Without HEAD, files are working-tree records.
 
 Native `noReindex` skips refresh entirely, even for an empty database. Opening can
-still import artifacts, write metadata, or repair sidecars; it is not read-only.
+still write metadata or repair sidecars; it is not read-only.
 Offline status/cross-search use the saved native snapshot, while uncached query
 embedding/reranking and task descriptions still call providers. The CLI sets
 `noReindex` from `--no-reindex`, overriding a JSON value. `reindex-files` is an
 explicit operation on saved source snapshots, not a new filesystem scan after
 the automatic refresh.
 
-An incompatible native identity can be reset with the confirmed force-reindex
-flag: live records, metadata, and result caches are cleared while reusable
-artifacts/vectors remain. A compatible identity is not reset just because the
-flag is present. The accepted rebuild-on-divergence option currently adds no
-engine behavior; refresh does not enforce checkpoint ancestry.
+Within the current table layout, an incompatible native identity (such as a
+changed root or embedding profile) can be reset with
+`--force-reindex --yes-really-rebuild-the-index`: live records, metadata, and result
+caches are cleared while reusable artifacts/vectors remain. A compatible identity
+is not reset just because the flag is present. The accepted rebuild-on-divergence
+option currently adds no engine behavior; refresh does not enforce checkpoint
+ancestry.
 
 ### Persistent vector snapshots and search
 

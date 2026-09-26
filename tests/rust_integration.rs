@@ -336,9 +336,9 @@ impl ConcurrentWork {
 
     fn paid_count(self, db: &Connection) -> Result<usize> {
         let sql = match self {
-            Self::Embeddings => "SELECT count(*) FROM rust_embeddings",
+            Self::Embeddings => "SELECT count(*) FROM embeddings",
             Self::Callables => {
-                "SELECT count(*) FROM rust_cache WHERE kind='description' AND value LIKE 'callable-summary:%'"
+                "SELECT count(*) FROM cache WHERE kind='description' AND value LIKE 'callable-summary:%'"
             }
         };
         let count: i64 = db.query_row(sql, [], |row| row.get(0))?;
@@ -619,23 +619,19 @@ fn near(actual: &Value, expected: f64) {
 fn file_record(repo: &Repo, path: &str) -> Result<Value> {
     let text: String =
         repo.db()?
-            .query_row("SELECT data FROM rust_files WHERE path=?", [path], |r| {
-                r.get(0)
-            })?;
+            .query_row("SELECT data FROM files WHERE path=?", [path], |r| r.get(0))?;
     Ok(serde_json::from_str(&text)?)
 }
 
 fn artifact_counts(repo: &Repo) -> Result<(i64, i64, i64)> {
     let db = repo.db()?;
     Ok((
-        db.query_row("SELECT count(*) FROM rust_embeddings", [], |r| r.get(0))?,
+        db.query_row("SELECT count(*) FROM embeddings", [], |r| r.get(0))?,
+        db.query_row("SELECT count(*) FROM cache WHERE kind='parse'", [], |r| {
+            r.get(0)
+        })?,
         db.query_row(
-            "SELECT count(*) FROM rust_cache WHERE kind='parse'",
-            [],
-            |r| r.get(0),
-        )?,
-        db.query_row(
-            "SELECT count(*) FROM rust_cache WHERE kind='description'",
+            "SELECT count(*) FROM cache WHERE kind='description'",
             [],
             |r| r.get(0),
         )?,
@@ -1427,7 +1423,7 @@ fn sqlite_publication_failure_rolls_back_deletes_and_updates_but_reuses_complete
     let status = engine.status()?;
     let db = repo.db()?;
     db.execute_batch(
-        "CREATE TRIGGER integration_abort BEFORE INSERT ON rust_items
+        "CREATE TRIGGER integration_abort BEFORE INSERT ON items
         WHEN NEW.path='z_abort.rs' BEGIN SELECT RAISE(ABORT, 'fixture publication failure'); END;",
     )?;
     fs::remove_file(repo.root.join("old.rs"))?;
@@ -1440,7 +1436,7 @@ fn sqlite_publication_failure_rolls_back_deletes_and_updates_but_reuses_complete
     assert_eq!(engine.status()?, status);
     assert_eq!(engine.search("east", "search-code", &all())?, before);
     let live_paths: Vec<String> = db
-        .prepare("SELECT path FROM rust_files ORDER BY path")?
+        .prepare("SELECT path FROM files ORDER BY path")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     assert_eq!(live_paths, ["old.rs"]);
@@ -1865,7 +1861,7 @@ fn regression_descriptions_with_markdown_refresh_is_noop_and_keeps_query_caches(
     // A cache miss would try to write the recomputed result, even for a query
     // whose embedding is already cached. Make that observable independently of reranking.
     repo.db()?.execute_batch(
-        "CREATE TRIGGER regression_cache_miss BEFORE INSERT ON rust_search_cache
+        "CREATE TRIGGER regression_cache_miss BEFORE INSERT ON search_cache
          BEGIN SELECT RAISE(ABORT, 'unexpected query cache miss'); END;",
     )?;
     for _ in 0..2 {
@@ -1965,145 +1961,6 @@ fn regression_description_model_change_retains_unchanged_and_regenerates_only_ed
     let mut engine = repo.open(&config)?;
     assert_eq!(engine.refresh()?["filesUpdated"], 0);
     assert_eq!(engine.search("east", "search", &all())?, after);
-    assert_eq!(mock.count(), calls);
-    Ok(())
-}
-
-#[test]
-fn regression_schema11_engine_migration_reuses_descriptions_and_preserves_settings_and_hashes()
--> Result<()> {
-    let mock = Mock::start()?;
-    let repo = Repo::new()?;
-    let db = repo.db()?;
-    // Ordinary schema-11 tables suffice; the native engine must not need vec0.
-    db.execute_batch(
-        "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-         CREATE TABLE embeddings(id INTEGER PRIMARY KEY,embedding_key TEXT UNIQUE,vector BLOB NOT NULL);
-         CREATE TABLE files(path TEXT PRIMARY KEY,file_description TEXT,file_description_content_hash TEXT,file_description_embedding_id INTEGER);
-         CREATE TABLE functions(path TEXT,qualified_name TEXT,source_hash TEXT,embedding_input TEXT,embedding_id INTEGER,description TEXT,description_embedding_id INTEGER);
-         CREATE TABLE markdown_chunks(path TEXT,heading_path TEXT,content TEXT,embedding_id INTEGER);
-         CREATE TABLE description_cache(description_key TEXT PRIMARY KEY,description TEXT NOT NULL);",
-    )?;
-    let legacy_profile = json!({"provider": "openai", "model": "legacy-description-model", "strategyVersion": "legacy-purpose"});
-    for (key, value) in [
-        ("schema_version", "11".to_owned()),
-        ("descriptions_enabled", "true".to_owned()),
-        ("description_profile", legacy_profile.to_string()),
-        ("embedding_profile", json!({"provider": "openai", "model": "integration-embedding", "dimensions": 4, "strategyVersion": "callable-v2"}).to_string()),
-    ] {
-        db.execute("INSERT INTO metadata VALUES(?,?)", [key, &value])?;
-    }
-    let mut fixtures = Vec::new();
-    for (ordinal, name) in ["fresh", "stale"].iter().enumerate() {
-        let path = format!("{name}.rs");
-        let source = function(name, "VECTOR_EAST");
-        repo.write(&path, &source)?;
-        let callable = slopdex::parser::parse(&path, &source)?.callables.remove(0);
-        let file_description = format!("file-summary: legacy {name}");
-        let description = format!("callable-summary: legacy {name}");
-        let description_hash = slopdex::hash(if ordinal == 0 {
-            &source
-        } else {
-            "older file contents"
-        });
-        let id = (ordinal * 3 + 1) as i64;
-        for (offset, input) in [&callable.embedding_input, &file_description, &description]
-            .iter()
-            .enumerate()
-        {
-            let bytes: Vec<u8> = embedding(input)
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            db.execute(
-                "INSERT INTO embeddings VALUES(?,?,?)",
-                rusqlite::params![
-                    id + offset as i64,
-                    format!("legacy-{ordinal}-{offset}"),
-                    bytes
-                ],
-            )?;
-        }
-        db.execute(
-            "INSERT INTO files VALUES(?,?,?,?)",
-            rusqlite::params![path, file_description, description_hash, id + 1],
-        )?;
-        db.execute(
-            "INSERT INTO functions VALUES(?,?,?,?,?,?,?)",
-            rusqlite::params![
-                path,
-                name,
-                callable.source_hash,
-                callable.embedding_input,
-                id,
-                description,
-                id + 2
-            ],
-        )?;
-        fixtures.push((
-            path,
-            *name,
-            source,
-            description_hash,
-            file_description,
-            description,
-        ));
-    }
-    drop(db);
-    let mut config = mock.config();
-    config
-        .as_object_mut()
-        .unwrap()
-        .remove("descriptionProvider");
-    config.as_object_mut().unwrap().remove("descriptionModel");
-    let mut engine = repo.open(&config)?;
-    assert_eq!(engine.status()?["descriptionsEnabled"], true);
-    assert_eq!(
-        engine.status()?["descriptionProfile"]["provider"],
-        legacy_profile["provider"]
-    );
-    assert_eq!(
-        engine.status()?["descriptionProfile"]["model"],
-        legacy_profile["model"]
-    );
-    let imported_profile: String = repo.db()?.query_row(
-        "SELECT value FROM rust_metadata WHERE key='description_profile'",
-        [],
-        |r| r.get(0),
-    )?;
-    assert_eq!(
-        serde_json::from_str::<Value>(&imported_profile)?,
-        legacy_profile
-    );
-    assert_eq!(engine.refresh()?["filesUpdated"], 2);
-    assert_eq!(
-        mock.count(),
-        0,
-        "migration must reuse all seeded document artifacts"
-    );
-    let rows = engine.search("east", "search-descriptions", &all())?;
-    assert_eq!(names(&rows), strings(&["fresh", "stale"]));
-    for (path, name, source, description_hash, file_description, description) in &fixtures {
-        let file = file_record(&repo, path)?;
-        assert_eq!(file["description"], *file_description);
-        assert_eq!(file["description_hash"], *description_hash);
-        assert_eq!(file["hash"], slopdex::hash(source));
-        assert_eq!(row(&rows, name)["function"]["description"], *description);
-        near(&row(&rows, name)["similarity"], 0.3);
-    }
-    let status = engine.status()?;
-    assert_eq!(status["descriptionCount"], 2);
-    assert_eq!(status["fileDescriptionCount"], 2);
-    assert_eq!(status["staleFileDescriptionCount"], 1);
-    assert_eq!(mock.embedding_inputs(), ["east"]);
-    assert!(mock.requests("/responses").is_empty());
-    let calls = mock.count();
-    drop(engine);
-    let mut engine = repo.open(&config)?;
-    assert_eq!(engine.status()?, status);
-    assert_eq!(engine.refresh()?["filesUpdated"], 0);
-    assert_eq!(engine.search("east", "search-descriptions", &all())?, rows);
-    assert_eq!(engine.status()?, status);
     assert_eq!(mock.count(), calls);
     Ok(())
 }
@@ -2283,7 +2140,7 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
     assert_eq!(status["staleFileDescriptionCount"], 1);
     assert_eq!(mock.requests("/responses").len(), 3);
     repo.db()?.execute_batch(
-        "CREATE TRIGGER regression_reindex_abort BEFORE INSERT ON rust_items
+        "CREATE TRIGGER regression_reindex_abort BEFORE INSERT ON items
          WHEN NEW.path='code.rs' BEGIN SELECT RAISE(ABORT, 'fixture forced reindex failure'); END;",
     )?;
     drop(engine);

@@ -232,6 +232,8 @@ task explanation itself is not cached.
 The default database is `<root>/.slopdex/index.sqlite`. SQLite is authoritative
 for file snapshots, callable/chunk records, provenance, diagnostics, descriptions,
 document/query vectors, reusable artifacts, metadata, and cached search results.
+Native schema **2** has six tables: `metadata`, `files`, `items`, `embeddings`,
+`cache`, and `search_cache`, plus the `items_path` index on `items(path)`.
 Parse results and successful description/embedding artifacts are committed before
 the final live-record transaction, so interrupted indexing can reuse completed
 work. Live changes update the generation and invalidate cached search results.
@@ -279,7 +281,8 @@ their catalogs. Use the CLI flag: the CLI overwrites a JSON `noReindex` value wi
 the flag's value on every invocation.
 
 Native index identity includes canonical root, native schema, and embedding
-profile (provider/model/dimensions/strategy). An incompatible identity requires
+profile (provider/model/dimensions/strategy). Within the current table layout,
+identity changes such as a different root or embedding profile require
 `--force-reindex --yes-really-rebuild-the-index`. This clears native live records,
 metadata, and search results while retaining artifact/vector caches. A compatible
 index follows normal refresh even with that flag. It conflicts with
@@ -287,23 +290,35 @@ index follows normal refresh even with that flag. It conflicts with
 but the current engine refreshes the working tree without a divergence gate;
 the flag adds no engine behavior.
 
-### Legacy schema 11 import
+### Rebuilding an old index
 
-Opening a database with legacy TypeScript **schema 11** imports description
-enabled/profile settings and, when provider/model/dimensions match, reusable
-document embeddings and file/callable descriptions into the native namespace.
-Original tables are retained intact; `vec0` is neither loaded nor mutated.
-This is artifact reuse, not a direct conversion of the legacy live snapshot:
-normal refresh reparses current files and populates native live records/USearch.
-A legacy-only database opened with `--no-reindex` therefore has no imported live
-callables to search.
+Native schema **2** is a clean break from the old `rust_`-prefixed native tables
+and TypeScript database layouts, including schema 11. Those databases are
+rejected with instructions to remove the existing SQLite index and rebuild, or
+choose a new index path. There is no legacy import or migration, and neither
+`--force-reindex` nor `--no-reindex` bypasses old-layout rejection.
 
-Imported vectors must have valid F32 storage and matching dimensions. OpenAI
-document vectors are reused only for inputs at most 8191 bytes (the native
-truncation policy); Jina uses compatible passage/truncation semantics. Missing or
-non-equivalent vectors are recomputed when needed. The import marker and artifacts
-commit together so a failed import can be retried. Other nonempty legacy schemas
-are rejected; there is no schema-6/7 migration path or force bypass for them.
+For the default database, stop any Slopdex process using the index, then run from
+the repository root:
+
+```bash
+rm -f .slopdex/index.sqlite .slopdex/index.sqlite-wal .slopdex/index.sqlite-shm
+slopdex update-git
+```
+
+For a custom database, remove that SQLite file and its `-wal`/`-shm` companions,
+then run `slopdex --index /path/to/index.sqlite update-git`. To rebuild at a new,
+unused path instead:
+
+```bash
+slopdex --index /path/to/new-index.sqlite update-git
+```
+
+Use that same `--index` path on subsequent commands, or save it as `indexPath` in
+config. Rebuilding scans current files and regenerates embeddings and enabled
+descriptions using the configured providers; old database artifacts and saved
+description settings are not imported. Derived USearch sidecars are reconciled
+or rebuilt from the new SQLite snapshot.
 
 ### Coverage and failures
 
