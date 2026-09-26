@@ -17,10 +17,6 @@ pub trait Vector: Send + Sync {
     /// Maximum inputs per call. Callers must persist each successful batch.
     fn batch_limit(&self) -> usize;
     fn embed(&self, inputs: &[String], query: bool) -> Result<Vec<Vec<f32>>>;
-    /// Whether a legacy document embedding uses equivalent input processing.
-    fn supports_legacy_input(&self, _input: &str) -> bool {
-        false
-    }
 }
 
 /// Ranks every supplied document, returning indices and descending scores.

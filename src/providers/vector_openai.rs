@@ -63,9 +63,4 @@ impl Vector for OpenAiVector {
         )?;
         self.config.parse(&response, inputs.len())
     }
-
-    fn supports_legacy_input(&self, input: &str) -> bool {
-        // Legacy OpenAI truncated at 8192 tokens; this implementation uses bytes.
-        input.len() <= 8191
-    }
 }

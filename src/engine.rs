@@ -12,7 +12,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::{
-    hash, parser,
+    hash, parse,
     providers::Providers,
     storage::{Database, File, Item},
     vectors::VectorIndex,
@@ -88,7 +88,6 @@ impl Engine {
             &providers.vector().profile(),
             flag(&config, "forceReindex"),
         )?;
-        db.import_legacy(providers.vector())?;
         // Persisted description settings also apply when an index is moved to a
         // caller without a config file. Explicit settings still take precedence.
         if config.get("descriptionProvider").is_none()
@@ -148,7 +147,7 @@ impl Engine {
                 continue;
             }
             let relative = relative(&self.root, entry.path())?;
-            if parser::language_for_path(&relative).is_none()
+            if parse::language_for_path(&relative).is_none()
                 || exclude.is_match(&relative)
                 || (!include.is_empty() && !include.is_match(&relative))
             {
@@ -192,7 +191,7 @@ impl Engine {
                         path: path.clone(),
                         hash: String::new(),
                         source: String::new(),
-                        language: parser::language_for_path(&path).unwrap().into(),
+                        language: parse::language_for_path(&path).unwrap().into(),
                         source_mode: source_mode.into(),
                         description: None,
                         description_hash: None,
@@ -208,7 +207,7 @@ impl Engine {
             let source_hash = hash(&source);
             let previous = self.files.get(&path);
             let needs_descriptions = self.enabled
-                && parser::language_for_path(&path) != Some("markdown")
+                && parse::language_for_path(&path) != Some("markdown")
                 && (previous.is_none_or(|f| f.description.is_none())
                     || missing_descriptions.contains(path.as_str()));
             if previous.is_some_and(|f| {
@@ -264,31 +263,16 @@ impl Engine {
     ) -> Result<(File, Vec<Item>)> {
         let source_hash = hash(source);
         let parse_key = hash(json!(["rust-parser-v1", path, source_hash]).to_string());
-        let parsed: parser::ParsedFile = if let Some(cached) = self.db.cache("parse", &parse_key)? {
+        let parsed: parse::ParsedFile = if let Some(cached) = self.db.cache("parse", &parse_key)? {
             serde_json::from_str(&cached)?
         } else {
-            let parsed = parser::parse(path, source)?;
+            let parsed = parse::parse(path, source)?;
             self.db
                 .cache_put("parse", &parse_key, &serde_json::to_string(&parsed)?)?;
             parsed
         };
         let previous = self.files.get(path);
-        let mut file=File{path:path.into(),hash:source_hash.clone(),source:source.into(),language:parser::language_for_path(path).unwrap_or("unknown").into(),source_mode:source_mode.into(),description:previous.and_then(|f|f.description.clone()),description_hash:previous.and_then(|f|f.description_hash.clone()),description_embedding:previous.and_then(|f|f.description_embedding.clone()),errors:parsed.errors.iter().map(|e|json!({"path":path,"code":"parse-error","message":e.message,"startLine":e.start_line,"endLine":e.end_line,"sourceMode":source_mode})).collect()};
-        if file.description.is_none()
-            && !regenerate_file
-            && let Some(legacy) = self.db.cache("legacy-file", path)?
-        {
-            let legacy: Value = serde_json::from_str(&legacy)?;
-            file.description = legacy["description"].as_str().map(str::to_owned);
-            file.description_hash = legacy["descriptionHash"].as_str().map(str::to_owned);
-            file.description_embedding = legacy["embeddingKey"].as_str().map(str::to_owned);
-            if self.enabled
-                && file.description_embedding.is_none()
-                && let Some(description) = &file.description
-            {
-                file.description_embedding = Some(self.embed_one(description, false)?);
-            }
-        }
+        let mut file=File{path:path.into(),hash:source_hash.clone(),source:source.into(),language:parse::language_for_path(path).unwrap_or("unknown").into(),source_mode:source_mode.into(),description:previous.and_then(|f|f.description.clone()),description_hash:previous.and_then(|f|f.description_hash.clone()),description_embedding:previous.and_then(|f|f.description_embedding.clone()),errors:parsed.errors.iter().map(|e|json!({"path":path,"code":"parse-error","message":e.message,"startLine":e.start_line,"endLine":e.end_line,"sourceMode":source_mode})).collect()};
         if self.enabled
             && (file.description.is_none() || regenerate_file)
             && file.language != "markdown"
@@ -339,23 +323,6 @@ impl Engine {
             if !unchanged {
                 description_embedding = None;
                 data["description"] = Value::Null;
-            }
-            if !unchanged
-                && !regenerate_callables
-                && let Some(legacy) = self.db.cache(
-                    "legacy-function",
-                    &hash(json!([path, callable.qualified_name, callable.source_hash]).to_string()),
-                )?
-            {
-                let legacy: Value = serde_json::from_str(&legacy)?;
-                data["description"] = legacy["description"].clone();
-                description_embedding = legacy["embeddingKey"].as_str().map(str::to_owned);
-                if self.enabled
-                    && description_embedding.is_none()
-                    && let Some(description) = data["description"].as_str()
-                {
-                    description_embedding = Some(self.embed_one(description, false)?);
-                }
             }
             if self.enabled
                 && (regenerate_callables || (!unchanged && description_embedding.is_none()))
@@ -1136,7 +1103,7 @@ impl Engine {
                     .ok()
                     .and_then(|b| String::from_utf8(b).ok());
                 let symbols = source
-                    .and_then(|s| parser::parse(&item.path, &s).ok())
+                    .and_then(|s| parse::parse(&item.path, &s).ok())
                     .map(|p| {
                         p.callables
                             .into_iter()

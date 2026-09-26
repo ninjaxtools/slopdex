@@ -54,9 +54,4 @@ impl Vector for JinaVector {
         )?;
         self.config.parse(&response, inputs.len())
     }
-
-    fn supports_legacy_input(&self, _input: &str) -> bool {
-        // Legacy embeddings used the same code.passage task and server truncation.
-        true
-    }
 }

@@ -17,8 +17,10 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/main.rs`, `src/lib.rs` | Native entry point/error exit handling, public core modules, shared SHA-256 helper. |
 | `src/cli.rs` | Clap commands/validation, root-selected JSON configuration, interactive prompts, summary/JSON/JSONL output, connected-component clusters. |
 | `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, search/filtering/fusion/reranking, cross-search, and task explanation context. |
-| `src/parser.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery, heading-aware bounded Markdown chunks. |
-| `src/providers.rs` | Blocking hosted embeddings/descriptions/rerankers, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
+| `src/parse/mod.rs` | Shared parsing result types, file-language detection, and dispatch to code or Markdown parsing. |
+| `src/parse/code.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery. |
+| `src/parse/markdown.rs` | Heading-aware bounded Markdown chunks, fence and comment handling. |
+| `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits and hosted implementations, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
 | `src/storage.rs` | Authoritative SQLite records, artifact/result caches, transactional live-state reconciliation, schema validation. |
 | `src/vectors.rs` | Persistent incremental filtered F32 cosine USearch HNSW indexes and validated sidecar publication/recovery. |
 | `tests/rust_integration.rs` | Engine/CLI integration coverage using temporary repositories, real SQLite/USearch, and local mock HTTP providers. |
