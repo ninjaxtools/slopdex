@@ -29,6 +29,7 @@ the [command reference](reference.md) for CLI documentation. Use
 | `.github/workflows/rust.yml` | Rust/npm checks on Linux, macOS and Windows for main-branch pushes, pull requests and manual runs. |
 | `dist-workspace.toml` | cargo-dist version, release targets, native runners, GitHub hosting and npm publication configuration. |
 | `.github/workflows/release.yml` | Generated cargo-dist workflow: release planning, platform archives/checksums, GitHub Releases and npm publication. |
+| `.github/workflows/publish-npm.yml` | Reusable npm trusted-publishing job, called by the generated release workflow with OIDC permissions. |
 
 Rust owns application behavior. Node is used only for npm installation and
 process launching; these scripts use Node built-ins and have no npm dependencies.
@@ -389,9 +390,27 @@ links, then publishes the generated npm package as `@ninjaxtools/slopdex`.
 Prerelease tags create prerelease GitHub Releases; npm publication is skipped for
 prereleases by default.
 
-Before releasing, add **`NPM_TOKEN`** to this repository's GitHub Actions secrets.
-The token needs publish access to `@ninjaxtools/slopdex`. GitHub release uploads use
-the workflow's automatically supplied `GITHUB_TOKEN` with `contents: write`.
+Before releasing, configure **Trusted Publisher** in the npm settings for
+`@ninjaxtools/slopdex`. Choose **GitHub Actions** and enter:
+
+| npm field | Value |
+| --- | --- |
+| Organization or user | `ninjaxtools` |
+| Repository | `slopdex` |
+| Workflow filename | `release.yml` |
+| Environment name | Leave blank |
+| Allowed actions | Enable direct publishing with `npm publish` |
+
+Use **`release.yml`**, the calling workflow, even though the publish command lives
+in the reusable `publish-npm.yml`. npm validates the caller's workflow identity.
+Both workflows receive `id-token: write` for the publishing job; no `NPM_TOKEN`
+secret is required. The job uses Node 24 and npm 11 (at least 11.5.1 is required),
+and npm obtains short-lived credentials from GitHub OIDC during `npm publish`.
+GitHub release uploads still use the automatically supplied `GITHUB_TOKEN`.
+
+The custom publisher is registered through `publish-jobs` and
+`github-custom-job-permissions` in `dist-workspace.toml`, so `dist generate`
+preserves this setup. See [npm's trusted publishing guide](https://docs.npmjs.com/trusted-publishers).
 
 Release procedure:
 

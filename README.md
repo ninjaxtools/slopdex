@@ -26,12 +26,27 @@ The main supported functions are
 
 `describe` does a `search` first, then passes the result through the configured LLM model to create a tailored description.
 
+## Installation
+
+Install from npm:
+
+```sh
+npm install -g @ninjaxtools/slopdex
+```
+
+You can also download a binary from one of the releases: https://github.com/ninjaxtools/slopdex/releases
+
+Or you can build from source:
+
+```sh
+cargo install --path .
+```
+
 ## Getting started
 
 An embedding-provider API key is required. You can use either OpenAI or Jina.
 
 ```console
-$ npm install -g @ninjaxtools/slopdex
 $ export OPENAI_API_KEY="your-api-key"
 $ slopdex search "validate an authenticated session"
 ...

@@ -7,7 +7,9 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 installers = ["npm"]
 npm-scope = "@ninjaxtools"
-publish-jobs = ["npm"]
+# cargo-dist's built-in npm publisher uses NPM_TOKEN. Use OIDC instead.
+publish-jobs = ["./publish-npm"]
+github-custom-job-permissions = { publish-npm = { id-token = "write", contents = "read" } }
 targets = [
   "aarch64-apple-darwin",
   "aarch64-unknown-linux-gnu",
