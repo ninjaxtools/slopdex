@@ -5,27 +5,13 @@ consolidate-commits = false
 pre-release-commit-message = "Release {{version}}"
 tag-name = "v{{version}}"
 tag-message = "Release {{version}}"
-pre-release-hook = ["npm", "run", "release:check"]
+pre-release-hook = ["cargo", "release-check"]
 
-# cargo-release updates Cargo.toml and Cargo.lock itself. Keep the development
-# npm package synchronized without running npm version lifecycle scripts.
+# cargo-release updates Cargo.toml and Cargo.lock itself. Keep npm publication
+# metadata synchronized with the native release version.
 [[pre-release-replacements]]
-file = "package.json"
+file = "npm/package.json"
 search = '(?m)^(  "version": ")[^"]+("[,]?)$'
-replace = '${1}{{version}}${2}'
-exactly = 1
-prerelease = true
-
-[[pre-release-replacements]]
-file = "package-lock.json"
-search = '(?m)^(  "version": ")[^"]+("[,]?)$'
-replace = '${1}{{version}}${2}'
-exactly = 1
-prerelease = true
-
-[[pre-release-replacements]]
-file = "package-lock.json"
-search = '(?m)(^      "name": "@ninjaxtools/slopdex",\r?\n      "version": ")[^"]+(")'
 replace = '${1}{{version}}${2}'
 exactly = 1
 prerelease = true

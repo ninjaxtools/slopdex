@@ -1,0 +1,13 @@
+{
+  "name": "@ninjaxtools/slopdex",
+  "version": "0.19.0",
+  "description": "Semantic code and Markdown search with SQLite and USearch",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ninjaxtools/slopdex.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

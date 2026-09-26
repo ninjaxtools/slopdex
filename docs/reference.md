@@ -9,9 +9,25 @@ commands, options, defaults, and argument combinations.** The workflows in the
 
 `npm install -g @ninjaxtools/slopdex` installs a small Node launcher and downloads
 the matching native Rust executable from its GitHub Release. Release binaries
-cover Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64. Local checkout
-installs can instead build from source, requiring Rust/Cargo, a C/C++ compiler,
-and platform build tools. See [implementation and distribution](implementation.md).
+cover Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64. cargo-dist
+generates the npm wrapper and installer; the release workflow publishes its
+generated tarball through npm trusted publishing.
+
+To install from a checkout, use `cargo install --path . --locked` at the repository
+root. Source builds require Rust/Cargo, a C/C++ compiler, and platform build tools;
+the native application runs without Node. For development, run:
+
+```bash
+cargo run --locked -- search "keep the repository index synchronized"
+cargo verify
+```
+
+`cargo verify` runs workspace checks and release CLI smoke checks.
+`cargo release-check` also checks the generated release workflow and release plan.
+The retained `npm/package.json` is release metadata for verification against the
+cargo-dist-generated package; cargo-dist adds the binary/launcher entries and
+installer files. Root `npm install` is no longer a local entry point. See
+[implementation and distribution](implementation.md) for tooling and release setup.
 
 Usage: `slopdex [global options] <command> [arguments] [options]`. Global options
 can also follow the command. Quote multiword queries.

@@ -10,7 +10,10 @@ the [command reference](reference.md) for CLI documentation. Use
 
 | Location | Responsibility |
 | --- | --- |
-| `Cargo.toml`, `Cargo.lock` | Root Rust package `slopdex`, version `0.19.0`, binary target and locked native dependencies. |
+| `Cargo.toml`, `Cargo.lock` | Cargo workspace, root/default member `slopdex`, binary target and locked workspace dependencies. |
+| `xtask/Cargo.toml`, `xtask/src/main.rs` | Workspace verification and release checks; tooling member with `publish = false`, `release = false`, and `dist = false`. |
+| `.cargo/config.toml` | `cargo verify` and `cargo release-check` aliases for xtask. |
+| `npm/package.json` | npm release metadata, version synchronization and verification against cargo-dist's generated package. |
 | `src/main.rs`, `src/lib.rs` | Native entry point/error exit handling, public core modules, shared SHA-256 helper. |
 | `src/cli.rs` | Clap commands/validation, root-selected JSON configuration, interactive prompts, summary/JSON/JSONL output, connected-component clusters. |
 | `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, search/filtering/fusion/reranking, cross-search, and task explanation context. |
@@ -20,25 +23,19 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/vectors.rs` | Persistent incremental filtered F32 cosine USearch HNSW indexes and validated sidecar publication/recovery. |
 | `tests/rust_integration.rs` | Engine/CLI integration coverage using temporary repositories, real SQLite/USearch, and local mock HTTP providers. |
 | `target/release/slopdex` | Locally built executable (`slopdex.exe` on Windows). |
-| `scripts/native-common.mjs` | Package-relative paths, OS/CPU/libc selection and native version checks. |
-| `scripts/native-install.mjs` | npm install lifecycle: validate an existing executable, select a bundled prebuilt or compile the bundled sources. |
-| `scripts/native-launcher.mjs` | npm `slopdex` entry point; forwards arguments, working directory, environment, standard streams, exit status and termination signals. |
-| `scripts/native-stage.mjs` | Copy a verified host release build into the prebuilt distribution layout. |
-| `scripts/native-test.mjs` | Node built-in test runner coverage for installation and launching. |
-| `scripts/smoke.mjs` | Offline checks of the real native CLI's version and help from outside the package directory. |
-| `.github/workflows/rust.yml` | Rust/npm checks on Linux, macOS and Windows for main-branch pushes, pull requests and manual runs. |
+| `.github/workflows/rust.yml` | `cargo verify` on Linux, macOS and Windows for main/master pushes, pull requests and manual runs; no Node setup. |
 | `dist-workspace.toml` | cargo-dist version, release targets, native runners, GitHub hosting and npm publication configuration. |
 | `release.toml` | cargo-release version synchronization, pre-release checks, commit and tag naming. |
 | `.github/workflows/release.yml` | Generated cargo-dist workflow: release planning, platform archives/checksums, GitHub Releases and npm publication. |
 | `.github/workflows/publish-npm.yml` | Reusable npm trusted-publishing job, called by the generated release workflow with OIDC permissions. |
 
-Rust owns application behavior. Node is used only for npm installation and
-process launching; these scripts use Node built-ins and have no npm dependencies.
-The native executable can also be invoked directly without Node.
+Rust owns application behavior and local development tooling. cargo-dist generates
+the npm installer and JavaScript launcher. The native executable runs directly
+without Node; in CI, Node is used only by the trusted npm publishing workflow.
 
 The package exposes the native CLI through its launcher; it has no JavaScript
-library entry point or TypeScript declarations. Application checks run against
-the root Cargo package. CLI options and output are implemented in Rust.
+library entry point or TypeScript declarations. Verification covers the Cargo
+workspace. CLI options and output are implemented in Rust.
 
 ### Root configuration and execution flow
 
@@ -237,126 +234,56 @@ GitHub Release during installation. Supported binaries need no Rust/C++ compiler
 they require a compatible host and network access to GitHub. Direct binary
 downloads are available from the same release.
 
-The checkout's `package.json` and `scripts/native-*.mjs` remain available for local
-development and source installation. Their packaging behavior is described below;
-the release workflow publishes cargo-dist's generated npm package instead.
+`npm/package.json` retains only release metadata: `name`, `version`,
+`description`, `license`, `repository`, and `publishConfig` with `access: public`.
+It is used to verify cargo-dist's generated npm package. cargo-dist adds the
+binary/launcher entries and installer files to the actual package; the generated
+`slopdex-npm-package.tar.gz` is what the trusted publishing workflow publishes.
+The metadata manifest is not a local installation package, and root `npm install`
+is no longer a development or installation entry point. There is no root npm
+manifest or lockfile.
 
-### Installing from the checkout or a locally packed tarball
+## Development and checks
 
-From the repository root, install the checkout globally with:
+Source builds require Rust (`rustc` and Cargo), a C/C++ compiler and platform
+build tools for native dependencies. Use current stable Rust unless `Cargo.toml`
+specifies a newer minimum. Typical setups are Rust via
+[rustup](https://rustup.rs/) plus GCC/G++ and Make on Linux, Xcode Command Line
+Tools on macOS, or the MSVC toolchain and Visual Studio Build Tools with the
+**Desktop development with C++** workload and Windows SDK on Windows.
+
+From the repository root:
 
 ```bash
-npm run install:local
+cargo verify
+cargo run --locked -- search "keep the repository index synchronized"
+cargo install --path . --locked
 slopdex --version
 slopdex --help
 ```
 
-This development package requires Node.js 24 or newer and includes `Cargo.toml`, `Cargo.lock`
-and `src/` so installation also works when no prebuilt is bundled for the host.
-The installer checks executable versions against `package.json`. It reuses a
-matching local executable, otherwise probes the matching prebuilt and copies it
-to `target/release/`. If a prebuilt is absent, has the wrong version or cannot run
-on the host, it executes:
+The root `slopdex` package remains the workspace's default member, so ordinary
+`cargo run` commands select the application. The `xtask` member is excluded from
+publishing, cargo-release releases and cargo-dist distribution.
 
-```bash
-cargo build --locked --release --bin slopdex \
-  --manifest-path <package>/Cargo.toml --target-dir <package>/target
-```
+`.cargo/config.toml` defines these aliases:
 
-**Source installation requires Rust (`rustc` and Cargo), a C/C++ compiler and
-platform build tools.** Native Rust dependencies include compiled C/C++ code.
-Use current stable Rust unless `Cargo.toml` specifies a newer minimum. Common
-toolchain setups are:
-
-- Linux: Rust via [rustup](https://rustup.rs/), plus GCC/G++ and Make (for example,
-  `build-essential` on Debian/Ubuntu).
-- macOS: Rust via rustup and Xcode Command Line Tools (`xcode-select --install`).
-- Windows: Rust's MSVC toolchain and Visual Studio Build Tools with the
-  **Desktop development with C++** workload and Windows SDK, available in the
-  shell running npm.
-
-Source builds need access to the Cargo registry unless dependencies are already
-cached, and sufficient time and disk space for a release build. Compilation
-errors fail npm installation with the compiler output and toolchain requirements.
-A usable bundled prebuilt needs no Rust/C++ toolchain and triggers no download.
-Prebuilts are selected from the package itself; the installer does not fetch
-executables from GitHub or a separate service.
-
-Install scripts must be enabled for automatic setup. After an installation with
-`--ignore-scripts`, run `node scripts/native-install.mjs` from the installed
-package directory, or reinstall with scripts enabled. The launcher can directly
-run an executable bundled for the host but does not compile on first invocation.
-An unusable executable reports how to repair the installation.
-
-## Development and checks
-
-Install the native build prerequisites above, then:
-
-```bash
-npm install --ignore-scripts  # npm tooling has no dependencies; defer native build
-npm run check
-npm run dev -- --help
-npm run install:local
-```
-
-| npm command | Native command / purpose |
+| Command | Expansion |
 | --- | --- |
-| `npm run fmt` | `cargo fmt --all` |
-| `npm run fmt:check` | `cargo fmt --all -- --check` |
-| `npm run typecheck` | `cargo check --locked --all-targets` |
-| `npm run clippy` | `cargo clippy --locked --all-targets -- -D warnings` |
-| `npm test`, `npm run test:run` | `cargo test --locked` |
-| `npm run test:npm` | Installer/launcher tests using Node's test runner. |
-| `npm run build` | `cargo build --locked --release --bin slopdex` |
-| `npm run smoke` | Real executable version and help; no provider credentials or network calls. |
-| `npm run dev -- <arguments>` | `cargo run --locked --bin slopdex -- <arguments>` |
-| `npm run check` | Format check, Cargo check, Clippy, Rust tests, npm tests, release build and smoke. |
-| `npm run install:local` | Release build followed by `npm install -g .`. |
+| `cargo verify` | `cargo run --locked --package xtask -- check` |
+| `cargo release-check` | `cargo run --locked --package xtask -- release-check` |
 
-The npm installer fixes the target directory to `<package>/target` and removes
-`CARGO_BUILD_TARGET` from its build environment. Use a host-native Cargo
-configuration when installing; user-level Cargo cross-compilation settings can
-still affect builds. For developer commands, Cargo's normal environment and
-configuration apply; the npm launcher expects a host build in `target/release/`.
+`cargo verify` validates the npm package name and checks its version, description,
+and license against Cargo metadata, checks formatting and all workspace targets, runs Clippy and
+workspace tests, then builds the release CLI and smoke-tests `--version` and
+`--help`. The CLI smoke checks need no provider credentials or network calls.
+`.github/workflows/rust.yml` runs `cargo verify` directly, without Node.
 
-Installer tests use executable/compiler fixtures to check prebuilt selection,
-source fallback, version mismatches, missing compilers, failed builds, paths with
-spaces, global npm bin links, argument/environment/stream forwarding and signals.
-POSIX fixture tests are skipped on Windows; CI additionally builds and smoke-tests
-the actual Windows executable. Application behavior belongs in the Rust tests.
+`cargo release-check` runs verification followed by `dist generate --check` and
+`dist plan`. Install the pinned cargo-dist version below before running release
+checks.
 
 ## Building and publishing packages
-
-A source-only npm tarball is supported:
-
-```bash
-npm pack                    # prepack builds Rust and runs native CLI smoke
-```
-
-To bundle a prebuilt, build and stage it on its actual host:
-
-```bash
-npm run build
-node scripts/native-stage.mjs
-npm pack
-```
-
-The distribution layout is `native/<platform-key>/slopdex` (or `slopdex.exe`).
-Keys use Node's OS and architecture names, with a libc suffix on Linux:
-
-```text
-native/linux-x64-gnu/slopdex
-native/linux-arm64-gnu/slopdex
-native/linux-x64-musl/slopdex
-native/darwin-x64/slopdex
-native/darwin-arm64/slopdex
-native/win32-x64/slopdex.exe
-```
-
-Only keys actually staged are shipped by a local `npm pack`. Linux GNU and musl
-binaries are never interchanged. This local installer can fall back to compiling
-the bundled sources when no runnable prebuilt exists. Do not stage cross-compiled
-output under the build host's key.
 
 ### GitHub binary releases and npm publication
 
@@ -434,10 +361,10 @@ For example, `patch` advances `0.19.0` to `0.19.1`; use `minor` for `0.20.0`,
 or specify an exact version. `release.toml` makes cargo-release:
 
 1. Update `Cargo.toml` and `Cargo.lock`.
-2. Synchronize `package.json` and both root-package version fields in
-   `package-lock.json` (including prerelease versions).
-3. Run `npm run release:check`: the full application/packaging checks, generated
-   workflow consistency check, and release plan.
+2. Synchronize the version in `npm/package.json` (including prerelease versions),
+   the only file in the configured version replacements.
+3. Run the pre-release hook `['cargo', 'release-check']`: workspace verification,
+   generated workflow consistency check, and release plan.
 4. Create the release commit and annotated `v<version>` tag, then push to `origin`.
 
 The pushed tag triggers the **Release** workflow, which uploads binaries and
@@ -458,15 +385,3 @@ Artifacts are written to `target/distrib/`. Use your host's target triple when
 testing on another platform. Released npm packages fetch these archives rather
 than shipping all binaries or falling back to a Rust source build. Unsupported
 platforms can build from the checkout.
-
-Keep the version in `package.json`, `package-lock.json`, `Cargo.toml` and
-`Cargo.lock` synchronized before tagging. Native version checks reject a mismatch.
-After npm metadata changes, regenerate its lockfile with:
-
-```bash
-npm install --package-lock-only --ignore-scripts
-```
-
-`target/`, staged `native/` files and npm tarballs are ignored by Git. npm's
-explicit files list includes the staged binaries and Rust sources while leaving
-build caches out of the published package.

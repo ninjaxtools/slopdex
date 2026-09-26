@@ -25,7 +25,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: artifacts-build-global
-          path: npm/
+          path: target/npm/
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -35,5 +35,19 @@ jobs:
       # rather than relying on the version bundled with the runner's Node.
       - name: Install OIDC-capable npm
         run: npm install --global npm@11
+      - name: Verify npm publication metadata
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { readFileSync } from 'node:fs';
+          const expected = JSON.parse(readFileSync('npm/package.json', 'utf8'));
+          const actual = JSON.parse(execFileSync('tar', ['-xOf', 'target/npm/slopdex-npm-package.tar.gz', 'package/package.json'], { encoding: 'utf8' }));
+          for (const key of ['name', 'version', 'description', 'license']) assert.equal(actual[key], expected[key], `npm ${key} mismatch`);
+          const repository = value => (typeof value === 'string' ? value : value.url).replace(/^git\+/, '').replace(/\.git$/, '');
+          assert.equal(repository(actual.repository), repository(expected.repository), 'npm repository mismatch');
+          assert.equal(expected.publishConfig.access, 'public');
+          assert.ok(actual.bin.slopdex, 'generated package must expose the native CLI');
+          NODE
       - name: Publish cargo-dist's npm installer
-        run: npm publish --access public ./npm/slopdex-npm-package.tar.gz
+        run: npm publish --access public ./target/npm/slopdex-npm-package.tar.gz

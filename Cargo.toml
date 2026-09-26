@@ -6,6 +6,11 @@ license = "MIT"
 description = "Semantic code and Markdown search with SQLite and USearch"
 repository = "https://github.com/ninjaxtools/slopdex"
 
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+resolver = "3"
+
 [lib]
 path = "src/lib.rs"
 
