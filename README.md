@@ -20,13 +20,15 @@ The main supported functions are
 - `slopdex describe <query>`
    <br/>explain code relevant to a task
 - `slopdex map [PATH]...`
-   <br/>show code declarations and Markdown headings without model calls
+   <br/>show a map/skeleton of the code structure
 
 `search` does a vector searche of code, and markdown, and when enabled generated code descriptions.
 
 `cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
 
 `describe` does a `search` first, then passes the result through the configured LLM model to create a tailored description.
+
+`map` shows a map/skeleton of the code, excluding implementation details like function bodies. This can be helpful to get a concise map of the code to allow an LLM to explore the codebase incrementally.
 
 ## Installation
 
@@ -46,8 +48,8 @@ cargo install --path . --locked
 
 ## Getting started
 
-Semantic search requires an embedding-provider API key from OpenAI or Jina.
-`slopdex map` works locally without a provider or API key.
+Semantic search requires an embedding-provider API key from OpenAI or Jina. `slopdex map` doesn't
+use vector search and works locally without a provider or API key.
 
 ```console
 $ export OPENAI_API_KEY="your-api-key"
@@ -55,9 +57,9 @@ $ slopdex search "validate an authenticated session"
 ...
 ```
 
-Index commands normally refresh the current working tree and git checkpoint in `.slopdex/index.sqlite`; `--no-reindex` uses the saved index. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
+The index tracks the current git commit and is created or updated on every command and stored in `.slopdex/index.sqlite`. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
 
-### Structure map
+### Code map/skeleton
 
 ```console
 $ slopdex map src docs
@@ -66,21 +68,9 @@ $ slopdex map -g '*.md' -e '^Guide\.Setup' -i --format json
 $ slopdex map --no-reindex
 ```
 
-Paths are root-relative files or recursive directories; absolute paths within the
-root also work. The default summary shows declarations, signatures, and line
-ranges; JSON retains full selected structure metadata. `-k fns` includes methods.
-Map refreshes only local structure in SQLite, without providers or vector sidecars.
-Later semantic commands prepare missing embeddings during their normal refresh.
+The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains many of the structurally useful information that can act as an index into the source code. The resulting index output is most useful to conserve tokens and improve the agentic programming experience.
 
-Map, search, describe, and cross-search share repeatable `-g` path globs and `-e`
-name regexes. Globs use ordered ignore-style overrides: `!` excludes, the last
-matching rule wins, and positive rules require a match. They select indexed files;
-they cannot override indexing exclusions. Regexes are ORed; `-i` ignores case.
-Cross-search applies these selectors only to sources, intersecting its path/Git
-filters. See the [selector reference](docs/reference.md#shared-selectors).
-
-Existing schema-2 indexes must be removed and rebuilt or replaced with a new index
-path; schema 3 has no migration. See [rebuild instructions](docs/reference.md#rebuilding-an-old-index).
+See the [selector reference](docs/reference.md#shared-selectors).
 
 ### Search
 
@@ -207,8 +197,10 @@ $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 Just put this in your `AGENTS.md` file, no skill required:
 
 ```
+- use `treesitter-index -g <glob> <files or directories...>` early to obtain a compact structural skeleton before reading the full file, and then perform targeted reads for implementation details. Line numbers are indicated in square brackets (e.g [5] means line 5, and [5-10] means lines 5 to 10). To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`. For example: `treesitter-index -g "*.ts" -i -e "manager|main" src`.
 - use semantic code search to find code with: `slopdex search "..." --threshold 0.5`
 - when reviewing uncommitted code avoid introducing duplicates by looking for related matches: `slopdex cross-search --uncommitted --threshold 0.8`
+- don't use `*` as the glob since that circumvents the default ignore rules.
 ```
 
 Any other use, like doing a full `cross-search` is probably better done interactively with the agent, in which case you can just ask the agent to run `slopdex --help` to get usage information.
