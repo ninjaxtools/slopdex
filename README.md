@@ -197,7 +197,7 @@ $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 Just put this in your `AGENTS.md` file, no skill required:
 
 ```
-- use `treesitter-index -g <glob> <files or directories...>` early to obtain a compact structural skeleton before reading the full file, and then perform targeted reads for implementation details. Line numbers are indicated in square brackets (e.g [5] means line 5, and [5-10] means lines 5 to 10). To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`. For example: `treesitter-index -g "*.ts" -i -e "manager|main" src`.
+- use `slopdex map -g <glob> <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads for implementation details. Line numbers are indicated in square brackets (e.g [5] means line 5, and [5-10] means lines 5 to 10). To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`. For example: `slopdex map -g "*.ts" -i -e "manager|main" src`.
 - use semantic code search to find code with: `slopdex search "..." --threshold 0.5`
 - when reviewing uncommitted code avoid introducing duplicates by looking for related matches: `slopdex cross-search --uncommitted --threshold 0.8`
 - don't use `*` as the glob since that circumvents the default ignore rules.

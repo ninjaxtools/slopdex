@@ -21,12 +21,20 @@ struct Active {
 struct TerminalDisplay {
     group: cliclack::MultiProgress,
     bar: cliclack::ProgressBar,
+    indicator: Option<Indicator>,
 }
 
 static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
 const TEXT_DELAY: Duration = Duration::from_millis(200);
 const BAR_THRESHOLD: Duration = Duration::from_secs(1);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(25);
+const PROGRESS_TEMPLATE: &str = "{msg} {bar:30.magenta} ETA {eta}";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Indicator {
+    Spinner,
+    Progress,
+}
 
 // Keep the last settled text while a replacement is pending. Frequent short
 // updates (such as filenames) must not reset the age of the enclosing task.
@@ -102,10 +110,11 @@ impl Scope {
         Render {
             message,
             counts: Some((self.count.completed, self.count.total)),
+            show_bar: false,
         }
     }
 
-    fn visible(&mut self, now: Instant) -> Option<String> {
+    fn visible(&mut self, now: Instant) -> Option<Render> {
         let elapsed = now.saturating_duration_since(self.since);
         if elapsed < TEXT_DELAY {
             return None;
@@ -126,7 +135,9 @@ impl Scope {
             .as_mut()
             .and_then(|detail| detail.get(now))
             .map(str::to_owned);
-        Some(self.render(detail.as_deref()).display(self.bar_visible))
+        let mut render = self.render(detail.as_deref());
+        render.show_bar = self.bar_visible;
+        Some(render)
     }
 }
 
@@ -140,27 +151,7 @@ struct Render {
     message: String,
     // None selects the unknown-size spinner template.
     counts: Option<(usize, usize)>,
-}
-
-impl Render {
-    fn display(&self, show_bar: bool) -> String {
-        match self.counts {
-            Some((completed, total)) if show_bar => {
-                let filled = if total == 0 {
-                    0
-                } else {
-                    (completed as u128 * 20 / total as u128) as usize
-                };
-                format!(
-                    "{}\n│    [{}{}]",
-                    self.message,
-                    "■".repeat(filled),
-                    "□".repeat(20 - filled)
-                )
-            }
-            _ => self.message.clone(),
-        }
-    }
+    show_bar: bool,
 }
 
 impl ProgressState {
@@ -238,21 +229,37 @@ impl ProgressState {
             Render {
                 message: self.spinner.text.clone(),
                 counts: None,
+                show_bar: false,
             }
         }
     }
 
-    fn visible(&mut self, now: Instant) -> Option<String> {
+    fn visible(&mut self, now: Instant) -> Option<Render> {
         if self.scopes.is_empty() {
-            return self.spinner.get(now).map(str::to_owned);
+            return self.spinner.get(now).map(|message| Render {
+                message: message.to_owned(),
+                counts: None,
+                show_bar: false,
+            });
         }
         // A short-lived child never displaces its already-visible parent.
-        let rows = self
+        let mut rows = self
             .scopes
             .iter_mut()
             .filter_map(|scope| scope.visible(now))
             .collect::<Vec<_>>();
-        (!rows.is_empty()).then(|| rows.join("\n│    "))
+        let mut active = rows.pop()?;
+        if !rows.is_empty() {
+            active.message = format!(
+                "{}\n│    {}",
+                rows.into_iter()
+                    .map(|render| render.message)
+                    .collect::<Vec<_>>()
+                    .join("\n│    "),
+                active.message
+            );
+        }
+        Some(active)
     }
 
     fn completion(&self, success: bool) -> String {
@@ -278,18 +285,27 @@ impl ProgressState {
 
 impl Active {
     fn render(&mut self) {
-        let Some(message) = self.state.visible(Instant::now()) else {
+        let Some(render) = self.state.visible(Instant::now()) else {
             return;
         };
-        // Update bar, percentage, and counts atomically. Separate native length,
-        // position, and message setters can draw mismatched nested-task states.
-        if let Some(display) = &self.display {
-            display.bar.set_message(message);
+        if let Some(display) = &mut self.display {
+            display.render(render);
         } else {
             let group = cliclack::multi_progress(&self.label);
-            let bar = group.add(cliclack::spinner());
-            bar.start(message);
-            self.display = Some(TerminalDisplay { group, bar });
+            let indicator = render.indicator();
+            let bar = match (indicator, render.counts) {
+                (Indicator::Progress, Some((_, total))) => group.add(
+                    cliclack::progress_bar(progress_value(total)).with_template(PROGRESS_TEMPLATE),
+                ),
+                _ => group.add(cliclack::spinner()),
+            };
+            let mut display = TerminalDisplay {
+                group,
+                bar,
+                indicator: None,
+            };
+            display.render(render);
+            self.display = Some(display);
         }
     }
 
@@ -300,6 +316,47 @@ impl Active {
             let _ = cliclack::log::info(message);
         }
     }
+}
+
+impl Render {
+    fn indicator(&self) -> Indicator {
+        if self.show_bar && self.counts.is_some() {
+            Indicator::Progress
+        } else {
+            Indicator::Spinner
+        }
+    }
+}
+
+impl TerminalDisplay {
+    fn render(&mut self, render: Render) {
+        let indicator = render.indicator();
+        let changed = self.indicator != Some(indicator);
+        if changed {
+            match indicator {
+                Indicator::Spinner => {
+                    self.bar.clone().with_spinner_template();
+                }
+                Indicator::Progress => {
+                    self.bar.clone().with_template(PROGRESS_TEMPLATE);
+                }
+            }
+            self.indicator = Some(indicator);
+        }
+        if let Some((completed, total)) = render.counts {
+            self.bar.set_length(progress_value(total));
+            self.bar.set_position(progress_value(completed));
+        }
+        if changed {
+            self.bar.start(render.message);
+        } else {
+            self.bar.set_message(render.message);
+        }
+    }
+}
+
+fn progress_value(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 /// A counted scope is silent unless an enclosing CLI spin owns the display.
@@ -481,37 +538,47 @@ pub(crate) fn error(message: impl Display) {
 mod tests {
     use super::*;
 
+    fn visible_message(state: &mut ProgressState, now: Instant) -> Option<String> {
+        state.visible(now).map(|render| render.message)
+    }
+
     #[test]
     fn transient_text_waits_for_each_replacement_to_settle() {
         let mut state = ProgressState::new("Opening index");
         let start = state.spinner.since;
         assert_eq!(
-            state.visible(start + TEXT_DELAY - Duration::from_nanos(1)),
+            visible_message(&mut state, start + TEXT_DELAY - Duration::from_nanos(1)),
             None
         );
         assert_eq!(
-            state.visible(start + TEXT_DELAY).as_deref(),
-            Some("Opening index")
+            visible_message(&mut state, start + TEXT_DELAY),
+            Some("Opening index".into())
         );
 
         state.message("Scanning files".into());
         let start = state.spinner.since;
-        assert_eq!(state.visible(start).as_deref(), Some("Opening index"));
+        assert_eq!(
+            visible_message(&mut state, start),
+            Some("Opening index".into())
+        );
         // Repeated reports of the same stage do not postpone its appearance.
         state.message("Scanning files".into());
         assert_eq!(state.spinner.since, start);
         assert_eq!(
-            state.visible(start + TEXT_DELAY).as_deref(),
-            Some("Scanning files")
+            visible_message(&mut state, start + TEXT_DELAY),
+            Some("Scanning files".into())
         );
 
         state.message("Short-lived stage".into());
         state.message("Saving index".into());
         let start = state.spinner.since;
-        assert_eq!(state.visible(start).as_deref(), Some("Scanning files"));
         assert_eq!(
-            state.visible(start + TEXT_DELAY).as_deref(),
-            Some("Saving index")
+            visible_message(&mut state, start),
+            Some("Scanning files".into())
+        );
+        assert_eq!(
+            visible_message(&mut state, start + TEXT_DELAY),
+            Some("Saving index".into())
         );
     }
 
@@ -521,21 +588,24 @@ mod tests {
         let files = state.push("Files".into(), 5);
         let start = state.scopes[0].since;
         state.inc(&files, 1);
-        assert_eq!(state.visible(start + Duration::from_millis(199)), None);
-        // 200 ms for one of five items predicts exactly one second: no bar.
         assert_eq!(
-            state.visible(start + TEXT_DELAY).as_deref(),
-            Some("Files 20% (1/5)")
+            visible_message(&mut state, start + Duration::from_millis(199)),
+            None
         );
-        let display = state.visible(start + Duration::from_millis(201)).unwrap();
-        assert_eq!(display, "Files 20% (1/5)\n│    [■■■■□□□□□□□□□□□□□□□□]");
+        // 200 ms for one of five items predicts exactly one second: no bar.
+        let render = state.visible(start + TEXT_DELAY).unwrap();
+        assert_eq!(render.message, "Files 20% (1/5)");
+        assert!(!render.show_bar);
+        let render = state.visible(start + Duration::from_millis(201)).unwrap();
+        assert_eq!(render.message, "Files 20% (1/5)");
+        assert!(render.show_bar);
         // A revised estimate must not make an already-visible bar flicker off.
         state.inc(&files, 3);
         assert!(
             state
                 .visible(start + Duration::from_millis(202))
                 .unwrap()
-                .contains("\n│    [")
+                .show_bar
         );
     }
 
@@ -545,13 +615,11 @@ mod tests {
         let files = state.push("Files".into(), 100);
         let start = state.scopes[0].since;
         state.inc(&files, 1);
-        assert_eq!(state.visible(start + Duration::from_millis(199)), None);
-        assert!(
-            state
-                .visible(start + TEXT_DELAY)
-                .unwrap()
-                .contains("\n│    [")
+        assert_eq!(
+            visible_message(&mut state, start + Duration::from_millis(199)),
+            None
         );
+        assert!(state.visible(start + TEXT_DELAY).unwrap().show_bar);
     }
 
     #[test]
@@ -559,30 +627,27 @@ mod tests {
         let mut state = ProgressState::new("Indexing");
         state.push("Files".into(), 4);
         let start = state.scopes[0].since;
-        assert_eq!(
-            state.visible(start + BAR_THRESHOLD).as_deref(),
-            Some("Files 0% (0/4)")
-        );
+        let render = state.visible(start + BAR_THRESHOLD).unwrap();
+        assert_eq!(render.message, "Files 0% (0/4)");
+        assert!(!render.show_bar);
         assert!(
             state
                 .visible(start + BAR_THRESHOLD + REFRESH_INTERVAL)
                 .unwrap()
-                .contains("\n│    [")
+                .show_bar
         );
 
         let mut state = ProgressState::new("Indexing");
         let files = state.push("Files".into(), 4);
         let start = state.scopes[0].since;
         state.inc(&files, 3);
-        assert_eq!(
-            state.visible(start + TEXT_DELAY).as_deref(),
-            Some("Files 75% (3/4)")
-        );
+        let render = state.visible(start + TEXT_DELAY).unwrap();
+        assert_eq!(render.message, "Files 75% (3/4)");
+        assert!(!render.show_bar);
         state.inc(&files, 1);
-        assert_eq!(
-            state.visible(start + BAR_THRESHOLD * 2).as_deref(),
-            Some("Files 100% (4/4)")
-        );
+        let render = state.visible(start + BAR_THRESHOLD * 2).unwrap();
+        assert_eq!(render.message, "Files 100% (4/4)");
+        assert!(!render.show_bar);
     }
 
     #[test]
@@ -590,61 +655,65 @@ mod tests {
         let mut state = ProgressState::new("Indexing");
         let files = state.push("Files".into(), 10);
         state.scopes[0].since = Instant::now() - TEXT_DELAY;
-        let parent = state.visible(Instant::now()).unwrap();
+        let parent = state.visible(Instant::now()).unwrap().message;
         state.message("short-lived.rs".into());
         let child = state.push("Embeddings".into(), 1);
         assert_eq!(
-            state.visible(Instant::now()).as_deref(),
-            Some(parent.as_str())
+            visible_message(&mut state, Instant::now()),
+            Some(parent.clone())
         );
         state.end(&child, true);
         state.message("long-lived.rs".into());
         let start = state.scopes[0].detail.as_ref().unwrap().since;
-        assert_eq!(state.visible(start).as_deref(), Some(parent.as_str()));
+        assert_eq!(visible_message(&mut state, start), Some(parent));
         assert!(
             state
                 .visible(start + TEXT_DELAY)
                 .unwrap()
+                .message
                 .contains(" — long-lived.rs")
         );
 
         state.end(&files, true);
         let start = state.spinner.since;
-        assert_eq!(state.visible(start), None);
+        assert_eq!(visible_message(&mut state, start), None);
         state.message("Saving snapshot".into());
         let start = state.spinner.since;
-        assert_eq!(state.visible(start), None);
+        assert_eq!(visible_message(&mut state, start), None);
         assert_eq!(
-            state.visible(start + TEXT_DELAY).as_deref(),
-            Some("Saving snapshot")
+            visible_message(&mut state, start + TEXT_DELAY),
+            Some("Saving snapshot".into())
         );
     }
 
     #[test]
-    fn graphical_bar_and_numeric_counts_share_one_snapshot() {
+    fn native_bar_and_numeric_counts_share_one_snapshot() {
         let mut state = ProgressState::new("Indexing");
         let files = state.push("Files".into(), 2);
         state.inc(&files, 1);
         let embeddings = state.push("Embeddings".into(), 5);
-        assert_eq!(
-            state.render().display(true),
-            "Embeddings 0% (0/5)\n│    [□□□□□□□□□□□□□□□□□□□□]"
-        );
+        let visible_since = Instant::now() - BAR_THRESHOLD - REFRESH_INTERVAL;
+        state.scopes[0].since = visible_since;
+        state.scopes[1].since = visible_since;
+        let render = state.visible(Instant::now()).unwrap();
+        assert_eq!(render.message, "Files 50% (1/2)\n│    Embeddings 0% (0/5)");
+        assert_eq!(render.counts, Some((0, 5)));
+        assert!(matches!(render.indicator(), Indicator::Progress));
         state.inc(&embeddings, 2);
-        assert_eq!(
-            state.render().display(true),
-            "Embeddings 40% (2/5)\n│    [■■■■■■■■□□□□□□□□□□□□]"
-        );
+        let render = state.visible(Instant::now()).unwrap();
+        assert_eq!(render.message, "Files 50% (1/2)\n│    Embeddings 40% (2/5)");
+        assert_eq!(render.counts, Some((2, 5)));
         state.inc(&embeddings, 3);
+        let render = state.visible(Instant::now()).unwrap();
         assert_eq!(
-            state.render().display(true),
-            "Embeddings 100% (5/5)\n│    [■■■■■■■■■■■■■■■■■■■■]"
+            render.message,
+            "Files 50% (1/2)\n│    Embeddings 100% (5/5)"
         );
+        assert_eq!(render.counts, Some((5, 5)));
         state.end(&embeddings, true);
-        assert_eq!(
-            state.render().display(true),
-            "Files 50% (1/2)\n│    [■■■■■■■■■■□□□□□□□□□□]"
-        );
+        assert_eq!(state.render().message, "Files 50% (1/2)");
+        assert!(PROGRESS_TEMPLATE.contains("{bar:"));
+        assert!(PROGRESS_TEMPLATE.contains("{eta}"));
     }
 
     #[test]
@@ -654,7 +723,7 @@ mod tests {
         state.inc(&queries, 1);
         state.end(&queries, true);
         state.message("Generating explanation".into());
-        assert_eq!(state.render().display(true), "Generating explanation");
+        assert_eq!(state.render().message, "Generating explanation");
         assert_eq!(state.completion(false), "Failed");
     }
 

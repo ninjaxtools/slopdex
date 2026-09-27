@@ -88,8 +88,9 @@ refreshing indexes, searches, explanations, and description regeneration.
 Replaceable status text waits until its task or message has lasted at least
 200 ms; faster tasks produce only permanent notices and completion summaries.
 Known-size tasks show completed/target counts and, when measured progress
-predicts more than one second of work, a 0–100% bar on its own line. With no
-completed items to estimate from, the bar waits until one second has elapsed.
+predicts more than one second of work, a native cliclack progress bar with an
+estimated time remaining. With no completed items to estimate from, the bar
+waits until one second has elapsed.
 These tasks include files indexed,
 embeddings and descriptions generated, vector snapshots processed, indexes
 searched, candidates rescored/reranked, and source functions compared. Embedding
@@ -110,7 +111,8 @@ slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--format su
 With no paths, map selects the indexed repository. Paths select files or recursive
 directories and are relative to `--root`, including when invoked from another
 working directory. Absolute paths within the root are accepted; paths outside it
-are rejected. Multiple paths form a union, intersected with the shared selectors.
+are rejected. Missing paths produce warnings on stderr and are ignored. Multiple
+paths form a union, intersected with the shared selectors.
 
 Map normally refreshes local file snapshots, declarations, headings, search units,
 and diagnostics in SQLite. It makes no provider requests, generates no descriptions

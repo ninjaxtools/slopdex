@@ -240,6 +240,43 @@ impl MapArgs {
         }
         value
     }
+
+    fn existing_options(&self, root: &Path) -> Result<Option<Value>> {
+        if self.paths.is_empty() {
+            return Ok(Some(self.options()));
+        }
+        let mut paths = Vec::new();
+        for path in &self.paths {
+            if !path.is_absolute() {
+                ensure!(
+                    !path.components().any(|c| matches!(c, Component::ParentDir)),
+                    "Source path must remain inside the repository"
+                );
+            }
+            let source = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                root.join(path)
+            };
+            if source
+                .try_exists()
+                .with_context(|| format!("Cannot inspect map path {}", path.display()))?
+            {
+                paths.push(path);
+            } else {
+                ui::warning(format!(
+                    "slopdex: warning: map path does not exist; ignoring: {}",
+                    path.display()
+                ));
+            }
+        }
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let mut options = self.options();
+        options["paths"] = json!(paths);
+        Ok(Some(options))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -518,6 +555,11 @@ pub fn run() -> Result<()> {
             Engine::open(&root, &index, config.clone())
         }
     })?;
+    let map_options = if let Command::Map(args) = &cli.command {
+        args.existing_options(&root)?
+    } else {
+        None
+    };
     let refreshed = if cli.global.no_reindex {
         None
     } else if is_map {
@@ -533,10 +575,12 @@ pub fn run() -> Result<()> {
     )?;
     let format = cli.global.format.unwrap_or(Format::Summary);
     match &cli.command {
-        Command::Map(args) => {
-            let rows = ui::spin("Mapping repository structure", || {
-                engine.map(&args.options())
-            })?;
+        Command::Map(_) => {
+            let rows = if let Some(options) = map_options.as_ref() {
+                ui::spin("Mapping repository structure", || engine.map(options))?
+            } else {
+                Vec::new()
+            };
             print_map(&mut out, &rows, format)?;
         }
         Command::Search(args) => {

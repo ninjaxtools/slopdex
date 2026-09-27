@@ -3101,6 +3101,40 @@ fn map_filters_keep_ancestors_without_siblings_and_cli_combines_paths_kinds_and_
 }
 
 #[test]
+fn map_cli_warns_and_ignores_missing_paths() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("src/api.ts", "export function api() {}\n")?;
+    repo.write("other.ts", "export function other() {}\n")?;
+    repo.cli_json(&["map"])?;
+
+    let absolute_missing = repo.root.join("absent-file.ts");
+    let output = repo.cli(&[
+        "--no-reindex",
+        "map",
+        "src",
+        "absent-directory",
+        absolute_missing.to_str().unwrap(),
+    ])?;
+    ensure!(
+        output.status.success(),
+        "map with missing paths failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["path"], "src/api.ts");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("warning: map path does not exist; ignoring: absent-directory"));
+    assert!(stderr.contains(&absolute_missing.display().to_string()));
+
+    let output = repo.cli(&["--no-reindex", "map", "absent-directory"])?;
+    ensure!(output.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&output.stdout)?, json!([]));
+    assert!(String::from_utf8(output.stderr)?.contains("absent-directory"));
+    Ok(())
+}
+
+#[test]
 fn map_then_semantic_prepare_and_structure_edit_never_reuses_stale_vectors() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
