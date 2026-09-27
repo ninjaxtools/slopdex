@@ -97,7 +97,8 @@ summary/JSON/JSONL format.
 
 Common query/cross-search filters:
 
-- `--threshold <number|min-max>`: default `0.3`; finite endpoints in `[-1,1]`,
+- `--threshold <number|min-max>`: default `0.8` for cross-search and `0.3` for
+  query commands (including `describe`); finite endpoints in `[-1,1]`,
   inclusive minimum and exclusive maximum. A range requires minimum < maximum.
 - `--limit <positive integer>`: default unlimited. Caps query results (including
   Markdown), or the context matches for `describe`. For cross-search it caps
@@ -214,6 +215,12 @@ Clusters are connected components of observed callable matches, sorted by member
 count and then name. The displayed similarity range covers observed links;
 members need not all match one another directly. Cross-search compares callables,
 not Markdown chunks. Sources with no surviving matches are omitted.
+
+Cross-search defaults to `--threshold 0.8` to avoid joining otherwise distinct
+groups through weak matches. Lower thresholds can produce one large transitive
+cluster; use `--threshold 0.3` to restore the pre-rewrite CLI's cutoff, or `0.9`
+for more selective duplicate detection. Explicit ranges retain their inclusive
+minimum and exclusive maximum.
 
 Cohesion changes the order of each source's selected semantic matches. Distance
 is `0` in one file, `1` between files in one directory, and `1` plus directory-tree

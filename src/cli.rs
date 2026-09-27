@@ -223,6 +223,7 @@ struct DescribeArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(mut_arg("threshold", |arg| arg.default_value("0.8")))]
 struct CrossArgs {
     #[command(flatten)]
     filters: Filters,
@@ -1877,6 +1878,43 @@ mod tests {
     }
 
     #[test]
+    fn cross_search_has_a_selective_default_without_changing_query_defaults() {
+        for command in [
+            "search",
+            "search-code",
+            "search-descriptions",
+            "search-md",
+            "describe",
+        ] {
+            let cli = parse(&[command, "query"]);
+            let filters = match cli.command {
+                Command::Search(args) => args.query.filters,
+                Command::SearchCode(args)
+                | Command::SearchDescriptions(args)
+                | Command::SearchMd(args) => args.filters,
+                Command::Describe(args) => args.query.filters,
+                _ => unreachable!(),
+            };
+            assert_eq!(filters.options()["minSimilarity"], 0.3, "{command}");
+            let help = Cli::try_parse_from(["slopdex", command, "--help"])
+                .unwrap_err()
+                .to_string();
+            assert!(help.contains("[default: 0.3]"), "{command}: {help}");
+        }
+        for args in [vec!["cross-search"], vec!["cross-search", "--cohesion"]] {
+            let Command::CrossSearch(args) = parse(&args).command else {
+                unreachable!()
+            };
+            assert_eq!(args.options()["minSimilarity"], 0.8);
+        }
+        let help = Cli::try_parse_from(["slopdex", "cross-search", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("[default: 0.8]"), "{help}");
+        assert!(!help.contains("[default: 0.3]"), "{help}");
+    }
+
+    #[test]
     fn options_defaults_and_limit_validation() {
         let cli = parse(&["cross-search"]);
         let Command::CrossSearch(args) = cli.command else {
@@ -1884,7 +1922,7 @@ mod tests {
         };
         assert_eq!(args.matches, 5);
         assert_eq!(args.min_lines, 2);
-        assert_eq!(args.filters.threshold.min, 0.3);
+        assert_eq!(args.filters.threshold.min, 0.8);
         assert!(args.filters.limit.is_none());
         let cli = parse(&["cross-search", "--limit", "1"]);
         let Command::CrossSearch(args) = cli.command else {

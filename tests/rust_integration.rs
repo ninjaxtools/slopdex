@@ -900,6 +900,116 @@ fn query_threshold_endpoints_apply_to_code_and_markdown_and_survive_restart() ->
 }
 
 #[test]
+fn cross_search_default_separates_strong_groups_and_explicit_thresholds_can_bridge_them()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    // Each family has cosine 1 internally, and 0.6 with the other family.
+    // The old 0.3 default connects all four functions transitively.
+    let source = [
+        ("mid_a", "VECTOR_MID"),
+        ("mid_b", "VECTOR_MID"),
+        ("north_a", "VECTOR_NORTH"),
+        ("north_b", "VECTOR_NORTH"),
+    ]
+    .into_iter()
+    .map(|(name, marker)| function(name, marker))
+    .collect::<String>();
+    repo.write("groups.rs", &source)?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let broad = engine.cross_search(None, &json!({"minSimilarity": 0.3}))?;
+    assert_eq!(
+        broad
+            .iter()
+            .map(|r| r["matches"].as_array().unwrap().len())
+            .sum::<usize>(),
+        6
+    );
+
+    // Model the previous release's cached result for an omitted engine threshold.
+    // The new effective default must not reuse that old low-threshold graph.
+    let status = engine.status()?;
+    let legacy_key = slopdex::hash(
+        json!([
+            "cross",
+            status["generation"],
+            repo.index.canonicalize()?,
+            status["generation"],
+            "code",
+            null,
+            status["gitCheckpoint"],
+            {}
+        ])
+        .to_string(),
+    );
+    repo.db()?.execute(
+        "INSERT OR REPLACE INTO search_cache VALUES(?, ?)",
+        [legacy_key, serde_json::to_string(&broad)?],
+    )?;
+    let focused = engine.cross_search(None, &json!({}))?;
+    assert_eq!(focused.len(), 2);
+    for row in &focused {
+        assert_eq!(row["matches"].as_array().unwrap().len(), 1);
+        near(&row["matches"][0]["similarity"], 1.0);
+    }
+    assert_eq!(
+        engine.cross_search(None, &json!({"minSimilarity": 0.8}))?,
+        focused
+    );
+    let calls = mock.count();
+    drop(engine);
+    let engine = repo.open(&config)?;
+    assert_eq!(engine.cross_search(None, &json!({}))?, focused);
+    assert_eq!(
+        engine.cross_search(None, &json!({"minSimilarity": 0.3}))?,
+        broad
+    );
+    drop(engine);
+
+    for (threshold_args, cluster_count) in [
+        (vec![], 2),
+        (vec!["--threshold", "0.8"], 2),
+        (vec!["--threshold", "0.3"], 1),
+        (vec!["--threshold", "0.3-0.8"], 1),
+    ] {
+        let args = [
+            vec!["--no-reindex", "--format", "clusters", "cross-search"],
+            threshold_args,
+        ]
+        .concat();
+        let output = repo
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .args(&args)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("Cluster "))
+                .count(),
+            cluster_count,
+            "{args:?}: {text}"
+        );
+        for name in ["mid_a", "mid_b", "north_a", "north_b"] {
+            assert!(text.contains(name), "{args:?}: {text}");
+        }
+    }
+    assert_eq!(mock.count(), calls, "threshold changes use saved vectors");
+    Ok(())
+}
+
+#[test]
 fn cross_search_threshold_endpoints_exclude_self_and_use_only_indexed_vectors() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;

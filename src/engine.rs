@@ -853,6 +853,14 @@ impl Engine {
     }
 
     pub fn cross_search(&self, target: Option<&Engine>, options: &Value) -> Result<Vec<Value>> {
+        // Cross-search needs a more selective floor than natural-language
+        // queries: weak edges can otherwise join every connected component.
+        // Include the effective default in the cache key as well as filtering.
+        let mut options = options.clone();
+        if options["minSimilarity"].as_f64().is_none() {
+            options["minSimilarity"] = json!(0.8);
+        }
+        let options = &options;
         let target = target.unwrap_or(self);
         ensure!(
             self.providers.vector().profile() == target.providers.vector().profile(),

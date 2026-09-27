@@ -135,6 +135,11 @@ Cluster 1 (3 functions, similarity 0.9124-0.9568)
 
 Using `--cross-file-only` is useful to exclude similar code in the same file.
 
+Cross-search defaults to `--threshold 0.8` (query search defaults to `0.3`).
+Clusters join matches transitively, so a low threshold can connect many groups
+into one large cluster. Use `0.9` for stricter duplicate detection, or explicitly
+pass `--threshold 0.3` for the pre-rewrite default.
+
 You can use threshold ranges as well:
 
 ```console
