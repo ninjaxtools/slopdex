@@ -217,8 +217,29 @@ $ slopdex --version
 
 ## Related Work
 
-- [qmd](https://github.com/tobi/qmd)
+Code similarity search
+
 - [treepeat](https://github.com/dsummersl/treepeat)
+
+Structured code queries:
+
+- [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext)
+- [CoderLM](https://github.com/JaredStewart/coderlm)
+
+Structured code queries and edits:
+
+- [srgn](https://github.com/alexpovel/srgn)
+- [comby](https://github.com/comby-tools/comby)
+- [ast-grep](https://ast-grep.github.io/guide/introduction)
+- [gritql](https://github.com/biomejs/gritql)
+
+Semantic code search with vector embeddings:
+
+- [qmd](https://github.com/tobi/qmd)
+- [grepai](https://github.com/yoanbernabeu/grepai)
+- [cocoindex-code](https://github.com/cocoindex-io/cocoindex-code)
+- [codana](https://github.com/bartolli/codanna)
+- [open-codebase-index](https://github.com/Helweg/open-codebase-index)
 
 ## Publishing
 
