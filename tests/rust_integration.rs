@@ -534,6 +534,11 @@ impl Repo {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("NO_PROXY", "*");
+        // Winsock needs SystemRoot to load networking DLLs in Windows children.
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
         command
     }
 
@@ -2338,7 +2343,11 @@ fn cli_redirected_progress_preserves_json_plain_diagnostics_and_offline_mode() -
     fs::write(repo.root.join("invalid.rs"), [0xff])?;
 
     let output = repo.cli(&["status"])?;
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "CLI status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let status: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(status["functionCount"], 1);
     let stderr = String::from_utf8(output.stderr)?;
@@ -2829,7 +2838,11 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
     drop(engine);
     let failed = repo.cli(&["--no-reindex", "reindex-files", "--callables"])?;
     assert!(!failed.status.success());
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("fixture forced reindex failure"));
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("fixture forced reindex failure"),
+        "CLI did not reach the forced publication failure: {stderr}"
+    );
     assert_eq!(
         mock.requests("/responses").len(),
         6,
