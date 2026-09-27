@@ -1,6 +1,6 @@
 //! Heading-aware Markdown chunking.
 
-use super::MarkdownChunk;
+use super::{FileStructure, MarkdownChunk, StructureNode};
 use crate::hash;
 
 const MARKDOWN_MAX_BYTES: usize = 8192;
@@ -63,6 +63,10 @@ pub(super) fn parse(source: &str) -> Vec<MarkdownChunk> {
     let mut body_start = 0;
     let mut fence: Option<(u8, usize)> = None;
     let mut html_comment = false;
+    // Use the same heading decisions as the canonical structure, including
+    // setext headings. Chunk size/content hashing rules remain independent.
+    let structure = structure(source);
+    let mut structural_headings = structure.nodes.iter().peekable();
     for index in 0..lines.len() {
         let line = lines[index];
         if let Some((marker, length)) = fence {
@@ -91,11 +95,20 @@ pub(super) fn parse(source: &str) -> Vec<MarkdownChunk> {
             fence = Some((marker, length));
             continue;
         }
-        if let Some(heading) = markdown_heading(line) {
+        if structural_headings.peek().is_some_and(|heading| {
+            heading.start_line + heading.signature.lines().count() - 2 == index
+        }) {
+            let node = structural_headings.next().unwrap();
+            let heading_start = node.start_line - 1;
+            let heading = Heading {
+                level: node.heading_level.unwrap(),
+                title: node.name.clone(),
+                source: node.signature.clone(),
+            };
             flush_markdown(
                 &lines,
                 body_start,
-                index,
+                heading_start,
                 section_start,
                 &headings,
                 &mut chunks,
@@ -104,7 +117,7 @@ pub(super) fn parse(source: &str) -> Vec<MarkdownChunk> {
                 headings.pop();
             }
             headings.push(heading);
-            section_start = index;
+            section_start = heading_start;
             body_start = index + 1;
         }
     }
@@ -117,6 +130,114 @@ pub(super) fn parse(source: &str) -> Vec<MarkdownChunk> {
         &mut chunks,
     );
     chunks
+}
+
+/// Structural headings are independent of embedding chunks: no size limits,
+/// continuation chunks, or synthetic headings are introduced into this model.
+pub(super) fn structure(source: &str) -> FileStructure {
+    let mut result = FileStructure::default();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut fence = None;
+    let mut html_comment = false;
+    let mut offset = 0;
+    let lines: Vec<_> = source.split_inclusive('\n').collect();
+    let mut previous: Option<(usize, usize, &str)> = None;
+    for (row, raw) in lines.iter().enumerate() {
+        let line = raw.trim_end_matches(['\r', '\n']);
+        let start_byte = offset;
+        offset += raw.len();
+        if let Some((marker, length)) = fence {
+            if fence_marker(line).is_some_and(|(m, n, rest)| {
+                m == marker && n >= length && rest.trim_matches([' ', '\t']).is_empty()
+            }) {
+                fence = None;
+            }
+            previous = None;
+            continue;
+        }
+        if html_comment {
+            if line.contains("-->") {
+                html_comment = false;
+            }
+            previous = None;
+            continue;
+        }
+        if markdown_indent(line).is_some_and(|s| s.starts_with("<!--")) {
+            html_comment = !line.contains("-->");
+            previous = None;
+            continue;
+        }
+        if let Some((marker, length, rest)) = fence_marker(line)
+            && (marker != b'`' || !rest.contains('`'))
+        {
+            fence = Some((marker, length));
+            previous = None;
+            continue;
+        }
+        let atx = markdown_heading(line).map(|h| (h.level, h.title, h.source, start_byte, row));
+        let setext = markdown_indent(line).and_then(|s| {
+            let s = s.trim_end();
+            if s.is_empty() || !s.bytes().all(|b| b == b'=') && !s.bytes().all(|b| b == b'-') {
+                return None;
+            }
+            let (byte, previous_row, title) = previous?;
+            Some((
+                if s.starts_with('=') { 1 } else { 2 },
+                title.trim().to_owned(),
+                format!("{}\n{line}", title.trim()),
+                byte,
+                previous_row,
+            ))
+        });
+        if let Some((level, title, signature, byte, heading_row)) = atx.or(setext) {
+            while stack
+                .last()
+                .is_some_and(|id| result.nodes[*id].heading_level.unwrap() >= level)
+            {
+                let id = stack.pop().unwrap();
+                set_heading_end(&mut result.nodes[id], byte, heading_row + 1, 1);
+            }
+            let parent_id = stack.last().copied();
+            let qualified_name = parent_id.map_or_else(
+                || title.clone(),
+                |p| format!("{}.{}", result.nodes[p].qualified_name, title),
+            );
+            let id = result.nodes.len();
+            result.nodes.push(StructureNode {
+                id,
+                parent_id,
+                language: "markdown".into(),
+                kind: "heading".into(),
+                name: title.clone(),
+                names: vec![title],
+                qualified_name,
+                signature,
+                start_byte: byte,
+                start_line: heading_row + 1,
+                start_column: 1,
+                heading_level: Some(level),
+                ..StructureNode::default()
+            });
+            stack.push(id);
+            previous = None;
+        } else {
+            previous = markdown_indent(line)
+                .filter(|s| !s.trim().is_empty() && !s.starts_with(['>', '-', '*', '+']))
+                .map(|_| (start_byte, row, line));
+        }
+    }
+    let end_line = source.bytes().filter(|b| *b == b'\n').count() + 1;
+    let end_column = source.rsplit('\n').next().unwrap_or("").len() + 1;
+    for id in stack {
+        set_heading_end(&mut result.nodes[id], source.len(), end_line, end_column);
+    }
+    result
+}
+
+fn set_heading_end(node: &mut StructureNode, end: usize, line: usize, column: usize) {
+    node.end_byte = end;
+    node.end_line = line;
+    node.end_column = column;
 }
 
 fn utf8_prefix(text: &str, limit: usize) -> &str {
@@ -553,5 +674,38 @@ mod tests {
         assert_eq!(chunks[3].heading_path, ["New root"]);
         assert_eq!(chunks[3].content, "# New root\n\nLast");
         assert_eq!((chunks[3].start_line, chunks[3].end_line), (6, 7));
+    }
+    #[test]
+    fn setext_chunk_paths_match_structure_headings() {
+        let source = "Root\n====\nintro\n\nChild\n-----\nchild body\n\n# Peer\npeer body\n\n```\nFake\n----\n```\n";
+        let parsed = crate::parse::parse("x.md", source).unwrap();
+        assert_eq!(
+            parsed
+                .structure
+                .nodes
+                .iter()
+                .map(|n| n.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Root", "Root.Child", "Peer"]
+        );
+        assert!(
+            parsed
+                .chunks
+                .iter()
+                .any(|c| c.heading_path == ["Root", "Child"] && c.content.contains("child body"))
+        );
+        assert!(
+            parsed
+                .chunks
+                .iter()
+                .any(|c| c.heading_path == ["Root"] && c.content.contains("intro"))
+        );
+        assert!(parsed.chunks.iter().all(|c| {
+            parsed
+                .structure
+                .nodes
+                .iter()
+                .any(|n| n.qualified_name == c.heading_path.join("."))
+        }));
     }
 }

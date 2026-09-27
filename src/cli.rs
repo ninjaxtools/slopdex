@@ -1,6 +1,6 @@
 //! Command-line parsing, configuration, and presentation. Engine operations live in engine.rs.
 
-use crate::{engine::Engine, providers::Providers, ui};
+use crate::{engine::Engine, filter, map, parse::StructureNode, providers::Providers, ui};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -101,6 +101,8 @@ enum Command {
     Describe(DescribeArgs),
     /// Compare functions; clusters are connected components of observed matches
     CrossSearch(CrossArgs),
+    /// Show code declarations and Markdown headings without calling providers
+    Map(MapArgs),
     /// Refresh and show index metadata, counts, and profiles as JSON
     Status,
     /// Refresh and inspect saved file/function indexing failures
@@ -169,22 +171,72 @@ struct Filters {
     /// Positive output limit; default: unlimited. Cross-search limits clusters or matched sources
     #[arg(long, value_parser = positive)]
     limit: Option<usize>,
-    /// Case-sensitive qualified-name regex (Rust regex syntax); cross-search filters sources only
-    #[arg(short = 'e', long, alias = "regex", value_parser = valid_regex)]
-    regexp: Option<String>,
+    #[command(flatten)]
+    selection: SelectionArgs,
 }
 
 impl Filters {
     fn options(&self) -> Value {
-        let mut value = json!({"minSimilarity": self.threshold.min});
+        let mut value = self.selection.options();
+        value["minSimilarity"] = json!(self.threshold.min);
         if let Some(max) = self.threshold.max {
             value["maxSimilarity"] = json!(max);
         }
         if let Some(limit) = self.limit {
             value["limit"] = json!(limit);
         }
-        if let Some(regexp) = &self.regexp {
-            value["regexp"] = json!(regexp);
+        value
+    }
+}
+
+#[derive(Debug, Args)]
+struct SelectionArgs {
+    /// Repository-relative glob; repeat in order, ! excludes, last match wins
+    #[arg(short = 'g', long, value_parser = valid_glob)]
+    glob: Vec<String>,
+    /// Qualified-name or heading-path regex; repeat for OR; cross-search selects sources
+    #[arg(short = 'e', long, alias = "regex", value_parser = valid_regex)]
+    regexp: Vec<String>,
+    /// Match regexes case-insensitively
+    #[arg(short = 'i', long)]
+    ignore_case: bool,
+}
+
+impl SelectionArgs {
+    fn options(&self) -> Value {
+        let mut value = json!({});
+        if !self.glob.is_empty() {
+            value["glob"] = json!(self.glob);
+        }
+        if !self.regexp.is_empty() {
+            value["regexp"] = json!(self.regexp);
+        }
+        if self.ignore_case {
+            value["ignoreCase"] = json!(true);
+        }
+        value
+    }
+}
+
+#[derive(Debug, Args)]
+struct MapArgs {
+    /// Files or recursive directories, repository-relative or absolute within the root
+    paths: Vec<PathBuf>,
+    #[command(flatten)]
+    selection: SelectionArgs,
+    /// Kinds, comma-separated or repeated (functions includes methods; types groups type declarations)
+    #[arg(short = 'k', long = "kind", alias = "kinds", value_delimiter = ',', value_parser = valid_kind)]
+    kinds: Vec<String>,
+}
+
+impl MapArgs {
+    fn options(&self) -> Value {
+        let mut value = self.selection.options();
+        if !self.paths.is_empty() {
+            value["paths"] = json!(self.paths);
+        }
+        if !self.kinds.is_empty() {
+            value["kinds"] = json!(self.kinds);
         }
         value
     }
@@ -357,6 +409,16 @@ fn valid_regex(input: &str) -> std::result::Result<String, String> {
         .map_err(|e| format!("invalid regex: {e}"))
 }
 
+fn valid_glob(input: &str) -> std::result::Result<String, String> {
+    filter::Selection::compile(&json!({"glob": [input]}))
+        .map(|_| input.to_owned())
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn valid_kind(input: &str) -> std::result::Result<String, String> {
+    filter::normalize_kind(input).map_err(|error| error.to_string())
+}
+
 impl Cli {
     fn validate(&self) -> Result<()> {
         if self.global.format == Some(Format::Clusters) {
@@ -448,10 +510,18 @@ pub fn run() -> Result<()> {
     if let Command::Descriptions { action } = &cli.command {
         config["descriptionsEnabled"] = json!(action.enabled());
     }
+    let is_map = matches!(&cli.command, Command::Map(_));
     let mut engine = ui::spin("Opening index", || {
-        Engine::open(&root, &index, config.clone())
+        if is_map {
+            Engine::open_map(&root, &index, config.clone())
+        } else {
+            Engine::open(&root, &index, config.clone())
+        }
     })?;
     let refreshed = if cli.global.no_reindex {
+        None
+    } else if is_map {
+        ui::spin("Refreshing structure", || engine.refresh_structure())?;
         None
     } else {
         Some(ui::spin("Refreshing index", || engine.refresh())?)
@@ -463,6 +533,12 @@ pub fn run() -> Result<()> {
     )?;
     let format = cli.global.format.unwrap_or(Format::Summary);
     match &cli.command {
+        Command::Map(args) => {
+            let rows = ui::spin("Mapping repository structure", || {
+                engine.map(&args.options())
+            })?;
+            print_map(&mut out, &rows, format)?;
+        }
         Command::Search(args) => {
             let mut options = args.query.filters.options();
             if args.code || args.descriptions || args.md {
@@ -1391,6 +1467,22 @@ fn print_json(out: &mut impl Write, value: &impl serde::Serialize) -> Result<()>
     Ok(())
 }
 
+fn print_map(out: &mut impl Write, rows: &[Value], format: Format) -> Result<()> {
+    if format == Format::Json {
+        return print_json(out, &rows);
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let path = row["path"].as_str().context("map result is missing path")?;
+        let nodes: Vec<StructureNode> = serde_json::from_value(row["nodes"].clone())
+            .with_context(|| format!("decode map nodes for {path}"))?;
+        if index > 0 {
+            writeln!(out)?;
+        }
+        write!(out, "{}", map::render_nodes(&nodes, Some(path)))?;
+    }
+    Ok(())
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
@@ -1734,6 +1826,141 @@ mod tests {
     }
 
     #[test]
+    fn shared_selection_arguments_reach_all_search_options() {
+        for command in [
+            "search",
+            "search-code",
+            "search-descriptions",
+            "search-md",
+            "describe",
+            "cross-search",
+        ] {
+            let mut argv = vec![command];
+            if command != "cross-search" {
+                argv.push("query");
+            }
+            argv.extend([
+                "-g",
+                "*.rs",
+                "--glob",
+                "!src/generated/**",
+                "-g",
+                "src/generated/keep.rs",
+                "-e",
+                "^Service\\.",
+                "--regex",
+                "Setup",
+                "--regexp",
+                "Guide",
+                "-i",
+            ]);
+            let cli = parse(&argv);
+            let options = match cli.command {
+                Command::Search(args) => args.query.filters.options(),
+                Command::SearchCode(args)
+                | Command::SearchDescriptions(args)
+                | Command::SearchMd(args) => args.filters.options(),
+                Command::Describe(args) => args.query.filters.options(),
+                Command::CrossSearch(args) => args.options(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                options["glob"],
+                json!(["*.rs", "!src/generated/**", "src/generated/keep.rs"]),
+                "{command}"
+            );
+            assert_eq!(
+                options["regexp"],
+                json!(["^Service\\.", "Setup", "Guide"]),
+                "{command}"
+            );
+            assert_eq!(options["ignoreCase"], true, "{command}");
+        }
+    }
+
+    #[test]
+    fn map_paths_kinds_and_shared_selection_parse() {
+        let cli = parse(&[
+            "--root",
+            "/repo",
+            "map",
+            "src",
+            "/repo/docs",
+            "-g",
+            "*.rs",
+            "-g",
+            "!test.rs",
+            "-e",
+            "Service",
+            "--regex",
+            "Guide",
+            "--ignore-case",
+            "-k",
+            "Functions,Types",
+            "--kind",
+            "Methods",
+            "--kinds",
+            "imports",
+            "--format",
+            "json",
+            "--no-reindex",
+        ]);
+        assert_eq!(cli.global.format, Some(Format::Json));
+        assert!(cli.global.no_reindex);
+        let Command::Map(args) = cli.command else {
+            panic!()
+        };
+        assert_eq!(
+            args.options(),
+            json!({
+                "paths": ["src", "/repo/docs"],
+                "glob": ["*.rs", "!test.rs"],
+                "regexp": ["Service", "Guide"],
+                "ignoreCase": true,
+                "kinds": ["functions", "types", "method", "import"]
+            })
+        );
+        let Command::Map(args) = parse(&["map"]).command else {
+            panic!()
+        };
+        assert_eq!(args.options(), json!({}));
+        for args in [
+            vec!["map", "-k", "unknown"],
+            vec!["map", "-k", "functions,"],
+            vec!["map", "-g", "["],
+            vec!["map", "-e", "["],
+            vec!["map", "--threshold", "0.5"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("slopdex").chain(args)).is_err());
+        }
+    }
+
+    #[test]
+    fn map_json_is_a_full_array_and_summary_uses_structure_renderer() {
+        let structure = crate::parse::parse(
+            "example.rs",
+            "pub struct Service { pub count: usize }\npub fn run() {}\n",
+        )
+        .unwrap()
+        .structure;
+        let rows = vec![json!({"path": "example.rs", "nodes": structure.nodes})];
+        let mut json_output = Vec::new();
+        print_map(&mut json_output, &rows, Format::Json).unwrap();
+        let decoded: Value = serde_json::from_slice(&json_output).unwrap();
+        assert_eq!(decoded, json!(rows));
+        assert!(decoded[0]["nodes"][0].get("startByte").is_some());
+        let mut summary = Vec::new();
+        print_map(&mut summary, &rows, Format::Summary).unwrap();
+        assert_eq!(
+            String::from_utf8(summary).unwrap(),
+            map::render_nodes(&structure.nodes, Some("example.rs"))
+        );
+        let mut empty = Vec::new();
+        print_map(&mut empty, &[], Format::Json).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&empty).unwrap(), json!([]));
+    }
+
+    #[test]
     fn readme_commands_parse() {
         for args in [
             vec!["search", "validate an authenticated session"],
@@ -1967,6 +2194,7 @@ mod tests {
         }
         for args in [
             vec!["search", "query", "--format", "clusters"],
+            vec!["map", "--format", "clusters"],
             vec!["cross-search", "--cohesion", "--format", "clusters"],
             vec!["config", "model"],
             vec!["config", "fallback-model"],

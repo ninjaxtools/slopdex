@@ -1,6 +1,8 @@
 pub mod cli;
 pub mod engine;
+pub mod filter;
 pub mod git;
+pub mod map;
 pub mod models;
 pub mod parse;
 pub mod providers;

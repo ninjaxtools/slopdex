@@ -7,13 +7,13 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::{
+    filter::Selection,
     git, hash, parse,
     providers::Providers,
-    storage::{Database, File, Item},
+    storage::{Database, File, Item, STRUCTURE_PARSER_VERSION},
     ui,
     vectors::VectorIndex,
 };
@@ -47,6 +47,8 @@ pub struct Engine {
     vectors: HashMap<String, Vec<f32>>,
     indexes: HashMap<String, VectorIndex>,
     complete_descriptions: bool,
+    complete_code: bool,
+    structural_only: bool,
     // Held for the engine's lifetime: SQLite transactions and multi-file USearch
     // publication must not interleave with another command using this index.
     _lock: fs::File,
@@ -54,6 +56,19 @@ pub struct Engine {
 
 impl Engine {
     pub fn open(root: &Path, index: &Path, mut config: Value) -> Result<Self> {
+        Self::open_internal(root, index, config.take(), false)
+    }
+
+    pub fn open_map(root: &Path, index: &Path, config: Value) -> Result<Self> {
+        Self::open_internal(root, index, config, true)
+    }
+
+    fn open_internal(
+        root: &Path,
+        index: &Path,
+        mut config: Value,
+        structural_only: bool,
+    ) -> Result<Self> {
         let root = root
             .canonicalize()
             .context("Repository root does not exist")?;
@@ -81,13 +96,7 @@ impl Engine {
             .open(PathBuf::from(lock_path))?;
         lock.try_lock_exclusive()
             .context("Index is in use by another slopdex command; retry when it completes")?;
-        let providers = Providers::new(&config)?;
-        let db = Database::open(
-            &index,
-            &root,
-            &providers.vector().profile(),
-            flag(&config, "forceReindex"),
-        )?;
+        let db = Database::open(&index, &root, &Value::Null, flag(&config, "forceReindex"))?;
         // Persisted description settings also apply when an index is moved to a
         // caller without a config file. Explicit settings still take precedence.
         if config.get("descriptionProvider").is_none()
@@ -98,7 +107,16 @@ impl Engine {
             config["descriptionProvider"] = profile["provider"].clone();
             config["descriptionModel"] = profile["model"].clone();
         }
-        let providers = Providers::new(&config)?;
+        // Construction makes no requests. Map does not validate or select a model profile.
+        let map_config = json!({});
+        let providers = Providers::new(if structural_only {
+            &map_config
+        } else {
+            &config
+        })?;
+        if !structural_only {
+            db.set_projection_profile(&providers.vector().profile())?;
+        }
         let enabled = config["descriptionsEnabled"]
             .as_bool()
             .unwrap_or(db.meta("descriptions_enabled")?.as_deref() == Some("true"));
@@ -113,6 +131,8 @@ impl Engine {
             vectors: HashMap::new(),
             indexes: HashMap::new(),
             complete_descriptions: false,
+            complete_code: false,
+            structural_only,
             _lock: lock,
         };
         engine.load()?;
@@ -120,6 +140,71 @@ impl Engine {
     }
 
     pub fn refresh(&mut self) -> Result<Value> {
+        let structure = self.refresh_structure()?;
+        if flag(&self.config, "noReindex") {
+            return Ok(structure);
+        }
+        ensure!(
+            !self.structural_only,
+            "Semantic preparation requires a search engine"
+        );
+        let mut paths = HashSet::new();
+        for item in &self.items {
+            if item.embedding.is_empty()
+                || (self.enabled && item.kind == "function" && item.description_embedding.is_none())
+            {
+                paths.insert(item.path.clone());
+            }
+        }
+        if self.enabled {
+            for file in self.files.values() {
+                if file.language != "markdown"
+                    && file.description_embedding.is_none()
+                    && !file.hash.is_empty()
+                {
+                    paths.insert(file.path.clone());
+                }
+            }
+        }
+        let mut paths: Vec<_> = paths.into_iter().collect();
+        paths.sort();
+        let mut changed = Vec::new();
+        for path in paths {
+            let file = &self.files[&path];
+            changed.push(self.prepare(&path, &file.source, &file.source_mode, false, false)?);
+        }
+        let checkpoint = self.db.meta("checkpoint")?;
+        ensure!(
+            git::head(&self.root) == checkpoint,
+            "Git HEAD changed during indexing; rerun"
+        );
+        for (file, _) in &changed {
+            ensure!(
+                hash(fs::read(self.root.join(&file.path))?) == file.hash,
+                "Source changed during indexing: {}; rerun",
+                file.path
+            );
+        }
+        self.db.apply(&changed, &[], checkpoint.as_deref())?;
+        self.db.set_meta(
+            "descriptions_enabled",
+            if self.enabled { "true" } else { "false" },
+        )?;
+        if self.enabled {
+            self.db.set_meta(
+                "description_profile",
+                &self.providers.llm().profile().to_string(),
+            )?;
+        }
+        self.load()?;
+        Ok(
+            json!({"filesUpdated":structure["filesUpdated"],"filesDeleted":structure["filesDeleted"],
+            "filesPrepared":changed.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),
+            "checkpoint":checkpoint,"generation":self.db.generation()?}),
+        )
+    }
+
+    pub fn refresh_structure(&mut self) -> Result<Value> {
         if flag(&self.config, "noReindex") {
             return Ok(json!({"skipped":true,"generation":self.db.generation()?}));
         }
@@ -165,12 +250,6 @@ impl Engine {
             .cloned()
             .collect();
         let mut changed = Vec::new();
-        let missing_descriptions: HashSet<_> = self
-            .items
-            .iter()
-            .filter(|i| i.kind == "function" && i.description_embedding.is_none())
-            .map(|i| i.path.as_str())
-            .collect();
         let indexing = ui::counted("Indexing files", paths.len());
         for path in paths {
             ui::progress(&path);
@@ -203,26 +282,35 @@ impl Engine {
                             json!({"path":path,"code":"read-error","message":error.to_string(),"sourceMode":source_mode}),
                         ],
                     };
-                    changed.push((file, Vec::new()));
+                    changed.push((file, parse::ParsedFile::default()));
                     indexing.inc(1);
                     continue;
                 }
             };
             let source_hash = hash(&source);
             let previous = self.files.get(&path);
-            let needs_descriptions = self.enabled
-                && parse::language_for_path(&path) != Some("markdown")
-                && (previous.is_none_or(|f| f.description.is_none())
-                    || missing_descriptions.contains(path.as_str()));
             if previous.is_some_and(|f| {
                 f.hash == source_hash && f.source_mode == source_mode && f.errors.is_empty()
-            }) && !needs_descriptions
+            }) && self
+                .db
+                .structure_current(&path, &source_hash, STRUCTURE_PARSER_VERSION)?
             {
                 indexing.inc(1);
                 continue;
             }
-            let prepared = self.prepare(&path, &source, source_mode, false, false)?;
-            changed.push(prepared);
+            let parsed = self.parsed(&path, &source)?;
+            let file = File {
+                path: path.clone(),
+                hash: source_hash,
+                source,
+                language: parse::language_for_path(&path).unwrap().into(),
+                source_mode: source_mode.into(),
+                description: previous.and_then(|f| f.description.clone()),
+                description_hash: previous.and_then(|f| f.description_hash.clone()),
+                description_embedding: previous.and_then(|f| f.description_embedding.clone()),
+                errors: Vec::new(),
+            };
+            changed.push((file, parsed));
             indexing.inc(1);
         }
         indexing.finish();
@@ -245,23 +333,61 @@ impl Engine {
         }
         verifying.finish();
         ui::progress("Saving index snapshot");
-        let dirty = self.db.apply(&changed, &removed, checkpoint.as_deref())?;
-        self.db.set_meta(
-            "descriptions_enabled",
-            if self.enabled { "true" } else { "false" },
-        )?;
-        if self.enabled {
-            self.db.set_meta(
-                "description_profile",
-                &self.providers.llm().profile().to_string(),
-            )?;
-        }
-        if dirty || self.enabled != self.complete_descriptions {
+        let dirty = self
+            .db
+            .apply_structure(&changed, &removed, checkpoint.as_deref())?;
+        if dirty {
             self.load()?;
         }
         Ok(
             json!({"filesUpdated":changed.len(),"filesDeleted":removed.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
         )
+    }
+
+    pub fn map(&self, options: &Value) -> Result<Vec<Value>> {
+        let selection = Selection::compile(options)?;
+        let paths = options["paths"]
+            .as_array()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .map(|path| {
+                        self.normalize_path(path.as_str().context("Map paths must be strings")?)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let mut result = Vec::new();
+        for path in self.db.paths()? {
+            if !selection.path_matches(&path)
+                || (!paths.is_empty() && !paths.iter().any(|p| under(&path, p)))
+            {
+                continue;
+            }
+            let file = &self.files[&path];
+            ensure!(
+                self.db
+                    .structure_current(&path, &file.hash, STRUCTURE_PARSER_VERSION)?,
+                "Structure for {path} requires refresh; run map without --no-reindex"
+            );
+            let nodes = selection.select_structure(&self.db.structure(&path)?);
+            if !nodes.is_empty() {
+                result.push(json!({"path":path,"nodes":nodes}));
+            }
+        }
+        Ok(result)
+    }
+
+    fn parsed(&self, path: &str, source: &str) -> Result<parse::ParsedFile> {
+        let key = hash(json!([STRUCTURE_PARSER_VERSION, path, hash(source)]).to_string());
+        if let Some(cached) = self.db.cache("parse", &key)? {
+            return Ok(serde_json::from_str(&cached)?);
+        }
+        let parsed = parse::parse(path, source)?;
+        self.db
+            .cache_put("parse", &key, &serde_json::to_string(&parsed)?)?;
+        Ok(parsed)
     }
 
     fn prepare(
@@ -273,15 +399,7 @@ impl Engine {
         regenerate_callables: bool,
     ) -> Result<(File, Vec<Item>)> {
         let source_hash = hash(source);
-        let parse_key = hash(json!(["rust-parser-v1", path, source_hash]).to_string());
-        let parsed: parse::ParsedFile = if let Some(cached) = self.db.cache("parse", &parse_key)? {
-            serde_json::from_str(&cached)?
-        } else {
-            let parsed = parse::parse(path, source)?;
-            self.db
-                .cache_put("parse", &parse_key, &serde_json::to_string(&parsed)?)?;
-            parsed
-        };
+        let parsed = self.parsed(path, source)?;
         let previous = self.files.get(path);
         let mut file=File{path:path.into(),hash:source_hash.clone(),source:source.into(),language:parse::language_for_path(path).unwrap_or("unknown").into(),source_mode:source_mode.into(),description:previous.and_then(|f|f.description.clone()),description_hash:previous.and_then(|f|f.description_hash.clone()),description_embedding:previous.and_then(|f|f.description_embedding.clone()),errors:parsed.errors.iter().map(|e|json!({"path":path,"code":"parse-error","message":e.message,"startLine":e.start_line,"endLine":e.end_line,"sourceMode":source_mode})).collect()};
         if self.enabled
@@ -295,6 +413,12 @@ impl Engine {
             file.description_embedding = Some(self.embed_one(&description, false)?);
             file.description = Some(description);
             file.description_hash = Some(source_hash.clone());
+        }
+        if self.enabled
+            && file.description_embedding.is_none()
+            && let Some(description) = &file.description
+        {
+            file.description_embedding = Some(self.embed_one(description, false)?);
         }
         let mut items = Vec::new();
         let mut description_jobs = BTreeMap::new();
@@ -329,7 +453,7 @@ impl Engine {
                 .map(|i| i.data["description"].clone())
                 .unwrap_or(Value::Null);
             let unchanged = old.is_some_and(|i| {
-                i.data["sourceHash"] == data["sourceHash"] && i.description_embedding.is_some()
+                i.data["sourceHash"] == data["sourceHash"] && i.data["description"].is_string()
             });
             if !unchanged {
                 description_embedding = None;
@@ -368,6 +492,12 @@ impl Engine {
             {
                 description_embedding = None;
                 data["description"] = Value::Null;
+            }
+            if self.enabled
+                && description_embedding.is_none()
+                && let Some(description) = data["description"].as_str()
+            {
+                description_embedding = Some(self.embed_one(description, false)?);
             }
             items.push(Item {
                 id: 0,
@@ -495,14 +625,37 @@ impl Engine {
 
     fn load(&mut self) -> Result<()> {
         ui::progress("Loading index records");
-        self.items = self.db.items()?;
-        self.files = self
-            .db
-            .files()?
-            .into_iter()
-            .map(|f| (f.path.clone(), f))
-            .collect();
+        let profile = self.providers.vector().profile();
+        self.items = if self.structural_only {
+            Vec::new()
+        } else {
+            self.db.items_for_profile(&profile)?
+        };
+        let files = if self.structural_only {
+            self.db.files()?
+        } else {
+            self.db.files_for_profile(&profile)?
+        };
+        self.files = files.into_iter().map(|f| (f.path.clone(), f)).collect();
         self.vectors.clear();
+        self.indexes.clear();
+        self.complete_code =
+            !self.structural_only && self.items.iter().all(|i| !i.embedding.is_empty());
+        self.complete_descriptions = self.enabled
+            && self.complete_code
+            && self.items.iter().filter(|i| i.kind == "function").all(|i| {
+                i.description_embedding.is_some()
+                    && self
+                        .files
+                        .get(&i.path)
+                        .is_some_and(|f| f.description_embedding.is_some())
+            });
+        for item in &mut self.items {
+            item.data["id"] = json!(item.id);
+        }
+        if !self.complete_code {
+            return Ok(());
+        }
         let keys: HashSet<_> = self
             .items
             .iter()
@@ -623,6 +776,11 @@ impl Engine {
     }
 
     pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>> {
+        ensure!(
+            self.complete_code && (!self.enabled || self.complete_descriptions),
+            "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"
+        );
+        let selection = Selection::compile(options)?;
         let key = hash(
             json!([
                 "query",
@@ -643,7 +801,6 @@ impl Engine {
             .db
             .embedding(&embedding_key)?
             .context("Missing query vector")?;
-        let regex = options["regexp"].as_str().map(Regex::new).transpose()?;
         let explicit = ["code", "descriptions", "md"]
             .iter()
             .any(|k| flag(options, k));
@@ -701,9 +858,8 @@ impl Engine {
                 .iter()
                 .filter(|i| {
                     i.kind == "function"
-                        && regex.as_ref().is_none_or(|r| {
-                            r.is_match(i.data["qualifiedName"].as_str().unwrap_or(""))
-                        })
+                        && selection.path_matches(&i.path)
+                        && selection.name_matches(i.data["qualifiedName"].as_str().unwrap_or(""))
                 })
                 .map(|i| i.id)
                 .collect();
@@ -727,7 +883,11 @@ impl Engine {
             let allowed = self
                 .items
                 .iter()
-                .filter(|i| i.kind == "markdown")
+                .filter(|i| {
+                    i.kind == "markdown"
+                        && selection.path_matches(&i.path)
+                        && selection.name_matches(&heading_name(&i.data))
+                })
                 .map(|i| i.id)
                 .collect();
             for (id, similarity) in
@@ -747,7 +907,26 @@ impl Engine {
         if rerank && !results.is_empty() {
             let documents: Vec<_> = results.iter().map(Value::to_string).collect();
             let reranking = ui::counted("Reranking candidates", documents.len());
-            let ranking = self.providers.reranker()?.rerank(query, &documents)?;
+            let ranking_key = hash(
+                json!([
+                    "rerank-v1",
+                    self.config["rerankerProvider"],
+                    self.config["rerankerModel"],
+                    self.config["rerankerBaseUrl"],
+                    query,
+                    documents
+                ])
+                .to_string(),
+            );
+            let ranking: Vec<(usize, f64)> =
+                if let Some(cached) = self.db.cache("rerank", &ranking_key)? {
+                    serde_json::from_str(&cached).context("Corrupt reranking artifact")?
+                } else {
+                    let ranking = self.providers.reranker()?.rerank(query, &documents)?;
+                    self.db
+                        .cache_put("rerank", &ranking_key, &serde_json::to_string(&ranking)?)?;
+                    ranking
+                };
             results = ranking
                 .into_iter()
                 .map(|(index, score)| {
@@ -863,6 +1042,13 @@ impl Engine {
         let options = &options;
         let target = target.unwrap_or(self);
         ensure!(
+            self.complete_code
+                && target.complete_code
+                && (!self.enabled || self.complete_descriptions)
+                && (!target.enabled || target.complete_descriptions),
+            "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"
+        );
+        ensure!(
             self.providers.vector().profile() == target.providers.vector().profile(),
             "Cross-search requires identical embedding profiles"
         );
@@ -887,6 +1073,7 @@ impl Engine {
                 self.db.generation()?,
                 target.db.path.canonicalize()?,
                 target.db.generation()?,
+                self.providers.vector().profile(),
                 kind,
                 base,
                 self.db.meta("checkpoint")?,
@@ -898,7 +1085,7 @@ impl Engine {
             return Ok(results);
         }
         let min_lines = options["minLines"].as_u64().unwrap_or(2);
-        let regex = options["regexp"].as_str().map(Regex::new).transpose()?;
+        let selection = Selection::compile(options)?;
         let source_path = options["sourcePath"]
             .as_str()
             .map(|path| self.normalize_path(path))
@@ -923,9 +1110,8 @@ impl Engine {
             .filter(|source| {
                 source.kind == "function"
                     && source.data["lineCount"].as_u64().unwrap_or(0) >= min_lines
-                    && regex.as_ref().is_none_or(|r| {
-                        r.is_match(source.data["qualifiedName"].as_str().unwrap_or(""))
-                    })
+                    && selection.path_matches(&source.path)
+                    && selection.name_matches(source.data["qualifiedName"].as_str().unwrap_or(""))
                     && source_path.as_ref().is_none_or(|p| under(&source.path, p))
                     && (!flag(options, "uncommitted")
                         || source.data["sourceMode"] == "working-tree")
@@ -1032,7 +1218,27 @@ impl Engine {
         let context =
             json!({"query":query,"files":files.values().collect::<Vec<_>>(),"matches":matches});
         ui::progress("Generating explanation from search results");
-        let description=self.providers.llm().describe("Explain the existing code and documentation relevant to the user's task using only the supplied search context. Cite paths and symbols. Do not propose an implementation. If there is insufficient context, say so.",&context.to_string())?;
+        let system = "Explain the existing code and documentation relevant to the user's task using only the supplied search context. Cite paths and symbols. Do not propose an implementation. If there is insufficient context, say so.";
+        let prompt = context.to_string();
+        let key = hash(
+            json!([
+                "explanation-v1",
+                self.providers.llm().profile(),
+                self.config["descriptionBaseUrl"],
+                self.config["descriptionFallbackModel"],
+                self.config["fallbackModel"],
+                system,
+                prompt
+            ])
+            .to_string(),
+        );
+        let description = if let Some(cached) = self.db.cache("explanation", &key)? {
+            cached
+        } else {
+            let description = self.providers.llm().describe(system, &prompt)?;
+            self.db.cache_put("explanation", &key, &description)?;
+            description
+        };
         let files: Vec<_> = files
             .into_values()
             .map(|mut f| {
@@ -1129,6 +1335,18 @@ impl Engine {
 
 fn flag(value: &Value, key: &str) -> bool {
     value[key].as_bool().unwrap_or(false)
+}
+fn heading_name(data: &Value) -> String {
+    data["headingPath"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .unwrap_or_default()
 }
 fn score(value: &Value, key: &str) -> f64 {
     value[key].as_f64().unwrap_or(0.0)

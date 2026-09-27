@@ -1,11 +1,63 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::hash;
+use crate::{
+    hash,
+    parse::{FileStructure, ParsedFile, StructureNode},
+};
+
+/// Bump when the structure or search-unit extraction contract changes.
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v1";
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS embeddings(key TEXT PRIMARY KEY,vector BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS cache(kind TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(kind,key));
+CREATE TABLE IF NOT EXISTS files(
+ path TEXT PRIMARY KEY,source TEXT NOT NULL,hash TEXT NOT NULL,language TEXT NOT NULL,
+ source_mode TEXT NOT NULL,parser_version TEXT,structure_hash TEXT,data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS symbols(
+ path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,id INTEGER NOT NULL,parent_id INTEGER,
+ ordinal INTEGER NOT NULL,language TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,
+ qualified_name TEXT NOT NULL,signature TEXT NOT NULL,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,
+ start_line INTEGER NOT NULL,start_column INTEGER NOT NULL,end_line INTEGER NOT NULL,end_column INTEGER NOT NULL,
+ metadata TEXT NOT NULL,PRIMARY KEY(path,id),
+ FOREIGN KEY(path,parent_id) REFERENCES symbols(path,id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX IF NOT EXISTS symbols_qualified_name ON symbols(qualified_name);
+CREATE INDEX IF NOT EXISTS symbols_parent ON symbols(path,parent_id,ordinal);
+CREATE INDEX IF NOT EXISTS symbols_kind ON symbols(kind,path);
+CREATE INDEX IF NOT EXISTS symbols_path_order ON symbols(path,ordinal);
+CREATE TABLE IF NOT EXISTS symbol_names(
+ path TEXT NOT NULL,symbol_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,name TEXT NOT NULL,
+ PRIMARY KEY(path,symbol_id,ordinal),FOREIGN KEY(path,symbol_id) REFERENCES symbols(path,id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS symbol_names_name ON symbol_names(name);
+CREATE TABLE IF NOT EXISTS search_units(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+ identity TEXT NOT NULL UNIQUE,kind TEXT NOT NULL,symbol_id INTEGER,data TEXT NOT NULL,
+ embedding_input_hash TEXT NOT NULL,
+ FOREIGN KEY(path,symbol_id) REFERENCES symbols(path,id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX IF NOT EXISTS search_units_path ON search_units(path);
+CREATE TABLE IF NOT EXISTS unit_embeddings(
+ unit_id INTEGER NOT NULL REFERENCES search_units(id) ON DELETE CASCADE,
+ role TEXT NOT NULL CHECK(role IN ('code','description')),profile_key TEXT NOT NULL,input_hash TEXT NOT NULL,
+ embedding_key TEXT NOT NULL REFERENCES embeddings(key),
+ PRIMARY KEY(unit_id,role,profile_key,input_hash));
+CREATE TABLE IF NOT EXISTS descriptions(
+ scope TEXT NOT NULL CHECK(scope IN ('file','callable')),path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+ identity TEXT NOT NULL,source_hash TEXT,text TEXT NOT NULL,embedding_key TEXT REFERENCES embeddings(key),
+ PRIMARY KEY(scope,path,identity));
+CREATE TABLE IF NOT EXISTS diagnostics(
+ path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,ordinal INTEGER NOT NULL,
+ code TEXT,message TEXT,start_line INTEGER,end_line INTEGER,data TEXT NOT NULL,PRIMARY KEY(path,ordinal));
+CREATE TABLE IF NOT EXISTS search_cache(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+";
 
 /// SQLite is authoritative. USearch files are disposable materialized indexes.
 pub struct Database {
@@ -38,12 +90,13 @@ pub struct Item {
 }
 
 impl Database {
-    pub fn open(path: &Path, root: &Path, profile: &Value, force: bool) -> Result<Self> {
+    pub fn open(path: &Path, root: &Path, _profile: &Value, force: bool) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        // Reject old layouts before creating tables with overlapping names.
+        // All compatibility checks precede even journal-mode changes. Force is
+        // only a root reset, never permission to migrate an older schema.
         let old_schema: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND (name GLOB 'rust_*' OR name IN ('functions','markdown_chunks','description_cache')))",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND (name GLOB 'rust_*' OR name IN ('items','functions','markdown_chunks','description_cache')))",
             [],
             |r| r.get(0),
         )?;
@@ -58,41 +111,74 @@ impl Database {
                 [],
                 |r| r.get::<_, bool>(0),
             )?;
+        let identity: Option<String> = if has_metadata {
+            conn.query_row("SELECT value FROM metadata WHERE key='identity'", [], |r| {
+                r.get(0)
+            })
+            .optional()?
+        } else {
+            None
+        };
+        let identity: Option<Value> = identity
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .context(
+                "Unsupported index table layout: invalid identity; rebuild using a new index path",
+            )?;
+        let has_tables: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')", [], |r| r.get(0))?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            !old_schema && !legacy_metadata,
+            !old_schema
+                && !legacy_metadata
+                && identity
+                    .as_ref()
+                    .is_none_or(|v| v["schema"] == 3 && v["root"].is_string())
+                && (!has_tables || identity.is_some())
+                && (version == 0 || version == 3),
             "Unsupported index table layout. Remove the existing SQLite index at {} and rebuild, or use --index with a new path.",
             path.display()
         );
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS embeddings(key TEXT PRIMARY KEY,vector BLOB NOT NULL);
-             CREATE TABLE IF NOT EXISTS cache(kind TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(kind,key));
-             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,data TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS items(
-               id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
-               identity TEXT NOT NULL UNIQUE,kind TEXT NOT NULL,data TEXT NOT NULL,
-               embedding TEXT NOT NULL REFERENCES embeddings(key),
-               description_embedding TEXT REFERENCES embeddings(key));
-             CREATE INDEX IF NOT EXISTS items_path ON items(path);
-             CREATE TABLE IF NOT EXISTS search_cache(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+        if has_tables {
+            for sql in [
+                "SELECT key,value FROM metadata LIMIT 0",
+                "SELECT path,source,hash,language,source_mode,parser_version,structure_hash,data FROM files LIMIT 0",
+                "SELECT path,id,parent_id,ordinal,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata FROM symbols LIMIT 0",
+                "SELECT path,symbol_id,ordinal,name FROM symbol_names LIMIT 0",
+                "SELECT id,path,identity,kind,symbol_id,data,embedding_input_hash FROM search_units LIMIT 0",
+                "SELECT unit_id,role,profile_key,input_hash,embedding_key FROM unit_embeddings LIMIT 0",
+                "SELECT scope,path,identity,source_hash,text,embedding_key FROM descriptions LIMIT 0",
+                "SELECT path,ordinal,code,message,start_line,end_line,data FROM diagnostics LIMIT 0",
+                "SELECT key,vector FROM embeddings LIMIT 0",
+                "SELECT kind,key,value FROM cache LIMIT 0",
+                "SELECT key,value FROM search_cache LIMIT 0",
+            ] {
+                conn.prepare(sql)
+                    .context("Unsupported index table layout. Rebuild using a new index path.")?;
+            }
+        }
+        let expected = json!({"schema":3,"root":root});
+        let incompatible_root = identity
+            .as_ref()
+            .is_some_and(|v| v["root"] != expected["root"]);
+        if incompatible_root && !force {
+            bail!(
+                "Incompatible index root. Use --force-reindex to rebuild live state (artifact caches are retained)."
+            );
+        }
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(SCHEMA)?;
+        tx.execute_batch("PRAGMA user_version=3;")?;
+        if incompatible_root {
+            reset_live(&tx)?;
+        }
+        tx.execute("INSERT INTO metadata VALUES('identity',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [expected.to_string()])?;
+        tx.commit()?;
         let db = Self {
             conn,
             path: path.to_owned(),
         };
-        let expected = json!({"schema":2,"root":root,"embedding":profile});
-        let expected = expected.to_string();
-        if let Some(stored) = db.meta("identity")?
-            && stored != expected
-        {
-            if !force {
-                bail!(
-                    "Incompatible index root or embedding profile. Use --force-reindex to rebuild live state (artifact caches are retained)."
-                );
-            }
-            db.reset()?;
-        }
-        db.set_meta("identity", &expected)?;
         Ok(db)
     }
 
@@ -101,9 +187,7 @@ impl Database {
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        tx.execute_batch(
-            "DELETE FROM items; DELETE FROM files; DELETE FROM search_cache; DELETE FROM metadata;",
-        )?;
+        reset_live(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -177,14 +261,90 @@ impl Database {
     }
 
     pub fn files(&self) -> Result<Vec<File>> {
-        let mut stmt = self.conn.prepare("SELECT data FROM files ORDER BY path")?;
-        stmt.query_map([], |r| r.get::<_, String>(0))?
-            .map(|r| Ok(serde_json::from_str(&r?)?))
-            .collect()
+        // files.data is a write-only compatibility snapshot. Live reads depend
+        // exclusively on normalized source/provenance and artifact tables.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path,source,hash,language,source_mode FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(File {
+                path: r.get(0)?,
+                source: r.get(1)?,
+                hash: r.get(2)?,
+                language: r.get(3)?,
+                source_mode: r.get(4)?,
+                description: None,
+                description_hash: None,
+                description_embedding: None,
+                errors: Vec::new(),
+            })
+        })?;
+        rows.map(|r| {
+            let mut file = r?;
+            let description = description(&self.conn, "file", &file.path, "")?;
+            file.description = description.as_ref().map(|d| d.1.clone());
+            file.description_hash = description.as_ref().and_then(|d| d.0.clone());
+            file.description_embedding = description.and_then(|d| d.2);
+            file.errors = self
+                .conn
+                .prepare("SELECT data FROM diagnostics WHERE path=? ORDER BY ordinal")?
+                .query_map([&file.path], |r| r.get::<_, String>(0))?
+                .map(|r| Ok(serde_json::from_str(&r?)?))
+                .collect::<Result<_>>()?;
+            Ok(file)
+        })
+        .collect()
     }
 
+    /// File description vectors, like unit vectors, must be projected for the
+    /// requested profile. Stale file descriptions remain available by policy.
+    pub fn files_for_profile(&self, profile: &Value) -> Result<Vec<File>> {
+        let mut files = self.files()?;
+        for file in &mut files {
+            file.description_embedding = file
+                .description
+                .as_deref()
+                .map(|input| self.cached_embedding_key(profile, input))
+                .transpose()?
+                .flatten();
+        }
+        Ok(files)
+    }
+
+    /// Compatibility view: the latest published association for the current
+    /// input. Engine search should use items_for_profile instead.
     pub fn items(&self) -> Result<Vec<Item>> {
-        let mut stmt = self.conn.prepare("SELECT id,path,identity,kind,data,embedding,description_embedding FROM items ORDER BY id")?;
+        self.read_items(None)
+    }
+
+    /// A missing vector is represented by an empty embedding string. This also
+    /// discovers durable vectors completed before a failed publication, without
+    /// requiring an association row or another provider call.
+    pub fn items_for_profile(&self, profile: &Value) -> Result<Vec<Item>> {
+        self.read_items(Some(profile))
+    }
+
+    pub fn set_projection_profile(&self, profile: &Value) -> Result<()> {
+        let value = profile.to_string();
+        if self.meta("active_embedding_profile")?.as_deref() != Some(&value) {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("INSERT INTO metadata VALUES('active_embedding_profile',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [value])?;
+            tx.execute("DELETE FROM search_cache", [])?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    fn cached_embedding_key(&self, profile: &Value, input: &str) -> Result<Option<String>> {
+        let key = Self::embedding_key(profile, false, input);
+        // Validate cached vectors, rather than silently hiding corrupt artifacts.
+        Ok(self.embedding(&key)?.map(|_| key))
+    }
+
+    fn read_items(&self, profile: Option<&Value>) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,path,identity,kind,data,embedding_input_hash FROM search_units ORDER BY id",
+        )?;
         stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)? as u64,
@@ -193,22 +353,76 @@ impl Database {
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
-                r.get::<_, Option<String>>(6)?,
             ))
         })?
         .map(|r| {
-            let (id, path, identity, kind, data, embedding, description_embedding) = r?;
+            let (id, path, identity, kind, data, input_hash) = r?;
+            let mut data: Value = serde_json::from_str(&data)?;
+            ensure!(data.is_object(), "Invalid stored search unit");
+            let stored_description = description(&self.conn, "callable", &path, &identity)?
+                .filter(|d| d.0.as_deref() == data["sourceHash"].as_str());
+            if let Some(d) = &stored_description {
+                data["description"] = json!(d.1);
+            } else if data.get("description").is_some() {
+                data["description"] = Value::Null;
+            }
+            let embedding = if let Some(profile) = profile {
+                match data["embeddingInput"].as_str() {
+                    Some(input) if hash(input) == input_hash => {
+                        self.cached_embedding_key(profile, input)?
+                    }
+                    _ => None,
+                }
+            } else {
+                latest_embedding(&self.conn, id, "code", &input_hash)?
+            }
+            .unwrap_or_default();
+            let description_embedding = if let Some(d) = stored_description {
+                if let Some(profile) = profile {
+                    self.cached_embedding_key(profile, &d.1)?
+                } else {
+                    latest_embedding(&self.conn, id, "description", &hash(&d.1))?
+                }
+            } else {
+                None
+            };
             Ok(Item {
                 id,
                 path,
                 identity,
                 kind,
-                data: serde_json::from_str(&data)?,
+                data,
                 embedding,
                 description_embedding,
             })
         })
         .collect()
+    }
+
+    pub fn paths(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT path FROM files ORDER BY path")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn structure_current(&self, path: &str, source_hash: &str, version: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE path=? AND hash=? AND structure_hash=? AND parser_version=?)",
+            params![path, source_hash, source_hash, version], |r| r.get(0))?)
+    }
+
+    pub fn missing_structure_paths(&self, version: &str) -> Result<Vec<String>> {
+        Ok(self.conn.prepare("SELECT path FROM files WHERE parser_version IS NULL OR parser_version<>? OR structure_hash IS NULL OR structure_hash<>hash ORDER BY path")?
+            .query_map([version], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Missing/unpublished structure is an error, distinct from a parsed file
+    /// with zero declarations. No parsing or providers occur in this accessor.
+    pub fn structure(&self, path: &str) -> Result<FileStructure> {
+        let current: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE path=? AND parser_version IS NOT NULL AND structure_hash=hash)", [path], |r| r.get(0))?;
+        ensure!(current, "No current structure for {path}");
+        read_structure(&self.conn, path)
     }
 
     /// A refresh commits live records and its generation together. Completed model
@@ -219,6 +433,58 @@ impl Database {
         removed: &[String],
         checkpoint: Option<&str>,
     ) -> Result<bool> {
+        let changed: Vec<_> = changed
+            .iter()
+            .map(|(f, items)| (f.clone(), items.clone(), None))
+            .collect();
+        self.publish(&changed, removed, checkpoint, STRUCTURE_PARSER_VERSION)
+    }
+
+    /// Publish parse results and pending search units atomically, without any
+    /// model calls. Unit identities use the same occurrence counting as engine.
+    pub fn apply_structure(
+        &mut self,
+        changed: &[(File, ParsedFile)],
+        removed: &[String],
+        checkpoint: Option<&str>,
+    ) -> Result<bool> {
+        self.apply_structure_with_version(changed, removed, checkpoint, STRUCTURE_PARSER_VERSION)
+    }
+
+    pub fn apply_structure_with_version(
+        &mut self,
+        changed: &[(File, ParsedFile)],
+        removed: &[String],
+        checkpoint: Option<&str>,
+        version: &str,
+    ) -> Result<bool> {
+        ensure!(!version.is_empty(), "Empty structure parser version");
+        let mut records = Vec::with_capacity(changed.len());
+        for (file, parsed) in changed {
+            let mut file = file.clone();
+            if file.description.is_none()
+                && let Some((source_hash, text, embedding)) =
+                    description(&self.conn, "file", &file.path, "")?
+            {
+                file.description = Some(text);
+                file.description_hash = source_hash;
+                file.description_embedding = embedding;
+            }
+            file.errors.extend(parsed.errors.iter().map(|e| json!({"path":file.path,"code":"parse-error",
+                "message":e.message,"startLine":e.start_line,"endLine":e.end_line,"sourceMode":file.source_mode})));
+            let items = parsed_items(&file, parsed)?;
+            records.push((file, items, Some(parsed.structure.clone())));
+        }
+        self.publish(&records, removed, checkpoint, version)
+    }
+
+    fn publish(
+        &mut self,
+        changed: &[(File, Vec<Item>, Option<FileStructure>)],
+        removed: &[String],
+        checkpoint: Option<&str>,
+        version: &str,
+    ) -> Result<bool> {
         let old_checkpoint = self.meta("checkpoint")?;
         let dirty = !changed.is_empty() || !removed.is_empty();
         if !dirty && old_checkpoint.as_deref() == checkpoint {
@@ -228,31 +494,48 @@ impl Database {
             .generation()?
             .checked_add(u64::from(dirty))
             .context("Index generation exhausted")?;
+        let profile: Option<Value> = self
+            .meta("active_embedding_profile")?
+            .map(|v| serde_json::from_str(&v))
+            .transpose()?;
         let tx = self.conn.transaction()?;
         for path in removed {
             tx.execute("DELETE FROM files WHERE path=?", [path])?;
         }
-        for (file, items) in changed {
-            tx.execute(
-                "INSERT INTO files VALUES(?,?) ON CONFLICT(path) DO UPDATE SET data=excluded.data",
-                params![file.path, serde_json::to_string(file)?],
-            )?;
-            // Reconcile by identity to preserve IDs across edits and line shifts.
-            let identities: std::collections::HashSet<_> =
-                items.iter().map(|i| i.identity.as_str()).collect();
-            let existing: Vec<(i64, String)> = tx
-                .prepare("SELECT id,identity FROM items WHERE path=?")?
-                .query_map([&file.path], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            for (id, identity) in existing {
-                if !identities.contains(identity.as_str()) {
-                    tx.execute("DELETE FROM items WHERE id=?", [id])?;
+        for (file, items, structure) in changed {
+            write_file(&tx, file)?;
+            if let Some(structure) = structure {
+                // IDs are file-local parser IDs. Relink all units after replacing
+                // symbols; deferred foreign keys keep the transaction atomic.
+                tx.execute(
+                    "UPDATE search_units SET symbol_id=NULL WHERE path=?",
+                    [&file.path],
+                )?;
+                tx.execute("DELETE FROM symbols WHERE path=?", [&file.path])?;
+                write_structure(&tx, &file.path, structure)?;
+                tx.execute(
+                    "UPDATE files SET parser_version=?,structure_hash=? WHERE path=?",
+                    params![version, file.hash, file.path],
+                )?;
+            } else {
+                let current: bool = tx.query_row("SELECT parser_version IS NOT NULL AND structure_hash=hash FROM files WHERE path=?", [&file.path], |r| r.get(0))?;
+                if !current {
+                    tx.execute(
+                        "UPDATE search_units SET symbol_id=NULL WHERE path=?",
+                        [&file.path],
+                    )?;
+                    tx.execute("DELETE FROM symbols WHERE path=?", [&file.path])?;
                 }
             }
-            for item in items {
-                tx.execute("INSERT INTO items(path,identity,kind,data,embedding,description_embedding) VALUES(?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET path=excluded.path,kind=excluded.kind,data=excluded.data,embedding=excluded.embedding,description_embedding=excluded.description_embedding",
-                    params![item.path,item.identity,item.kind,item.data.to_string(),item.embedding,item.description_embedding])?;
-            }
+            let nodes = read_structure(&tx, &file.path)?;
+            write_units(
+                &tx,
+                file,
+                items,
+                &nodes,
+                structure.is_some(),
+                profile.as_ref(),
+            )?;
         }
         tx.execute("INSERT INTO metadata VALUES('generation',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[generation.to_string()])?;
         tx.execute("DELETE FROM metadata WHERE key='checkpoint'", [])?;
@@ -285,6 +568,325 @@ impl Database {
         )?;
         Ok(())
     }
+}
+
+fn reset_live(conn: &Connection) -> Result<()> {
+    // Provider artifacts are durable even across a forced root reset. Retaining
+    // identity keeps a reset v3 database identifiable when it is reopened.
+    conn.execute_batch("DELETE FROM search_units; DELETE FROM files; DELETE FROM search_cache; DELETE FROM metadata WHERE key<>'identity';")?;
+    Ok(())
+}
+
+type Description = (Option<String>, String, Option<String>);
+
+fn description(
+    conn: &Connection,
+    scope: &str,
+    path: &str,
+    identity: &str,
+) -> Result<Option<Description>> {
+    Ok(conn.query_row("SELECT source_hash,text,embedding_key FROM descriptions WHERE scope=? AND path=? AND identity=?",
+        params![scope, path, identity], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
+}
+
+fn latest_embedding(
+    conn: &Connection,
+    id: u64,
+    role: &str,
+    input_hash: &str,
+) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT embedding_key FROM unit_embeddings WHERE unit_id=? AND role=? AND input_hash=? ORDER BY rowid DESC LIMIT 1",
+        params![i64::try_from(id)?, role, input_hash], |r| r.get(0)).optional()?)
+}
+
+fn write_file(conn: &Connection, file: &File) -> Result<()> {
+    conn.execute("INSERT INTO files(path,source,hash,language,source_mode,data) VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+        source=excluded.source,hash=excluded.hash,language=excluded.language,source_mode=excluded.source_mode,data=excluded.data,
+        parser_version=CASE WHEN files.hash=excluded.hash THEN files.parser_version END,
+        structure_hash=CASE WHEN files.hash=excluded.hash THEN files.structure_hash END",
+        params![file.path, file.source, file.hash, file.language, file.source_mode, serde_json::to_string(file)?])?;
+    conn.execute(
+        "DELETE FROM descriptions WHERE scope='file' AND path=?",
+        [&file.path],
+    )?;
+    if let Some(text) = &file.description {
+        conn.execute("INSERT INTO descriptions(scope,path,identity,source_hash,text,embedding_key) VALUES('file',?,'',?,?,?)",
+            params![file.path, file.description_hash, text, file.description_embedding])?;
+    }
+    conn.execute("DELETE FROM diagnostics WHERE path=?", [&file.path])?;
+    for (ordinal, error) in file.errors.iter().enumerate() {
+        conn.execute("INSERT INTO diagnostics(path,ordinal,code,message,start_line,end_line,data) VALUES(?,?,?,?,?,?,?)",
+            params![file.path, i64::try_from(ordinal)?, error["code"].as_str(), error["message"].as_str(),
+                error["startLine"].as_i64(), error["endLine"].as_i64(), error.to_string()])?;
+    }
+    Ok(())
+}
+
+fn write_structure(conn: &Connection, path: &str, structure: &FileStructure) -> Result<()> {
+    for (ordinal, node) in structure.nodes.iter().enumerate() {
+        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level});
+        conn.execute("INSERT INTO symbols(path,id,parent_id,ordinal,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![path, i64::try_from(node.id)?, node.parent_id.map(i64::try_from).transpose()?, i64::try_from(ordinal)?, node.language, node.kind, node.name, node.qualified_name,
+                node.signature, i64::try_from(node.start_byte)?, i64::try_from(node.end_byte)?, i64::try_from(node.start_line)?, i64::try_from(node.start_column)?, i64::try_from(node.end_line)?, i64::try_from(node.end_column)?, metadata.to_string()])?;
+        for (ordinal, name) in node.names.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO symbol_names(path,symbol_id,ordinal,name) VALUES(?,?,?,?)",
+                params![path, i64::try_from(node.id)?, i64::try_from(ordinal)?, name],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn row_usize(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<usize> {
+    let value: i64 = row.get(column)?;
+    usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
+fn read_structure(conn: &Connection, path: &str) -> Result<FileStructure> {
+    let mut names = HashMap::<usize, Vec<String>>::new();
+    let mut names_stmt = conn.prepare(
+        "SELECT symbol_id,name FROM symbol_names WHERE path=? ORDER BY symbol_id,ordinal",
+    )?;
+    for row in names_stmt.query_map([path], |r| Ok((row_usize(r, 0)?, r.get::<_, String>(1)?)))? {
+        let (id, name) = row?;
+        names.entry(id).or_default().push(name);
+    }
+    let mut stmt = conn.prepare("SELECT id,parent_id,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata FROM symbols WHERE path=? ORDER BY ordinal")?;
+    let rows = stmt.query_map([path], |r| {
+        Ok((
+            StructureNode {
+                id: row_usize(r, 0)?,
+                parent_id: r
+                    .get::<_, Option<i64>>(1)?
+                    .map(|_| row_usize(r, 1))
+                    .transpose()?,
+                language: r.get(2)?,
+                kind: r.get(3)?,
+                name: r.get(4)?,
+                qualified_name: r.get(5)?,
+                signature: r.get(6)?,
+                start_byte: row_usize(r, 7)?,
+                end_byte: row_usize(r, 8)?,
+                start_line: row_usize(r, 9)?,
+                start_column: row_usize(r, 10)?,
+                end_line: row_usize(r, 11)?,
+                end_column: row_usize(r, 12)?,
+                ..Default::default()
+            },
+            r.get::<_, String>(13)?,
+        ))
+    })?;
+    let nodes = rows
+        .map(|r| {
+            let (mut node, metadata) = r?;
+            let metadata: Value = serde_json::from_str(&metadata)?;
+            node.attributes = serde_json::from_value(metadata["attributes"].clone())?;
+            node.imports = serde_json::from_value(metadata["imports"].clone())?;
+            node.heading_level = serde_json::from_value(metadata["headingLevel"].clone())?;
+            node.names = names.remove(&node.id).unwrap_or_default();
+            Ok(node)
+        })
+        .collect::<Result<_>>()?;
+    Ok(FileStructure { nodes })
+}
+
+fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
+    let mut occurrences = HashMap::<&str, usize>::new();
+    let mut items = Vec::with_capacity(parsed.callables.len() + parsed.chunks.len());
+    for callable in &parsed.callables {
+        let occurrence = occurrences.entry(&callable.qualified_name).or_default();
+        let identity = hash(
+            json!([
+                file.path,
+                callable.qualified_name,
+                callable.kind,
+                *occurrence
+            ])
+            .to_string(),
+        );
+        *occurrence += 1;
+        let mut data = serde_json::to_value(callable)?;
+        data["path"] = json!(file.path);
+        data["sourceMode"] = json!(file.source_mode);
+        data["description"] = Value::Null;
+        items.push(Item {
+            id: 0,
+            path: file.path.clone(),
+            identity,
+            kind: "function".into(),
+            data,
+            embedding: String::new(),
+            description_embedding: None,
+        });
+    }
+    for (ordinal, chunk) in parsed.chunks.iter().enumerate() {
+        let mut data = serde_json::to_value(chunk)?;
+        data["path"] = json!(file.path);
+        data["sourceMode"] = json!(file.source_mode);
+        items.push(Item {
+            id: 0,
+            path: file.path.clone(),
+            identity: hash(json!([file.path, "markdown", ordinal]).to_string()),
+            kind: "markdown".into(),
+            data,
+            embedding: String::new(),
+            description_embedding: None,
+        });
+    }
+    Ok(items)
+}
+
+fn symbol_for(item: &Item, structure: &FileStructure) -> Option<usize> {
+    let start = item.data["startLine"].as_u64()? as usize;
+    let end = item.data["endLine"].as_u64().unwrap_or(start as u64) as usize;
+    let qualified = item.data["qualifiedName"].as_str();
+    let name = item.data["name"].as_str();
+    // Both parser APIs use one-based UTF-8 columns and exclusive end positions.
+    // Prefer exact callable ranges, then the closest declaration with its name.
+    structure
+        .nodes
+        .iter()
+        .filter(|n| {
+            if item.kind == "markdown" {
+                n.kind == "heading" && n.start_line <= start && n.end_line >= start
+            } else {
+                matches!(n.kind.as_str(), "function" | "method" | "constructor")
+                    && (qualified == Some(n.qualified_name.as_str())
+                        || (name == Some(n.name.as_str())
+                            && n.start_line <= end
+                            && n.end_line >= start))
+            }
+        })
+        .min_by_key(|n| {
+            (
+                qualified != Some(n.qualified_name.as_str()),
+                n.start_line.abs_diff(start) + n.end_line.abs_diff(end),
+                n.start_column
+                    .abs_diff(item.data["startColumn"].as_u64().unwrap_or(1) as usize),
+                n.id,
+            )
+        })
+        .map(|n| n.id)
+}
+
+fn associate(
+    conn: &Connection,
+    id: i64,
+    role: &str,
+    profile: Option<&Value>,
+    input: &str,
+    key: &str,
+) -> Result<()> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    if let Some(profile) = profile {
+        ensure!(
+            key == Database::embedding_key(profile, false, input),
+            "Embedding reference does not match projection profile/input"
+        );
+    }
+    let profile_key = profile.map(|p| hash(p.to_string())).unwrap_or_default();
+    let input_hash = hash(input);
+    // Reinsert the same association to make rowid a deterministic latest-write
+    // order for the compatibility items() view; other profiles/inputs survive.
+    conn.execute(
+        "DELETE FROM unit_embeddings WHERE unit_id=? AND role=? AND profile_key=? AND input_hash=?",
+        params![id, role, profile_key, input_hash],
+    )?;
+    conn.execute("INSERT INTO unit_embeddings(unit_id,role,profile_key,input_hash,embedding_key) VALUES(?,?,?,?,?)", params![id, role, profile_key, input_hash, key])?;
+    Ok(())
+}
+
+fn write_units(
+    conn: &Connection,
+    file: &File,
+    items: &[Item],
+    structure: &FileStructure,
+    structural: bool,
+    profile: Option<&Value>,
+) -> Result<()> {
+    let identities: HashSet<_> = items.iter().map(|i| i.identity.as_str()).collect();
+    ensure!(
+        identities.len() == items.len(),
+        "Duplicate search unit identity for {}",
+        file.path
+    );
+    let existing: Vec<(i64, String)> = conn
+        .prepare("SELECT id,identity FROM search_units WHERE path=?")?
+        .query_map([&file.path], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, identity) in existing {
+        if !identities.contains(identity.as_str()) {
+            conn.execute("DELETE FROM search_units WHERE id=?", [id])?;
+            conn.execute(
+                "DELETE FROM descriptions WHERE scope='callable' AND path=? AND identity=?",
+                params![file.path, identity],
+            )?;
+        }
+    }
+    for item in items {
+        ensure!(
+            item.path == file.path && item.data.is_object(),
+            "Invalid search unit for {}",
+            file.path
+        );
+        let previous_path: Option<String> = conn
+            .query_row(
+                "SELECT path FROM search_units WHERE identity=?",
+                [&item.identity],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            previous_path.as_ref().is_none_or(|p| p == &file.path),
+            "Search unit identity belongs to another file"
+        );
+        let mut data = item.data.clone();
+        let old_description = description(conn, "callable", &file.path, &item.identity)?;
+        if structural
+            && let Some(d) = &old_description
+            && d.0.as_deref() == data["sourceHash"].as_str()
+        {
+            data["description"] = json!(d.1);
+        }
+        let input = data["embeddingInput"].as_str().unwrap_or("");
+        let input_hash = hash(input);
+        conn.execute("INSERT INTO search_units(path,identity,kind,symbol_id,data,embedding_input_hash) VALUES(?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET
+            kind=excluded.kind,symbol_id=excluded.symbol_id,data=excluded.data,embedding_input_hash=excluded.embedding_input_hash",
+            params![item.path, item.identity, item.kind, symbol_for(item, structure).map(i64::try_from).transpose()?, data.to_string(), input_hash])?;
+        let id: i64 = conn.query_row(
+            "SELECT id FROM search_units WHERE identity=?",
+            [&item.identity],
+            |r| r.get(0),
+        )?;
+        associate(conn, id, "code", profile, input, &item.embedding)?;
+        conn.execute(
+            "DELETE FROM descriptions WHERE scope='callable' AND path=? AND identity=?",
+            params![item.path, item.identity],
+        )?;
+        if let Some(text) = data["description"].as_str() {
+            let embedding = if structural {
+                old_description.as_ref().and_then(|d| d.2.as_deref())
+            } else {
+                item.description_embedding.as_deref()
+            };
+            conn.execute("INSERT INTO descriptions(scope,path,identity,source_hash,text,embedding_key) VALUES('callable',?,?,?,?,?)",
+                params![item.path, item.identity, data["sourceHash"].as_str(), text, embedding])?;
+            if !structural && let Some(key) = embedding {
+                associate(conn, id, "description", profile, text, key)?;
+            }
+        } else {
+            ensure!(
+                item.description_embedding
+                    .as_deref()
+                    .is_none_or(str::is_empty),
+                "Description vector has no description text"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
@@ -339,7 +941,8 @@ mod tests {
             path: path.into(),
             identity: format!("{path}:example"),
             kind: "function".into(),
-            data: json!({"qualifiedName": "example", "startLine": 1}),
+            data: json!({"qualifiedName": "example", "startLine": 1,"sourceHash":"callable-hash",
+                "embeddingInput":"fn example() {}","description":"Callable description"}),
             embedding: "code".into(),
             description_embedding: Some("description".into()),
         };
@@ -418,7 +1021,10 @@ mod tests {
         db.reset()?;
         assert!(db.files()?.is_empty());
         assert!(db.items()?.is_empty());
-        assert!(db.meta("identity")?.is_none());
+        assert_eq!(
+            db.meta("identity")?,
+            before["identity"].as_str().map(str::to_owned)
+        );
         assert!(db.meta("checkpoint")?.is_none());
         assert_eq!(db.generation()?, 0);
         assert!(db.search_cache("query")?.is_none());
@@ -447,6 +1053,17 @@ mod tests {
             } else {
                 json!({"model": "other"})
             };
+            if !change_root {
+                for force in [false, true] {
+                    let db = Database::open(&path, &root, &profile, force)?;
+                    assert_eq!(snapshot(&db)?, before);
+                    assert_eq!(
+                        db.cache("description", "paid")?.as_deref(),
+                        Some("retained")
+                    );
+                }
+                continue;
+            }
             let error = Database::open(&path, &root, &profile, false)
                 .err()
                 .expect("identity mismatch");
@@ -601,13 +1218,24 @@ mod tests {
     fn corrupt_json_records_fail_reads_and_can_be_repaired() -> Result<()> {
         let (_dir, mut db) = fixture()?;
         db.apply(&[record("code.rs")], &[], None)?;
+        let before = snapshot(&db)?;
         for value in ["{", "null", "{}"] {
             db.conn.execute("UPDATE files SET data=?", [value])?;
+            assert_eq!(
+                snapshot(&db)?,
+                before,
+                "compatibility JSON is not authoritative"
+            );
+        }
+        for value in ["{", "[", "not-json"] {
+            db.conn.execute("UPDATE diagnostics SET data=?", [value])?;
             assert!(db.files().is_err(), "{value}");
         }
         db.apply(&[record("code.rs")], &[], None)?;
-        db.conn.execute("UPDATE items SET data='{'", [])?;
-        assert!(db.items().is_err());
+        for value in ["{", "null", "[]"] {
+            db.conn.execute("UPDATE search_units SET data=?", [value])?;
+            assert!(db.items().is_err(), "{value}");
+        }
         for value in ["{", "null", "{}"] {
             db.conn.execute(
                 "INSERT OR REPLACE INTO search_cache VALUES('query', ?)",
@@ -711,11 +1339,16 @@ mod tests {
             tables,
             [
                 "cache",
+                "descriptions",
+                "diagnostics",
                 "embeddings",
                 "files",
-                "items",
                 "metadata",
-                "search_cache"
+                "search_cache",
+                "search_units",
+                "symbol_names",
+                "symbols",
+                "unit_embeddings"
             ]
         );
         db.put_embedding("vector", &[0.6, 0.8])?;
@@ -741,6 +1374,8 @@ mod tests {
             "CREATE TABLE rust_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO rust_metadata VALUES('identity','old');",
             "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO metadata VALUES('schema_version','11');",
             "CREATE TABLE functions(id INTEGER PRIMARY KEY);",
+            "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO metadata VALUES('identity','{\"schema\":2,\"root\":\"old\",\"embedding\":{}}');",
+            "CREATE TABLE files(path TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE items(id INTEGER PRIMARY KEY);",
         ] {
             let dir = tempfile::tempdir()?;
             let path = dir.path().join("index.sqlite");
@@ -750,6 +1385,7 @@ mod tests {
                 .prepare("SELECT sql FROM sqlite_master ORDER BY name")?
                 .query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
+            let before_bytes = std::fs::read(&path)?;
             for force in [false, true] {
                 let error = Database::open(&path, dir.path(), &json!({}), force)
                     .err()
@@ -760,8 +1396,316 @@ mod tests {
                     .query_map([], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 assert_eq!(before, after);
+                assert_eq!(std::fs::read(&path)?, before_bytes);
             }
         }
+        Ok(())
+    }
+
+    fn parsed_record(path: &str, source: &str) -> Result<(File, ParsedFile)> {
+        let mut file = record(path).0;
+        file.source = source.into();
+        file.hash = hash(source);
+        file.language = crate::parse::language_for_path(path).unwrap().into();
+        file.description = None;
+        file.description_hash = None;
+        file.description_embedding = None;
+        file.errors.clear();
+        Ok((file, crate::parse::parse(path, source)?))
+    }
+
+    #[test]
+    fn structure_roundtrips_full_metadata_and_links_pending_units() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let mut record = parsed_record(
+            "code.rs",
+            "use std::collections::HashMap as Map;\nstruct Café { value: i32 }\nimpl Café { fn run(&self) -> i32 { self.value } }\n",
+        )?;
+        // Storage preserves the extraction in full; presentation limits belong
+        // to the renderer, never to the normalized source of truth.
+        record.1.structure.nodes[0].signature = "é".repeat(20_000);
+        record.1.structure.nodes[0].names = vec!["Map".into(), "HashMap".into(), "Map".into()];
+        record.1.structure.nodes[0]
+            .attributes
+            .push("#[cfg(feature = \"test\")]".into());
+        db.apply_structure(std::slice::from_ref(&record), &[], Some("commit"))?;
+        assert_eq!(db.structure("code.rs")?, record.1.structure);
+        assert!(db.structure_current("code.rs", &record.0.hash, STRUCTURE_PARSER_VERSION)?);
+        assert!(!db.structure_current("code.rs", "different", STRUCTURE_PARSER_VERSION)?);
+        assert_eq!(db.missing_structure_paths("next-version")?, ["code.rs"]);
+        assert!(
+            db.missing_structure_paths(STRUCTURE_PARSER_VERSION)?
+                .is_empty()
+        );
+        assert_eq!(db.paths()?, ["code.rs"]);
+        let items = db.items_for_profile(&json!({"model":"a"}))?;
+        assert_eq!(items.len(), record.1.callables.len());
+        assert!(items.iter().all(|i| i.embedding.is_empty()));
+        let linked: i64 = db.conn.query_row(
+            "SELECT count(*) FROM search_units WHERE symbol_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(linked as usize, items.len());
+        assert_eq!(
+            items[0].identity,
+            hash(
+                json!([
+                    "code.rs",
+                    record.1.callables[0].qualified_name,
+                    record.1.callables[0].kind,
+                    0
+                ])
+                .to_string()
+            )
+        );
+        let mut file = db.files()?.remove(0);
+        file.source_mode = "git-head".into();
+        db.apply(&[(file, items)], &[], Some("commit"))?;
+        assert_eq!(
+            db.structure("code.rs")?,
+            record.1.structure,
+            "semantic apply must reuse stored structure"
+        );
+        assert_eq!(db.files()?[0].source_mode, "git-head");
+        // File-local symbol IDs overlap; the bulk name load must stay scoped
+        // to its file and preserve name order, duplicates and empty lists.
+        let mut other = parsed_record("other.rs", "struct Other; impl Other { fn run() {} }")?;
+        other.1.structure.nodes[0].names.clear();
+        db.apply_structure(std::slice::from_ref(&other), &[], Some("commit"))?;
+        assert_eq!(db.structure("code.rs")?, record.1.structure);
+        assert_eq!(db.structure("other.rs")?, other.1.structure);
+        Ok(())
+    }
+
+    #[test]
+    fn projections_reuse_durable_artifacts_and_never_return_stale_or_other_profile_vectors()
+    -> Result<()> {
+        let (dir, mut db) = fixture()?;
+        let a = json!({"model":"a","dimensions":2});
+        let b = json!({"model":"b","dimensions":2});
+        let original = parsed_record("code.rs", "fn example() -> i32 { 1 }")?;
+        db.apply_structure(std::slice::from_ref(&original), &[], None)?;
+        let id = db.items()?[0].id;
+        let input = original.1.callables[0].embedding_input.clone();
+        let code_a = Database::embedding_key(&a, false, &input);
+        db.put_embedding(&code_a, &[1.0, 0.0])?;
+        assert_eq!(
+            db.items_for_profile(&a)?[0].embedding,
+            code_a,
+            "cache lookup requires no published association"
+        );
+        assert!(db.items_for_profile(&b)?[0].embedding.is_empty());
+        let text = "Returns one";
+        let mut file = original.0.clone();
+        file.description = Some("Example file".into());
+        file.description_hash = Some(file.hash.clone());
+        for profile in [&a, &b] {
+            db.set_projection_profile(profile)?;
+            let key = Database::embedding_key(profile, false, &input);
+            db.put_embedding(&key, &[1.0, 0.0])?;
+            let description_key = Database::embedding_key(profile, false, text);
+            db.put_embedding(&description_key, &[0.0, 1.0])?;
+            let file_key =
+                Database::embedding_key(profile, false, file.description.as_deref().unwrap());
+            db.put_embedding(&file_key, &[0.6, 0.8])?;
+            file.description_embedding = Some(file_key);
+            let mut items = db.items_for_profile(profile)?;
+            items[0].data["description"] = json!(text);
+            items[0].description_embedding = Some(description_key.clone());
+            db.apply(&[(file.clone(), items)], &[], None)?;
+            assert_eq!(db.items_for_profile(profile)?[0].embedding, key);
+            assert_eq!(
+                db.items_for_profile(profile)?[0]
+                    .description_embedding
+                    .as_deref(),
+                Some(description_key.as_str())
+            );
+        }
+        let associations: i64 =
+            db.conn
+                .query_row("SELECT count(*) FROM unit_embeddings", [], |r| r.get(0))?;
+        assert_eq!(associations, 4);
+        assert_eq!(db.items_for_profile(&a)?[0].embedding, code_a);
+        assert_eq!(
+            db.files_for_profile(&a)?[0].description_embedding,
+            Some(Database::embedding_key(&a, false, "Example file"))
+        );
+        let shifted = parsed_record("code.rs", "\n\nfn example() -> i32 { 1 }")?;
+        db.apply_structure(&[shifted], &[], None)?;
+        let item = db.items_for_profile(&a)?.remove(0);
+        assert_eq!(item.id, id);
+        assert_eq!(item.data["description"], text);
+        assert_eq!(item.embedding, code_a);
+        assert!(item.description_embedding.is_some());
+        let changed = parsed_record("code.rs", "fn example() -> i32 { 2 }")?;
+        db.apply_structure(&[changed], &[], Some("edited"))?;
+        for profile in [&a, &b] {
+            let item = db.items_for_profile(profile)?.remove(0);
+            assert_eq!(item.id, id);
+            assert!(item.embedding.is_empty());
+            assert!(item.description_embedding.is_none());
+            assert!(item.data["description"].is_null());
+        }
+        assert!(db.items()?[0].embedding.is_empty());
+        assert_eq!(db.files()?[0].description.as_deref(), Some("Example file"));
+        assert_eq!(
+            db.files()?[0].description_hash,
+            Some(original.0.hash.clone())
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT count(*) FROM unit_embeddings", [], |r| r
+                    .get::<_, i64>(0))?,
+            associations
+        );
+        db.cache_put("rerank", "paid", "cached response")?;
+        drop(db);
+        let mut db = Database::open(&dir.path().join("index.sqlite"), dir.path(), &a, true)?;
+        assert_eq!(db.items()?[0].id, id);
+        db.apply_structure(&[original], &[], None)?;
+        assert_eq!(db.items_for_profile(&a)?[0].embedding, code_a);
+        db.reset()?;
+        assert_eq!(
+            db.cache("rerank", "paid")?.as_deref(),
+            Some("cached response")
+        );
+        assert!(db.embedding(&code_a)?.is_some());
+        drop(db);
+        let db = Database::open(&dir.path().join("index.sqlite"), dir.path(), &b, false)?;
+        assert!(db.paths()?.is_empty());
+        assert!(db.embedding(&code_a)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn structural_publication_rolls_back_symbols_units_diagnostics_and_checkpoint() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let original = parsed_record("code.rs", "struct A; impl A { fn run() {} }")?;
+        db.apply_structure(std::slice::from_ref(&original), &[], Some("old"))?;
+        db.put_search_cache("query", &[json!("old result")])?;
+        let before = snapshot(&db)?;
+        db.conn.execute_batch("CREATE TRIGGER abort_structure BEFORE DELETE ON search_cache BEGIN SELECT RAISE(ABORT, 'late structure failure'); END;")?;
+        db.cache_put("description", "paid", "survives")?;
+        let mut changed = parsed_record("code.rs", "struct B; impl B { fn run() { let x = 2; } }")?;
+        changed.1.errors.push(crate::parse::Diagnostic {
+            message: "new diagnostic".into(),
+            start_line: 1,
+            end_line: 1,
+        });
+        let read_error =
+            json!({"code":"read-error","message":"using saved source","path":"code.rs"});
+        changed.0.errors.push(read_error.clone());
+        assert!(
+            db.apply_structure(std::slice::from_ref(&changed), &[], Some("new"))
+                .is_err()
+        );
+        assert!(db.conn.is_autocommit());
+        assert_eq!(snapshot(&db)?, before);
+        assert_eq!(db.structure("code.rs")?, original.1.structure);
+        assert_eq!(
+            db.cache("description", "paid")?.as_deref(),
+            Some("survives")
+        );
+        db.conn.execute_batch("DROP TRIGGER abort_structure")?;
+        // A deferred FK failure at commit must roll back the entire publication.
+        let mut invalid = changed.clone();
+        invalid.1.structure.nodes[0].parent_id = Some(999_999);
+        assert!(
+            db.apply_structure(&[invalid], &[], Some("invalid"))
+                .is_err()
+        );
+        assert!(db.conn.is_autocommit());
+        assert_eq!(snapshot(&db)?, before);
+        assert_eq!(db.structure("code.rs")?, original.1.structure);
+        db.apply_structure(&[changed], &[], Some("new"))?;
+        assert_eq!(db.files()?[0].errors[0], read_error);
+        assert_eq!(db.files()?[0].errors[1]["message"], "new diagnostic");
+        assert_eq!(db.generation()?, 2);
+        assert_eq!(db.meta("checkpoint")?.as_deref(), Some("new"));
+        db.apply_structure(&[], &["code.rs".into()], None)?;
+        assert!(db.paths()?.is_empty());
+        for table in [
+            "symbols",
+            "symbol_names",
+            "search_units",
+            "unit_embeddings",
+            "descriptions",
+            "diagnostics",
+        ] {
+            assert_eq!(
+                db.conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))?,
+                0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn markdown_and_empty_structures_are_versioned_without_embeddings() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let markdown = parsed_record("readme.md", "# Overview\n\nHello.\n\n## Detail\n\nWorld.\n")?;
+        let empty = parsed_record("empty.rs", "// nothing to declare\n")?;
+        db.apply_structure_with_version(&[markdown.clone(), empty.clone()], &[], None, "parser-2")?;
+        assert!(db.structure("empty.rs")?.nodes.is_empty());
+        assert!(db.structure_current("empty.rs", &empty.0.hash, "parser-2")?);
+        assert!(db.structure("missing.rs").is_err());
+        assert_eq!(db.structure("readme.md")?, markdown.1.structure);
+        for (ordinal, item) in db.items()?.iter().enumerate() {
+            assert_eq!(
+                item.identity,
+                hash(json!(["readme.md", "markdown", ordinal]).to_string())
+            );
+            assert_eq!(item.kind, "markdown");
+            assert!(item.embedding.is_empty());
+        }
+        let mut semantic = empty.0.clone();
+        semantic.source = "fn new() {}".into();
+        semantic.hash = hash(&semantic.source);
+        db.apply(&[(semantic, vec![])], &[], None)?;
+        assert!(
+            db.structure("empty.rs").is_err(),
+            "old structures must not be presented for new source"
+        );
+        assert_eq!(db.missing_structure_paths("parser-2")?, ["empty.rs"]);
+        Ok(())
+    }
+
+    #[test]
+    fn projection_selection_and_mismatched_associations_fail_atomically() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let record = parsed_record("code.rs", "fn example() {}")?;
+        db.apply_structure(std::slice::from_ref(&record), &[], None)?;
+        let a = json!({"model":"a"});
+        let b = json!({"model":"b"});
+        db.set_projection_profile(&a)?;
+        db.put_search_cache("query", &[json!("a result")])?;
+        db.conn.execute_batch("CREATE TRIGGER abort_profile BEFORE DELETE ON search_cache BEGIN SELECT RAISE(ABORT, 'profile failure'); END;")?;
+        assert!(db.set_projection_profile(&b).is_err());
+        assert_eq!(db.meta("active_embedding_profile")?, Some(a.to_string()));
+        assert!(db.search_cache("query")?.is_some());
+        db.conn.execute_batch("DROP TRIGGER abort_profile")?;
+        let before = snapshot(&db)?;
+        let input = &record.1.callables[0].embedding_input;
+        let wrong_key = Database::embedding_key(&b, false, input);
+        db.put_embedding(&wrong_key, &[0.6, 0.8])?;
+        let mut items = db.items_for_profile(&b)?;
+        assert_eq!(items[0].embedding, wrong_key);
+        assert!(
+            db.apply(&[(record.0.clone(), items.clone())], &[], Some("wrong"))
+                .is_err()
+        );
+        assert_eq!(snapshot(&db)?, before);
+        let right_key = Database::embedding_key(&a, false, input);
+        db.put_embedding(&right_key, &[0.6, 0.8])?;
+        items[0].embedding = right_key;
+        db.apply(&[(record.0, items)], &[], Some("right"))?;
+        db.set_projection_profile(&b)?;
+        assert_eq!(db.meta("active_embedding_profile")?, Some(b.to_string()));
+        assert_eq!(db.structure("code.rs")?, record.1.structure);
+        assert_eq!(db.items_for_profile(&b)?[0].embedding, wrong_key);
         Ok(())
     }
 }

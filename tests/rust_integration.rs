@@ -523,6 +523,21 @@ impl Repo {
         Ok(Connection::open(&self.index)?)
     }
 
+    fn open_map(&self, config: &Value) -> Result<Engine> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match Engine::open_map(&self.root, &self.index, config.clone()) {
+                Err(error)
+                    if error.to_string().starts_with("Index is in use")
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn child(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
         command
@@ -619,6 +634,25 @@ fn sources(rows: &[Value]) -> BTreeSet<String> {
 
 fn strings(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|s| (*s).into()).collect()
+}
+
+fn assert_incomplete(engine: &Engine) {
+    for kind in ["search", "search-code", "search-md"] {
+        let error = engine.search("east", kind, &all()).unwrap_err();
+        assert!(
+            error.to_string().contains("incomplete"),
+            "{kind}: {error:#}"
+        );
+    }
+    let error = engine.cross_search(None, &all()).unwrap_err();
+    assert!(error.to_string().contains("incomplete"), "{error:#}");
+}
+
+fn map_names(rows: &[Value]) -> BTreeSet<String> {
+    rows.iter()
+        .flat_map(|row| row["nodes"].as_array().unwrap())
+        .map(|node| node["name"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 fn row<'a>(rows: &'a [Value], name: &str) -> &'a Value {
@@ -744,17 +778,15 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
     let mock = Mock::start_with(Some(concurrent.clone()))?;
     let config = concurrency_fixture(&repo, &mock, work, limit)?;
     let mut engine = repo.open(&config)?;
-    let before = engine.status()?;
     let error = engine
         .refresh()
         .expect_err("one request in the first window must fail");
     assert!(format!("{error:#}").contains("HTTP 503"));
     mock.requests(""); // Surface any timeout/protocol failure in the scheduling harness.
-    assert_eq!(
-        engine.status()?,
-        before,
-        "failed refresh must not publish a partial file"
-    );
+    assert_eq!(engine.status()?["functionCount"], 10);
+    assert_eq!(engine.status()?["fileCount"], 1);
+    assert_eq!(map_names(&engine.map(&json!({}))?).len(), 10);
+    assert_incomplete(&engine);
     let completed = {
         let progress = concurrent.progress.lock().unwrap();
         assert_eq!(
@@ -794,11 +826,14 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
     drop(engine);
 
     let mut engine = repo.open(&config)?;
-    assert_eq!(engine.status()?, before);
+    assert_eq!(engine.status()?["functionCount"], 10);
+    assert_incomplete(&engine);
     assert_eq!(work.paid_count(&repo.db()?)?, preserved);
     concurrent.fail_first.store(false, Ordering::Relaxed);
     let offset = mock.count();
-    assert_eq!(engine.refresh()?["filesUpdated"], 1);
+    let retry = engine.refresh()?;
+    assert_eq!(retry["filesUpdated"], 0, "structure was already published");
+    assert_eq!(retry["filesPrepared"], 1);
     assert_eq!(engine.status()?["functionCount"], 10);
     let retry_inputs: Vec<_> = mock.requests("")[offset..]
         .iter()
@@ -1116,13 +1151,14 @@ fn empty_search_caches_are_invalidated_when_items_are_added_or_removed() -> Resu
     }
     assert_eq!(mock.embedding_inputs(), ["east"]);
     repo.write("new.rs", &function("added", "VECTOR_EAST"))?;
-    assert_eq!(engine.refresh()?["generation"], 1);
+    let populated_generation = engine.refresh()?["generation"].as_u64().unwrap();
+    assert!(populated_generation > 0);
     assert_eq!(
         names(&engine.search("east", "search", &all())?),
         strings(&["added"])
     );
     fs::remove_file(repo.root.join("new.rs"))?;
-    assert_eq!(engine.refresh()?["generation"], 2);
+    assert_eq!(engine.refresh()?["generation"], populated_generation + 1);
     assert!(engine.search("east", "search", &all())?.is_empty());
     let calls = mock.count();
     drop(engine);
@@ -1234,14 +1270,15 @@ fn max_file_size_is_inclusive_and_oversize_files_recover_without_losing_peers() 
 }
 
 #[test]
-fn source_change_during_embedding_aborts_publication_but_retains_paid_artifacts() -> Result<()> {
+fn source_change_during_embedding_keeps_structure_pending_and_retains_paid_artifacts() -> Result<()>
+{
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     repo.write("old.rs", &function("old", "VECTOR_EAST"))?;
     let config = mock.config();
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
-    let before = engine.search("east", "search-code", &all())?;
+    engine.search("east", "search-code", &all())?;
     let status = engine.status()?;
     let source = function("added", "VECTOR_MID");
     repo.write("new.rs", &source)?;
@@ -1257,12 +1294,17 @@ fn source_change_during_embedding_aborts_publication_but_retains_paid_artifacts(
             .to_string()
             .contains("Source changed during indexing")
     );
-    assert_eq!(engine.status()?, status);
-    assert_eq!(engine.search("east", "search-code", &all())?, before);
+    assert!(engine.status()?["generation"].as_u64() > status["generation"].as_u64());
+    assert_eq!(
+        map_names(&engine.map(&json!({}))?),
+        strings(&["old", "added"])
+    );
+    assert_eq!(file_record(&repo, "new.rs")?["source"], source);
+    assert_incomplete(&engine);
     let calls = mock.count();
     drop(engine);
     let mut engine = repo.open(&config)?;
-    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.status()?["functionCount"], 2);
     repo.write("new.rs", &source)?;
     engine.refresh()?;
     assert_eq!(
@@ -1278,7 +1320,7 @@ fn source_change_during_embedding_aborts_publication_but_retains_paid_artifacts(
 }
 
 #[test]
-fn git_head_change_during_embedding_aborts_publication_and_can_retry() -> Result<()> {
+fn git_head_change_during_embedding_keeps_structure_pending_and_can_retry() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     repo.git(&["init", "--quiet"])?;
@@ -1317,7 +1359,12 @@ fn git_head_change_during_embedding_aborts_publication_and_can_retry() -> Result
             .to_string()
             .contains("Git HEAD changed during indexing")
     );
-    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.status()?["gitCheckpoint"], status["gitCheckpoint"]);
+    assert_eq!(
+        map_names(&engine.map(&json!({}))?),
+        strings(&["old", "added"])
+    );
+    assert_incomplete(&engine);
     let calls = mock.count();
     engine.refresh()?;
     assert_eq!(engine.status()?["functionCount"], 2);
@@ -1481,7 +1528,7 @@ fn incremental_refresh_reuses_artifacts_and_reconciles_edits_deletes_and_renames
     assert_eq!(engine.status()?["functionCount"], 0);
     let initial = engine.refresh()?;
     assert_eq!(initial["filesUpdated"], 2);
-    assert_eq!(initial["generation"], 1);
+    assert!(initial["generation"].as_u64().unwrap() > 0);
     let before = engine.search("east", "search-code", &all())?;
     assert_eq!(names(&before), strings(&["alpha", "beta"]));
     let alpha_id = row(&before, "alpha")["function"]["id"].clone();
@@ -1979,8 +2026,7 @@ fn describe_sends_thresholded_indexed_context_and_returns_compact_provenance() -
 }
 
 #[test]
-fn failed_provider_keeps_live_snapshot_atomic_and_partial_artifacts_survive_restart() -> Result<()>
-{
+fn failed_provider_publishes_structure_and_partial_artifacts_survive_restart() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let mut config = mock.config();
@@ -1988,7 +2034,7 @@ fn failed_provider_keeps_live_snapshot_atomic_and_partial_artifacts_survive_rest
     repo.write("baseline.rs", &function("baseline", "VECTOR_EAST"))?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
-    let before = engine.search("east", "search", &all())?;
+    engine.search("east", "search", &all())?;
     let status = engine.status()?;
     let counts = artifact_counts(&repo)?;
     fs::remove_file(repo.root.join("baseline.rs"))?;
@@ -2004,12 +2050,18 @@ fn failed_provider_keeps_live_snapshot_atomic_and_partial_artifacts_survive_rest
     let error = format!("{error:#}");
     assert!(error.contains("HTTP 503"));
     assert!(!error.contains(TEST_KEY));
-    assert_eq!(engine.status()?, status);
-    assert_eq!(engine.search("east", "search", &all())?, before);
+    assert_eq!(engine.status()?["functionCount"], 2);
+    assert!(engine.status()?["generation"].as_u64() > status["generation"].as_u64());
     assert_eq!(
-        file_record(&repo, "baseline.rs")?["source"],
-        function("baseline", "VECTOR_EAST")
+        map_names(&engine.map(&json!({}))?),
+        strings(&["completed", "failing"])
     );
+    assert!(file_record(&repo, "baseline.rs").is_err());
+    assert_eq!(
+        file_record(&repo, "a_completed.rs")?["source"],
+        function("completed", "VECTOR_MID")
+    );
+    assert_incomplete(&engine);
     let partial = artifact_counts(&repo)?;
     assert!(
         partial.0 > counts.0 && partial.1 > counts.1 && partial.2 > counts.2,
@@ -2017,17 +2069,14 @@ fn failed_provider_keeps_live_snapshot_atomic_and_partial_artifacts_survive_rest
     );
     drop(engine);
     let mut engine = repo.open(&config)?;
-    assert_eq!(engine.status()?, status);
-    assert_eq!(engine.search("east", "search", &all())?, before);
+    assert_eq!(engine.status()?["functionCount"], 2);
+    assert_incomplete(&engine);
     let request_offset = mock.count();
     mock.fail_on(None);
     let retried = engine.refresh()?;
-    assert_eq!(retried["filesUpdated"], 2);
-    assert_eq!(retried["filesDeleted"], 1);
-    assert_eq!(
-        retried["generation"].as_u64().unwrap(),
-        status["generation"].as_u64().unwrap() + 1
-    );
+    assert_eq!(retried["filesUpdated"], 0);
+    assert_eq!(retried["filesDeleted"], 0);
+    assert!(retried["generation"].as_u64() > status["generation"].as_u64());
     assert_eq!(
         names(&engine.search("east", "search", &all())?),
         strings(&["completed", "failing"])
@@ -2057,8 +2106,7 @@ fn failed_provider_keeps_live_snapshot_atomic_and_partial_artifacts_survive_rest
 }
 
 #[test]
-fn sqlite_publication_failure_rolls_back_deletes_and_updates_but_reuses_completed_embeddings()
--> Result<()> {
+fn sqlite_structure_failure_rolls_back_deletes_and_updates_before_provider_calls() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let config = mock.config();
@@ -2069,12 +2117,13 @@ fn sqlite_publication_failure_rolls_back_deletes_and_updates_but_reuses_complete
     let status = engine.status()?;
     let db = repo.db()?;
     db.execute_batch(
-        "CREATE TRIGGER integration_abort BEFORE INSERT ON items
+        "CREATE TRIGGER integration_abort BEFORE INSERT ON search_units
         WHEN NEW.path='z_abort.rs' BEGIN SELECT RAISE(ABORT, 'fixture publication failure'); END;",
     )?;
     fs::remove_file(repo.root.join("old.rs"))?;
     repo.write("a_new.rs", &function("new_a", "VECTOR_MID"))?;
     repo.write("z_abort.rs", &function("new_z", "VECTOR_NORTH"))?;
+    let calls = mock.count();
     let error = engine
         .refresh()
         .expect_err("publication trigger should abort");
@@ -2086,7 +2135,12 @@ fn sqlite_publication_failure_rolls_back_deletes_and_updates_but_reuses_complete
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     assert_eq!(live_paths, ["old.rs"]);
-    let calls = mock.count();
+    assert_eq!(
+        mock.count(),
+        calls,
+        "structural failure precedes paid preparation"
+    );
+    assert_eq!(map_names(&engine.map(&json!({}))?), strings(&["old"]));
     db.execute_batch("DROP TRIGGER integration_abort")?;
     drop(engine);
     let mut engine = repo.open(&config)?;
@@ -2097,9 +2151,9 @@ fn sqlite_publication_failure_rolls_back_deletes_and_updates_but_reuses_complete
         strings(&["new_a", "new_z"])
     );
     assert_eq!(
-        mock.count(),
-        calls,
-        "retry must use already committed artifact caches"
+        mock.embedding_inputs().len(),
+        4,
+        "old document, query, and two new documents"
     );
     Ok(())
 }
@@ -2329,8 +2383,11 @@ fn cli_refresh_search_no_reindex_jsonl_and_provider_failure_are_end_to_end() -> 
     assert!(String::from_utf8_lossy(&failed.stderr).contains("HTTP 503"));
     assert_eq!(
         repo.cli_json(&["--no-reindex", "status"])?["functionCount"],
-        3
+        4
     );
+    let incomplete = repo.cli(&["--no-reindex", "search-code", "east"])?;
+    assert!(!incomplete.status.success());
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("incomplete"));
     Ok(())
 }
 
@@ -2452,23 +2509,8 @@ fn open_enforces_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot(
     assert_eq!(mock.count(), calls);
     drop(offline);
 
-    let mut mismatched = config.clone();
-    mismatched["embeddingModel"] = json!("incompatible-fixture-model");
-    let error = match repo.open(&mismatched) {
-        Ok(_) => panic!("opening with an incompatible profile must require a rebuild"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("Incompatible index root or embedding profile")
-    );
     let mut resumed = repo.open(&config)?;
-    assert_eq!(
-        resumed.status()?,
-        status,
-        "failed open must preserve the old index"
-    );
+    assert_eq!(resumed.status()?, status);
     resumed.refresh()?;
     assert_eq!(
         names(&resumed.search("east", "search-code", &all())?),
@@ -2832,7 +2874,7 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
     assert_eq!(status["staleFileDescriptionCount"], 1);
     assert_eq!(mock.requests("/responses").len(), 3);
     repo.db()?.execute_batch(
-        "CREATE TRIGGER regression_reindex_abort BEFORE INSERT ON items
+        "CREATE TRIGGER regression_reindex_abort BEFORE INSERT ON search_units
          WHEN NEW.path='code.rs' BEGIN SELECT RAISE(ABORT, 'fixture forced reindex failure'); END;",
     )?;
     drop(engine);
@@ -2886,5 +2928,522 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
         );
     }
     assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens_offline()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    config["rerankingEnabled"] = json!(true);
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write("src/api.ts", "export class Api {\n  run(value: string): string {\n    const BODY_ONLY_SENTINEL = value;\n    return BODY_ONLY_SENTINEL;\n  }\n}\n")?;
+    repo.write(
+        "guide.md",
+        "# Guide\n\nMARKDOWN_BODY_SENTINEL\n\n## Usage\n\nExamples.\n",
+    )?;
+    let mut engine = repo.open_map(&config)?;
+    assert_eq!(engine.refresh_structure()?["filesUpdated"], 2);
+    let expected = engine.map(&json!({}))?;
+    assert_eq!(expected.len(), 2);
+    assert_eq!(
+        map_names(&expected),
+        strings(&["Api", "run", "Guide", "Usage"])
+    );
+    let serialized = serde_json::to_string(&expected)?;
+    assert!(!serialized.contains("BODY_ONLY_SENTINEL"));
+    assert!(!serialized.contains("MARKDOWN_BODY_SENTINEL"));
+    for node in expected
+        .iter()
+        .flat_map(|row| row["nodes"].as_array().unwrap())
+    {
+        for field in [
+            "source",
+            "content",
+            "embeddingInput",
+            "embedding",
+            "description",
+        ] {
+            assert!(node.get(field).is_none(), "map exposes {field}: {node}");
+        }
+    }
+    let db = repo.db()?;
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
+        3
+    );
+    let identity: String =
+        db.query_row("SELECT value FROM metadata WHERE key='identity'", [], |r| {
+            r.get(0)
+        })?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&identity)?,
+        json!({"schema":3,"root":repo.root.canonicalize()?})
+    );
+    assert!(db.query_row("SELECT count(*) FROM symbols", [], |r| r.get::<_, i64>(0))? >= 4);
+    assert!(
+        db.query_row("SELECT count(*) FROM search_units", [], |r| r
+            .get::<_, i64>(0))?
+            > 0
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM embeddings", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM unit_embeddings", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert!(
+        db.prepare("PRAGMA foreign_key_check")?
+            .query([])?
+            .next()?
+            .is_none()
+    );
+    drop(engine);
+
+    repo.write("src/api.ts", "export function not_indexed() {}\n")?;
+    fs::remove_file(repo.root.join("guide.md"))?;
+    // Neither the parse cache nor compatibility JSON is an authoritative map source.
+    db.execute_batch("DELETE FROM cache WHERE kind='parse'; UPDATE files SET data='{}';")?;
+    config["noReindex"] = json!(true);
+    let mut engine = repo.open_map(&config)?;
+    assert_eq!(engine.refresh_structure()?["skipped"], true);
+    assert_eq!(engine.map(&json!({}))?, expected);
+    assert_eq!(
+        engine.map(&json!({"paths":["guide.md"]}))?,
+        vec![expected[0].clone()]
+    );
+    drop(engine);
+    assert_eq!(repo.cli_json(&["--no-reindex", "map"])?, json!(expected));
+    let refreshed = repo.cli_json(&["map", "src"])?;
+    assert_eq!(
+        map_names(refreshed.as_array().unwrap()),
+        strings(&["not_indexed"])
+    );
+    assert_eq!(mock.count(), 0);
+    for kind in ["code", "markdown", "descriptions", "combined"] {
+        let path = PathBuf::from(format!("{}.{kind}.usearch", repo.index.display()));
+        assert!(
+            !path.exists(),
+            "map created a vector sidecar: {}",
+            path.display()
+        );
+        assert!(!PathBuf::from(format!("{}.manifest.json", path.display())).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn map_filters_keep_ancestors_without_siblings_and_cli_combines_paths_kinds_and_repeated_filters()
+-> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("src/api.ts", "export class Api {\n  run(): number { return 1; }\n  skip(): number { return 2; }\n}\nexport class Other {\n  run(): number { return 3; }\n}\n")?;
+    repo.write("src/skip.ts", "export class Skip {}\n")?;
+    repo.write("outside.ts", "export class Outside {}\n")?;
+    repo.write(
+        "docs/guide.md",
+        "# Guide\n\n## Setup\n\nDetails.\n\n## Other\n\nOther details.\n",
+    )?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    let options = json!({"paths":["src"], "glob":["**/*.ts", "!**/skip.ts"], "regexp":["^API\\.RUN$", "^absent$"], "ignoreCase":true, "kinds":["methods"]});
+    let selected = engine.map(&options)?;
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0]["path"], "src/api.ts");
+    let nodes = selected[0]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0]["name"], "Api");
+    assert_eq!(nodes[1]["name"], "run");
+    assert_eq!(nodes[1]["parentId"], nodes[0]["id"]);
+    assert_eq!(nodes[1]["kind"], "method");
+    let parent = engine.map(&json!({"paths":["src/api.ts"], "regexp":"^Api$", "kinds":"class"}))?;
+    assert_eq!(
+        map_names(&parent),
+        strings(&["Api"]),
+        "matching a parent must not expand its children"
+    );
+    let markdown =
+        engine.map(&json!({"glob":"docs/**", "regexp":"^Guide\\.Setup$", "kinds":"headings"}))?;
+    assert_eq!(map_names(&markdown), strings(&["Guide", "Setup"]));
+    let md_nodes = markdown[0]["nodes"].as_array().unwrap();
+    assert_eq!(md_nodes[1]["parentId"], md_nodes[0]["id"]);
+    assert!(engine.map(&json!({"paths":["sr"]}))?.is_empty());
+    assert!(engine.map(&json!({"paths":["../outside"]})).is_err());
+    drop(engine);
+    assert_eq!(
+        repo.cli_json(&[
+            "--no-reindex",
+            "map",
+            "src",
+            "-g",
+            "**/*.ts",
+            "-g",
+            "!**/skip.ts",
+            "-e",
+            "^API\\.RUN$",
+            "-e",
+            "^absent$",
+            "-i",
+            "-k",
+            "methods",
+            "-k",
+            "headings"
+        ])?,
+        json!(selected)
+    );
+    Ok(())
+}
+
+#[test]
+fn map_then_semantic_prepare_and_structure_edit_never_reuses_stale_vectors() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write("code.rs", &function("alpha", "VECTOR_EAST"))?;
+    let mut map = repo.open_map(&config)?;
+    map.refresh_structure()?;
+    assert_eq!(mock.count(), 0);
+    drop(map);
+    let mut engine = repo.open(&config)?;
+    assert_incomplete(&engine);
+    assert_eq!(
+        mock.count(),
+        0,
+        "opening a pending index must not prepare it"
+    );
+    let prepared = engine.refresh()?;
+    assert_eq!(prepared["filesUpdated"], 0);
+    assert_eq!(prepared["filesPrepared"], 1);
+    let before = engine.search("east", "search-code", &all())?;
+    near(&before[0]["similarity"], 1.0);
+    let id = before[0]["function"]["id"].clone();
+    let calls = mock.count();
+    drop(engine);
+
+    repo.write("code.rs", &function("alpha", "BROKEN_EMBED VECTOR_NORTH"))?;
+    let mut map = repo.open_map(&config)?;
+    map.refresh_structure()?;
+    assert_eq!(map_names(&map.map(&json!({}))?), strings(&["alpha"]));
+    assert_eq!(mock.count(), calls);
+    drop(map);
+    let mut offline = config.clone();
+    offline["noReindex"] = json!(true);
+    let engine = repo.open(&offline)?;
+    assert_incomplete(&engine);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "cached search results cannot bypass readiness"
+    );
+    drop(engine);
+    mock.fail_on(Some("BROKEN_EMBED"));
+    let mut engine = repo.open(&config)?;
+    assert!(engine.refresh().is_err());
+    assert_incomplete(&engine);
+    drop(engine);
+    mock.fail_on(None);
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let after = engine.search("east", "search-code", &all())?;
+    assert_eq!(after[0]["function"]["id"], id);
+    near(&after[0]["similarity"], 0.0);
+    assert!(
+        after[0]["function"]["source"]
+            .as_str()
+            .unwrap()
+            .contains("VECTOR_NORTH")
+    );
+    Ok(())
+}
+
+#[test]
+fn embedding_profiles_switch_without_rebuild_and_reuse_each_warm_profile() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let a = mock.config();
+    let mut b = a.clone();
+    b["embeddingModel"] = json!("second-embedding-profile");
+    repo.write("code.rs", &function("alpha", "VECTOR_EAST"))?;
+    let mut engine = repo.open(&a)?;
+    engine.refresh()?;
+    let expected = engine.search("east", "search-code", &all())?;
+    let calls = mock.count();
+    drop(engine);
+    let mut offline_b = b.clone();
+    offline_b["noReindex"] = json!(true);
+    let engine = repo.open(&offline_b)?;
+    assert_eq!(engine.status()?["functionCount"], 1);
+    assert_incomplete(&engine);
+    assert_eq!(mock.count(), calls);
+    drop(engine);
+    let mut engine = repo.open(&b)?;
+    assert_eq!(engine.refresh()?["filesUpdated"], 0);
+    assert_eq!(engine.search("east", "search-code", &all())?, expected);
+    drop(engine);
+    let calls = mock.count();
+    for config in [&a, &b, &a] {
+        let mut engine = repo.open(config)?;
+        assert_eq!(engine.search("east", "search-code", &all())?, expected);
+        assert_eq!(engine.refresh()?["filesUpdated"], 0);
+        assert_eq!(engine.search("east", "search-code", &all())?, expected);
+        assert_eq!(
+            mock.count(),
+            calls,
+            "warm profile switch must not repeat paid work"
+        );
+    }
+    for model in ["integration-embedding", "second-embedding-profile"] {
+        let inputs: Vec<_> = mock
+            .requests("/embeddings")
+            .into_iter()
+            .filter(|request| request.body["model"] == model)
+            .flat_map(|request| request.body["input"].as_array().unwrap().clone())
+            .collect();
+        assert_eq!(
+            inputs.len(),
+            2,
+            "one document and query per profile: {model}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn partially_prepared_profile_rejects_search_and_reuses_successful_batches_on_retry() -> Result<()>
+{
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("a.rs", &function("ready", "VECTOR_EAST"))?;
+    repo.write("z.rs", &function("pending", "PROFILE_FAILURE VECTOR_NORTH"))?;
+    let a = mock.config();
+    let mut engine = repo.open(&a)?;
+    engine.refresh()?;
+    let expected = engine.search("east", "search-code", &all())?;
+    drop(engine);
+    let mut b = a.clone();
+    b["embeddingModel"] = json!("partial-profile");
+    mock.fail_on(Some("PROFILE_FAILURE"));
+    let mut engine = repo.open(&b)?;
+    assert!(engine.refresh().is_err());
+    assert_incomplete(&engine);
+    drop(engine);
+    let calls = mock.count();
+    let mut offline = b.clone();
+    offline["noReindex"] = json!(true);
+    let engine = repo.open(&offline)?;
+    assert_incomplete(&engine);
+    assert_eq!(mock.count(), calls);
+    drop(engine);
+    let engine = repo.open(&a)?;
+    assert_eq!(engine.search("east", "search-code", &all())?, expected);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "a failed new profile must not damage the old profile"
+    );
+    drop(engine);
+    mock.fail_on(None);
+    let mut engine = repo.open(&b)?;
+    engine.refresh()?;
+    assert_eq!(engine.search("east", "search-code", &all())?, expected);
+    let inputs: Vec<_> = mock
+        .requests("/embeddings")
+        .into_iter()
+        .filter(|request| request.body["model"] == "partial-profile")
+        .flat_map(|request| request.body["input"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| input.as_str().unwrap().contains("symbol: ready"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| input.as_str().unwrap().contains("PROFILE_FAILURE"))
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn shared_search_globs_precede_limit_and_markdown_regexes_match_heading_paths() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    let distractors: String = (0..48)
+        .map(|i| function(&format!("distractor_{i}"), "VECTOR_EAST"))
+        .collect();
+    repo.write("other/nearest.rs", &distractors)?;
+    repo.write("src/selected.rs", &function("Selected", "VECTOR_NORTH"))?;
+    repo.write("src/excluded.rs", &function("Excluded", "VECTOR_EAST"))?;
+    repo.write("docs/guide.md", "# Guide\n\nOverview VECTOR_EAST.\n\n## Install\n\nVECTOR_NORTH.\n\n## Usage\n\nVECTOR_MID.\n")?;
+    repo.write("other/guide.md", "# Guide\n\n## Install\n\nVECTOR_EAST.\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let options = json!({"glob":["src/**", "!src/excluded.rs"], "regexp":["^selected$", "^absent$"], "ignoreCase":true, "limit":1, "minSimilarity":-1});
+    let selected = engine.search("east", "search-code", &options)?;
+    assert_eq!(names(&selected), strings(&["Selected"]));
+    near(&selected[0]["similarity"], 0.0);
+    let restored = engine.search("east", "search-code", &json!({"glob":["src/**", "!src/excluded.rs", "src/excluded.rs"], "limit":1, "minSimilarity":-1}))?;
+    assert_eq!(
+        names(&restored),
+        strings(&["Excluded"]),
+        "the last matching glob wins"
+    );
+    let md_options = json!({"glob":["docs/**"], "regexp":["^guide\\.install$", "^absent$"], "ignoreCase":true, "limit":1, "minSimilarity":-1});
+    let md = engine.search("east", "search-md", &md_options)?;
+    assert_eq!(md.len(), 1);
+    assert_eq!(md[0]["chunk"]["path"], "docs/guide.md");
+    assert_eq!(md[0]["chunk"]["headingPath"], json!(["Guide", "Install"]));
+    near(&md[0]["similarity"], 0.0);
+    let calls = mock.count();
+    drop(engine);
+    assert_eq!(
+        repo.cli_json(&[
+            "--no-reindex",
+            "search-code",
+            "east",
+            "-g",
+            "src/**",
+            "-g",
+            "!src/excluded.rs",
+            "-e",
+            "^selected$",
+            "-e",
+            "^absent$",
+            "-i",
+            "--limit",
+            "1",
+            "--threshold",
+            "-1"
+        ])?,
+        json!(selected)
+    );
+    assert_eq!(
+        repo.cli_json(&[
+            "--no-reindex",
+            "search-md",
+            "east",
+            "-g",
+            "**/*.md",
+            "-g",
+            "!other/**",
+            "-e",
+            "^guide\\.install$",
+            "-e",
+            "^absent$",
+            "-i",
+            "--limit",
+            "1",
+            "--threshold",
+            "-1"
+        ])?,
+        json!(md)
+    );
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn shared_cross_filters_select_sources_without_filtering_targets() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("src/source.rs", &function("Source", "VECTOR_EAST"))?;
+    repo.write("src/excluded.rs", &function("Excluded", "VECTOR_NORTH"))?;
+    repo.write("targets/peer.rs", &function("Peer", "VECTOR_MID"))?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let calls = mock.count();
+    let rows = engine.cross_search(None, &json!({"glob":["src/**", "!src/excluded.rs"], "regexp":["^source$", "^absent$"], "ignoreCase":true, "matches":1, "minSimilarity":-1}))?;
+    assert_eq!(sources(&rows), strings(&["Source"]));
+    assert_eq!(
+        names(rows[0]["matches"].as_array().unwrap()),
+        strings(&["Peer"])
+    );
+    near(&rows[0]["matches"][0]["similarity"], 0.8);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn rerank_and_task_description_caches_survive_restart_and_unrelated_generation_changes()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["rerankingEnabled"] = json!(true);
+    repo.write("selected.rs", &function("selected", "VECTOR_EAST"))?;
+    repo.write("unrelated.rs", &function("other", "VECTOR_NORTH"))?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let options = json!({"glob":"selected.rs", "minSimilarity":-1});
+    let ranked = engine.search("east", "search-code", &options)?;
+    let answer = engine.describe("east", &options)?;
+    assert_eq!(mock.requests("/responses").len(), 1);
+    let calls = mock.count();
+    assert_eq!(engine.describe("east", &options)?, answer);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "repeated task descriptions reuse their paid answer"
+    );
+    let generation = engine.status()?["generation"].as_u64().unwrap();
+    // This only shifts an excluded callable's position; all paid inputs are identical.
+    repo.write(
+        "unrelated.rs",
+        &(String::from("\n\n") + &function("other", "VECTOR_NORTH")),
+    )?;
+    engine.refresh()?;
+    assert!(engine.status()?["generation"].as_u64().unwrap() > generation);
+    assert_eq!(engine.search("east", "search-code", &options)?, ranked);
+    assert_eq!(engine.describe("east", &options)?, answer);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "identical query, rerank documents and explanation prompt survive generation changes"
+    );
+    drop(engine);
+    // Force query-result misses so persistence of paid artifacts is independently tested.
+    repo.db()?.execute("DELETE FROM search_cache", [])?;
+    let engine = repo.open(&config)?;
+    assert_eq!(engine.search("east", "search-code", &options)?, ranked);
+    assert_eq!(engine.describe("east", &options)?, answer);
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn schema3_file_columns_are_authoritative_for_saved_description_context() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    let source = function("saved", "VECTOR_EAST");
+    repo.write("code.rs", &source)?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let expected = engine.search("east", "search-code", &all())?;
+    drop(engine);
+    repo.db()?.execute("UPDATE files SET data='{}'", [])?;
+    fs::remove_file(repo.root.join("code.rs"))?;
+    let engine = repo.open(&config)?;
+    assert_eq!(engine.search("east", "search-code", &all())?, expected);
+    engine.describe("east", &json!({"minSimilarity":0.9}))?;
+    let requests = mock.requests("/responses");
+    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let context: Value = serde_json::from_str(prompt)?;
+    assert_eq!(context["files"][0]["content"], source);
     Ok(())
 }

@@ -18,9 +18,12 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/cli.rs` | Clap commands/validation, root-selected JSON configuration, interactive prompts, summary/JSON/JSONL output, connected-component clusters. |
 | `src/ui.rs` | Shared cliclack progress and diagnostic rendering on terminal stderr, plain redirected diagnostics, synchronized provider notices. |
 | `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, search/filtering/fusion/reranking, cross-search, and task explanation context. |
+| `src/filter.rs` | Shared ordered path globs, qualified-name regexes, and map kind selection with ancestor context. |
+| `src/map.rs` | Compact structure summaries from canonical metadata; display-only truncation. |
 | `src/parse/mod.rs` | Shared parsing result types, file-language detection, and dispatch to code or Markdown parsing. |
 | `src/parse/code.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery. |
-| `src/parse/markdown.rs` | Heading-aware bounded Markdown chunks, fence and comment handling. |
+| `src/parse/structure.rs`, `src/parse/imports.rs` | Canonical declarations, signatures, hierarchy, source ranges, and imported bindings/aliases. |
+| `src/parse/markdown.rs` | Structural heading hierarchy and separate bounded Markdown search chunks, fence and comment handling. |
 | `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits and hosted implementations, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
 | `src/storage.rs` | Authoritative SQLite records, artifact/result caches, transactional live-state reconciliation, schema validation. |
 | `src/vectors.rs` | Persistent incremental filtered F32 cosine USearch HNSW indexes and validated sidecar publication/recovery. |
@@ -60,34 +63,64 @@ requests; credentials are resolved only on a request. Saved description state
 and, when neither provider nor model is explicit, the saved description profile
 can supply engine defaults.
 
+`map` uses the structure-only open/refresh path: SQLite and local parsing, without
+provider requests or USearch sidecars. `--no-reindex` reads stored structure.
+Map paths are root-relative (or absolute within the root) and select output from
+the indexed universe, not the discovery scope. Semantic refresh subsequently
+prepares any missing embeddings, including for files unchanged since map refresh.
+
+Shared selectors compile ordered `ignore::overrides` path rules and an ORed Rust
+`RegexSet`; `-i` affects regexes only. Positive globs require a match, `!` excludes,
+and the last matching rule wins. Query names use callable `qualifiedName` or
+Markdown heading paths joined with `.`. Map shares qualified names, qualifies
+extra declaration bindings in their enclosing scope, and exposes import paths
+and aliases. Its kind/name
+matches retain ancestors as context without expanding unmatched children.
+Cross-search applies selectors only to sources, intersecting path/Git selection.
+
 ### SQLite schema and artifacts
 
-SQLite is the authority. Native schema **2** uses six unprefixed tables and the
-`items_path` index on `items(path)`.
+SQLite is the authority. Native schema **3** separates canonical structure,
+search units, and model-specific embedding associations into normalized tables.
+Compatibility JSON `data` snapshots remain alongside explicit columns in files,
+search units, and diagnostics; the layout does not fully deduplicate payloads.
 
 | Table | Contents |
 | --- | --- |
-| `metadata` | Identity (canonical root, schema, embedding profile), generation, Git checkpoint, description enabled/profile settings. |
-| `files` | Path-keyed serialized file snapshots: source/hash/language, Git or working-tree provenance, file description/hash/vector key, diagnostics. |
-| `items` | Callable/Markdown records, stable integer IDs, unique logical identities, metadata/source, code/chunk and optional callable-description vector references. |
+| `metadata` | Identity (canonical root and schema), generation, Git checkpoint, active embedding profile, description enabled/profile settings. |
+| `files` | Path-keyed source/hash/language, provenance, parser version/structure hash, and compatibility snapshot. |
+| `symbols` | File-local declaration IDs/parents, order, kinds, qualified names, complete signatures, source ranges, and metadata. |
+| `symbol_names` | Ordered declared/imported names and aliases linked to symbols. |
+| `search_units` | Callable/Markdown records with stable integer IDs, unique logical identities, optional symbol links, compatibility data, and embedding-input hashes. |
+| `unit_embeddings` | Search-unit vector associations by role, profile, and input hash. |
+| `descriptions` | Live file/callable descriptions, source hashes, and optional vector references. |
+| `diagnostics` | Per-file read/parse/extraction diagnostics with structured columns and compatibility data. |
 | `embeddings` | Content-addressed document/query embeddings stored as little-endian F32 blobs. |
-| `cache` | Parsed-file artifacts and generated descriptions, keyed by kind and cache key. |
+| `cache` | Durable parse and model-generated artifacts, keyed by kind and content-addressed cache key. |
 | `search_cache` | Serialized query and cross-search result rows, separate from reusable model/parse artifacts. |
 
 Callable identity hashes path, qualified name, kind, and same-name occurrence;
 Markdown identity hashes path and chunk ordinal. Reconciliation preserves item
 IDs across source edits/line shifts when identity is unchanged. Deleting a file
-cascades to its items. Foreign keys also link item vectors to the embedding table.
+cascades to its structure and search units. Foreign keys link units to symbols
+and vector associations to the embedding table. Structure publication can create
+search units with no embeddings; canonical records do not depend on a model.
 
 Parse keys contain parser version, path, and source hash. Embedding keys contain
 the embedding profile, query/document operation, and full input. Description keys
 include the configured generator profile and file or callable source identity;
 explicit callable regeneration also includes the enclosing file hash. Completed
-artifacts are persisted independently of the final live update. The engine
-persists each successful embedding batch before requesting the next, so later
+artifacts are persisted independently of the final live update and result cache,
+remaining reusable across generation changes and failed-refresh retries. The
+engine persists each successful embedding batch as it completes, so later
 failures do not discard earlier paid batches. Unchanged callable descriptions
 and stale file descriptions can survive profile changes until work explicitly
 requires their regeneration; a profile change is not a blanket regeneration.
+
+Rerankings and task explanations also have durable artifact caches, independent
+of the generation-keyed search-result cache. Their keys include the model
+configuration and complete query/documents or explanation prompt. An unrelated
+structural change can invalidate result rows without repeating those paid calls.
 
 Query-result keys include generation, enabled state, effective config, query,
 kind, and options. Cross-search keys include source/target generations, canonical
@@ -95,8 +128,8 @@ target database path, scoring kind, resolved changed-since commit, saved checkpo
 and options. A moving Git branch is resolved before cache lookup and its ancestry
 is checked again. Dirty live publication clears the local search-result cache.
 
-This is a clean schema break: databases with the old `rust_`-prefixed tables or
-TypeScript layouts are rejected. There is no legacy import or migration, and
+This is a hard schema cutoff: all schema-2 databases, old `rust_`-prefixed tables,
+and TypeScript layouts are rejected. There is no legacy import or migration, and
 `--force-reindex` cannot bypass old-layout rejection. Remove the existing SQLite
 index and rebuild with `slopdex update-git`, or select a new database with
 `slopdex --index /path/to/new-index.sqlite update-git`. See the
@@ -116,20 +149,28 @@ Refresh proceeds as follows:
 1. Read current Git HEAD if available and collect dirty/untracked paths. Walk the
    current filesystem with ignore rules, built-in exclusions, include/exclude
    globs, supported extensions, and the size limit.
-2. Compare source hashes and provenance to saved files. Prepare changed/failed
-   files and files missing enabled descriptions; remove paths no longer eligible.
-   Save reusable parse/model artifacts as they complete. Read/size failures become
+2. Compare source hashes, parser versions, and provenance to saved files. Parse
+   changed/failed files and remove paths no longer eligible. Save reusable parse
+   artifacts as they complete. Read/size failures become
    diagnostic file records, and parser errors can coexist with healthy callables.
-3. Before publication, verify HEAD is unchanged and re-read every successfully
-   prepared file to verify its hash. Failures abort live publication but leave
-   completed artifacts available for retry. This is optimistic validation, not an
+3. Before structural publication, verify HEAD is unchanged and re-read every
+   successfully parsed file to verify its hash. Failures abort publication but leave
+   completed parse artifacts available for retry. This is optimistic validation, not an
    atomic filesystem snapshot; unchanged files and discovery are not revalidated
    as a full filesystem transaction.
-4. In one SQLite transaction, reconcile live files/items, checkpoint, generation,
-   and result-cache invalidation. Generation advances for file/item changes;
-   checkpoint-only updates do not increment it. Description enabled/profile
-   metadata is written separately after that transaction.
-5. Load the committed SQLite snapshot and reconcile the derived USearch indexes.
+4. In one SQLite transaction, reconcile files, symbols, pending search units,
+   diagnostics, checkpoint, generation, and result-cache invalidation.
+   Generation advances for live-record changes; checkpoint-only updates do not
+   increment it. Map reads this structure without opening sidecars.
+5. Semantic refresh prepares missing active-profile embeddings and enabled
+   descriptions, including for files unchanged since a map refresh. Each completed
+   model artifact is saved immediately. After rechecking HEAD and prepared source
+   hashes, a second transaction publishes semantic associations and descriptions.
+   Provider or publication failure leaves the committed structure available and
+   paid artifacts reusable. Incomplete configured semantic projections cannot be
+   searched with `--no-reindex`; refresh finishes their preparation first.
+6. Load the committed semantic snapshot and reconcile USearch indexes. Description
+   enabled/profile settings are saved separately from live-record publication.
 
 Git records provenance and a checkpoint, while all indexed source comes from the
 working tree. `update-git --target` supports HEAD only. Changed-since selection
@@ -138,18 +179,22 @@ uncommitted selection uses saved file provenance, including unchanged callables
 inside dirty files. Without HEAD, files are working-tree records.
 
 Native `noReindex` skips refresh entirely, even for an empty database. Opening can
-still write metadata or repair sidecars; it is not read-only.
+still write metadata or, for semantic operations, repair sidecars; it is not
+read-only. Map reads saved structure without provider or sidecar work.
 Offline status/cross-search use the saved native snapshot, while uncached query
 embedding/reranking and task descriptions still call providers. The CLI sets
 `noReindex` from `--no-reindex`, overriding a JSON value. `reindex-files` is an
 explicit operation on saved source snapshots, not a new filesystem scan after
 the automatic refresh.
 
-Within the current table layout, an incompatible native identity (such as a
-changed root or embedding profile) can be reset with
-`--force-reindex --yes-really-rebuild-the-index`: live records, metadata, and result
-caches are cleared while reusable artifacts/vectors remain. A compatible identity
-is not reset just because the flag is present. The accepted rebuild-on-divergence
+Embedding profiles are separate from structural identity. Changing provider,
+model, or dimensions selects/prepares a new semantic projection without resetting
+structure; older cached profile artifacts remain reusable.
+
+Within schema 3, an incompatible root can be reset with
+`--force-reindex --yes-really-rebuild-the-index`: live records, non-identity
+metadata, and result caches are cleared while reusable artifacts/vectors remain.
+A compatible identity is not reset just because the flag is present. The accepted rebuild-on-divergence
 option currently adds no engine behavior; refresh does not enforce checkpoint
 ancestry.
 

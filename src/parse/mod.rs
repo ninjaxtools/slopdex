@@ -5,7 +5,11 @@
 //! parser initialization/failure is returned as an error.
 
 mod code;
+mod imports;
 mod markdown;
+mod structure;
+
+pub use structure::{FileStructure, ImportBinding, StructureNode};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -53,6 +57,8 @@ pub struct ParsedFile {
     pub callables: Vec<Callable>,
     pub chunks: Vec<MarkdownChunk>,
     pub errors: Vec<Diagnostic>,
+    #[serde(default)]
+    pub structure: FileStructure,
 }
 
 pub fn language_for_path(path: &str) -> Option<&'static str> {
@@ -80,6 +86,7 @@ pub fn parse(path: &str, source: &str) -> Result<ParsedFile> {
     match language_for_path(path) {
         Some("markdown") => Ok(ParsedFile {
             chunks: markdown::parse(source),
+            structure: markdown::structure(source),
             ..ParsedFile::default()
         }),
         Some(language) => code::parse(language, path, source),

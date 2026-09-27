@@ -19,6 +19,8 @@ The main supported functions are
    <br/>find clusters of similar code/docs
 - `slopdex describe <query>`
    <br/>explain code relevant to a task
+- `slopdex map [PATH]...`
+   <br/>show code declarations and Markdown headings without model calls
 
 `search` does a vector searche of code, and markdown, and when enabled generated code descriptions.
 
@@ -44,7 +46,8 @@ cargo install --path . --locked
 
 ## Getting started
 
-An embedding-provider API key is required. You can use either OpenAI or Jina.
+Semantic search requires an embedding-provider API key from OpenAI or Jina.
+`slopdex map` works locally without a provider or API key.
 
 ```console
 $ export OPENAI_API_KEY="your-api-key"
@@ -52,7 +55,32 @@ $ slopdex search "validate an authenticated session"
 ...
 ```
 
-The index tracks the current git commit and is created or updated on every command and stored in `.slopdex/index.sqlite`. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
+Index commands normally refresh the current working tree and git checkpoint in `.slopdex/index.sqlite`; `--no-reindex` uses the saved index. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
+
+### Structure map
+
+```console
+$ slopdex map src docs
+$ slopdex map src -g '*.rs' -k fns -e 'refresh|search'
+$ slopdex map -g '*.md' -e '^Guide\.Setup' -i --format json
+$ slopdex map --no-reindex
+```
+
+Paths are root-relative files or recursive directories; absolute paths within the
+root also work. The default summary shows declarations, signatures, and line
+ranges; JSON retains full selected structure metadata. `-k fns` includes methods.
+Map refreshes only local structure in SQLite, without providers or vector sidecars.
+Later semantic commands prepare missing embeddings during their normal refresh.
+
+Map, search, describe, and cross-search share repeatable `-g` path globs and `-e`
+name regexes. Globs use ordered ignore-style overrides: `!` excludes, the last
+matching rule wins, and positive rules require a match. They select indexed files;
+they cannot override indexing exclusions. Regexes are ORed; `-i` ignores case.
+Cross-search applies these selectors only to sources, intersecting its path/Git
+filters. See the [selector reference](docs/reference.md#shared-selectors).
+
+Existing schema-2 indexes must be removed and rebuilt or replaced with a new index
+path; schema 3 has no migration. See [rebuild instructions](docs/reference.md#rebuilding-an-old-index).
 
 ### Search
 

@@ -40,6 +40,7 @@ can also follow the command. Quote multiword queries.
 | `search-md <query>` | Search heading-aware `.md`/`.markdown` chunks. | Summary with chunk text |
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
+| `map [PATH]...` | Refresh local structure and show code declarations/Markdown headings without providers or vector sidecars. | Summary |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index-errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update-git` | Explicitly refresh the current working tree and Git HEAD, when available. Alias: `refresh`; `--target` accepts only `HEAD`. | JSON refresh statistics |
@@ -79,6 +80,8 @@ Advanced endpoint/HTTP settings are edited in JSON.
 
 Help, version, configuration, and model-catalog commands do not refresh the index.
 Other commands open it and normally refresh before doing their work.
+`map` refreshes only local structure; semantic commands also prepare missing
+embeddings and enabled descriptions.
 
 On terminal stderr, cliclack displays progress for catalog loading, opening and
 refreshing indexes, searches, explanations, and description regeneration.
@@ -98,6 +101,70 @@ runtime errors use the same terminal styling. Redirected stderr and `TERM=dumb`
 use plain diagnostics without animations; result data on stdout retains its
 summary/JSON/JSONL format.
 
+## Structure map
+
+```text
+slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--format summary|json]
+```
+
+With no paths, map selects the indexed repository. Paths select files or recursive
+directories and are relative to `--root`, including when invoked from another
+working directory. Absolute paths within the root are accepted; paths outside it
+are rejected. Multiple paths form a union, intersected with the shared selectors.
+
+Map normally refreshes local file snapshots, declarations, headings, search units,
+and diagnostics in SQLite. It makes no provider requests, generates no descriptions
+or embeddings, and does not open/rebuild USearch sidecars. `map --no-reindex` reads stored
+SQLite structure without reading current source files. Selection narrows output,
+not repository indexing; the normal indexing ignore/include/exclude rules apply.
+
+`-k`, `--kind` (alias `--kinds`) accepts repeated or comma-separated kinds.
+`fns`/`functions` groups functions, methods, constructors, and generators;
+`methods` selects methods alone. `types` groups aliases, classes, structs, unions,
+interfaces, traits, and enums. Other selectors include `imports`, `modules`,
+`consts`, `variables`, `fields`, `variants`, `impls`, `macros`, and `headings`.
+Kinds are ORed and intersect name regexes. Matching nodes retain their ancestors
+as context; a matching parent does not automatically include unmatched children.
+
+Summary output groups declarations with signatures and inclusive line ranges.
+Long signatures and child lists can be truncated for display. JSON is an array of
+file objects with `path` and `nodes`, retaining full selected metadata: file-local
+`id`/`parentId`, kind, names, `qualifiedName`, signature, attributes, import
+bindings, heading level, and source ranges. Byte offsets are zero-based and
+half-open; lines and UTF-8 byte columns are one-based with exclusive ends.
+
+```bash
+slopdex map src docs -g '*.rs' -g '*.md'
+slopdex map src -k fns,types -e '^Engine\.'
+slopdex map -k imports -e 'HashMap|MapAlias' --format json
+slopdex map docs -k headings -e '^Guide\.Setup' -i --no-reindex
+```
+
+## Shared selectors
+
+Map, query searches, `describe`, and cross-search accept:
+
+- `-g`, `--glob <GLOB>`: repeatable, case-sensitive globs over root-relative file
+  paths. Uses ignore-style override rules: positive patterns include, `!` patterns
+  exclude, and the last matching rule wins. If any positive rule exists, a path
+  must match one; with only exclusions, other paths remain eligible. These select
+  the indexed universe and never reopen files excluded by indexing configuration
+  or discovery ignore rules. Quote patterns, for example `-g '*.rs' -g '!tests/**'`.
+- `-e`, `--regexp <REGEXP>` (alias `--regex`): repeatable, case-sensitive **Rust
+  regexes**, ORed together. Callable searches match `qualifiedName`, with no anchor
+  rewriting or implicit bare-name fallback. Map uses the same qualified-name contract,
+  including extra bindings qualified in their enclosing scope, and matches import
+  paths and aliases. Markdown
+  names are heading paths joined with `.`, for example `Guide.Setup`.
+  Look-around and backreferences are unsupported.
+- `-i`, `--ignore-case`: case-insensitive regex matching; does not change glob
+  matching.
+
+Path and name selection intersect and apply before query result limits, including
+to Markdown results. Cross-search applies these selectors **only to sources**,
+intersecting `--source-path`, `--changed-since`, and `--uncommitted`; candidate
+neighbors remain eligible regardless of source selectors. `-k` is map-only.
+
 ## Search and analysis options
 
 Common query/cross-search filters:
@@ -109,10 +176,7 @@ Common query/cross-search filters:
   Markdown), or the context matches for `describe`. For cross-search it caps
   emitted clusters or matched-source rows **after all selected sources are
   searched**.
-- `-e`, `--regexp`, or `--regex`: case-sensitive **Rust regex** over qualified
-  callable names. Applied before query result limits; Markdown is unaffected.
-  For cross-search it filters sources only. Look-around and backreferences are
-  unsupported by this regex engine.
+- `-g`, `-e`, and `-i`: the [shared selectors](#shared-selectors).
 
 `search` accepts `--code`, `--descriptions`, and `--md`. With no selector, it
 searches all available kinds; any selector makes selection explicit. Explicit
@@ -231,7 +295,7 @@ Cohesion changes the order of each source's selected semantic matches. Distance
 is `0` in one file, `1` between files in one directory, and `1` plus directory-tree
 hops otherwise. It does not alter similarity or the neighbor selection score.
 
-`--format json` produces query/diagnostic/model arrays, configuration/status
+`--format json` produces map/query/diagnostic/model arrays, configuration/status
 objects, and **JSONL for cross-search** (one object per matched source).
 `--format clusters` is valid only for cross-search without cohesion. Results go
 to stdout and warnings/errors to stderr. Clap argument errors exit with `2`;
@@ -251,8 +315,7 @@ The engine does not reread live files for this context or retry with whole-file
 content removed. Provider retries/failover still apply. JSON output contains
 `query`, `description`, `files`, and `functions`; full source and embedding input
 are stripped from returned function metadata. Reranker order informs the prompt,
-but `rerankScore` is not copied to the returned `functions` array. The generated
-task explanation itself is not cached.
+but `rerankScore` is not copied to the returned `functions` array.
 
 ## Index lifecycle and persistence
 
@@ -261,11 +324,19 @@ task explanation itself is not cached.
 The default database is `<root>/.slopdex/index.sqlite`. SQLite is authoritative
 for file snapshots, callable/chunk records, provenance, diagnostics, descriptions,
 document/query vectors, reusable artifacts, metadata, and cached search results.
-Native schema **2** has six tables: `metadata`, `files`, `items`, `embeddings`,
-`cache`, and `search_cache`, plus the `items_path` index on `items(path)`.
-Parse results and successful description/embedding artifacts are committed before
-the final live-record transaction, so interrupted indexing can reuse completed
-work. Live changes update the generation and invalidate cached search results.
+Native schema **3** has normalized `files`, `symbols`, `symbol_names`,
+`search_units`, `unit_embeddings`, `descriptions`, and `diagnostics` tables, plus
+`cache`, `embeddings`, `metadata`, and `search_cache`. Compatibility JSON snapshots
+remain alongside columns; this is not a fully deduplicated representation.
+Canonical structure and search units exist independently of semantic embeddings.
+After a map-only refresh, a semantic command's normal refresh prepares missing
+vectors for its active profile.
+
+Content-addressed parse and model-generated artifacts are durable independently
+of live generations and search-result caches. Completed description/embedding
+work is persisted before final live publication, so retries after an interrupted
+refresh can reuse it. Live changes update the generation and invalidate search
+results without discarding those reusable artifacts.
 
 Persistent derived indexes sit beside the database:
 `<index>.code.usearch`, `<index>.markdown.usearch`, and, when descriptions are
@@ -309,20 +380,25 @@ offline when the matching artifacts/results exist. Catalog commands still fetch
 their catalogs. Use the CLI flag: the CLI overwrites a JSON `noReindex` value with
 the flag's value on every invocation.
 
-Native index identity includes canonical root, native schema, and embedding
-profile (provider/model/dimensions/strategy). Within the current table layout,
-identity changes such as a different root or embedding profile require
+`map --no-reindex` needs neither providers nor sidecar repair. A structure-only
+index can have search units without vectors; `--no-reindex` does not prepare those
+missing vectors. Run a semantic command with normal refresh to prepare them.
+
+Native index identity includes canonical root and schema. Embedding profiles
+(provider/model/dimensions/strategy) are separate projections: changing a model
+does not reset structural data, and cached vectors from older profiles remain
+available for reuse. Within schema 3, changing the root requires
 `--force-reindex --yes-really-rebuild-the-index`. This clears native live records,
-metadata, and search results while retaining artifact/vector caches. A compatible
-index follows normal refresh even with that flag. It conflicts with
+non-identity metadata, and search results while retaining artifact/vector caches.
+A compatible index follows normal refresh even with that flag. It conflicts with
 `--no-reindex`. `--rebuild-on-divergence` is accepted with the same confirmation,
 but the current engine refreshes the working tree without a divergence gate;
 the flag adds no engine behavior.
 
 ### Rebuilding an old index
 
-Native schema **2** is a clean break from the old `rust_`-prefixed native tables
-and TypeScript database layouts, including schema 11. Those databases are
+Native schema **3** is a hard cutoff: **all schema-2 indexes**, old
+`rust_`-prefixed native tables, and TypeScript layouts (including schema 11) are
 rejected with instructions to remove the existing SQLite index and rebuild, or
 choose a new index path. There is no legacy import or migration, and neither
 `--force-reindex` nor `--no-reindex` bypasses old-layout rejection.
@@ -348,6 +424,9 @@ config. Rebuilding scans current files and regenerates embeddings and enabled
 descriptions using the configured providers; old database artifacts and saved
 description settings are not imported. Derived USearch sidecars are reconciled
 or rebuilt from the new SQLite snapshot.
+
+Use `slopdex map` instead of `update-git` to build only local structure without
+provider calls; semantic refresh can prepare embeddings later.
 
 ### Coverage and failures
 

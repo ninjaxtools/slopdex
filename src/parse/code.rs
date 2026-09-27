@@ -44,6 +44,7 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
     collector.candidates.sort_by_key(|c| c.node.start_byte());
     let mut result = ParsedFile {
         errors: diagnostics(tree.root_node(), source, &collector.candidates),
+        structure: super::structure::extract(language, tree.root_node(), source),
         ..ParsedFile::default()
     };
     for candidate in collector.candidates {
