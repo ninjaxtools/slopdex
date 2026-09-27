@@ -168,9 +168,11 @@ impl Drop for Mock {
             let joined = worker.join();
             if !thread::panicking() {
                 assert!(joined.is_ok(), "mock server thread panicked");
+                let state = self.state.lock().unwrap();
                 assert!(
-                    self.state.lock().unwrap().errors.is_empty(),
-                    "mock protocol failure"
+                    state.errors.is_empty(),
+                    "mock protocol failure: {:?}",
+                    state.errors
                 );
             }
         }
@@ -178,6 +180,9 @@ impl Drop for Mock {
 }
 
 fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
+    // Windows accepted sockets inherit the listener's nonblocking mode.
+    // Request parsing needs blocking I/O, bounded by the timeouts below.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut reader = BufReader::new(&mut stream);
