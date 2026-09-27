@@ -99,7 +99,7 @@ class SlopdexOpenCodeOptions(OpenCodeOptions):
     )
     prebuild_index: bool = Field(
         default=True,
-        description="Run `slopdex update-git` before the agent starts.",
+        description="Run `slopdex update` before the agent starts.",
     )
     prebuild_timeout_sec: int = Field(
         default=0,
@@ -498,7 +498,7 @@ class SlopdexOpenCode(OpenCode):
                 environment,
                 command=(
                     'ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; '
-                    'cd "$ROOT"; slopdex update-git'
+                    'cd "$ROOT"; slopdex update'
                 ),
                 env=env,
                 timeout_sec=self._prebuild_timeout_sec,

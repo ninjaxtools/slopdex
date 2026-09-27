@@ -43,7 +43,7 @@ can also follow the command. Quote multiword queries.
 | `map [PATH]...` | Refresh local structure and show code declarations/Markdown headings without providers or vector sidecars. | Summary |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index-errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
-| `update-git` | Explicitly refresh the current working tree and Git HEAD, when available. Alias: `refresh`; `--target` accepts only `HEAD`. | JSON refresh statistics |
+| `update` | Explicitly refresh the current working tree and Git HEAD, when available. Alias: `refresh`; `--target` accepts only `HEAD`. | JSON refresh statistics |
 | `descriptions <enable\|disable>` | Apply description state to the index and save it in config; retain reusable caches. | JSON status |
 | `reindex-files [--callables]` | Regenerate stale file descriptions from indexed source; optionally regenerate their callable descriptions too. Requires enabled descriptions. | JSON statistics |
 | `models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
@@ -410,15 +410,15 @@ the repository root:
 
 ```bash
 rm -f .slopdex/index.sqlite .slopdex/index.sqlite-wal .slopdex/index.sqlite-shm
-slopdex update-git
+slopdex update
 ```
 
 For a custom database, remove that SQLite file and its `-wal`/`-shm` companions,
-then run `slopdex --index /path/to/index.sqlite update-git`. To rebuild at a new,
+then run `slopdex --index /path/to/index.sqlite update`. To rebuild at a new,
 unused path instead:
 
 ```bash
-slopdex --index /path/to/new-index.sqlite update-git
+slopdex --index /path/to/new-index.sqlite update
 ```
 
 Use that same `--index` path on subsequent commands, or save it as `indexPath` in
@@ -427,7 +427,7 @@ descriptions using the configured providers; old database artifacts and saved
 description settings are not imported. Derived USearch sidecars are reconciled
 or rebuilt from the new SQLite snapshot.
 
-Use `slopdex map` instead of `update-git` to build only local structure without
+Use `slopdex map` instead of `update` to build only local structure without
 provider calls; semantic refresh can prepare embeddings later.
 
 ### Coverage and failures

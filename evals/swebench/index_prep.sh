@@ -87,7 +87,7 @@ restore() {
 
 prebuild_and_store() {
   [[ "${PREBUILD_INDEX:-true}" == "true" ]] || return 0
-  if ! sloxec_env "slopdex update-git"; then
+  if ! sloxec_env "slopdex update"; then
     echo "prebuild failed, agent will build lazily" >&2
     return 0
   fi

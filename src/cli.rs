@@ -109,7 +109,7 @@ enum Command {
     IndexErrors,
     /// Refresh the current working tree and Git HEAD; alias: refresh
     #[command(alias = "refresh")]
-    UpdateGit(UpdateArgs),
+    Update(UpdateArgs),
     /// Enable/disable generated descriptions; preserves cached descriptions
     Descriptions { action: Toggle },
     /// Regenerate stale file descriptions, optionally including their callables
@@ -371,7 +371,7 @@ impl CrossArgs {
 
 #[derive(Debug, Args)]
 struct UpdateArgs {
-    /// This refresh alias currently supports HEAD only
+    /// This update command currently supports HEAD only
     #[arg(long, default_value = "HEAD", value_parser = ["HEAD"])]
     target: String,
 }
@@ -666,7 +666,7 @@ pub fn run() -> Result<()> {
         }
         Command::Status => print_json(&mut out, &engine.status()?)?,
         Command::IndexErrors => print_errors(&mut out, &engine.errors()?, format)?,
-        Command::UpdateGit(_) => print_json(
+        Command::Update(_) => print_json(
             &mut out,
             &refreshed.unwrap_or(json!({"refreshed": false, "noReindex": true})),
         )?,
@@ -2272,7 +2272,7 @@ mod tests {
             "100",
         ]);
         parse(&[
-            "update-git",
+            "update",
             "--force-reindex",
             "--yes-really-rebuild-the-index",
         ]);

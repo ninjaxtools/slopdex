@@ -131,8 +131,8 @@ is checked again. Dirty live publication clears the local search-result cache.
 This is a hard schema cutoff: all schema-2 databases, old `rust_`-prefixed tables,
 and TypeScript layouts are rejected. There is no legacy import or migration, and
 `--force-reindex` cannot bypass old-layout rejection. Remove the existing SQLite
-index and rebuild with `slopdex update-git`, or select a new database with
-`slopdex --index /path/to/new-index.sqlite update-git`. See the
+index and rebuild with `slopdex update`, or select a new database with
+`slopdex --index /path/to/new-index.sqlite update`. See the
 [rebuild instructions](reference.md#rebuilding-an-old-index) for the default path.
 
 ### Refresh snapshots and locking
@@ -173,7 +173,7 @@ Refresh proceeds as follows:
    enabled/profile settings are saved separately from live-record publication.
 
 Git records provenance and a checkpoint, while all indexed source comes from the
-working tree. `update-git --target` supports HEAD only. Changed-since selection
+working tree. `update --target` supports HEAD only. Changed-since selection
 parses base-commit files and compares qualified-name/source-hash pairs;
 uncommitted selection uses saved file provenance, including unchanged callables
 inside dirty files. Without HEAD, files are working-tree records.
