@@ -48,8 +48,7 @@ cargo install --path . --locked
 
 ## Getting started
 
-Semantic search requires an embedding-provider API key from OpenAI or Jina. `slopdex map` doesn't
-use vector search and works locally without a provider or API key.
+Vector search requires an embedding-provider API key from OpenAI or Jina.
 
 ```console
 $ export OPENAI_API_KEY="your-api-key"
@@ -60,6 +59,8 @@ $ slopdex search "validate an authenticated session"
 The index tracks the current git commit and is created or updated on every command and stored in `.slopdex/index.sqlite`. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
 
 ### Code map/skeleton
+
+`slopdex map` doesn't use vector search and works locally without a provider or API key.
 
 ```console
 $ slopdex map src docs
