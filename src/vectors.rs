@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -396,7 +396,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&temp.0, path).with_context(|| format!("replace {}", path.display()))?;
     // Persist the directory entry as well as file contents on Unix.
     #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -445,7 +445,7 @@ mod tests {
 
     fn mark_old(path: &Path) -> std::time::SystemTime {
         let time = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        File::open(path)
+        fs::File::open(path)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(time))
             .unwrap();
