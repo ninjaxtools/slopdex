@@ -65,6 +65,7 @@ The index tracks the current git commit and is created or updated on every comma
 ```console
 $ slopdex map src docs
 $ slopdex map src -g '*.rs' -k fns -e 'refresh|search'
+$ slopdex map src --private
 $ slopdex map -g '*.md' -e '^Guide\.Setup' -i --format json
 $ slopdex map --no-reindex
 ```

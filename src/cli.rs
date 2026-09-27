@@ -227,6 +227,9 @@ struct MapArgs {
     /// Kinds, comma-separated or repeated (functions includes methods; types groups type declarations)
     #[arg(short = 'k', long = "kind", alias = "kinds", value_delimiter = ',', value_parser = valid_kind)]
     kinds: Vec<String>,
+    /// Include private and unexported symbols
+    #[arg(long)]
+    private: bool,
 }
 
 impl MapArgs {
@@ -237,6 +240,9 @@ impl MapArgs {
         }
         if !self.kinds.is_empty() {
             value["kinds"] = json!(self.kinds);
+        }
+        if self.private {
+            value["private"] = json!(true);
         }
         value
     }
@@ -1945,6 +1951,7 @@ mod tests {
             "Methods",
             "--kinds",
             "imports",
+            "--private",
             "--format",
             "json",
             "--no-reindex",
@@ -1961,7 +1968,8 @@ mod tests {
                 "glob": ["*.rs", "!test.rs"],
                 "regexp": ["Service", "Guide"],
                 "ignoreCase": true,
-                "kinds": ["functions", "types", "method", "import"]
+                "kinds": ["functions", "types", "method", "import"],
+                "private": true
             })
         );
         let Command::Map(args) = parse(&["map"]).command else {

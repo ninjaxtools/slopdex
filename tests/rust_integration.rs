@@ -822,7 +822,7 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
     mock.requests(""); // Surface any timeout/protocol failure in the scheduling harness.
     assert_eq!(engine.status()?["functionCount"], 10);
     assert_eq!(engine.status()?["fileCount"], 1);
-    assert_eq!(map_names(&engine.map(&json!({}))?).len(), 10);
+    assert_eq!(map_names(&engine.map(&json!({"private":true}))?).len(), 10);
     assert_incomplete(&engine);
     let completed = {
         let progress = concurrent.progress.lock().unwrap();
@@ -1333,7 +1333,7 @@ fn source_change_during_embedding_keeps_structure_pending_and_retains_paid_artif
     );
     assert!(engine.status()?["generation"].as_u64() > status["generation"].as_u64());
     assert_eq!(
-        map_names(&engine.map(&json!({}))?),
+        map_names(&engine.map(&json!({"private":true}))?),
         strings(&["old", "added"])
     );
     assert_eq!(file_record(&repo, "new.rs")?["source"], source);
@@ -1398,7 +1398,7 @@ fn git_head_change_during_embedding_keeps_structure_pending_and_can_retry() -> R
     );
     assert_eq!(engine.status()?["gitCheckpoint"], status["gitCheckpoint"]);
     assert_eq!(
-        map_names(&engine.map(&json!({}))?),
+        map_names(&engine.map(&json!({"private":true}))?),
         strings(&["old", "added"])
     );
     assert_incomplete(&engine);
@@ -2090,7 +2090,7 @@ fn failed_provider_publishes_structure_and_partial_artifacts_survive_restart() -
     assert_eq!(engine.status()?["functionCount"], 2);
     assert!(engine.status()?["generation"].as_u64() > status["generation"].as_u64());
     assert_eq!(
-        map_names(&engine.map(&json!({}))?),
+        map_names(&engine.map(&json!({"private":true}))?),
         strings(&["completed", "failing"])
     );
     assert!(file_record(&repo, "baseline.rs").is_err());
@@ -2177,7 +2177,10 @@ fn sqlite_structure_failure_rolls_back_deletes_and_updates_before_provider_calls
         calls,
         "structural failure precedes paid preparation"
     );
-    assert_eq!(map_names(&engine.map(&json!({}))?), strings(&["old"]));
+    assert_eq!(
+        map_names(&engine.map(&json!({"private":true}))?),
+        strings(&["old"])
+    );
     db.execute_batch("DROP TRIGGER integration_abort")?;
     drop(engine);
     let mut engine = repo.open(&config)?;
@@ -3138,6 +3141,32 @@ fn map_filters_keep_ancestors_without_siblings_and_cli_combines_paths_kinds_and_
 }
 
 #[test]
+fn map_excludes_private_symbols_unless_requested() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write(
+        "api.ts",
+        "export class Api { public run() {} private stop() {} }\nexport function visible() {}\nfunction hidden() {}\n",
+    )?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    assert_eq!(
+        map_names(&engine.map(&json!({}))?),
+        strings(&["Api", "run", "visible"])
+    );
+    assert_eq!(
+        map_names(&engine.map(&json!({"private":true}))?),
+        strings(&["Api", "run", "stop", "visible", "hidden"])
+    );
+    drop(engine);
+    let rows = repo.cli_json(&["--no-reindex", "map", "--private"])?;
+    assert_eq!(
+        map_names(rows.as_array().unwrap()),
+        strings(&["Api", "run", "stop", "visible", "hidden"])
+    );
+    Ok(())
+}
+
+#[test]
 fn map_cli_warns_and_ignores_missing_paths() -> Result<()> {
     let repo = Repo::new()?;
     repo.write("src/api.ts", "export function api() {}\n")?;
@@ -3200,7 +3229,10 @@ fn map_then_semantic_prepare_and_structure_edit_never_reuses_stale_vectors() -> 
     repo.write("code.rs", &function("alpha", "BROKEN_EMBED VECTOR_NORTH"))?;
     let mut map = repo.open_map(&config)?;
     map.refresh_structure()?;
-    assert_eq!(map_names(&map.map(&json!({}))?), strings(&["alpha"]));
+    assert_eq!(
+        map_names(&map.map(&json!({"private":true}))?),
+        strings(&["alpha"])
+    );
     assert_eq!(mock.count(), calls);
     drop(map);
     let mut offline = config.clone();

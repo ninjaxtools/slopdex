@@ -12,10 +12,11 @@ pub struct Selection {
     globs: Override,
     names: Option<RegexSet>,
     kinds: HashSet<&'static str>,
+    private: bool,
 }
 
 impl Selection {
-    /// Compile `glob`, `regexp`, `ignoreCase`, and map-only `kinds` options.
+    /// Compile `glob`, `regexp`, `ignoreCase`, and map-only `kinds`/`private` options.
     /// String lists accept either a string (including legacy `regexp`) or an array.
     /// Glob rules use gitignore syntax with inverted `!`: the last matching rule
     /// wins, and any positive rule requires a positive match. `ignoreCase` affects
@@ -50,10 +51,16 @@ impl Selection {
                 kinds.extend(kind_group(&normalize_kind(kind)?)?.iter().copied());
             }
         }
+        let private = match options.get("private") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            _ => bail!("private must be a boolean"),
+        };
         Ok(Self {
             globs: globs.build().context("compile selection globs")?,
             names,
             kinds,
+            private,
         })
     }
 
@@ -99,9 +106,15 @@ impl Selection {
             .iter()
             .map(|node| (node.id, node.parent_id))
             .collect();
+        let nodes: HashMap<_, _> = structure.nodes.iter().map(|node| (node.id, node)).collect();
+        let mut visibility = HashMap::new();
         let mut selected = HashSet::new();
         for node in &structure.nodes {
-            if !self.kind_matches(&node.kind) || !self.symbol_matches(node) {
+            if (!self.private
+                && symbol_is_private(node.id, &nodes, &mut visibility, &mut HashSet::new()))
+                || !self.kind_matches(&node.kind)
+                || !self.symbol_matches(node)
+            {
                 continue;
             }
             let mut current = Some(node.id);
@@ -119,6 +132,123 @@ impl Selection {
             .cloned()
             .collect()
     }
+}
+
+fn symbol_is_private(
+    id: usize,
+    nodes: &HashMap<usize, &StructureNode>,
+    cache: &mut HashMap<usize, bool>,
+    visiting: &mut HashSet<usize>,
+) -> bool {
+    if let Some(value) = cache.get(&id) {
+        return *value;
+    }
+    let Some(node) = nodes.get(&id).copied() else {
+        return false;
+    };
+    if !visiting.insert(id) {
+        return false;
+    }
+    let parent = node.parent_id.and_then(|id| nodes.get(&id).copied());
+    let inherited_private = parent.is_some_and(|parent| {
+        parent.kind != "impl" && symbol_is_private(parent.id, nodes, cache, visiting)
+    });
+    let private = inherited_private || locally_private(node, parent);
+    visiting.remove(&id);
+    cache.insert(id, private);
+    private
+}
+
+fn locally_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
+    if matches!(node.kind.as_str(), "heading" | "import") {
+        return false;
+    }
+    if parent.is_some_and(|parent| {
+        matches!(
+            parent.kind.as_str(),
+            "function" | "method" | "constructor" | "generator"
+        )
+    }) {
+        return true;
+    }
+    match node.language.as_str() {
+        "rust" => rust_private(node, parent),
+        "javascript" | "jsx" | "typescript" | "tsx" => javascript_private(node, parent),
+        "python" => node.names.iter().all(|name| name.starts_with('_')),
+        "go" => go_private(node),
+        "java" => java_private(node, parent),
+        "c" => has_word(&node.signature, "static"),
+        _ => false,
+    }
+}
+
+fn rust_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
+    if node.kind == "impl" {
+        return true;
+    }
+    if parent.is_some_and(|parent| {
+        matches!(parent.kind.as_str(), "trait" | "enum" | "variant")
+            || parent.kind == "impl" && parent.signature.contains(" for ")
+    }) {
+        return false;
+    }
+    node.kind == "macro"
+        && !node
+            .attributes
+            .iter()
+            .any(|attr| attr.contains("macro_export"))
+        || node.kind != "macro" && !node.signature.trim_start().starts_with("pub")
+}
+
+fn javascript_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
+    let signature = node.signature.trim_start();
+    if parent.is_some() {
+        return signature.starts_with('#')
+            || has_word(signature, "private")
+            || has_word(signature, "protected");
+    }
+    !node.attributes.iter().any(|attr| attr == "export")
+        && !signature.starts_with("export ")
+        && !signature.starts_with("module.exports")
+        && !signature.starts_with("exports.")
+}
+
+fn go_private(node: &StructureNode) -> bool {
+    if node.kind == "module" {
+        return false;
+    }
+    let name = node
+        .name
+        .rsplit(['.', '*'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(&node.name);
+    !name.chars().next().is_some_and(char::is_uppercase)
+        || node.kind == "method"
+            && node
+                .qualified_name
+                .split('.')
+                .next()
+                .and_then(|part| part.trim_start_matches('*').chars().next())
+                .is_some_and(char::is_lowercase)
+}
+
+fn java_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
+    if node.kind == "module" {
+        return false;
+    }
+    if parent.is_some_and(|parent| parent.kind == "interface") {
+        return has_word(&node.signature, "private");
+    }
+    if node.kind == "variant" && parent.is_some_and(|parent| parent.kind == "enum") {
+        return false;
+    }
+    !has_word(&node.signature, "public")
+}
+
+fn has_word(value: &str, expected: &str) -> bool {
+    value
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == expected)
 }
 
 fn strings<'a>(options: &'a Value, key: &str) -> Result<Vec<&'a str>> {
@@ -285,6 +415,7 @@ mod tests {
             json!({"ignoreCase": "true"}),
             json!({"kinds": ["methdos"]}),
             json!({"kinds": "functions,"}),
+            json!({"private": "true"}),
         ] {
             assert!(Selection::compile(&options).is_err(), "{options}");
         }
@@ -323,9 +454,10 @@ mod tests {
             "namespace API { export class Service { run() {} stop() {} } function helper() {} }",
         )
         .unwrap();
-        let selection =
-            Selection::compile(&json!({"kinds": "methods", "regexp": "^API\\.Service\\.run$"}))
-                .unwrap();
+        let selection = Selection::compile(
+            &json!({"kinds": "methods", "regexp": "^API\\.Service\\.run$", "private": true}),
+        )
+        .unwrap();
         let nodes = selection.select_structure(&parsed.structure);
         assert_eq!(
             nodes
@@ -334,7 +466,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["API", "Service", "run"]
         );
-        let parent_only = Selection::compile(&json!({"regexp": "^API\\.Service$"})).unwrap();
+        let parent_only =
+            Selection::compile(&json!({"regexp": "^API\\.Service$", "private": true})).unwrap();
         let nodes = parent_only.select_structure(&parsed.structure);
         assert_eq!(
             nodes
@@ -344,17 +477,70 @@ mod tests {
             ["API", "Service"]
         );
         assert!(
-            Selection::compile(&json!({"regexp": "missing"}))
+            Selection::compile(&json!({"regexp": "missing", "private": true}))
                 .unwrap()
                 .select_structure(&parsed.structure)
                 .is_empty()
         );
         assert!(
-            Selection::compile(&json!({"regexp": "^run$"}))
+            Selection::compile(&json!({"regexp": "^run$", "private": true}))
                 .unwrap()
                 .select_structure(&parsed.structure)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn structure_selection_excludes_private_symbols_by_default() {
+        for (path, source, public, private) in [
+            (
+                "example.rs",
+                "pub fn visible() {} fn hidden() {}",
+                "visible",
+                "hidden",
+            ),
+            (
+                "example.ts",
+                "export function visible() {} function hidden() {}",
+                "visible",
+                "hidden",
+            ),
+            (
+                "example.py",
+                "def visible(): pass\ndef _hidden(): pass\n",
+                "visible",
+                "_hidden",
+            ),
+            (
+                "example.go",
+                "package example\nfunc Visible() {}\nfunc hidden() {}\n",
+                "Visible",
+                "hidden",
+            ),
+            (
+                "Example.java",
+                "public class Visible {} class Hidden {}",
+                "Visible",
+                "Hidden",
+            ),
+            (
+                "example.c",
+                "void visible(void) {} static void hidden(void) {}",
+                "visible",
+                "hidden",
+            ),
+        ] {
+            let structure = crate::parse::parse(path, source).unwrap().structure;
+            let selected = Selection::compile(&json!({}))
+                .unwrap()
+                .select_structure(&structure);
+            assert!(selected.iter().any(|node| node.name == public), "{path}");
+            assert!(!selected.iter().any(|node| node.name == private), "{path}");
+            let complete = Selection::compile(&json!({"private": true}))
+                .unwrap()
+                .select_structure(&structure);
+            assert!(complete.iter().any(|node| node.name == private), "{path}");
+        }
     }
 
     #[test]
@@ -409,7 +595,8 @@ mod tests {
             ],
         };
         let selection =
-            Selection::compile(&json!({"regexp": "^match$", "kinds": "methods"})).unwrap();
+            Selection::compile(&json!({"regexp": "^match$", "kinds": "methods", "private": true}))
+                .unwrap();
         assert_eq!(
             selection
                 .select_structure(&structure)

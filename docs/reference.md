@@ -105,7 +105,7 @@ summary/JSON/JSONL format.
 ## Structure map
 
 ```text
-slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--format summary|json]
+slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--format summary|json]
 ```
 
 With no paths, map selects the indexed repository. Paths select files or recursive
@@ -119,6 +119,10 @@ and diagnostics in SQLite. It makes no provider requests, generates no descripti
 or embeddings, and does not open/rebuild USearch sidecars. `map --no-reindex` reads stored
 SQLite structure without reading current source files. Selection narrows output,
 not repository indexing; the normal indexing ignore/include/exclude rules apply.
+
+Private and unexported symbols are omitted by default according to each language's
+visibility conventions. Pass `--private` to include them. Ancestors needed to
+identify a selected public symbol remain as structural context.
 
 `-k`, `--kind` (alias `--kinds`) accepts repeated or comma-separated kinds.
 `fns`/`functions` groups functions, methods, constructors, and generators;
@@ -138,6 +142,7 @@ half-open; lines and UTF-8 byte columns are one-based with exclusive ends.
 ```bash
 slopdex map src docs -g '*.rs' -g '*.md'
 slopdex map src -k fns,types -e '^Engine\.'
+slopdex map src --private
 slopdex map -k imports -e 'HashMap|MapAlias' --format json
 slopdex map docs -k headings -e '^Guide\.Setup' -i --no-reindex
 ```
