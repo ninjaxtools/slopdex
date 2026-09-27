@@ -171,12 +171,9 @@ impl Engine {
             .filter(|i| i.kind == "function" && i.description_embedding.is_none())
             .map(|i| i.path.as_str())
             .collect();
-        let total = paths.len();
-        for (position, path) in paths.into_iter().enumerate() {
-            ui::progress(format_args!(
-                "Indexing file {}/{total}: {path}",
-                position + 1
-            ));
+        let indexing = ui::counted("Indexing files", paths.len());
+        for path in paths {
+            ui::progress(&path);
             let source_mode = if checkpoint.is_none() || dirty.contains(&path) {
                 "working-tree"
             } else {
@@ -207,6 +204,7 @@ impl Engine {
                         ],
                     };
                     changed.push((file, Vec::new()));
+                    indexing.inc(1);
                     continue;
                 }
             };
@@ -220,17 +218,21 @@ impl Engine {
                 f.hash == source_hash && f.source_mode == source_mode && f.errors.is_empty()
             }) && !needs_descriptions
             {
+                indexing.inc(1);
                 continue;
             }
             let prepared = self.prepare(&path, &source, source_mode, false, false)?;
             changed.push(prepared);
+            indexing.inc(1);
         }
+        indexing.finish();
         // Never publish a mixture of snapshots if files changed while remote
         // providers were running. Their completed artifacts remain reusable.
         ensure!(
             git::head(&self.root) == checkpoint,
             "Git HEAD changed during indexing; rerun"
         );
+        let verifying = ui::counted("Verifying indexed files", changed.len());
         for (file, _) in &changed {
             if !file.hash.is_empty() {
                 ensure!(
@@ -239,7 +241,9 @@ impl Engine {
                     file.path
                 );
             }
+            verifying.inc(1);
         }
+        verifying.finish();
         ui::progress("Saving index snapshot");
         let dirty = self.db.apply(&changed, &removed, checkpoint.as_deref())?;
         self.db.set_meta(
@@ -381,6 +385,7 @@ impl Engine {
             "Generating callable descriptions",
             &jobs,
             self.parallelism()?,
+            |_| 1,
             |(_, prompt)| {
                 llm.describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)
             },
@@ -430,9 +435,11 @@ impl Engine {
         if let Some(cached) = self.db.cache("description", key)? {
             return Ok(cached);
         }
-        ui::progress("Generating file description");
+        let progress = ui::counted("Generating file descriptions", 1);
         let description=self.providers.llm().describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)?;
         self.db.cache_put("description", key, &description)?;
+        progress.inc(1);
+        progress.finish();
         Ok(description)
     }
 
@@ -450,9 +457,10 @@ impl Engine {
         let batch = vector.batch_limit();
         let batches: Vec<_> = pending.chunks(batch).collect();
         run_jobs(
-            "Embedding batches",
+            "Generating embeddings",
             &batches,
             self.parallelism()?,
+            |entries| entries.len(),
             |entries| {
                 let texts: Vec<_> = entries.iter().map(|(_, text)| text.clone()).collect();
                 vector.embed(&texts, query)
@@ -507,6 +515,7 @@ impl Engine {
                     .filter_map(|f| f.description_embedding.clone()),
             )
             .collect();
+        let loading = ui::counted("Loading embeddings", keys.len());
         for key in keys {
             self.vectors.insert(
                 key.clone(),
@@ -514,7 +523,9 @@ impl Engine {
                     .embedding(&key)?
                     .context("Missing indexed embedding")?,
             );
+            loading.inc(1);
         }
+        loading.finish();
         self.complete_descriptions = self.enabled
             && self.items.iter().filter(|i| i.kind == "function").all(|i| {
                 i.description_embedding.is_some()
@@ -528,6 +539,10 @@ impl Engine {
         }
         self.indexes.clear();
         let dimensions = self.providers.vector().dimensions();
+        let loading = ui::counted(
+            "Loading vector indexes",
+            if self.complete_descriptions { 4 } else { 2 },
+        );
         for (kind, parts) in [
             ("code", 1),
             ("markdown", 1),
@@ -537,7 +552,7 @@ impl Engine {
             if parts > 1 && !self.complete_descriptions {
                 continue;
             }
-            let vectors: Vec<_> = self
+            let items: Vec<_> = self
                 .items
                 .iter()
                 .filter(|i| {
@@ -547,8 +562,14 @@ impl Engine {
                         i.kind == "function"
                     }
                 })
-                .map(|i| Ok((i.id, self.item_vector(i, kind)?)))
-                .collect::<Result<_>>()?;
+                .collect();
+            let preparing = ui::counted(format_args!("Preparing {kind} vectors"), items.len());
+            let mut vectors = Vec::with_capacity(items.len());
+            for item in items {
+                vectors.push((item.id, self.item_vector(item, kind)?));
+                preparing.inc(1);
+            }
+            preparing.finish();
             let mut path = self.db.path.as_os_str().to_os_string();
             path.push(format!(".{kind}.usearch"));
             ui::progress(format_args!("Loading {kind} vector index"));
@@ -559,7 +580,9 @@ impl Engine {
                 &vectors,
             )?;
             self.indexes.insert(kind.into(), index);
+            loading.inc(1);
         }
+        loading.finish();
         Ok(())
     }
 
@@ -652,6 +675,10 @@ impl Engine {
             limit
         };
         let mut results = Vec::new();
+        let searching = ui::counted(
+            "Searching vector indexes",
+            usize::from(code || descriptions) + usize::from(markdown),
+        );
         if code || descriptions {
             let index_kind = if code && descriptions {
                 "combined"
@@ -660,6 +687,7 @@ impl Engine {
             } else {
                 "code"
             };
+            ui::progress(format_args!("Searching {index_kind} index"));
             let repeats = if index_kind == "combined" {
                 3
             } else if index_kind == "descriptions" {
@@ -692,8 +720,10 @@ impl Engine {
                 self.add_scores(&mut result, item, &vector, None, index_kind)?;
                 results.push(result);
             }
+            searching.inc(1);
         }
         if markdown {
+            ui::progress("Searching markdown index");
             let allowed = self
                 .items
                 .iter()
@@ -707,13 +737,16 @@ impl Engine {
                     json!({"type":"markdown","chunk":self.item(id)?.data,"similarity":similarity}),
                 );
             }
+            searching.inc(1);
         }
+        searching.finish();
         sort_scores(&mut results, "similarity");
         if let Some(limit) = candidate_limit {
             results.truncate(limit);
         }
         if rerank && !results.is_empty() {
             let documents: Vec<_> = results.iter().map(Value::to_string).collect();
+            let reranking = ui::counted("Reranking candidates", documents.len());
             let ranking = self.providers.reranker()?.rerank(query, &documents)?;
             results = ranking
                 .into_iter()
@@ -723,6 +756,8 @@ impl Engine {
                     row
                 })
                 .collect();
+            reranking.inc(documents.len());
+            reranking.finish();
         }
         if let Some(limit) = limit {
             results.truncate(limit);
@@ -874,22 +909,23 @@ impl Engine {
             })
             .map(|i| (i.id, target.root.join(&i.path)))
             .collect();
-        for source in &self.items {
-            if source.kind != "function"
-                || source.data["lineCount"].as_u64().unwrap_or(0) < min_lines
-                || regex.as_ref().is_some_and(|r| {
-                    !r.is_match(source.data["qualifiedName"].as_str().unwrap_or(""))
-                })
-                || source_path
-                    .as_ref()
-                    .is_some_and(|p| !under(&source.path, p))
-                || (flag(options, "uncommitted") && source.data["sourceMode"] != "working-tree")
-                || changed
-                    .as_ref()
-                    .is_some_and(|ids| !ids.contains(&source.id))
-            {
-                continue;
-            }
+        let sources: Vec<_> = self
+            .items
+            .iter()
+            .filter(|source| {
+                source.kind == "function"
+                    && source.data["lineCount"].as_u64().unwrap_or(0) >= min_lines
+                    && regex.as_ref().is_none_or(|r| {
+                        r.is_match(source.data["qualifiedName"].as_str().unwrap_or(""))
+                    })
+                    && source_path.as_ref().is_none_or(|p| under(&source.path, p))
+                    && (!flag(options, "uncommitted")
+                        || source.data["sourceMode"] == "working-tree")
+                    && changed.as_ref().is_none_or(|ids| ids.contains(&source.id))
+            })
+            .collect();
+        let searching = ui::counted("Searching source functions", sources.len());
+        for source in sources {
             let source_file = self.root.join(&source.path);
             let cross_file = flag(options, "crossFileOnly");
             let allowed = |id| {
@@ -954,7 +990,9 @@ impl Engine {
             if !matches.is_empty() {
                 results.push(json!({"source":source.data,"matches":matches,"scoring":{"similarityMode":if combined {"code-description-file-average"}else{"code"},"similarityWeights":if combined {json!({"code":1.0/3.0,"description":1.0/3.0,"fileDescription":1.0/3.0})}else{json!({"code":1,"description":0,"fileDescription":0})}}}));
             }
+            searching.inc(1);
         }
+        searching.finish();
         self.db.put_search_cache(&key, &results)?;
         Ok(results)
     }
@@ -1022,17 +1060,25 @@ impl Engine {
     pub fn reindex_files(&mut self, callables: bool) -> Result<Value> {
         ensure!(self.enabled, "Enable descriptions first");
         let mut changed = Vec::new();
-        for file in self.files.values() {
-            if file.language != "markdown" && file.description_hash.as_deref() != Some(&file.hash) {
-                changed.push(self.prepare(
-                    &file.path,
-                    &file.source,
-                    &file.source_mode,
-                    true,
-                    callables,
-                )?);
-            }
+        let files: Vec<_> = self
+            .files
+            .values()
+            .filter(|file| {
+                file.language != "markdown" && file.description_hash.as_deref() != Some(&file.hash)
+            })
+            .collect();
+        let reindexing = ui::counted("Regenerating file descriptions", files.len());
+        for file in files {
+            changed.push(self.prepare(
+                &file.path,
+                &file.source,
+                &file.source_mode,
+                true,
+                callables,
+            )?);
+            reindexing.inc(1);
         }
+        reindexing.finish();
         let checkpoint = self.db.meta("checkpoint")?;
         self.db.apply(&changed, &[], checkpoint.as_deref())?;
         self.load()?;
@@ -1142,13 +1188,11 @@ fn run_jobs<T: Sync, R: Send>(
     label: &str,
     jobs: &[T],
     parallelism: usize,
+    units: impl Fn(&T) -> usize,
     work: impl Fn(&T) -> Result<R> + Sync,
     mut persist: impl FnMut(&T, R) -> Result<()>,
 ) -> Result<()> {
-    let mut completed = 0;
-    if !jobs.is_empty() {
-        ui::progress(format_args!("{label}: 0/{}", jobs.len()));
-    }
+    let progress = ui::counted(label, jobs.iter().map(&units).sum());
     for window in jobs.chunks(parallelism) {
         std::thread::scope(|scope| -> Result<()> {
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -1165,8 +1209,7 @@ fn run_jobs<T: Sync, R: Send>(
                 if let Err(error) = result.and_then(|value| persist(job, value)) {
                     failure.get_or_insert(error);
                 } else {
-                    completed += 1;
-                    ui::progress(format_args!("{label}: {completed}/{}", jobs.len()));
+                    progress.inc(units(job));
                 }
             }
             if let Some(error) = failure {
@@ -1176,6 +1219,7 @@ fn run_jobs<T: Sync, R: Send>(
             }
         })?;
     }
+    progress.finish();
     Ok(())
 }
 

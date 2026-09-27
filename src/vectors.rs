@@ -42,6 +42,7 @@ impl Manifest {
     fn new(dimensions: usize, generation: u64, vectors: &[(u64, Vec<f32>)]) -> Result<Self> {
         ensure!(dimensions > 0, "vector dimensions must be positive");
         let mut hashes = BTreeMap::new();
+        let progress = crate::ui::counted("Validating and hashing snapshot vectors", vectors.len());
         for (key, vector) in vectors {
             // USearch's native tombstone cannot be a searchable/persistable key.
             ensure!(
@@ -54,6 +55,7 @@ impl Manifest {
                 hashes.insert(*key, vector_hash(vector)).is_none(),
                 "duplicate vector key {key}"
             );
+            progress.inc(1);
         }
         let mut manifest = Self {
             version: VERSION,
@@ -65,6 +67,7 @@ impl Manifest {
             binary_hash: String::new(),
         };
         manifest.fingerprint = manifest.compute_fingerprint()?;
+        progress.finish();
         Ok(manifest)
     }
 
@@ -160,6 +163,7 @@ impl VectorIndex {
         let query_norm: f64 = query.iter().map(|&v| f64::from(v).powi(2)).sum();
         let mut stored = vec![0.0_f32; self.dimensions];
         let mut results = Vec::with_capacity(matches.keys.len());
+        let progress = crate::ui::counted("Rescoring search candidates", matches.keys.len());
         for key in matches.keys {
             ensure!(
                 self.index
@@ -176,8 +180,10 @@ impl VectorIndex {
             }
             let similarity = (dot / (query_norm * stored_norm).sqrt()).clamp(-1.0, 1.0);
             results.push((key, similarity));
+            progress.inc(1);
         }
         results.sort_by(|a, b| b.1.total_cmp(&a.1));
+        progress.finish();
         Ok(results)
     }
 
@@ -241,11 +247,14 @@ fn build(dimensions: usize, vectors: &[(u64, Vec<f32>)]) -> Result<Index> {
     index
         .reserve(vectors.len().max(1))
         .context("reserve vector index")?;
+    let progress = crate::ui::counted("Building native vector index", vectors.len());
     for (key, vector) in vectors {
         index
             .add(*key, &normalized(vector, dimensions)?)
             .with_context(|| format!("add vector key {key}"))?;
+        progress.inc(1);
     }
+    progress.finish();
     Ok(index)
 }
 
@@ -301,6 +310,12 @@ fn reconcile(
     new: &Manifest,
     vectors: &[(u64, Vec<f32>)],
 ) -> Result<()> {
+    // Count both scans, including unchanged entries; replacements are visited
+    // once for removal in the old snapshot and once for addition in the new one.
+    let progress = crate::ui::counted(
+        "Reconciling vector snapshot (entries scanned)",
+        old.vectors.len() + vectors.len(),
+    );
     for (key, hash) in &old.vectors {
         if new.vectors.get(key) != Some(hash) {
             ensure!(
@@ -308,6 +323,7 @@ fn reconcile(
                 "failed to remove vector key {key}"
             );
         }
+        progress.inc(1);
     }
     // Deleted slots are reused by USearch. Keep existing capacity (including
     // tombstones), and grow before additions if the new live set exceeds it.
@@ -316,11 +332,13 @@ fn reconcile(
         if old.vectors.get(key) != new.vectors.get(key) {
             index.add(*key, &normalized(vector, new.dimensions)?)?;
         }
+        progress.inc(1);
     }
     ensure!(
         index.size() == vectors.len(),
         "vector update count mismatch"
     );
+    progress.finish();
     Ok(())
 }
 

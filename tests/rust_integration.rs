@@ -2232,6 +2232,9 @@ fn cli_redirected_progress_preserves_json_plain_diagnostics_and_offline_mode() -
     assert!(!stderr.contains('\x1b'));
     assert!(!stderr.contains("Refreshing index"));
     assert!(!stderr.contains("Embedding batches"));
+    assert!(!stderr.contains("Generating embeddings"));
+    assert!(!stderr.contains("Indexing files"));
+    assert!(!stderr.contains("% ("));
 
     let requests = mock.count();
     repo.write("new.rs", &function("beta", "VECTOR_NORTH"))?;

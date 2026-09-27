@@ -82,8 +82,13 @@ Other commands open it and normally refresh before doing their work.
 
 On terminal stderr, cliclack displays progress for catalog loading, opening and
 refreshing indexes, searches, explanations, and description regeneration.
-Indexing reports the current file and completed embedding batches/callable
-descriptions. Provider notices appear above the progress display. Warnings and
+Known-size tasks show a 0–100% bar with completed/target counts: files indexed,
+embeddings and descriptions generated, vector snapshots processed, indexes
+searched, candidates rescored/reranked, and source functions compared. Embedding
+counts measure individual inputs, including partial batches. Parent progress
+stays visible during nested work; completed stages retain their final counts.
+Unknown-size operations, such as repository discovery or a model's text response,
+use a spinner. Provider notices appear above the progress display. Warnings and
 runtime errors use the same terminal styling. Redirected stderr and `TERM=dumb`
 use plain diagnostics without animations; result data on stdout retains its
 summary/JSON/JSONL format.
