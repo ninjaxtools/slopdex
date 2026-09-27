@@ -54,6 +54,28 @@ pub struct Engine {
     _lock: fs::File,
 }
 
+struct PrepareInput {
+    path: String,
+    source: String,
+    source_mode: String,
+    regenerate_file: bool,
+    regenerate_callables: bool,
+}
+
+struct PreparedCallable {
+    identity: String,
+    data: Value,
+    description_embedding: Option<String>,
+}
+
+struct PreparedFile {
+    file: File,
+    parsed: parse::ParsedFile,
+    regenerate_file: bool,
+    regenerate_callables: bool,
+    callables: Vec<PreparedCallable>,
+}
+
 impl Engine {
     pub fn open(root: &Path, index: &Path, mut config: Value) -> Result<Self> {
         Self::open_internal(root, index, config.take(), false)
@@ -168,11 +190,18 @@ impl Engine {
         }
         let mut paths: Vec<_> = paths.into_iter().collect();
         paths.sort();
-        let mut changed = Vec::new();
+        let mut inputs = Vec::new();
         for path in paths {
             let file = &self.files[&path];
-            changed.push(self.prepare(&path, &file.source, &file.source_mode, false, false)?);
+            inputs.push(PrepareInput {
+                path,
+                source: file.source.clone(),
+                source_mode: file.source_mode.clone(),
+                regenerate_file: false,
+                regenerate_callables: false,
+            });
         }
+        let changed = self.prepare_all(inputs)?;
         let checkpoint = self.db.meta("checkpoint")?;
         ensure!(
             git::head(&self.root) == checkpoint,
@@ -390,202 +419,296 @@ impl Engine {
         Ok(parsed)
     }
 
-    fn prepare(
-        &self,
-        path: &str,
-        source: &str,
-        source_mode: &str,
-        regenerate_file: bool,
-        regenerate_callables: bool,
-    ) -> Result<(File, Vec<Item>)> {
-        let source_hash = hash(source);
-        let parsed = self.parsed(path, source)?;
-        let previous = self.files.get(path);
-        let mut file=File{path:path.into(),hash:source_hash.clone(),source:source.into(),language:parse::language_for_path(path).unwrap_or("unknown").into(),source_mode:source_mode.into(),description:previous.and_then(|f|f.description.clone()),description_hash:previous.and_then(|f|f.description_hash.clone()),description_embedding:previous.and_then(|f|f.description_embedding.clone()),errors:parsed.errors.iter().map(|e|json!({"path":path,"code":"parse-error","message":e.message,"startLine":e.start_line,"endLine":e.end_line,"sourceMode":source_mode})).collect()};
-        if self.enabled
-            && (file.description.is_none() || regenerate_file)
-            && file.language != "markdown"
-        {
-            let key = hash(
-                json!([self.providers.llm().profile(), "file", path, source_hash]).to_string(),
-            );
-            let description=self.description(&key,&format!("Describe the purpose, responsibilities, and important relationships of this existing source file. Do not propose changes.\nFile: {path}\n\n{source}"))?;
-            file.description_embedding = Some(self.embed_one(&description, false)?);
-            file.description = Some(description);
-            file.description_hash = Some(source_hash.clone());
-        }
-        if self.enabled
-            && file.description_embedding.is_none()
-            && let Some(description) = &file.description
-        {
-            file.description_embedding = Some(self.embed_one(description, false)?);
-        }
-        let mut items = Vec::new();
-        let mut description_jobs = BTreeMap::new();
-        let mut description_assignments = Vec::new();
-        let mut occurrences = HashMap::<String, usize>::new();
-        let inputs: Vec<_> = parsed
-            .callables
-            .iter()
-            .map(|c| c.embedding_input.clone())
-            .chain(parsed.chunks.iter().map(|c| c.embedding_input.clone()))
-            .collect();
-        self.ensure_embeddings(&inputs, false)?;
-        for callable in parsed.callables {
-            let occurrence = occurrences
-                .entry(callable.qualified_name.clone())
-                .or_default();
-            let identity = hash(
-                json!([path, callable.qualified_name, callable.kind, *occurrence]).to_string(),
-            );
-            *occurrence += 1;
-            let embedding = Database::embedding_key(
-                &self.providers.vector().profile(),
-                false,
-                &callable.embedding_input,
-            );
-            let mut data = serde_json::to_value(&callable)?;
-            data["path"] = json!(path);
-            data["sourceMode"] = json!(source_mode);
-            let old = self.items.iter().find(|i| i.identity == identity);
-            let mut description_embedding = old.and_then(|i| i.description_embedding.clone());
-            data["description"] = old
-                .map(|i| i.data["description"].clone())
-                .unwrap_or(Value::Null);
-            let unchanged = old.is_some_and(|i| {
-                i.data["sourceHash"] == data["sourceHash"] && i.data["description"].is_string()
+    fn prepare_all(&self, inputs: Vec<PrepareInput>) -> Result<Vec<(File, Vec<Item>)>> {
+        let mut prepared = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let source_hash = hash(&input.source);
+            let parsed = self.parsed(&input.path, &input.source)?;
+            let previous = self.files.get(&input.path);
+            let file = File {
+                path: input.path.clone(),
+                hash: source_hash,
+                source: input.source,
+                language: parse::language_for_path(&input.path)
+                    .unwrap_or("unknown")
+                    .into(),
+                source_mode: input.source_mode.clone(),
+                description: previous.and_then(|f| f.description.clone()),
+                description_hash: previous.and_then(|f| f.description_hash.clone()),
+                description_embedding: previous.and_then(|f| f.description_embedding.clone()),
+                errors: parsed
+                    .errors
+                    .iter()
+                    .map(|e| {
+                        json!({"path":input.path,"code":"parse-error","message":e.message,"startLine":e.start_line,"endLine":e.end_line,"sourceMode":input.source_mode})
+                    })
+                    .collect(),
+            };
+            prepared.push(PreparedFile {
+                file,
+                parsed,
+                regenerate_file: input.regenerate_file,
+                regenerate_callables: input.regenerate_callables,
+                callables: Vec::new(),
             });
-            if !unchanged {
-                description_embedding = None;
-                data["description"] = Value::Null;
-            }
+        }
+
+        let mut file_jobs = BTreeMap::new();
+        let mut file_assignments = Vec::new();
+        for (index, prepared) in prepared.iter().enumerate() {
             if self.enabled
-                && (regenerate_callables || (!unchanged && description_embedding.is_none()))
+                && (prepared.file.description.is_none() || prepared.regenerate_file)
+                && prepared.file.language != "markdown"
             {
                 let key = hash(
                     json!([
                         self.providers.llm().profile(),
-                        "function",
-                        path,
-                        callable.qualified_name,
-                        callable.source_hash,
-                        if regenerate_callables {
-                            Some(source_hash.as_str())
-                        } else {
-                            None
-                        }
+                        "file",
+                        prepared.file.path,
+                        prepared.file.hash
                     ])
                     .to_string(),
                 );
                 let prompt = format!(
-                    "Describe what this existing callable does, its inputs, outputs and side effects. Be concise; do not propose changes.\nFile: {path}\nFile context: {}\nSymbol: {}\n\n{}",
-                    file.description.as_deref().unwrap_or(""),
-                    callable.qualified_name,
-                    callable.source
+                    "Describe the purpose, responsibilities, and important relationships of this existing source file. Do not propose changes.\nFile: {}\n\n{}",
+                    prepared.file.path, prepared.file.source
                 );
                 if self.db.cache("description", &key)?.is_none() {
-                    description_jobs.insert(key.clone(), prompt);
+                    file_jobs.insert(key.clone(), prompt);
                 }
-                description_assignments.push((items.len(), key));
-            } else if !self.enabled
-                && old.is_some_and(|i| i.data["sourceHash"] != data["sourceHash"])
-            {
-                description_embedding = None;
-                data["description"] = Value::Null;
+                file_assignments.push((index, key));
             }
-            if self.enabled
-                && description_embedding.is_none()
-                && let Some(description) = data["description"].as_str()
-            {
-                description_embedding = Some(self.embed_one(description, false)?);
+        }
+        let jobs: Vec<_> = file_jobs.into_iter().collect();
+        let llm = self.providers.llm();
+        run_jobs(
+            "Generating file descriptions",
+            &jobs,
+            self.parallelism()?,
+            |_| 1,
+            |(_, prompt)| {
+                llm.describe(
+                    "You explain existing source code accurately and concisely. Return plain text, without a preamble.",
+                    prompt,
+                )
+            },
+            |(key, _), description| self.db.cache_put("description", key, &description),
+        )?;
+        for (index, key) in file_assignments {
+            let description = self
+                .db
+                .cache("description", &key)?
+                .context("Missing generated file description")?;
+            prepared[index].file.description = Some(description);
+            prepared[index].file.description_hash = Some(prepared[index].file.hash.clone());
+        }
+
+        let mut description_jobs = BTreeMap::new();
+        let mut description_assignments = Vec::new();
+        for (file_index, prepared) in prepared.iter_mut().enumerate() {
+            let mut occurrences = HashMap::<String, usize>::new();
+            for callable in &prepared.parsed.callables {
+                let occurrence = occurrences
+                    .entry(callable.qualified_name.clone())
+                    .or_default();
+                let identity = hash(
+                    json!([
+                        prepared.file.path,
+                        callable.qualified_name,
+                        callable.kind,
+                        *occurrence
+                    ])
+                    .to_string(),
+                );
+                *occurrence += 1;
+                let mut data = serde_json::to_value(callable)?;
+                data["path"] = json!(prepared.file.path);
+                data["sourceMode"] = json!(prepared.file.source_mode);
+                let old = self.items.iter().find(|item| item.identity == identity);
+                let mut description_embedding =
+                    old.and_then(|item| item.description_embedding.clone());
+                data["description"] = old
+                    .map(|item| item.data["description"].clone())
+                    .unwrap_or(Value::Null);
+                let unchanged = old.is_some_and(|item| {
+                    item.data["sourceHash"] == data["sourceHash"]
+                        && item.data["description"].is_string()
+                });
+                if !unchanged {
+                    description_embedding = None;
+                    data["description"] = Value::Null;
+                }
+                if self.enabled
+                    && (prepared.regenerate_callables
+                        || (!unchanged && description_embedding.is_none()))
+                {
+                    let key = hash(
+                        json!([
+                            self.providers.llm().profile(),
+                            "function",
+                            prepared.file.path,
+                            callable.qualified_name,
+                            callable.source_hash,
+                            if prepared.regenerate_callables {
+                                Some(prepared.file.hash.as_str())
+                            } else {
+                                None
+                            }
+                        ])
+                        .to_string(),
+                    );
+                    let prompt = format!(
+                        "Describe what this existing callable does, its inputs, outputs and side effects. Be concise; do not propose changes.\nFile: {}\nFile context: {}\nSymbol: {}\n\n{}",
+                        prepared.file.path,
+                        prepared.file.description.as_deref().unwrap_or(""),
+                        callable.qualified_name,
+                        callable.source
+                    );
+                    if self.db.cache("description", &key)?.is_none() {
+                        description_jobs.insert(key.clone(), prompt);
+                    }
+                    description_assignments.push((file_index, prepared.callables.len(), key));
+                } else if !self.enabled
+                    && old.is_some_and(|item| item.data["sourceHash"] != data["sourceHash"])
+                {
+                    description_embedding = None;
+                    data["description"] = Value::Null;
+                }
+                prepared.callables.push(PreparedCallable {
+                    identity,
+                    data,
+                    description_embedding,
+                });
             }
-            items.push(Item {
-                id: 0,
-                path: path.into(),
-                identity,
-                kind: "function".into(),
-                data,
-                embedding,
-                description_embedding,
-            });
         }
         let jobs: Vec<_> = description_jobs.into_iter().collect();
-        let llm = self.providers.llm();
         run_jobs(
             "Generating callable descriptions",
             &jobs,
             self.parallelism()?,
             |_| 1,
             |(_, prompt)| {
-                llm.describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)
+                llm.describe(
+                    "You explain existing source code accurately and concisely. Return plain text, without a preamble.",
+                    prompt,
+                )
             },
             |(key, _), description| self.db.cache_put("description", key, &description),
         )?;
-        let descriptions: Vec<_> = description_assignments
-            .iter()
-            .map(|(_, key)| {
-                self.db
-                    .cache("description", key)?
-                    .context("Missing generated description")
-            })
-            .collect::<Result<_>>()?;
-        self.ensure_embeddings(&descriptions, false)?;
-        for ((index, _), description) in description_assignments.into_iter().zip(descriptions) {
-            items[index].description_embedding = Some(Database::embedding_key(
-                &self.providers.vector().profile(),
-                false,
-                &description,
-            ));
-            items[index].data["description"] = json!(description);
+        for (file_index, callable_index, key) in description_assignments {
+            let description = self
+                .db
+                .cache("description", &key)?
+                .context("Missing generated callable description")?;
+            prepared[file_index].callables[callable_index].data["description"] = json!(description);
         }
-        for (ordinal, chunk) in parsed.chunks.into_iter().enumerate() {
-            let embedding = Database::embedding_key(
-                &self.providers.vector().profile(),
-                false,
-                &chunk.embedding_input,
-            );
-            let identity = hash(json!([path, "markdown", ordinal]).to_string());
-            let mut data = serde_json::to_value(chunk)?;
-            data["path"] = json!(path);
-            data["sourceMode"] = json!(source_mode);
-            items.push(Item {
-                id: 0,
-                path: path.into(),
-                identity,
-                kind: "markdown".into(),
-                data,
-                embedding,
-                description_embedding: None,
-            });
-        }
-        Ok((file, items))
-    }
 
-    fn description(&self, key: &str, prompt: &str) -> Result<String> {
-        if let Some(cached) = self.db.cache("description", key)? {
-            return Ok(cached);
+        let mut embedding_groups = Vec::with_capacity(prepared.len());
+        for prepared in &prepared {
+            let mut inputs = Vec::new();
+            inputs.extend(
+                prepared
+                    .parsed
+                    .callables
+                    .iter()
+                    .map(|callable| callable.embedding_input.clone()),
+            );
+            inputs.extend(
+                prepared
+                    .parsed
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.embedding_input.clone()),
+            );
+            if self.enabled {
+                inputs.extend(prepared.file.description.clone());
+                inputs.extend(prepared.callables.iter().filter_map(|callable| {
+                    callable.data["description"].as_str().map(str::to_owned)
+                }));
+            }
+            embedding_groups.push(inputs);
         }
-        let progress = ui::counted("Generating file descriptions", 1);
-        let description=self.providers.llm().describe("You explain existing source code accurately and concisely. Return plain text, without a preamble.",prompt)?;
-        self.db.cache_put("description", key, &description)?;
-        progress.inc(1);
-        progress.finish();
-        Ok(description)
+        self.ensure_embedding_groups(embedding_groups, false)?;
+
+        let vector_profile = self.providers.vector().profile();
+        let mut result = Vec::with_capacity(prepared.len());
+        for mut prepared in prepared {
+            if self.enabled
+                && let Some(description) = &prepared.file.description
+            {
+                prepared.file.description_embedding =
+                    Some(Database::embedding_key(&vector_profile, false, description));
+            }
+            let mut items = Vec::new();
+            for (callable, mut prepared_callable) in prepared
+                .parsed
+                .callables
+                .into_iter()
+                .zip(prepared.callables)
+            {
+                if self.enabled
+                    && let Some(description) = prepared_callable.data["description"].as_str()
+                {
+                    prepared_callable.description_embedding =
+                        Some(Database::embedding_key(&vector_profile, false, description));
+                }
+                items.push(Item {
+                    id: 0,
+                    path: prepared.file.path.clone(),
+                    identity: prepared_callable.identity,
+                    kind: "function".into(),
+                    data: prepared_callable.data,
+                    embedding: Database::embedding_key(
+                        &vector_profile,
+                        false,
+                        &callable.embedding_input,
+                    ),
+                    description_embedding: prepared_callable.description_embedding,
+                });
+            }
+            for (ordinal, chunk) in prepared.parsed.chunks.into_iter().enumerate() {
+                let embedding =
+                    Database::embedding_key(&vector_profile, false, &chunk.embedding_input);
+                let identity = hash(json!([prepared.file.path, "markdown", ordinal]).to_string());
+                let mut data = serde_json::to_value(chunk)?;
+                data["path"] = json!(prepared.file.path);
+                data["sourceMode"] = json!(prepared.file.source_mode);
+                items.push(Item {
+                    id: 0,
+                    path: prepared.file.path.clone(),
+                    identity,
+                    kind: "markdown".into(),
+                    data,
+                    embedding,
+                    description_embedding: None,
+                });
+            }
+            result.push((prepared.file, items));
+        }
+        Ok(result)
     }
 
     fn ensure_embeddings(&self, inputs: &[String], query: bool) -> Result<()> {
+        self.ensure_embedding_groups(vec![inputs.to_vec()], query)
+    }
+
+    fn ensure_embedding_groups(&self, groups: Vec<Vec<String>>, query: bool) -> Result<()> {
         let vector = self.providers.vector();
         let profile = vector.profile();
-        let mut pending = BTreeMap::new();
-        for input in inputs {
-            let key = Database::embedding_key(&profile, query, input);
-            if self.db.embedding(&key)?.is_none() {
-                pending.insert(key, input.clone());
-            }
-        }
-        let pending: Vec<_> = pending.into_iter().collect();
         let batch = vector.batch_limit();
-        let batches: Vec<_> = pending.chunks(batch).collect();
+        let mut seen = HashSet::new();
+        let mut batches = Vec::new();
+        for inputs in groups {
+            let mut pending = BTreeMap::new();
+            for input in inputs {
+                let key = Database::embedding_key(&profile, query, &input);
+                if seen.insert(key.clone()) && self.db.embedding(&key)?.is_none() {
+                    pending.insert(key, input);
+                }
+            }
+            let pending: Vec<_> = pending.into_iter().collect();
+            batches.extend(pending.chunks(batch).map(<[_]>::to_vec));
+        }
         run_jobs(
             "Generating embeddings",
             &batches,
@@ -1273,26 +1396,21 @@ impl Engine {
 
     pub fn reindex_files(&mut self, callables: bool) -> Result<Value> {
         ensure!(self.enabled, "Enable descriptions first");
-        let mut changed = Vec::new();
-        let files: Vec<_> = self
+        let inputs: Vec<_> = self
             .files
             .values()
             .filter(|file| {
                 file.language != "markdown" && file.description_hash.as_deref() != Some(&file.hash)
             })
+            .map(|file| PrepareInput {
+                path: file.path.clone(),
+                source: file.source.clone(),
+                source_mode: file.source_mode.clone(),
+                regenerate_file: true,
+                regenerate_callables: callables,
+            })
             .collect();
-        let reindexing = ui::counted("Regenerating file descriptions", files.len());
-        for file in files {
-            changed.push(self.prepare(
-                &file.path,
-                &file.source,
-                &file.source_mode,
-                true,
-                callables,
-            )?);
-            reindexing.inc(1);
-        }
-        reindexing.finish();
+        let changed = self.prepare_all(inputs)?;
         let checkpoint = self.db.meta("checkpoint")?;
         self.db.apply(&changed, &[], checkpoint.as_deref())?;
         self.load()?;
@@ -1418,6 +1536,9 @@ fn run_jobs<T: Sync, R: Send>(
     work: impl Fn(&T) -> Result<R> + Sync,
     mut persist: impl FnMut(&T, R) -> Result<()>,
 ) -> Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
     let progress = ui::counted(label, jobs.iter().map(&units).sum());
     for window in jobs.chunks(parallelism) {
         std::thread::scope(|scope| -> Result<()> {

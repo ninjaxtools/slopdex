@@ -771,6 +771,43 @@ fn concurrency_callable_descriptions_respect_configured_parallelism() -> Result<
     assert_bounded_concurrency(ConcurrentWork::Callables)
 }
 
+#[test]
+fn preparation_finishes_callable_descriptions_before_global_embeddings() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("a.rs", &function("alpha", "VECTOR_EAST"))?;
+    repo.write("b.rs", &function("beta", "VECTOR_NORTH"))?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+
+    let requests = mock.requests("");
+    let callable_indices: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            request.body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|prompt| prompt.starts_with("Describe what"))
+                .then_some(index)
+        })
+        .collect();
+    let embedding_indices: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| request.path.ends_with("/embeddings").then_some(index))
+        .collect();
+    assert_eq!(callable_indices.len(), 2);
+    assert_eq!(embedding_indices.len(), 2);
+    assert!(
+        callable_indices.last() < embedding_indices.first(),
+        "description and embedding phases must not interleave"
+    );
+    Ok(())
+}
+
 fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<()> {
     let repo = Repo::new()?;
     let limit = 3;
