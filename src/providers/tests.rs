@@ -78,6 +78,9 @@ impl Mock {
                         Err(e) => panic!("mock accept failed: {e}"),
                     }
                 };
+                // Windows accepted sockets inherit the listener's nonblocking mode.
+                // Use blocking reads for partial requests, bounded by the timeout below.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();

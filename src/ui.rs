@@ -4,18 +4,61 @@
 use std::{
     fmt::Display,
     io::{self, IsTerminal, Write},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
 
 struct Active {
-    group: cliclack::MultiProgress,
-    bar: cliclack::ProgressBar,
+    id: ScopeId,
+    label: String,
+    display: Option<TerminalDisplay>,
     state: ProgressState,
 }
 
+struct TerminalDisplay {
+    group: cliclack::MultiProgress,
+    bar: cliclack::ProgressBar,
+}
+
 static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
+const TEXT_DELAY: Duration = Duration::from_millis(200);
+const BAR_THRESHOLD: Duration = Duration::from_secs(1);
+const REFRESH_INTERVAL: Duration = Duration::from_millis(25);
+
+// Keep the last settled text while a replacement is pending. Frequent short
+// updates (such as filenames) must not reset the age of the enclosing task.
+struct DelayedText {
+    text: String,
+    since: Instant,
+    visible: Option<String>,
+}
+
+impl DelayedText {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            since: Instant::now(),
+            visible: None,
+        }
+    }
+
+    fn set(&mut self, text: String) {
+        if self.text != text {
+            self.text = text;
+            self.since = Instant::now();
+        }
+    }
+
+    fn get(&mut self, now: Instant) -> Option<&str> {
+        if now.saturating_duration_since(self.since) >= TEXT_DELAY {
+            self.visible = Some(self.text.clone());
+        }
+        self.visible.as_deref()
+    }
+}
 
 // Tokens belong to a scope, rather than a stack index or display generation:
 // a late increment/drop cannot affect another scope or a later CLI operation.
@@ -44,13 +87,15 @@ impl Count {
 struct Scope {
     id: ScopeId,
     count: Count,
-    detail: Option<String>,
+    detail: Option<DelayedText>,
+    since: Instant,
+    bar_visible: bool,
 }
 
 impl Scope {
-    fn render(&self) -> Render {
+    fn render(&self, detail: Option<&str>) -> Render {
         let mut message = self.count.message(false);
-        if let Some(detail) = &self.detail {
+        if let Some(detail) = detail {
             message.push_str(" — ");
             message.push_str(detail);
         }
@@ -59,10 +104,34 @@ impl Scope {
             counts: Some((self.count.completed, self.count.total)),
         }
     }
+
+    fn visible(&mut self, now: Instant) -> Option<String> {
+        let elapsed = now.saturating_duration_since(self.since);
+        if elapsed < TEXT_DELAY {
+            return None;
+        }
+        // With no samples, wait until the task actually exceeds a second.
+        // Once shown, keep the bar stable even if later samples are faster.
+        if self.count.completed < self.count.total
+            && (elapsed > BAR_THRESHOLD
+                || (self.count.completed > 0
+                    && elapsed.as_secs_f64() * self.count.total as f64
+                        / self.count.completed as f64
+                        > BAR_THRESHOLD.as_secs_f64()))
+        {
+            self.bar_visible = true;
+        }
+        let detail = self
+            .detail
+            .as_mut()
+            .and_then(|detail| detail.get(now))
+            .map(str::to_owned);
+        Some(self.render(detail.as_deref()).display(self.bar_visible))
+    }
 }
 
 struct ProgressState {
-    spinner: String,
+    spinner: DelayedText,
     scopes: Vec<Scope>,
     last: Option<(Count, bool)>,
 }
@@ -74,22 +143,22 @@ struct Render {
 }
 
 impl Render {
-    fn display(&self) -> String {
+    fn display(&self, show_bar: bool) -> String {
         match self.counts {
-            Some((completed, total)) => {
+            Some((completed, total)) if show_bar => {
                 let filled = if total == 0 {
                     0
                 } else {
                     (completed as u128 * 20 / total as u128) as usize
                 };
                 format!(
-                    "{} [{}{}]",
+                    "{}\n│    [{}{}]",
                     self.message,
                     "■".repeat(filled),
                     "□".repeat(20 - filled)
                 )
             }
-            None => self.message.clone(),
+            _ => self.message.clone(),
         }
     }
 }
@@ -97,7 +166,7 @@ impl Render {
 impl ProgressState {
     fn new(label: &str) -> Self {
         Self {
-            spinner: label.to_owned(),
+            spinner: DelayedText::new(label.to_owned()),
             scopes: Vec::new(),
             last: None,
         }
@@ -116,6 +185,8 @@ impl ProgressState {
                 total,
             },
             detail: None,
+            since: Instant::now(),
+            bar_visible: false,
         });
         id
     }
@@ -138,27 +209,50 @@ impl ProgressState {
             if index == 0 {
                 self.last = Some((scope.count, success));
             }
+            if self.scopes.is_empty() {
+                // Returning to an unknown-size stage is itself a replacement.
+                self.spinner.since = Instant::now();
+                self.spinner.visible = None;
+            }
         }
     }
 
     fn message(&mut self, message: String) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.detail = Some(message);
+            if let Some(detail) = &mut scope.detail {
+                detail.set(message);
+            } else {
+                scope.detail = Some(DelayedText::new(message));
+            }
         } else {
-            self.spinner = message;
+            self.spinner.set(message);
             self.last = None;
         }
     }
 
+    #[cfg(test)]
     fn render(&self) -> Render {
         if let Some(scope) = self.scopes.last() {
-            scope.render()
+            scope.render(scope.detail.as_ref().map(|detail| detail.text.as_str()))
         } else {
             Render {
-                message: self.spinner.clone(),
+                message: self.spinner.text.clone(),
                 counts: None,
             }
         }
+    }
+
+    fn visible(&mut self, now: Instant) -> Option<String> {
+        if self.scopes.is_empty() {
+            return self.spinner.get(now).map(str::to_owned);
+        }
+        // A short-lived child never displaces its already-visible parent.
+        let rows = self
+            .scopes
+            .iter_mut()
+            .filter_map(|scope| scope.visible(now))
+            .collect::<Vec<_>>();
+        (!rows.is_empty()).then(|| rows.join("\n│    "))
     }
 
     fn completion(&self, success: bool) -> String {
@@ -184,21 +278,27 @@ impl ProgressState {
 
 impl Active {
     fn render(&mut self) {
-        let message = if self.state.scopes.is_empty() {
-            self.state.render().display()
-        } else {
-            // Keep parent totals visible while nested work is running. A single
-            // reusable multiline row avoids accumulating a row for every file.
-            self.state
-                .scopes
-                .iter()
-                .map(|s| s.render().display())
-                .collect::<Vec<_>>()
-                .join("\n│    ")
+        let Some(message) = self.state.visible(Instant::now()) else {
+            return;
         };
         // Update bar, percentage, and counts atomically. Separate native length,
         // position, and message setters can draw mismatched nested-task states.
-        self.bar.set_message(message);
+        if let Some(display) = &self.display {
+            display.bar.set_message(message);
+        } else {
+            let group = cliclack::multi_progress(&self.label);
+            let bar = group.add(cliclack::spinner());
+            bar.start(message);
+            self.display = Some(TerminalDisplay { group, bar });
+        }
+    }
+
+    fn println(&self, message: impl Display) {
+        if let Some(display) = &self.display {
+            display.group.println(message);
+        } else {
+            let _ = cliclack::log::info(message);
+        }
     }
 }
 
@@ -242,7 +342,7 @@ impl Progress {
             {
                 // A fast subsequent stage can otherwise replace the last
                 // frame before the terminal ever displays its completion.
-                active.group.println(scope.count.message(true));
+                active.println(scope.count.message(true));
             }
             active.state.end(&id, success);
             active.render();
@@ -261,36 +361,52 @@ pub(crate) fn terminal() -> bool {
 }
 
 /// Owns a display only when no enclosing operation already owns it.
-struct DisplayGuard(bool);
+struct DisplayGuard(Option<(mpsc::Sender<()>, JoinHandle<()>)>);
 
 impl DisplayGuard {
     fn start(label: &str) -> Self {
         if !terminal() {
-            return Self(false);
+            return Self(None);
         }
         let mut active = ACTIVE.lock().unwrap();
         if active.is_some() {
-            return Self(false);
+            return Self(None);
         }
-        let group = cliclack::multi_progress(label);
-        let bar = group.add(cliclack::spinner());
-        bar.start(label);
+        let id = Arc::new(());
         *active = Some(Active {
-            group,
-            bar,
+            id: id.clone(),
+            label: label.to_owned(),
+            display: None,
             state: ProgressState::new(label),
         });
-        Self(true)
+        let (stop, receiver) = mpsc::channel();
+        // Rendering must wake even while the main thread is blocked on I/O.
+        let worker = thread::spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = receiver.recv_timeout(REFRESH_INTERVAL)
+            {
+                let mut active = ACTIVE.lock().unwrap();
+                if let Some(active) = active.as_mut()
+                    && Arc::ptr_eq(&active.id, &id)
+                {
+                    active.render();
+                } else {
+                    break;
+                }
+            }
+        });
+        Self(Some((stop, worker)))
     }
 
     fn finish(&mut self, success: bool) {
-        if !self.0 {
+        let Some((stop, worker)) = self.0.take() else {
             return;
-        }
-        self.0 = false;
+        };
+        let _ = stop.send(());
         let mut active = ACTIVE.lock().unwrap();
-        if let Some(display) = active.take() {
-            let message = display.state.completion(success);
+        if let Some(active) = active.take()
+            && let Some(display) = active.display
+        {
+            let message = active.state.completion(success);
             if success {
                 display.bar.stop(message);
                 display.group.stop();
@@ -299,6 +415,8 @@ impl DisplayGuard {
                 display.group.error("Failed");
             }
         }
+        drop(active);
+        let _ = worker.join();
     }
 }
 
@@ -333,9 +451,9 @@ enum Level {
 fn log(level: Level, message: impl Display) {
     let message = message.to_string();
     let active = ACTIVE.lock().unwrap();
-    if let Some(active) = active.as_ref() {
+    if let Some(display) = active.as_ref().and_then(|active| active.display.as_ref()) {
         // MultiProgress serializes notices from HTTP workers above the animation.
-        active.group.println(&message);
+        display.group.println(&message);
     } else if terminal() {
         let _ = match level {
             Level::Info => cliclack::log::info(&message),
@@ -364,29 +482,168 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transient_text_waits_for_each_replacement_to_settle() {
+        let mut state = ProgressState::new("Opening index");
+        let start = state.spinner.since;
+        assert_eq!(
+            state.visible(start + TEXT_DELAY - Duration::from_nanos(1)),
+            None
+        );
+        assert_eq!(
+            state.visible(start + TEXT_DELAY).as_deref(),
+            Some("Opening index")
+        );
+
+        state.message("Scanning files".into());
+        let start = state.spinner.since;
+        assert_eq!(state.visible(start).as_deref(), Some("Opening index"));
+        // Repeated reports of the same stage do not postpone its appearance.
+        state.message("Scanning files".into());
+        assert_eq!(state.spinner.since, start);
+        assert_eq!(
+            state.visible(start + TEXT_DELAY).as_deref(),
+            Some("Scanning files")
+        );
+
+        state.message("Short-lived stage".into());
+        state.message("Saving index".into());
+        let start = state.spinner.since;
+        assert_eq!(state.visible(start).as_deref(), Some("Scanning files"));
+        assert_eq!(
+            state.visible(start + TEXT_DELAY).as_deref(),
+            Some("Saving index")
+        );
+    }
+
+    #[test]
+    fn bars_require_more_than_one_second_of_expected_work() {
+        let mut state = ProgressState::new("Indexing");
+        let files = state.push("Files".into(), 5);
+        let start = state.scopes[0].since;
+        state.inc(&files, 1);
+        assert_eq!(state.visible(start + Duration::from_millis(199)), None);
+        // 200 ms for one of five items predicts exactly one second: no bar.
+        assert_eq!(
+            state.visible(start + TEXT_DELAY).as_deref(),
+            Some("Files 20% (1/5)")
+        );
+        let display = state.visible(start + Duration::from_millis(201)).unwrap();
+        assert_eq!(display, "Files 20% (1/5)\n│    [■■■■□□□□□□□□□□□□□□□□]");
+        // A revised estimate must not make an already-visible bar flicker off.
+        state.inc(&files, 3);
+        assert!(
+            state
+                .visible(start + Duration::from_millis(202))
+                .unwrap()
+                .contains("\n│    [")
+        );
+    }
+
+    #[test]
+    fn slow_estimates_still_observe_the_minimum_text_delay() {
+        let mut state = ProgressState::new("Indexing");
+        let files = state.push("Files".into(), 100);
+        let start = state.scopes[0].since;
+        state.inc(&files, 1);
+        assert_eq!(state.visible(start + Duration::from_millis(199)), None);
+        assert!(
+            state
+                .visible(start + TEXT_DELAY)
+                .unwrap()
+                .contains("\n│    [")
+        );
+    }
+
+    #[test]
+    fn unsampled_work_waits_one_second_and_finished_work_never_introduces_a_bar() {
+        let mut state = ProgressState::new("Indexing");
+        state.push("Files".into(), 4);
+        let start = state.scopes[0].since;
+        assert_eq!(
+            state.visible(start + BAR_THRESHOLD).as_deref(),
+            Some("Files 0% (0/4)")
+        );
+        assert!(
+            state
+                .visible(start + BAR_THRESHOLD + REFRESH_INTERVAL)
+                .unwrap()
+                .contains("\n│    [")
+        );
+
+        let mut state = ProgressState::new("Indexing");
+        let files = state.push("Files".into(), 4);
+        let start = state.scopes[0].since;
+        state.inc(&files, 3);
+        assert_eq!(
+            state.visible(start + TEXT_DELAY).as_deref(),
+            Some("Files 75% (3/4)")
+        );
+        state.inc(&files, 1);
+        assert_eq!(
+            state.visible(start + BAR_THRESHOLD * 2).as_deref(),
+            Some("Files 100% (4/4)")
+        );
+    }
+
+    #[test]
+    fn fast_children_and_details_do_not_replace_visible_parent() {
+        let mut state = ProgressState::new("Indexing");
+        let files = state.push("Files".into(), 10);
+        state.scopes[0].since = Instant::now() - TEXT_DELAY;
+        let parent = state.visible(Instant::now()).unwrap();
+        state.message("short-lived.rs".into());
+        let child = state.push("Embeddings".into(), 1);
+        assert_eq!(
+            state.visible(Instant::now()).as_deref(),
+            Some(parent.as_str())
+        );
+        state.end(&child, true);
+        state.message("long-lived.rs".into());
+        let start = state.scopes[0].detail.as_ref().unwrap().since;
+        assert_eq!(state.visible(start).as_deref(), Some(parent.as_str()));
+        assert!(
+            state
+                .visible(start + TEXT_DELAY)
+                .unwrap()
+                .contains(" — long-lived.rs")
+        );
+
+        state.end(&files, true);
+        let start = state.spinner.since;
+        assert_eq!(state.visible(start), None);
+        state.message("Saving snapshot".into());
+        let start = state.spinner.since;
+        assert_eq!(state.visible(start), None);
+        assert_eq!(
+            state.visible(start + TEXT_DELAY).as_deref(),
+            Some("Saving snapshot")
+        );
+    }
+
+    #[test]
     fn graphical_bar_and_numeric_counts_share_one_snapshot() {
         let mut state = ProgressState::new("Indexing");
         let files = state.push("Files".into(), 2);
         state.inc(&files, 1);
         let embeddings = state.push("Embeddings".into(), 5);
         assert_eq!(
-            state.render().display(),
-            "Embeddings 0% (0/5) [□□□□□□□□□□□□□□□□□□□□]"
+            state.render().display(true),
+            "Embeddings 0% (0/5)\n│    [□□□□□□□□□□□□□□□□□□□□]"
         );
         state.inc(&embeddings, 2);
         assert_eq!(
-            state.render().display(),
-            "Embeddings 40% (2/5) [■■■■■■■■□□□□□□□□□□□□]"
+            state.render().display(true),
+            "Embeddings 40% (2/5)\n│    [■■■■■■■■□□□□□□□□□□□□]"
         );
         state.inc(&embeddings, 3);
         assert_eq!(
-            state.render().display(),
-            "Embeddings 100% (5/5) [■■■■■■■■■■■■■■■■■■■■]"
+            state.render().display(true),
+            "Embeddings 100% (5/5)\n│    [■■■■■■■■■■■■■■■■■■■■]"
         );
         state.end(&embeddings, true);
         assert_eq!(
-            state.render().display(),
-            "Files 50% (1/2) [■■■■■■■■■■□□□□□□□□□□]"
+            state.render().display(true),
+            "Files 50% (1/2)\n│    [■■■■■■■■■■□□□□□□□□□□]"
         );
     }
 
@@ -397,7 +654,7 @@ mod tests {
         state.inc(&queries, 1);
         state.end(&queries, true);
         state.message("Generating explanation".into());
-        assert_eq!(state.render().display(), "Generating explanation");
+        assert_eq!(state.render().display(true), "Generating explanation");
         assert_eq!(state.completion(false), "Failed");
     }
 

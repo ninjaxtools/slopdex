@@ -445,7 +445,10 @@ mod tests {
 
     fn mark_old(path: &Path) -> std::time::SystemTime {
         let time = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        fs::File::open(path)
+        // Windows requires write access to update file timestamps.
+        OpenOptions::new()
+            .write(true)
+            .open(path)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(time))
             .unwrap();

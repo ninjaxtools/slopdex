@@ -82,7 +82,12 @@ Other commands open it and normally refresh before doing their work.
 
 On terminal stderr, cliclack displays progress for catalog loading, opening and
 refreshing indexes, searches, explanations, and description regeneration.
-Known-size tasks show a 0–100% bar with completed/target counts: files indexed,
+Replaceable status text waits until its task or message has lasted at least
+200 ms; faster tasks produce only permanent notices and completion summaries.
+Known-size tasks show completed/target counts and, when measured progress
+predicts more than one second of work, a 0–100% bar on its own line. With no
+completed items to estimate from, the bar waits until one second has elapsed.
+These tasks include files indexed,
 embeddings and descriptions generated, vector snapshots processed, indexes
 searched, candidates rescored/reranked, and source functions compared. Embedding
 counts measure individual inputs, including partial batches. Parent progress
