@@ -16,7 +16,7 @@ use std::{
     name = "slopdex",
     version,
     about = "Semantic code and Markdown search",
-    after_help = "Examples:\n  slopdex search \"validate an authenticated session\"\n  slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nIndex commands refresh automatically. --no-reindex reuses the index offline."
+    after_help = "Examples:\n  slopdex search \"validate an authenticated session\"\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nIndex commands refresh automatically. --no-reindex reuses the index offline."
 )]
 struct Cli {
     #[command(flatten)]
@@ -325,9 +325,15 @@ struct CrossArgs {
     /// Matches kept per source function
     #[arg(long, default_value = "5", value_parser = positive)]
     matches: usize,
-    /// Minimum length of both source and candidate functions
-    #[arg(long, default_value = "2", value_parser = positive)]
-    min_lines: usize,
+    /// Inclusive minimum, or inclusive-min/exclusive-max line count for sources and candidates
+    #[arg(
+        long,
+        visible_alias = "min-lines",
+        value_name = "N[-N]",
+        default_value = "2",
+        value_parser = line_range
+    )]
+    lines: LineRange,
     /// Source file or recursive directory, repo-relative or absolute within the repository
     #[arg(long)]
     source_path: Option<PathBuf>,
@@ -360,7 +366,10 @@ impl CrossArgs {
         // The engine must scan all sources. Limit applies to emitted clusters/rows, never edges.
         value.as_object_mut().unwrap().remove("limit");
         value["matches"] = json!(self.matches);
-        value["minLines"] = json!(self.min_lines);
+        value["minLines"] = json!(self.lines.min);
+        if let Some(max) = self.lines.max {
+            value["maxLines"] = json!(max);
+        }
         value["uncommitted"] = json!(self.uncommitted);
         value["crossFileOnly"] = json!(self.cross_file_only);
         value["includeSymmetricDuplicates"] = json!(self.include_symmetric_duplicates);
@@ -388,6 +397,12 @@ struct Threshold {
     max: Option<f64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LineRange {
+    min: usize,
+    max: Option<usize>,
+}
+
 fn nonempty(input: &str) -> std::result::Result<String, String> {
     if input.trim().is_empty() {
         Err("must not be empty".into())
@@ -402,6 +417,23 @@ fn positive(input: &str) -> std::result::Result<usize, String> {
         .ok()
         .filter(|n| *n > 0)
         .ok_or_else(|| "must be a positive integer".into())
+}
+
+fn line_range(input: &str) -> std::result::Result<LineRange, String> {
+    let input = input.trim();
+    if let Ok(min) = positive(input) {
+        return Ok(LineRange { min, max: None });
+    }
+    if let Some((min, max)) = input.split_once('-')
+        && let (Ok(min), Ok(max)) = (positive(min.trim()), positive(max.trim()))
+        && min < max
+    {
+        return Ok(LineRange {
+            min,
+            max: Some(max),
+        });
+    }
+    Err("lines must be a positive integer or min-max, with min < max (maximum exclusive)".into())
 }
 
 fn candidates(input: &str) -> std::result::Result<usize, String> {
@@ -2036,7 +2068,7 @@ mod tests {
             vec![
                 "cross-search",
                 "--cross-file-only",
-                "--min-lines",
+                "--lines",
                 "4",
                 "--threshold",
                 "0.9",
@@ -2044,7 +2076,7 @@ mod tests {
             vec![
                 "cross-search",
                 "--cross-file-only",
-                "--min-lines",
+                "--lines",
                 "4",
                 "--threshold",
                 "0.85-0.9",
@@ -2053,7 +2085,7 @@ mod tests {
                 "cross-search",
                 "--uncommitted",
                 "--cross-file-only",
-                "--min-lines",
+                "--lines",
                 "4",
                 "--threshold",
                 "0.9",
@@ -2157,6 +2189,38 @@ mod tests {
     }
 
     #[test]
+    fn line_ranges_have_an_exclusive_maximum() {
+        for (value, min, max) in [("1", 1, None), ("4", 4, None), ("4-10", 4, Some(10))] {
+            let cli = parse(&["cross-search", "--lines", value]);
+            let Command::CrossSearch(args) = cli.command else {
+                panic!()
+            };
+            assert_eq!(args.lines, LineRange { min, max });
+            let options = args.options();
+            assert_eq!(options["minLines"], json!(min));
+            assert_eq!(options.get("maxLines"), max.map(|n| json!(n)).as_ref());
+        }
+        for value in ["0", "-1", "1-1", "2-1", "1-", "1-2-3", "1.5", ""] {
+            assert!(
+                Cli::try_parse_from(["slopdex", "cross-search", "--lines", value]).is_err(),
+                "accepted {value}"
+            );
+        }
+
+        let Command::CrossSearch(args) = parse(&["cross-search", "--min-lines", "4-10"]).command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            args.lines,
+            LineRange {
+                min: 4,
+                max: Some(10)
+            }
+        );
+    }
+
+    #[test]
     fn cross_search_has_a_selective_default_without_changing_query_defaults() {
         for command in [
             "search",
@@ -2200,7 +2264,7 @@ mod tests {
             panic!()
         };
         assert_eq!(args.matches, 5);
-        assert_eq!(args.min_lines, 2);
+        assert_eq!(args.lines, LineRange { min: 2, max: None });
         assert_eq!(args.filters.threshold.min, 0.8);
         assert!(args.filters.limit.is_none());
         let cli = parse(&["cross-search", "--limit", "1"]);
@@ -2208,7 +2272,7 @@ mod tests {
             panic!()
         };
         assert!(args.options().get("limit").is_none());
-        for option in ["--limit", "--matches", "--min-lines"] {
+        for option in ["--limit", "--matches", "--lines", "--min-lines"] {
             for value in ["0", "-1", "1.5", "NaN"] {
                 assert!(Cli::try_parse_from(["slopdex", "cross-search", option, value]).is_err());
             }

@@ -145,7 +145,7 @@ For the best matching files (configured with `--describe-full-file-threshold`, d
 Compare functions across files, exclude short wrappers, and group matches into clusters:
 
 ```console
-$ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
+$ slopdex cross-search --cross-file-only --lines 4 --threshold 0.9
 Cluster 1 (3 functions, similarity 0.9124-0.9568)
   src/auth/session.ts:18:1 :: validateSession
   src/http/middleware.ts:42:1 :: authenticate
@@ -160,11 +160,13 @@ Clusters join matches transitively, so a low threshold can connect many groups
 into one large cluster. Use `0.9` for stricter duplicate detection, or explicitly
 pass `--threshold 0.3` for the pre-rewrite default.
 
-You can use threshold ranges as well:
+You can use threshold and line-count ranges as well. Range starts are inclusive
+and ends are exclusive, so `--lines 4-20` selects functions with 4 through 19
+lines:
 
 ```console
-$ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.9
-$ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
+$ slopdex cross-search --cross-file-only --lines 4 --threshold 0.9
+$ slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 ```
 
 ### Restrict functions used in the cross-search
@@ -172,7 +174,7 @@ $ slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
 Only use uncommitted working-tree functions as sources:
 
 ```console
-$ slopdex cross-search --uncommitted --cross-file-only --min-lines 4 --threshold 0.9
+$ slopdex cross-search --uncommitted --cross-file-only --lines 4 --threshold 0.9
 ```
 
 Only use functions changed since origin/main as sources:

@@ -194,7 +194,7 @@ Cross-search options:
 | Option | Behavior |
 | --- | --- |
 | `--matches <number>` | Maximum neighbors retrieved per source, default `5`. Symmetric-pair suppression can reduce the emitted count. |
-| `--min-lines <number>` | Minimum line count for both sources and candidates, default `2`; use `1` for one-line callables. |
+| `--lines <number|min-max>` | Line count for both sources and candidates, default `2`: the minimum is inclusive and the optional maximum is exclusive. A single number means at least that many lines. `--min-lines` is an alias. |
 | `--source-path <path>` | Source file or recursive directory, root-relative or absolute within the root. |
 | `--changed-since <commit>` | Source callables differing from this ancestor of the indexed Git checkpoint; details below. |
 | `--uncommitted` | Source callables whose indexed file has working-tree provenance. |
@@ -214,7 +214,7 @@ slopdex descriptions enable --description-provider opencode-go
 slopdex search-descriptions "keep the repository index synchronized"
 slopdex describe "I want to implement a new rpc endpoint"
 slopdex reindex-files --callables
-slopdex cross-search --cross-file-only --min-lines 4 --threshold 0.85-0.9
+slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 slopdex cross-search --uncommitted --cross-file-only --threshold 0.9
 slopdex cross-search --changed-since origin/main --threshold 0.9
 slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 0.9

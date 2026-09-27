@@ -1208,6 +1208,11 @@ impl Engine {
             return Ok(results);
         }
         let min_lines = options["minLines"].as_u64().unwrap_or(2);
+        let max_lines = options["maxLines"].as_u64();
+        let lines_match = |item: &Item| {
+            let lines = item.data["lineCount"].as_u64().unwrap_or(0);
+            lines >= min_lines && max_lines.is_none_or(|max| lines < max)
+        };
         let selection = Selection::compile(options)?;
         let source_path = options["sourcePath"]
             .as_str()
@@ -1222,9 +1227,7 @@ impl Engine {
         let eligible: HashMap<_, _> = target
             .items
             .iter()
-            .filter(|i| {
-                i.kind == "function" && i.data["lineCount"].as_u64().unwrap_or(0) >= min_lines
-            })
+            .filter(|i| i.kind == "function" && lines_match(i))
             .map(|i| (i.id, target.root.join(&i.path)))
             .collect();
         let sources: Vec<_> = self
@@ -1232,7 +1235,7 @@ impl Engine {
             .iter()
             .filter(|source| {
                 source.kind == "function"
-                    && source.data["lineCount"].as_u64().unwrap_or(0) >= min_lines
+                    && lines_match(source)
                     && selection.path_matches(&source.path)
                     && selection.name_matches(source.data["qualifiedName"].as_str().unwrap_or(""))
                     && source_path.as_ref().is_none_or(|p| under(&source.path, p))

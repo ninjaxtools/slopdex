@@ -1767,6 +1767,15 @@ fn cross_search_applies_candidate_filters_before_limit_and_deduplicates_pairs() 
     none["minLines"] = json!(5);
     assert!(engine.cross_search(None, &none)?.is_empty());
     none = options.clone();
+    none["maxLines"] = json!(4);
+    assert!(
+        engine.cross_search(None, &none)?.is_empty(),
+        "the maximum line count is exclusive for sources and candidates"
+    );
+    let mut bounded = options.clone();
+    bounded["maxLines"] = json!(5);
+    assert_eq!(engine.cross_search(None, &bounded)?, rows);
+    none = options.clone();
     none["sourcePath"] = json!("sr");
     assert!(
         engine.cross_search(None, &none)?.is_empty(),
