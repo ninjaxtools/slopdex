@@ -329,6 +329,9 @@ workspace tests, then builds the release CLI and smoke-tests `--version` and
 `--help`. The CLI smoke checks need no provider credentials or network calls.
 `.github/workflows/rust.yml` runs `cargo verify` directly, without Node.
 
+Run `cargo verify` before finishing code changes. `AGENTS.md` also instructs
+coding agents to run it as their final verification step.
+
 `cargo release-check` runs verification followed by `dist generate --check` and
 `dist plan`. Install the pinned cargo-dist version below before running release
 checks.

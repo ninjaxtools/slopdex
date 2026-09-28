@@ -750,11 +750,13 @@ pub fn run() -> Result<()> {
             print_cross(
                 &mut out,
                 rows,
-                format,
-                target.is_none(),
-                args.cohesion,
-                args.filters.limit,
-                cli.global.detail,
+                CrossOutput::new(
+                    format,
+                    target.is_none(),
+                    args.cohesion,
+                    args.filters.limit,
+                    cli.global.detail,
+                ),
                 &mut Presentation::new(&engine),
                 target.as_ref().map(Presentation::new).as_mut(),
             )?;
@@ -1795,9 +1797,9 @@ fn print_function_with_header(
                 .and_then(|engine| engine.presentation_file_description(text(function, "path")))
                 .filter(|text| !text.trim().is_empty())
         {
-            write!(
+            writeln!(
                 out,
-                "{}\n",
+                "{}",
                 map::comment_block(text(function, "path"), description)
             )?;
         }
@@ -1848,9 +1850,9 @@ fn print_function_with_header(
                 )
             })
             .unwrap_or_default();
-        write!(
+        writeln!(
             out,
-            "{}{name}{suffix}\n",
+            "{}{name}{suffix}",
             map::hunk(start, end, Some(&annotation))
         )?;
     }
@@ -1872,9 +1874,9 @@ fn print_markdown(
             .and_then(|engine| engine.presentation_file_description(text(chunk, "path")))
             .filter(|text| !text.trim().is_empty())
     {
-        write!(
+        writeln!(
             out,
-            "{}\n",
+            "{}",
             map::comment_block(text(chunk, "path"), description)
         )?;
     }
@@ -2020,17 +2022,47 @@ fn print_errors(out: &mut impl Write, errors: &[Value], format: Format) -> Resul
     Ok(())
 }
 
-fn print_cross(
-    out: &mut impl Write,
-    mut rows: Vec<Value>,
+#[derive(Clone, Copy)]
+struct CrossOutput {
     format: Format,
     same_index: bool,
     cohesion: bool,
     limit: Option<usize>,
     detail: Detail,
+}
+
+impl CrossOutput {
+    fn new(
+        format: Format,
+        same_index: bool,
+        cohesion: bool,
+        limit: Option<usize>,
+        detail: Detail,
+    ) -> Self {
+        Self {
+            format,
+            same_index,
+            cohesion,
+            limit,
+            detail,
+        }
+    }
+}
+
+fn print_cross(
+    out: &mut impl Write,
+    mut rows: Vec<Value>,
+    options: CrossOutput,
     source_presentation: &mut Presentation<'_>,
     mut target_presentation: Option<&mut Presentation<'_>>,
 ) -> Result<()> {
+    let CrossOutput {
+        format,
+        same_index,
+        cohesion,
+        limit,
+        detail,
+    } = options;
     rows.retain(|row| !array(&row["matches"]).is_empty());
     if format == Format::Clusters {
         return print_clusters(
@@ -2804,11 +2836,7 @@ mod tests {
         print_cross(
             &mut out,
             rows,
-            Format::Clusters,
-            true,
-            false,
-            Some(1),
-            Detail::Compact,
+            CrossOutput::new(Format::Clusters, true, false, Some(1), Detail::Compact),
             &mut Presentation::empty(),
             None,
         )
@@ -2834,11 +2862,7 @@ mod tests {
         print_cross(
             &mut out,
             rows,
-            Format::Json,
-            true,
-            true,
-            Some(1),
-            Detail::Compact,
+            CrossOutput::new(Format::Json, true, true, Some(1), Detail::Compact),
             &mut Presentation::empty(),
             None,
         )
@@ -3761,7 +3785,7 @@ mod tests {
         let mut output = Vec::new();
         print_search(
             &mut output,
-            &[description.clone()],
+            std::slice::from_ref(&description),
             Format::Summary,
             Detail::Standard,
             true,
@@ -3869,7 +3893,7 @@ mod tests {
         let mut output = Vec::new();
         print_search(
             &mut output,
-            &[result.clone()],
+            std::slice::from_ref(&result),
             Format::Summary,
             Detail::Compact,
             true,
@@ -3993,11 +4017,7 @@ mod tests {
             print_cross(
                 &mut out,
                 vec![json!({"source": function("a"), "matches": []})],
-                format,
-                true,
-                false,
-                None,
-                Detail::Compact,
+                CrossOutput::new(format, true, false, None, Detail::Compact),
                 &mut Presentation::empty(),
                 None,
             )
@@ -4052,11 +4072,7 @@ mod tests {
         print_cross(
             &mut out,
             rows.clone(),
-            Format::Json,
-            false,
-            false,
-            Some(1),
-            Detail::Compact,
+            CrossOutput::new(Format::Json, false, false, Some(1), Detail::Compact),
             &mut Presentation::empty(),
             None,
         )
@@ -4069,11 +4085,7 @@ mod tests {
         print_cross(
             &mut out,
             rows,
-            Format::Summary,
-            false,
-            false,
-            Some(1),
-            Detail::Compact,
+            CrossOutput::new(Format::Summary, false, false, Some(1), Detail::Compact),
             &mut Presentation::empty(),
             None,
         )
@@ -4116,11 +4128,7 @@ mod tests {
         print_cross(
             &mut out,
             vec![same_id],
-            Format::Clusters,
-            false,
-            false,
-            None,
-            Detail::Compact,
+            CrossOutput::new(Format::Clusters, false, false, None, Detail::Compact),
             &mut Presentation::empty(),
             None,
         )
@@ -4166,11 +4174,7 @@ mod tests {
         print_cross(
             &mut expected,
             rows.clone(),
-            Format::Clusters,
-            true,
-            false,
-            None,
-            Detail::Expanded,
+            CrossOutput::new(Format::Clusters, true, false, None, Detail::Expanded),
             &mut Presentation::empty(),
             None,
         )
@@ -4185,11 +4189,7 @@ mod tests {
         print_cross(
             &mut actual,
             reversed,
-            Format::Clusters,
-            true,
-            false,
-            None,
-            Detail::Expanded,
+            CrossOutput::new(Format::Clusters, true, false, None, Detail::Expanded),
             &mut Presentation::empty(),
             None,
         )
@@ -4212,11 +4212,7 @@ mod tests {
         print_cross(
             &mut output,
             rows,
-            Format::Clusters,
-            true,
-            false,
-            None,
-            Detail::Compact,
+            CrossOutput::new(Format::Clusters, true, false, None, Detail::Compact),
             &mut Presentation::empty(),
             None,
         )
@@ -4260,11 +4256,7 @@ mod tests {
                 print_cross(
                     &mut BrokenPipe,
                     rows.clone(),
-                    format,
-                    true,
-                    false,
-                    None,
-                    Detail::Compact,
+                    CrossOutput::new(format, true, false, None, Detail::Compact),
                     &mut Presentation::empty(),
                     None
                 )
@@ -4275,11 +4267,7 @@ mod tests {
             print_cross(
                 &mut BrokenPipe,
                 rows,
-                Format::Clusters,
-                true,
-                false,
-                None,
-                Detail::Compact,
+                CrossOutput::new(Format::Clusters, true, false, None, Detail::Compact),
                 &mut Presentation::empty(),
                 None
             )
