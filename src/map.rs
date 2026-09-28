@@ -108,7 +108,14 @@ fn render_node(
         return;
     }
     let indent = "  ".repeat(depth);
+    let javascript = matches!(
+        node.language.as_str(),
+        "javascript" | "jsx" | "typescript" | "tsx"
+    );
     for attr in &node.attributes {
+        if javascript && matches!(attr.as_str(), "export" | "default" | "declare") {
+            continue;
+        }
         for line in display(attr, options.max_signature_chars).lines() {
             lines.push(format!("{indent}{line}"));
         }
@@ -118,7 +125,33 @@ fn render_node(
     } else {
         &node.signature
     };
-    let signature = display(signature, options.max_signature_chars);
+    let signature = if javascript {
+        let modifiers: Vec<_> = node
+            .attributes
+            .iter()
+            .filter(|attr| matches!(attr.as_str(), "export" | "default" | "declare"))
+            .filter(|attr| {
+                !signature
+                    .split_whitespace()
+                    .take(3)
+                    .any(|word| word == attr.as_str())
+            })
+            .map(String::as_str)
+            .collect();
+        format!(
+            "{}{}",
+            modifiers.join(" "),
+            if modifiers.is_empty() { "" } else { " " }
+        ) + signature
+    } else {
+        signature.to_owned()
+    };
+    // Signatures are already compacted by the parser except for newlines inside
+    // literals. Escape those for display so the source range stays on the same line.
+    let signature = display(
+        &signature.replace('\r', "\\r").replace('\n', "\\n"),
+        options.max_signature_chars,
+    );
     let signature = if depth == 1 && node.parent_id.is_some() && node.qualified_name != node.name {
         format!("{}: {signature}", node.qualified_name)
     } else {
@@ -136,14 +169,7 @@ fn render_node(
     } else {
         format!("[{}-{end}]", node.start_line)
     };
-    let mut signature_lines = signature.lines();
-    lines.push(format!(
-        "{indent}{} {range}",
-        signature_lines.next().unwrap_or("")
-    ));
-    for line in signature_lines {
-        lines.push(format!("{indent}{line}"));
-    }
+    lines.push(format!("{indent}{signature} {range}"));
     if let Some(children_of_node) = children.get(&node.id) {
         let count = options
             .max_children
@@ -243,13 +269,54 @@ mod tests {
         let parsed = crate::parse::parse("x.ts", "type Literal = 'two  words' | `line one\n  line two`; @decorate('a  b') class C { run() { implementation(); } }").unwrap();
         let output = render(&parsed.structure, None);
         assert!(output.contains("'two  words'"), "{output}");
-        assert!(output.contains("`line one"));
-        assert!(output.contains("    line two`"));
+        assert!(output.contains("`line one\\n  line two` [1-2]"), "{output}");
         assert!(output.contains("@decorate('a  b')"));
         assert!(!output.contains("implementation"));
         // Preserve raw attributes without attempting to interpret their quoting.
         let attribute = "#[example(r###\"one \"  two\"###)]";
         assert_eq!(display(attribute, None), attribute);
         assert_eq!(display("`first\n  second`", None), "`first\n  second`");
+    }
+
+    #[test]
+    fn javascript_exports_and_multiline_signatures_render_on_one_line() {
+        for path in ["x.js", "x.jsx", "x.ts", "x.tsx"] {
+            let source = "export default class Api { run() {} }\nexport const load = (value) => value;\nexport function use(\n  value\n) { return value; }";
+            let parsed = crate::parse::parse(path, source).unwrap();
+            let output = render(&parsed.structure, None);
+            assert!(
+                output.contains("  export default class Api [1]"),
+                "{path}: {output}"
+            );
+            assert!(
+                output.contains("  export const load = (value) => [2]"),
+                "{path}: {output}"
+            );
+            assert!(
+                output.contains("  export function use( value ) [3-5]"),
+                "{path}: {output}"
+            );
+            assert!(
+                !output
+                    .lines()
+                    .any(|line| line.trim() == "export" || line.trim() == "default"),
+                "{path}: {output}"
+            );
+        }
+        let parsed = crate::parse::parse(
+            "x.ts",
+            "export namespace API { export function run(): void {} }\ndeclare function external(): void;",
+        )
+        .unwrap();
+        let output = render(&parsed.structure, None);
+        assert!(output.contains("  export namespace API [1]"), "{output}");
+        assert!(
+            output.contains("    export function run(): void [1]"),
+            "{output}"
+        );
+        assert!(
+            output.contains("  declare function external(): void [2]"),
+            "{output}"
+        );
     }
 }
