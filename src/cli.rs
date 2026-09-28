@@ -1,6 +1,12 @@
 //! Command-line parsing, configuration, and presentation. Engine operations live in engine.rs.
 
-use crate::{engine::Engine, filter, map, parse::StructureNode, providers::Providers, ui};
+use crate::{
+    engine::Engine,
+    filter, map,
+    parse::{FileStructure, StructureNode},
+    providers::Providers,
+    ui,
+};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -56,9 +62,12 @@ struct Global {
     /// OpenAI reranker candidate count (1..=100; default: 10)
     #[arg(long, global = true, value_parser = candidates)]
     reranker_candidates: Option<usize>,
-    /// summary by default; cross-search uses clusters, cohesion uses summary; cross JSON is JSONL
+    /// Text excerpts by default; cross-search uses clusters, cohesion uses source/match groups; cross JSON is JSONL
     #[arg(long, global = true, value_enum)]
     format: Option<Format>,
+    /// Declaration-only by default; standard adds attributes, expanded adds descriptions and Markdown text
+    #[arg(long, global = true, value_enum, default_value = "compact")]
+    detail: Detail,
     /// Reuse the existing index offline, without automatic refresh
     #[arg(long, global = true, conflicts_with = "force_reindex")]
     no_reindex: bool,
@@ -81,9 +90,27 @@ struct Global {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Format {
+    #[value(name = "text", alias = "summary")]
     Summary,
     Json,
     Clusters,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Detail {
+    Compact,
+    Standard,
+    Expanded,
+}
+
+impl From<Detail> for map::Detail {
+    fn from(value: Detail) -> Self {
+        match value {
+            Detail::Compact => Self::Compact,
+            Detail::Standard => Self::Standard,
+            Detail::Expanded => Self::Expanded,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -619,7 +646,7 @@ pub fn run() -> Result<()> {
             } else {
                 Vec::new()
             };
-            print_map(&mut out, &rows, format)?;
+            print_map(&mut out, &rows, format, cli.global.detail)?;
         }
         Command::Search(args) => {
             let mut options = args.query.filters.options();
@@ -631,7 +658,13 @@ pub fn run() -> Result<()> {
             let rows = ui::spin("Searching index", || {
                 engine.search(&args.query.query, "search", &options)
             })?;
-            print_search(&mut out, &rows, format, false)?;
+            print_search(
+                &mut out,
+                &rows,
+                format,
+                cli.global.detail,
+                &mut Presentation::new(&engine),
+            )?;
         }
         Command::SearchCode(args) | Command::SearchDescriptions(args) | Command::SearchMd(args) => {
             let kind = match &cli.command {
@@ -642,7 +675,13 @@ pub fn run() -> Result<()> {
             let rows = ui::spin("Searching index", || {
                 engine.search(&args.query, kind, &args.filters.options())
             })?;
-            print_search(&mut out, &rows, format, kind == "search-descriptions")?;
+            print_search(
+                &mut out,
+                &rows,
+                format,
+                cli.global.detail,
+                &mut Presentation::new(&engine),
+            )?;
         }
         Command::Describe(args) => {
             let mut options = args.query.filters.options();
@@ -653,7 +692,19 @@ pub fn run() -> Result<()> {
             if format == Format::Json {
                 print_json(&mut out, &result)?;
             } else {
-                writeln!(out, "{}", text(&result, "description"))?;
+                writeln!(out, "Explanation\n{}", text(&result, "description"))?;
+                // Describe uses the same cached query results it used as LLM context.
+                let references = engine.search(&args.query.query, "search", &options)?;
+                if !references.is_empty() {
+                    writeln!(out, "\nReferences")?;
+                    print_search(
+                        &mut out,
+                        &references,
+                        format,
+                        cli.global.detail,
+                        &mut Presentation::new(&engine),
+                    )?;
+                }
             }
         }
         Command::CrossSearch(args) => {
@@ -700,6 +751,9 @@ pub fn run() -> Result<()> {
                 target.is_none(),
                 args.cohesion,
                 args.filters.limit,
+                cli.global.detail,
+                &mut Presentation::new(&engine),
+                target.as_ref().map(Presentation::new).as_mut(),
             )?;
         }
         Command::Status => print_json(&mut out, &engine.status()?)?,
@@ -1549,7 +1603,7 @@ fn print_json(out: &mut impl Write, value: &impl serde::Serialize) -> Result<()>
     Ok(())
 }
 
-fn print_map(out: &mut impl Write, rows: &[Value], format: Format) -> Result<()> {
+fn print_map(out: &mut impl Write, rows: &[Value], format: Format, detail: Detail) -> Result<()> {
     if format == Format::Json {
         return print_json(out, &rows);
     }
@@ -1560,7 +1614,11 @@ fn print_map(out: &mut impl Write, rows: &[Value], format: Format) -> Result<()>
         if index > 0 {
             writeln!(out)?;
         }
-        write!(out, "{}", map::render_nodes(&nodes, Some(path)))?;
+        write!(
+            out,
+            "{}",
+            map::render_with_detail(&nodes, Some(path), detail.into())
+        )?;
     }
     Ok(())
 }
@@ -1575,13 +1633,6 @@ fn array(value: &Value) -> &[Value] {
 
 fn number(value: &Value, key: &str) -> f64 {
     value[key].as_f64().unwrap_or(0.0)
-}
-
-fn function_name(function: &Value) -> String {
-    let name = function["qualifiedName"]
-        .as_str()
-        .unwrap_or_else(|| text(function, "name"));
-    format!("{} :: {name}", text(function, "path"))
 }
 
 fn function_location(function: &Value) -> String {
@@ -1599,9 +1650,9 @@ fn function_location(function: &Value) -> String {
 fn rank(row: &Value) -> String {
     let similarity = number(row, "similarity");
     if let Some(rerank) = row["rerankScore"].as_f64() {
-        format!("{rerank:.4} rerank ({similarity:.4} similarity)")
+        format!("score={rerank:.4} similarity={similarity:.4}")
     } else {
-        format!("{similarity:.4}")
+        format!("score={similarity:.4}")
     }
 }
 
@@ -1623,11 +1674,133 @@ fn score_details(row: &Value) -> String {
     }
 }
 
+struct Presentation<'a> {
+    engine: Option<&'a Engine>,
+    structures: HashMap<String, Option<FileStructure>>,
+}
+
+impl<'a> Presentation<'a> {
+    fn new(engine: &'a Engine) -> Self {
+        Self {
+            engine: Some(engine),
+            structures: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            engine: None,
+            structures: HashMap::new(),
+        }
+    }
+
+    fn node(&mut self, function: &Value) -> Result<Option<StructureNode>> {
+        let path = text(function, "path");
+        if !self.structures.contains_key(path) {
+            self.structures.insert(
+                path.to_owned(),
+                self.engine
+                    .map(|engine| engine.presentation_structure(path))
+                    .transpose()?
+                    .flatten(),
+            );
+        }
+        Ok(self.structures[path]
+            .as_ref()
+            .and_then(|structure| map::matching_node(structure, function))
+            .cloned())
+    }
+}
+
+fn print_function(
+    out: &mut impl Write,
+    function: &Value,
+    annotation: &str,
+    detail: Detail,
+    presentation: &mut Presentation<'_>,
+) -> Result<()> {
+    write!(out, "{}", map::file_header(text(function, "path")))?;
+    let node = presentation.node(function)?;
+    let qualified = node
+        .as_ref()
+        .and_then(|node| node.parent_id.map(|_| node.qualified_name.as_str()));
+    let annotation = [Some(annotation), qualified]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(node) = node {
+        write!(
+            out,
+            "{}",
+            map::render_node(&node, 0, Some(&annotation), detail.into())
+        )?;
+    } else {
+        let start = function["startLine"].as_u64().unwrap_or(1) as usize;
+        let end = function["endLine"].as_u64().unwrap_or(start as u64) as usize;
+        let name = function["qualifiedName"]
+            .as_str()
+            .unwrap_or_else(|| text(function, "name"));
+        write!(out, "{}{name}\n", map::hunk(start, end, Some(&annotation)))?;
+    }
+    if detail == Detail::Expanded
+        && let Some(description) = function["description"].as_str().filter(|s| !s.is_empty())
+    {
+        for line in description.lines() {
+            writeln!(out, "@ description: {line}")?;
+        }
+    }
+    Ok(())
+}
+
+fn print_markdown(out: &mut impl Write, row: &Value, detail: Detail) -> Result<()> {
+    let chunk = &row["chunk"];
+    write!(out, "{}", map::file_header(text(chunk, "path")))?;
+    let start = chunk["startLine"].as_u64().unwrap_or(1) as usize;
+    let end = chunk["endLine"].as_u64().unwrap_or(start as u64) as usize;
+    write!(out, "{}", map::hunk(start, end, Some(&rank(row))))?;
+    let last_heading = array(&chunk["headingPath"]).last().and_then(Value::as_str);
+    let heading = text(chunk, "content")
+        .lines()
+        .filter(|line| line.starts_with('#'))
+        .find(|line| last_heading.is_some_and(|name| line.trim_start_matches('#').trim() == name))
+        .map(str::to_owned)
+        .or_else(|| last_heading.map(|s| format!("# {s}")))
+        .unwrap_or_else(|| {
+            text(chunk, "content")
+                .lines()
+                .find(|line| !line.is_empty())
+                .unwrap_or("(untitled)")
+                .to_owned()
+        });
+    writeln!(out, "{heading}")?;
+    if detail == Detail::Expanded {
+        let content = text(chunk, "content");
+        let body = if content.lines().any(|line| line == heading) {
+            content
+                .lines()
+                .skip_while(|line| *line != heading)
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            content.to_owned()
+        };
+        if !body.trim().is_empty() {
+            writeln!(out, "{body}")?;
+        }
+    }
+    Ok(())
+}
+
 fn print_search(
     out: &mut impl Write,
     rows: &[Value],
     format: Format,
-    descriptions: bool,
+    detail: Detail,
+    presentation: &mut Presentation<'_>,
 ) -> Result<()> {
     if format == Format::Json {
         return print_json(out, &rows);
@@ -1635,42 +1808,23 @@ fn print_search(
     if rows.is_empty() {
         writeln!(out, "No matches.")?;
     }
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            writeln!(out)?;
+        }
         if row["type"] == "markdown" {
-            let chunk = &row["chunk"];
-            let heading = array(&chunk["headingPath"])
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" > ");
-            writeln!(
-                out,
-                "{}  {}:{}{}\n{}",
-                rank(row),
-                text(chunk, "path"),
-                chunk["startLine"].as_u64().unwrap_or(1),
-                if heading.is_empty() {
-                    String::new()
-                } else {
-                    format!(" :: {heading}")
-                },
-                text(chunk, "content")
-            )?;
+            print_markdown(out, row, detail)?;
         } else {
-            writeln!(
-                out,
-                "{}  {}{}",
+            let annotation = format!(
+                "{}{}",
                 rank(row),
-                function_name(&row["function"]),
-                score_details(row)
-            )?;
-            if descriptions
-                && let Some(description) = row["function"]["description"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-            {
-                writeln!(out, "{description}")?;
-            }
+                if detail == Detail::Expanded {
+                    score_details(row)
+                } else {
+                    String::new()
+                }
+            );
+            print_function(out, &row["function"], &annotation, detail, presentation)?;
         }
     }
     Ok(())
@@ -1713,10 +1867,21 @@ fn print_cross(
     same_index: bool,
     cohesion: bool,
     limit: Option<usize>,
+    detail: Detail,
+    source_presentation: &mut Presentation<'_>,
+    mut target_presentation: Option<&mut Presentation<'_>>,
 ) -> Result<()> {
     rows.retain(|row| !array(&row["matches"]).is_empty());
     if format == Format::Clusters {
-        return print_clusters(out, &rows, same_index, limit);
+        return print_clusters(
+            out,
+            &rows,
+            same_index,
+            limit,
+            detail,
+            source_presentation,
+            target_presentation,
+        );
     }
     if cohesion {
         for row in &mut rows {
@@ -1732,24 +1897,43 @@ fn print_cross(
     if rows.is_empty() && format == Format::Summary {
         writeln!(out, "No matches.")?;
     }
-    for row in rows.iter().take(limit.unwrap_or(usize::MAX)) {
+    for (index, row) in rows.iter().take(limit.unwrap_or(usize::MAX)).enumerate() {
         if format == Format::Json {
             serde_json::to_writer(&mut *out, row)?;
             writeln!(out)?;
         } else {
-            writeln!(out, "{}", function_name(&row["source"]))?;
+            if index > 0 {
+                writeln!(out)?;
+            }
+            writeln!(out, "Source")?;
+            print_function(out, &row["source"], "", detail, source_presentation)?;
             for item in array(&row["matches"]) {
                 let distance = item["physicalDistance"]
                     .as_f64()
-                    .map(|d| format!("  [distance {d}]"))
+                    .map(|d| format!(" distance={d}"))
                     .unwrap_or_default();
-                writeln!(
-                    out,
-                    "  {}  {}{distance}{}",
+                writeln!(out)?;
+                let annotation = format!(
+                    "{}{}{distance}{}",
+                    if same_index { "" } else { "target " },
                     rank(item),
-                    function_name(&item["function"]),
-                    score_details(item)
-                )?;
+                    if detail == Detail::Expanded {
+                        score_details(item)
+                    } else {
+                        String::new()
+                    }
+                );
+                if let Some(target) = target_presentation.as_deref_mut() {
+                    print_function(out, &item["function"], &annotation, detail, target)?;
+                } else {
+                    print_function(
+                        out,
+                        &item["function"],
+                        &annotation,
+                        detail,
+                        source_presentation,
+                    )?;
+                }
             }
         }
     }
@@ -1758,10 +1942,43 @@ fn print_cross(
 
 #[derive(Debug)]
 struct Cluster {
-    members: Vec<String>,
+    members: Vec<ClusterMember>,
+    edges: Vec<(String, String, f64)>,
     min: f64,
     max: f64,
     combined: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ClusterMember {
+    function: Value,
+    role: &'static str,
+}
+
+impl ClusterMember {
+    fn label(&self) -> String {
+        format!(
+            "{}{}",
+            if self.role == "index" {
+                ""
+            } else if self.role == "source" {
+                "[source] "
+            } else {
+                "[target] "
+            },
+            function_location(&self.function)
+        )
+    }
+
+    fn source_key(&self) -> (u8, &str, u64, u64, &str) {
+        (
+            u8::from(self.role == "target"),
+            text(&self.function, "path"),
+            self.function["startLine"].as_u64().unwrap_or(1),
+            self.function["startColumn"].as_u64().unwrap_or(1),
+            text(&self.function, "qualifiedName"),
+        )
+    }
 }
 
 fn node_key(function: &Value, role: &str) -> String {
@@ -1774,7 +1991,7 @@ fn node_key(function: &Value, role: &str) -> String {
 }
 
 fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
-    let mut nodes = BTreeMap::<String, String>::new();
+    let mut nodes = BTreeMap::<String, ClusterMember>::new();
     let mut neighbors = HashMap::<String, Vec<(String, f64, bool)>>::new();
     for row in rows {
         let source = &row["source"];
@@ -1787,19 +2004,17 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
             }
             nodes.insert(
                 left.clone(),
-                format!(
-                    "{}{}",
-                    if same_index { "" } else { "[source] " },
-                    function_location(source)
-                ),
+                ClusterMember {
+                    function: source.clone(),
+                    role: if same_index { "index" } else { "source" },
+                },
             );
             nodes.insert(
                 right.clone(),
-                format!(
-                    "{}{}",
-                    if same_index { "" } else { "[target] " },
-                    function_location(function)
-                ),
+                ClusterMember {
+                    function: function.clone(),
+                    role: if same_index { "index" } else { "target" },
+                },
             );
             let score = number(item, "similarity");
             let combined = item["descriptionSimilarity"].is_number();
@@ -1822,6 +2037,7 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
         let mut pending = vec![start.clone()];
         let mut cluster = Cluster {
             members: Vec::new(),
+            edges: Vec::new(),
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             combined: false,
@@ -1829,6 +2045,11 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
         while let Some(key) = pending.pop() {
             cluster.members.push(nodes[&key].clone());
             for (neighbor, score, combined) in &neighbors[&key] {
+                if key < *neighbor {
+                    cluster
+                        .edges
+                        .push((nodes[&key].label(), nodes[neighbor].label(), *score));
+                }
                 cluster.min = cluster.min.min(*score);
                 cluster.max = cluster.max.max(*score);
                 cluster.combined |= combined;
@@ -1837,14 +2058,22 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
                 }
             }
         }
-        cluster.members.sort();
+        cluster
+            .members
+            .sort_by(|a, b| a.source_key().cmp(&b.source_key()));
+        cluster.edges.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.total_cmp(&b.2))
+        });
+        cluster.edges.dedup();
         result.push(cluster);
     }
     result.sort_by(|a, b| {
         b.members
             .len()
             .cmp(&a.members.len())
-            .then_with(|| a.members[0].cmp(&b.members[0]))
+            .then_with(|| a.members[0].label().cmp(&b.members[0].label()))
     });
     result
 }
@@ -1854,6 +2083,9 @@ fn print_clusters(
     rows: &[Value],
     same_index: bool,
     limit: Option<usize>,
+    detail: Detail,
+    source_presentation: &mut Presentation<'_>,
+    mut target_presentation: Option<&mut Presentation<'_>>,
 ) -> Result<()> {
     let clusters = clusters(rows, same_index);
     if clusters.is_empty() {
@@ -1874,17 +2106,30 @@ fn print_clusters(
         };
         writeln!(
             out,
-            "Cluster {} ({} functions, similarity {range}{})",
+            "Cluster {} · {} functions · similarity {range}{}",
             index + 1,
             cluster.members.len(),
-            if cluster.combined {
+            if cluster.combined && detail == Detail::Expanded {
                 ", combined code + callable description + file description"
             } else {
                 ""
             }
         )?;
+        if detail == Detail::Expanded {
+            for (left, right, similarity) in &cluster.edges {
+                writeln!(out, "@ match: {left} ↔ {right} score={similarity:.4}")?;
+            }
+        }
         for member in &cluster.members {
-            writeln!(out, "  {member}")?;
+            writeln!(out)?;
+            let role = if same_index { "" } else { member.role };
+            if member.role == "target"
+                && let Some(target) = target_presentation.as_deref_mut()
+            {
+                print_function(out, &member.function, role, detail, target)?;
+            } else {
+                print_function(out, &member.function, role, detail, source_presentation)?;
+            }
         }
     }
     Ok(())
@@ -2029,18 +2274,18 @@ mod tests {
         .structure;
         let rows = vec![json!({"path": "example.rs", "nodes": structure.nodes})];
         let mut json_output = Vec::new();
-        print_map(&mut json_output, &rows, Format::Json).unwrap();
+        print_map(&mut json_output, &rows, Format::Json, Detail::Compact).unwrap();
         let decoded: Value = serde_json::from_slice(&json_output).unwrap();
         assert_eq!(decoded, json!(rows));
         assert!(decoded[0]["nodes"][0].get("startByte").is_some());
         let mut summary = Vec::new();
-        print_map(&mut summary, &rows, Format::Summary).unwrap();
+        print_map(&mut summary, &rows, Format::Summary, Detail::Compact).unwrap();
         assert_eq!(
             String::from_utf8(summary).unwrap(),
             map::render_nodes(&structure.nodes, Some("example.rs"))
         );
         let mut empty = Vec::new();
-        print_map(&mut empty, &[], Format::Json).unwrap();
+        print_map(&mut empty, &[], Format::Json, Detail::Compact).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&empty).unwrap(), json!([]));
     }
 
@@ -2373,10 +2618,21 @@ mod tests {
         assert_eq!(grouped[0].members.len(), 4);
         assert_eq!((grouped[0].min, grouped[0].max), (0.91, 0.95));
         let mut out = Vec::new();
-        print_cross(&mut out, rows, Format::Clusters, true, false, Some(1)).unwrap();
+        print_cross(
+            &mut out,
+            rows,
+            Format::Clusters,
+            true,
+            false,
+            Some(1),
+            Detail::Compact,
+            &mut Presentation::empty(),
+            None,
+        )
+        .unwrap();
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("Cluster 1 (4 functions, similarity 0.9100-0.9500)"));
-        assert!(output.contains("src/d.rs:1:1 :: d"));
+        assert!(output.contains("Cluster 1 · 4 functions · similarity 0.9100-0.9500"));
+        assert!(output.contains("*** src/d.rs\n@@ 1 @@\nd"));
         assert!(!output.contains("Cluster 2"));
         assert_eq!(clusters(&[edge("a", "a", 0.9)], false)[0].members.len(), 2);
     }
@@ -2392,7 +2648,18 @@ mod tests {
             edge("x", "y", 0.9),
         ];
         let mut out = Vec::new();
-        print_cross(&mut out, rows, Format::Json, true, true, Some(1)).unwrap();
+        print_cross(
+            &mut out,
+            rows,
+            Format::Json,
+            true,
+            true,
+            Some(1),
+            Detail::Compact,
+            &mut Presentation::empty(),
+            None,
+        )
+        .unwrap();
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output.lines().count(), 1);
         let row: Value = serde_json::from_str(output.trim()).unwrap();
@@ -3207,39 +3474,116 @@ mod tests {
                 "fileDescriptionSimilarity": 0.6, "function": {"path": "other.rs", "name": "fallback"}}),
         ];
         let mut out = Vec::new();
-        print_search(&mut out, &rows, Format::Json, true).unwrap();
+        print_search(
+            &mut out,
+            &rows,
+            Format::Json,
+            Detail::Compact,
+            &mut Presentation::empty(),
+        )
+        .unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), json!(rows));
         assert!(out.ends_with(b"\n"));
         out.clear();
-        print_search(&mut out, &rows, Format::Summary, true).unwrap();
+        print_search(
+            &mut out,
+            &rows,
+            Format::Summary,
+            Detail::Compact,
+            &mut Presentation::empty(),
+        )
+        .unwrap();
         let summary = String::from_utf8(out).unwrap();
         assert_eq!(
             summary,
             concat!(
-                "0.9500 rerank (0.6000 similarity)  src/λ.rs :: Service.run  [combined thirds; code 0.3000, description 0.6000, file 0.9000]\n",
-                "Purpose\nsecond line\n",
-                "0.7000  guide.md:12 :: Setup > Credentials\nUse `KEY`.\nNext step.\n",
-                "0.4000  other.rs :: fallback  [combined 50/50; description 0.2000, file 0.6000]\n"
+                "*** src/λ.rs\n@@ 1 @@ score=0.9500 similarity=0.6000\nService.run\n",
+                "\n*** guide.md\n@@ 12 @@ score=0.7000\n# Credentials\n",
+                "\n*** other.rs\n@@ 1 @@ score=0.4000\nfallback\n"
             )
         );
         let mut out = Vec::new();
-        print_search(&mut out, &rows, Format::Summary, false).unwrap();
+        print_search(
+            &mut out,
+            &rows,
+            Format::Summary,
+            Detail::Expanded,
+            &mut Presentation::empty(),
+        )
+        .unwrap();
+        let expanded = String::from_utf8(out).unwrap();
+        assert!(expanded.contains("@ description: Purpose\n@ description: second line"));
+        assert!(expanded.contains("Use `KEY`.\nNext step."));
+        assert!(summary.len() < expanded.len());
+    }
+
+    #[test]
+    fn search_uses_indexed_declaration_instead_of_callable_source() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("api.rs"),
+            "pub struct Api;\nimpl Api {\n  pub fn run(&self) { secret(); }\n}\n",
+        )?;
+        let index = dir.path().join("index.sqlite");
+        let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+        engine.refresh_structure()?;
+        let rows = vec![json!({"type":"function", "similarity":0.9, "function":{
+            "path":"api.rs", "qualifiedName":"Api.run", "name":"run", "startLine":3,
+            "endLine":3, "source":"pub fn run(&self) { secret(); }"}})];
+        let mut output = Vec::new();
+        print_search(
+            &mut output,
+            &rows,
+            Format::Summary,
+            Detail::Compact,
+            &mut Presentation::new(&engine),
+        )?;
+        let output = String::from_utf8(output)?;
         assert_eq!(
-            String::from_utf8(out).unwrap(),
-            summary.replace("Purpose\nsecond line\n", "")
+            output,
+            "*** api.rs\n@@ 3 @@ score=0.9000 Api.run\npub fn run(&self)\n"
+        );
+        assert!(!output.contains("secret") && !output.contains('{'));
+        Ok(())
+    }
+
+    #[test]
+    fn markdown_search_uses_last_heading_of_chunk() {
+        let row = json!({"type":"markdown", "similarity":0.8, "chunk":{
+            "path":"guide.md", "startLine":8, "endLine":14,
+            "headingPath":["Guide", "Setup"], "content":"# Guide\n\n## Setup\n\nDetails."}});
+        let mut output = Vec::new();
+        print_markdown(&mut output, &row, Detail::Compact).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "*** guide.md\n@@ 8-14 @@ score=0.8000\n## Setup\n"
         );
     }
 
     #[test]
     fn empty_results_obey_array_jsonl_and_plain_output_contracts() {
         let mut out = Vec::new();
-        print_search(&mut out, &[], Format::Json, false).unwrap();
+        print_search(
+            &mut out,
+            &[],
+            Format::Json,
+            Detail::Compact,
+            &mut Presentation::empty(),
+        )
+        .unwrap();
         assert_eq!(out, b"[]\n");
         out.clear();
         print_errors(&mut out, &[], Format::Json).unwrap();
         assert_eq!(out, b"[]\n");
         out.clear();
-        print_search(&mut out, &[], Format::Summary, false).unwrap();
+        print_search(
+            &mut out,
+            &[],
+            Format::Summary,
+            Detail::Compact,
+            &mut Presentation::empty(),
+        )
+        .unwrap();
         assert_eq!(out, b"No matches.\n");
         out.clear();
         print_errors(&mut out, &[], Format::Summary).unwrap();
@@ -3256,6 +3600,9 @@ mod tests {
                 format,
                 true,
                 false,
+                None,
+                Detail::Compact,
+                &mut Presentation::empty(),
                 None,
             )
             .unwrap();
@@ -3306,17 +3653,39 @@ mod tests {
             edge("x", "y", 0.7),
         ];
         let mut out = Vec::new();
-        print_cross(&mut out, rows.clone(), Format::Json, false, false, Some(1)).unwrap();
+        print_cross(
+            &mut out,
+            rows.clone(),
+            Format::Json,
+            false,
+            false,
+            Some(1),
+            Detail::Compact,
+            &mut Presentation::empty(),
+            None,
+        )
+        .unwrap();
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output.lines().count(), 1);
         assert!(output.ends_with('\n'));
         assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), first);
         let mut out = Vec::new();
-        print_cross(&mut out, rows, Format::Summary, false, false, Some(1)).unwrap();
+        print_cross(
+            &mut out,
+            rows,
+            Format::Summary,
+            false,
+            false,
+            Some(1),
+            Detail::Compact,
+            &mut Presentation::empty(),
+            None,
+        )
+        .unwrap();
         let output = String::from_utf8(out).unwrap();
-        assert!(output.starts_with("src/a.rs :: a\n"));
-        assert!(output.contains("src/b.rs :: b"));
-        assert!(output.contains("src/c.rs :: c"));
+        assert!(output.starts_with("Source\n*** src/a.rs\n@@ 1 @@\na\n"));
+        assert!(output.contains("*** src/b.rs\n@@ 1 @@ target score=0.8000"));
+        assert!(output.contains("*** src/c.rs\n@@ 1 @@ target score=0.9000"));
         assert!(!output.contains("src/x.rs"));
     }
 
@@ -3326,11 +3695,19 @@ mod tests {
         let grouped = clusters(&rows, false);
         assert_eq!(grouped.len(), 2);
         assert_eq!(
-            grouped[0].members,
+            grouped[0]
+                .members
+                .iter()
+                .map(ClusterMember::label)
+                .collect::<Vec<_>>(),
             ["[source] src/a.rs:1:1 :: a", "[target] src/b.rs:1:1 :: b"]
         );
         assert_eq!(
-            grouped[1].members,
+            grouped[1]
+                .members
+                .iter()
+                .map(ClusterMember::label)
+                .collect::<Vec<_>>(),
             ["[source] src/b.rs:1:1 :: b", "[target] src/a.rs:1:1 :: a"]
         );
         assert_eq!((grouped[0].min, grouped[0].max), (0.8, 0.8));
@@ -3347,14 +3724,17 @@ mod tests {
             false,
             false,
             None,
+            Detail::Compact,
+            &mut Presentation::empty(),
+            None,
         )
         .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             concat!(
-                "Cluster 1 (2 functions, similarity 0.7000)\n",
-                "  [source] src/a.rs:1:1 :: a\n",
-                "  [target] src/a.rs:1:1 :: a\n"
+                "Cluster 1 · 2 functions · similarity 0.7000\n",
+                "\n*** src/a.rs\n@@ 1 @@ source\na\n",
+                "\n*** src/a.rs\n@@ 1 @@ target\na\n"
             )
         );
     }
@@ -3374,7 +3754,11 @@ mod tests {
         let grouped = clusters(&rows, true);
         assert_eq!(grouped.len(), 1);
         assert_eq!(
-            grouped[0].members,
+            grouped[0]
+                .members
+                .iter()
+                .map(ClusterMember::label)
+                .collect::<Vec<_>>(),
             [
                 "same.rs:4:1 :: overload",
                 "same.rs:4:9 :: overload",
@@ -3390,6 +3774,9 @@ mod tests {
             true,
             false,
             None,
+            Detail::Expanded,
+            &mut Presentation::empty(),
+            None,
         )
         .unwrap();
         assert!(
@@ -3399,8 +3786,32 @@ mod tests {
         let mut reversed = rows;
         reversed.reverse();
         let mut actual = Vec::new();
-        print_cross(&mut actual, reversed, Format::Clusters, true, false, None).unwrap();
+        print_cross(
+            &mut actual,
+            reversed,
+            Format::Clusters,
+            true,
+            false,
+            None,
+            Detail::Expanded,
+            &mut Presentation::empty(),
+            None,
+        )
+        .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn cluster_members_in_one_file_follow_numeric_source_lines() {
+        let first =
+            json!({"id": 1, "path":"same.rs", "name":"first", "startLine":2, "startColumn":1});
+        let second =
+            json!({"id": 2, "path":"same.rs", "name":"second", "startLine":10, "startColumn":1});
+        let rows =
+            vec![json!({"source": second, "matches": [{"function": first, "similarity":0.9}]})];
+        let cluster = clusters(&rows, true).remove(0);
+        assert_eq!(cluster.members[0].function["startLine"], 2);
+        assert_eq!(cluster.members[1].function["startLine"], 10);
     }
 
     #[test]
@@ -3421,15 +3832,42 @@ mod tests {
                     &mut BrokenPipe,
                     &[json!({"function": function("a")})],
                     format,
-                    false
+                    Detail::Compact,
+                    &mut Presentation::empty()
                 )
                 .is_err()
             );
             assert!(
                 print_errors(&mut BrokenPipe, &[json!({"message": "failure"})], format).is_err()
             );
-            assert!(print_cross(&mut BrokenPipe, rows.clone(), format, true, false, None).is_err());
+            assert!(
+                print_cross(
+                    &mut BrokenPipe,
+                    rows.clone(),
+                    format,
+                    true,
+                    false,
+                    None,
+                    Detail::Compact,
+                    &mut Presentation::empty(),
+                    None
+                )
+                .is_err()
+            );
         }
-        assert!(print_cross(&mut BrokenPipe, rows, Format::Clusters, true, false, None).is_err());
+        assert!(
+            print_cross(
+                &mut BrokenPipe,
+                rows,
+                Format::Clusters,
+                true,
+                false,
+                None,
+                Detail::Compact,
+                &mut Presentation::empty(),
+                None
+            )
+            .is_err()
+        );
     }
 }

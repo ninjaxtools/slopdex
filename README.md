@@ -80,9 +80,13 @@ By default all available indexes are searched and ranked together.
 
 ```console
 $ slopdex search "keep the repository index synchronized"
-0.4284  tests/languages.test.ts :: refresh
-0.4200  src/cli.ts :: refreshIndex
-0.4113  src/code-index.ts :: CodeIndex.updateFromGit
+*** src/engine.rs
+@@ 914-1082 @@ score=0.4284 Engine.search
+pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>>
+
+*** src/engine.rs
+@@ 376-409 @@ score=0.4200 Engine.map
+pub fn map(&self, options: &Value) -> Result<Vec<Value>>
 ...
 ```
 
@@ -146,10 +150,19 @@ Compare functions across files, exclude short wrappers, and group matches into c
 
 ```console
 $ slopdex cross-search --cross-file-only --lines 4 --threshold 0.9
-Cluster 1 (3 functions, similarity 0.9124-0.9568)
-  src/auth/session.ts:18:1 :: validateSession
-  src/http/middleware.ts:42:1 :: authenticate
-  src/users/user-service.ts:27:3 :: UserService.authenticate
+Cluster 1 · 3 functions · similarity 0.9124-0.9568
+
+*** src/auth/session.ts
+@@ 18-29 @@
+export function validateSession(token: string): Session
+
+*** src/http/middleware.ts
+@@ 42-57 @@
+export function authenticate(req: Request): Session
+
+*** src/users/user-service.ts
+@@ 27-48 @@ UserService.authenticate
+authenticate(token: string): Session
 ...
 ```
 

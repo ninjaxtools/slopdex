@@ -3176,6 +3176,36 @@ fn map_excludes_private_symbols_unless_requested() -> Result<()> {
 }
 
 #[test]
+fn map_cli_defaults_to_terse_source_order_excerpts() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write(
+        "api.rs",
+        "pub struct Api { pub count: usize }\nimpl Api {\n  pub fn run(&self) { secret(); }\n}\n",
+    )?;
+    let output = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args(["map", "--private"])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    assert!(
+        text.starts_with("*** api.rs\n\n@@ 1 @@\npub struct Api\n"),
+        "{text}"
+    );
+    assert!(text.contains("@@ 3 @@\n  pub fn run(&self)\n"), "{text}");
+    assert!(!text.contains("secret") && !text.contains("implementation omitted"));
+    Ok(())
+}
+
+#[test]
 fn map_cli_warns_and_ignores_missing_paths() -> Result<()> {
     let repo = Repo::new()?;
     repo.write("src/api.ts", "export function api() {}\n")?;

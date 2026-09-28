@@ -408,6 +408,22 @@ impl Engine {
         Ok(result)
     }
 
+    /// Search presentation uses the same indexed declarations as map. Older
+    /// offline indexes can still return hits without current structure; callers
+    /// can fall back to the search unit's declaration metadata in that case.
+    pub fn presentation_structure(&self, path: &str) -> Result<Option<parse::FileStructure>> {
+        let Some(file) = self.files.get(path) else {
+            return Ok(None);
+        };
+        if !self
+            .db
+            .structure_current(path, &file.hash, STRUCTURE_PARSER_VERSION)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.db.structure(path)?))
+    }
+
     fn parsed(&self, path: &str, source: &str) -> Result<parse::ParsedFile> {
         let key = hash(json!([STRUCTURE_PARSER_VERSION, path, hash(source)]).to_string());
         if let Some(cached) = self.db.cache("parse", &key)? {

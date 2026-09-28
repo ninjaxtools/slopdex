@@ -100,12 +100,12 @@ Unknown-size operations, such as repository discovery or a model's text response
 use a spinner. Provider notices appear above the progress display. Warnings and
 runtime errors use the same terminal styling. Redirected stderr and `TERM=dumb`
 use plain diagnostics without animations; result data on stdout retains its
-summary/JSON/JSONL format.
+ text/JSON/JSONL format.
 
 ## Structure map
 
 ```text
-slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--format summary|json]
+slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--detail compact|standard|expanded] [--format text|json]
 ```
 
 With no paths, map selects the indexed repository. Paths select files or recursive
@@ -132,8 +132,14 @@ interfaces, traits, and enums. Other selectors include `imports`, `modules`,
 Kinds are ORed and intersect name regexes. Matching nodes retain their ancestors
 as context; a matching parent does not automatically include unmatched children.
 
-Summary output groups declarations with signatures and inclusive line ranges.
-Long signatures and child lists can be truncated for display. JSON is an array of
+Text output prints declarations in source order using `*** path` file headers and
+`@@ start-end @@` source ranges. Each hunk contains only a declaration signature;
+no executable body, body braces, per-line number prefix, or omission marker is
+printed. Nested declarations are indented. Source ranges cover the original
+declaration, even when the displayed signature occupies only one line. The
+renderer uses indexed declaration metadata (and remains offline with
+`--no-reindex`). Long signatures are truncated at the default detail level.
+JSON is an array of
 file objects with `path` and `nodes`, retaining full selected metadata: file-local
 `id`/`parentId`, kind, names, `qualifiedName`, signature, attributes, import
 bindings, heading level, and source ranges. Byte offsets are zero-based and
@@ -279,6 +285,32 @@ Similarity is model-dependent, not a probability of duplication.
 
 ### Reranking, clusters, and output
 
+Text is the default for `map`, `search`, `cross-search`, and `describe`.
+`--detail compact` (default) prints declaration signatures and scores only;
+`--detail standard` also shows declaration attributes;
+`--detail expanded` additionally shows full signatures, callable descriptions,
+Markdown chunk text, component scores, and observed cross-search cluster edges.
+This setting affects text presentation, not which symbols are selected or the
+contents of JSON. Map's `-k` and `--private` remain selection filters.
+
+```text
+*** src/auth/session.rs
+@@ 11-39 @@
+impl SessionService
+
+@@ 14-22 @@
+  pub fn validate(&self, token: &str) -> Result<Session>
+```
+
+Search prints ranked excerpts with `score=...` (and `similarity=...` if
+reranked) on the hunk header. When a parent declaration is not displayed, its
+qualified name is placed on the header. Markdown search prints the matched
+heading at compact detail; expanded detail also prints its chunk text.
+Cross-search clusters use the same excerpts under a cluster header. The
+similarity range belongs to observed edges, not individual members. With
+`--cohesion` or `--format text`, cross-search can instead print source/match
+groups with per-match scores and optional filesystem distance.
+
 Reranking applies to query commands, including the search inside `describe`, not
 cross-search. Embedding thresholds are applied first. Cohere/Jina receive up to
 five times an explicit result limit, or all retrieved threshold-passing candidates
@@ -304,6 +336,7 @@ hops otherwise. It does not alter similarity or the neighbor selection score.
 
 `--format json` produces map/query/diagnostic/model arrays, configuration/status
 objects, and **JSONL for cross-search** (one object per matched source).
+`--format text` (legacy alias `summary`) selects the text view;
 `--format clusters` is valid only for cross-search without cohesion. Results go
 to stdout and warnings/errors to stderr. Clap argument errors exit with `2`;
 runtime/configuration/domain failures exit with `1`; success/help/version exit
@@ -323,6 +356,9 @@ content removed. Provider retries/failover still apply. JSON output contains
 `query`, `description`, `files`, and `functions`; full source and embedding input
 are stripped from returned function metadata. Reranker order informs the prompt,
 but `rerankScore` is not copied to the returned `functions` array.
+Text output labels the generated prose `Explanation` and follows it with
+`References` in the shared excerpt syntax. The prose is model-generated; its
+format and wording are not deterministic.
 
 ## Index lifecycle and persistence
 

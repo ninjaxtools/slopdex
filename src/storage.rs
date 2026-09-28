@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    hash,
+    hash, map,
     parse::{FileStructure, ParsedFile, StructureNode},
 };
 
@@ -738,36 +738,24 @@ fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
 }
 
 fn symbol_for(item: &Item, structure: &FileStructure) -> Option<usize> {
+    if item.kind != "markdown" {
+        return map::matching_node(structure, &item.data).map(|node| node.id);
+    }
     let start = item.data["startLine"].as_u64()? as usize;
     let end = item.data["endLine"].as_u64().unwrap_or(start as u64) as usize;
-    let qualified = item.data["qualifiedName"].as_str();
-    let name = item.data["name"].as_str();
-    // Both parser APIs use one-based UTF-8 columns and exclusive end positions.
-    // Prefer exact callable ranges, then the closest declaration with its name.
     structure
         .nodes
         .iter()
-        .filter(|n| {
-            if item.kind == "markdown" {
-                n.kind == "heading" && n.start_line <= start && n.end_line >= start
-            } else {
-                matches!(n.kind.as_str(), "function" | "method" | "constructor")
-                    && (qualified == Some(n.qualified_name.as_str())
-                        || (name == Some(n.name.as_str())
-                            && n.start_line <= end
-                            && n.end_line >= start))
-            }
-        })
-        .min_by_key(|n| {
+        .filter(|node| node.kind == "heading" && node.start_line <= start && node.end_line >= start)
+        .min_by_key(|node| {
             (
-                qualified != Some(n.qualified_name.as_str()),
-                n.start_line.abs_diff(start) + n.end_line.abs_diff(end),
-                n.start_column
+                node.start_line.abs_diff(start) + node.end_line.abs_diff(end),
+                node.start_column
                     .abs_diff(item.data["startColumn"].as_u64().unwrap_or(1) as usize),
-                n.id,
+                node.id,
             )
         })
-        .map(|n| n.id)
+        .map(|node| node.id)
 }
 
 fn associate(
