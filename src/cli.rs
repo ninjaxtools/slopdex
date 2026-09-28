@@ -646,7 +646,7 @@ pub fn run() -> Result<()> {
             } else {
                 Vec::new()
             };
-            print_map(&mut out, &rows, format, cli.global.detail)?;
+            print_map(&mut out, &rows, format, cli.global.detail, Some(&engine))?;
         }
         Command::Search(args) => {
             let mut options = args.query.filters.options();
@@ -1603,7 +1603,13 @@ fn print_json(out: &mut impl Write, value: &impl serde::Serialize) -> Result<()>
     Ok(())
 }
 
-fn print_map(out: &mut impl Write, rows: &[Value], format: Format, detail: Detail) -> Result<()> {
+fn print_map(
+    out: &mut impl Write,
+    rows: &[Value],
+    format: Format,
+    detail: Detail,
+    engine: Option<&Engine>,
+) -> Result<()> {
     if format == Format::Json {
         return print_json(out, &rows);
     }
@@ -1617,7 +1623,12 @@ fn print_map(out: &mut impl Write, rows: &[Value], format: Format, detail: Detai
         write!(
             out,
             "{}",
-            map::render_with_detail(&nodes, Some(path), detail.into())
+            map::render_with_source(
+                &nodes,
+                Some(path),
+                detail.into(),
+                engine.and_then(|engine| engine.presentation_source(path))
+            )
         )?;
     }
     Ok(())
@@ -1695,8 +1706,7 @@ impl<'a> Presentation<'a> {
         }
     }
 
-    fn node(&mut self, function: &Value) -> Result<Option<StructureNode>> {
-        let path = text(function, "path");
+    fn structure(&mut self, path: &str) -> Result<Option<&FileStructure>> {
         if !self.structures.contains_key(path) {
             self.structures.insert(
                 path.to_owned(),
@@ -1706,10 +1716,23 @@ impl<'a> Presentation<'a> {
                     .flatten(),
             );
         }
-        Ok(self.structures[path]
-            .as_ref()
-            .and_then(|structure| map::matching_node(structure, function))
-            .cloned())
+        Ok(self.structures[path].as_ref())
+    }
+
+    fn context(&mut self, function: &Value) -> Result<Vec<StructureNode>> {
+        Ok(self
+            .structure(text(function, "path"))?
+            .and_then(|structure| {
+                map::matching_node(structure, function).map(|node| map::ancestors(structure, node))
+            })
+            .unwrap_or_default())
+    }
+
+    fn markdown_context(&mut self, chunk: &Value) -> Result<Vec<StructureNode>> {
+        Ok(self
+            .structure(text(chunk, "path"))?
+            .map(|structure| map::heading_context(structure, chunk))
+            .unwrap_or_default())
     }
 }
 
@@ -1721,21 +1744,22 @@ fn print_function(
     presentation: &mut Presentation<'_>,
 ) -> Result<()> {
     write!(out, "{}", map::file_header(text(function, "path")))?;
-    let node = presentation.node(function)?;
-    let qualified = node
-        .as_ref()
-        .and_then(|node| node.parent_id.map(|_| node.qualified_name.as_str()));
+    let nodes = presentation.context(function)?;
+    let qualified = nodes
+        .last()
+        .filter(|node| nodes.len() == 1 && node.parent_id.is_some())
+        .map(|node| node.qualified_name.as_str());
     let annotation = [Some(annotation), qualified]
         .into_iter()
         .flatten()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some(node) = node {
+    if !nodes.is_empty() {
         write!(
             out,
             "{}",
-            map::render_node(&node, 0, Some(&annotation), detail.into())
+            map::render_context(&nodes, Some(&annotation), detail.into())
         )?;
     } else {
         let start = function["startLine"].as_u64().unwrap_or(1) as usize;
@@ -1755,38 +1779,62 @@ fn print_function(
     Ok(())
 }
 
-fn print_markdown(out: &mut impl Write, row: &Value, detail: Detail) -> Result<()> {
+fn print_markdown(
+    out: &mut impl Write,
+    row: &Value,
+    detail: Detail,
+    presentation: &mut Presentation<'_>,
+) -> Result<()> {
     let chunk = &row["chunk"];
     write!(out, "{}", map::file_header(text(chunk, "path")))?;
     let start = chunk["startLine"].as_u64().unwrap_or(1) as usize;
     let end = chunk["endLine"].as_u64().unwrap_or(start as u64) as usize;
     write!(out, "{}", map::hunk(start, end, Some(&rank(row))))?;
-    let last_heading = array(&chunk["headingPath"]).last().and_then(Value::as_str);
-    let heading = text(chunk, "content")
-        .lines()
-        .filter(|line| line.starts_with('#'))
-        .find(|line| last_heading.is_some_and(|name| line.trim_start_matches('#').trim() == name))
-        .map(str::to_owned)
-        .or_else(|| last_heading.map(|s| format!("# {s}")))
-        .unwrap_or_else(|| {
-            text(chunk, "content")
+    let nodes = presentation.markdown_context(chunk)?;
+    let last_heading = if let Some(node) = nodes.last() {
+        write!(out, "{}", map::render_declarations(&nodes, detail.into()))?;
+        Some(node.signature.clone())
+    } else {
+        let content = text(chunk, "content");
+        let mut last = None;
+        for (depth, name) in array(&chunk["headingPath"])
+            .iter()
+            .filter_map(Value::as_str)
+            .enumerate()
+        {
+            let heading = content
                 .lines()
-                .find(|line| !line.is_empty())
-                .unwrap_or("(untitled)")
-                .to_owned()
-        });
-    writeln!(out, "{heading}")?;
+                .find(|line| line.starts_with('#') && line.trim_start_matches('#').trim() == name)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{} {name}", "#".repeat(depth + 1)));
+            writeln!(out, "{}{heading}", "  ".repeat(depth))?;
+            last = Some(heading);
+        }
+        if last.is_none() {
+            writeln!(
+                out,
+                "{}",
+                content
+                    .lines()
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("(untitled)")
+            )?;
+        }
+        last
+    };
     if detail == Detail::Expanded {
         let content = text(chunk, "content");
-        let body = if content.lines().any(|line| line == heading) {
+        let body = if let Some(heading) = last_heading
+            .as_deref()
+            .filter(|heading| content.contains(*heading))
+        {
             content
-                .lines()
-                .skip_while(|line| *line != heading)
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join("\n")
+                .split_once(heading)
+                .unwrap()
+                .1
+                .trim_start_matches('\n')
         } else {
-            content.to_owned()
+            content
         };
         if !body.trim().is_empty() {
             writeln!(out, "{body}")?;
@@ -1813,7 +1861,7 @@ fn print_search(
             writeln!(out)?;
         }
         if row["type"] == "markdown" {
-            print_markdown(out, row, detail)?;
+            print_markdown(out, row, detail, presentation)?;
         } else {
             let annotation = format!(
                 "{}{}",
@@ -2274,18 +2322,18 @@ mod tests {
         .structure;
         let rows = vec![json!({"path": "example.rs", "nodes": structure.nodes})];
         let mut json_output = Vec::new();
-        print_map(&mut json_output, &rows, Format::Json, Detail::Compact).unwrap();
+        print_map(&mut json_output, &rows, Format::Json, Detail::Compact, None).unwrap();
         let decoded: Value = serde_json::from_slice(&json_output).unwrap();
         assert_eq!(decoded, json!(rows));
         assert!(decoded[0]["nodes"][0].get("startByte").is_some());
         let mut summary = Vec::new();
-        print_map(&mut summary, &rows, Format::Summary, Detail::Compact).unwrap();
+        print_map(&mut summary, &rows, Format::Summary, Detail::Compact, None).unwrap();
         assert_eq!(
             String::from_utf8(summary).unwrap(),
             map::render_nodes(&structure.nodes, Some("example.rs"))
         );
         let mut empty = Vec::new();
-        print_map(&mut empty, &[], Format::Json, Detail::Compact).unwrap();
+        print_map(&mut empty, &[], Format::Json, Detail::Compact, None).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&empty).unwrap(), json!([]));
     }
 
@@ -3498,7 +3546,7 @@ mod tests {
             summary,
             concat!(
                 "*** src/λ.rs\n@@ 1 @@ score=0.9500 similarity=0.6000\nService.run\n",
-                "\n*** guide.md\n@@ 12 @@ score=0.7000\n# Credentials\n",
+                "\n*** guide.md\n@@ 12 @@ score=0.7000\n# Setup\n  ## Credentials\n",
                 "\n*** other.rs\n@@ 1 @@ score=0.4000\nfallback\n"
             )
         );
@@ -3541,7 +3589,7 @@ mod tests {
         let output = String::from_utf8(output)?;
         assert_eq!(
             output,
-            "*** api.rs\n@@ 3 @@ score=0.9000 Api.run\npub fn run(&self)\n"
+            "*** api.rs\n@@ 3 @@ score=0.9000\nimpl Api\n  pub fn run(&self)\n"
         );
         assert!(!output.contains("secret") && !output.contains('{'));
         Ok(())
@@ -3553,11 +3601,68 @@ mod tests {
             "path":"guide.md", "startLine":8, "endLine":14,
             "headingPath":["Guide", "Setup"], "content":"# Guide\n\n## Setup\n\nDetails."}});
         let mut output = Vec::new();
-        print_markdown(&mut output, &row, Detail::Compact).unwrap();
+        print_markdown(
+            &mut output,
+            &row,
+            Detail::Compact,
+            &mut Presentation::empty(),
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "*** guide.md\n@@ 8-14 @@ score=0.8000\n## Setup\n"
+            "*** guide.md\n@@ 8-14 @@ score=0.8000\n# Guide\n  ## Setup\n"
         );
+    }
+
+    #[test]
+    fn ranked_hits_repeat_their_code_and_markdown_ancestors() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("api.rs"),
+            "impl Api {\n  fn write(&self) { first(); }\n  fn flush(&self) { second(); }\n}\n",
+        )?;
+        fs::write(
+            dir.path().join("guide.md"),
+            "# Guide\n\n## Setup\nFirst.\n\n### Details\nSecond.\n",
+        )?;
+        let index = dir.path().join("index.sqlite");
+        let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+        engine.refresh_structure()?;
+        let rows = vec![
+            json!({"type":"function", "similarity":0.9, "function":{"path":"api.rs", "qualifiedName":"Api.flush", "name":"flush", "startLine":3, "endLine":3}}),
+            json!({"type":"markdown", "similarity":0.8, "chunk":{"path":"guide.md", "startLine":6, "endLine":7, "headingPath":["Guide", "Setup", "Details"], "content":"# Guide\n## Setup\n### Details\n\nSecond."}}),
+            json!({"type":"function", "similarity":0.7, "function":{"path":"api.rs", "qualifiedName":"Api.write", "name":"write", "startLine":2, "endLine":2}}),
+            json!({"type":"markdown", "similarity":0.6, "chunk":{"path":"guide.md", "startLine":3, "endLine":4, "headingPath":["Guide", "Setup"], "content":"# Guide\n## Setup\n\nFirst."}}),
+        ];
+        let mut output = Vec::new();
+        print_search(
+            &mut output,
+            &rows,
+            Format::Summary,
+            Detail::Compact,
+            &mut Presentation::new(&engine),
+        )?;
+        let output = String::from_utf8(output)?;
+        assert!(
+            output.contains("@@ 3 @@ score=0.9000\nimpl Api\n  fn flush(&self)\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("@@ 2 @@ score=0.7000\nimpl Api\n  fn write(&self)\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("@@ 6-7 @@ score=0.8000\n# Guide\n  ## Setup\n    ### Details\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("@@ 3-4 @@ score=0.6000\n# Guide\n  ## Setup\n"),
+            "{output}"
+        );
+        assert_eq!(output.matches("impl Api").count(), 2);
+        assert_eq!(output.matches("# Guide").count(), 2);
+        assert!(!output.contains("first()") && !output.contains("second()"));
+        Ok(())
     }
 
     #[test]

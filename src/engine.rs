@@ -424,6 +424,10 @@ impl Engine {
         Ok(Some(self.db.structure(path)?))
     }
 
+    pub fn presentation_source(&self, path: &str) -> Option<&str> {
+        self.files.get(path).map(|file| file.source.as_str())
+    }
+
     fn parsed(&self, path: &str, source: &str) -> Result<parse::ParsedFile> {
         let key = hash(json!([STRUCTURE_PARSER_VERSION, path, hash(source)]).to_string());
         if let Some(cached) = self.db.cache("parse", &key)? {

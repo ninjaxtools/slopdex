@@ -36,8 +36,8 @@ can also follow the command. Quote multiword queries.
 | --- | --- | --- |
 | `search <query>` | Search callable code, complete enabled descriptions, and Markdown together. | Summary |
 | `search-code <query>` | Search callable code. | Summary |
-| `search-descriptions <query>` | Search callable/file description fusion; descriptions must be enabled and complete. Alias: `search-description`. | Summary with callable descriptions |
-| `search-md <query>` | Search heading-aware `.md`/`.markdown` chunks. | Summary with chunk text |
+| `search-descriptions <query>` | Search callable/file description fusion; descriptions must be enabled and complete. Alias: `search-description`. | Ranked declaration excerpts |
+| `search-md <query>` | Search heading-aware `.md`/`.markdown` chunks. | Ranked heading paths |
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Refresh local structure and show code declarations/Markdown headings without providers or vector sidecars. | Summary |
@@ -133,11 +133,14 @@ Kinds are ORed and intersect name regexes. Matching nodes retain their ancestors
 as context; a matching parent does not automatically include unmatched children.
 
 Text output prints declarations in source order using `*** path` file headers and
-`@@ start-end @@` source ranges. Each hunk contains only a declaration signature;
-no executable body, body braces, per-line number prefix, or omission marker is
-printed. Nested declarations are indented. Source ranges cover the original
-declaration, even when the displayed signature occupies only one line. The
-renderer uses indexed declaration metadata (and remains offline with
+`@@ start-end @@` source ranges. Adjacent code declarations of the same kind and
+scope share a hunk. Markdown headings share one when only blank lines separate
+them, including parent and child headings. Prose or code between declarations
+starts a new hunk. In file order, each ancestor is printed once. Hunks contain only
+declaration signatures: no executable body, body braces, per-line number prefix,
+or omission marker is printed. Nested declarations are indented. Code ranges
+cover original declarations; Markdown map ranges cover heading lines, not whole
+sections. The renderer uses indexed declaration metadata (and remains offline with
 `--no-reindex`). Long signatures are truncated at the default detail level.
 JSON is an array of
 file objects with `path` and `nodes`, retaining full selected metadata: file-local
@@ -303,9 +306,12 @@ impl SessionService
 ```
 
 Search prints ranked excerpts with `score=...` (and `similarity=...` if
-reranked) on the hunk header. When a parent declaration is not displayed, its
-qualified name is placed on the header. Markdown search prints the matched
-heading at compact detail; expanded detail also prints its chunk text.
+reranked) on the hunk header. Every ranked code result includes its ancestor
+declarations above the match, even when another hit has the same ancestors;
+the hunk range still identifies the matched symbol. Markdown search likewise
+repeats the complete heading path for each result, since hits are not in file
+order. Its range identifies the matched chunk; expanded detail also prints
+the chunk text.
 Cross-search clusters use the same excerpts under a cluster header. The
 similarity range belongs to observed edges, not individual members. With
 `--cohesion` or `--format text`, cross-search can instead print source/match

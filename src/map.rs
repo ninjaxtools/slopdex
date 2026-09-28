@@ -25,30 +25,102 @@ pub fn render_nodes(nodes: &[StructureNode], path: Option<&str>) -> String {
 }
 
 pub fn render_with_detail(nodes: &[StructureNode], path: Option<&str>, detail: Detail) -> String {
+    render_with_source(nodes, path, detail, None)
+}
+
+/// Source is the indexed snapshot. It lets Markdown headings separated only by
+/// blank lines share one hunk without folding across omitted prose.
+pub fn render_with_source(
+    nodes: &[StructureNode],
+    path: Option<&str>,
+    detail: Detail,
+    source: Option<&str>,
+) -> String {
     let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let mut ordered: Vec<_> = nodes.iter().collect();
     ordered.sort_by_key(|node| (node.start_byte, node.id));
+    let source_lines = if nodes.first().is_some_and(|node| node.kind == "heading") {
+        source.map(|source| source.lines().collect::<Vec<_>>())
+    } else {
+        None
+    };
     let mut output = path.map(file_header).unwrap_or_default();
+    let mut group: Vec<&StructureNode> = Vec::new();
     for node in ordered {
-        if !output.is_empty() {
-            output.push('\n');
+        let adjacent_sibling = group.last().is_some_and(|previous| {
+            let parent_present = node.parent_id.is_none_or(|id| by_id.contains_key(&id));
+            let previous_parent_present =
+                previous.parent_id.is_none_or(|id| by_id.contains_key(&id));
+            let end = display_end(previous);
+            parent_present
+                && previous_parent_present
+                && previous.kind == node.kind
+                && if node.kind == "heading" {
+                    end < node.start_line
+                        && (end + 1 == node.start_line
+                            || source_lines.as_ref().is_some_and(|lines| {
+                                lines.get(end..node.start_line - 1).is_some_and(|gap| {
+                                    gap.iter().all(|line| line.trim().is_empty())
+                                })
+                            }))
+                } else {
+                    previous.parent_id == node.parent_id
+                        && end.checked_add(1) == Some(node.start_line)
+                }
+        });
+        if !adjacent_sibling && !group.is_empty() {
+            append_group(&mut output, &group, &by_id, detail);
+            group.clear();
         }
-        let mut depth = 0;
-        let mut parent = node.parent_id;
-        let mut visited = HashSet::new();
-        while let Some(id) = parent.filter(|id| visited.insert(*id)) {
-            let Some(ancestor) = by_id.get(&id) else {
-                break;
-            };
-            depth += 1;
-            parent = ancestor.parent_id;
-        }
-        let qualified =
-            (depth == 0 && node.parent_id.is_some() && node.qualified_name != node.name)
-                .then_some(node.qualified_name.as_str());
-        output.push_str(&render_node(node, depth, qualified, detail));
+        group.push(node);
+    }
+    if !group.is_empty() {
+        append_group(&mut output, &group, &by_id, detail);
     }
     output
+}
+
+fn append_group(
+    output: &mut String,
+    group: &[&StructureNode],
+    by_id: &HashMap<usize, &StructureNode>,
+    detail: Detail,
+) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    let first = group[0];
+    let last = group[group.len() - 1];
+    let first_depth = depth(first, by_id);
+    let qualified =
+        (first_depth == 0 && first.parent_id.is_some() && first.qualified_name != first.name)
+            .then_some(first.qualified_name.as_str());
+    output.push_str(&hunk(first.start_line, display_end(last), qualified));
+    for node in group {
+        output.push_str(&declaration(node, depth(node, by_id), detail));
+    }
+}
+
+fn depth(node: &StructureNode, by_id: &HashMap<usize, &StructureNode>) -> usize {
+    let mut depth = 0;
+    let mut parent = node.parent_id;
+    let mut visited = HashSet::new();
+    while let Some(id) = parent.filter(|id| visited.insert(*id)) {
+        let Some(ancestor) = by_id.get(&id) else {
+            break;
+        };
+        depth += 1;
+        parent = ancestor.parent_id;
+    }
+    depth
+}
+
+fn display_end(node: &StructureNode) -> usize {
+    if node.kind == "heading" {
+        node.start_line + node.signature.lines().count().saturating_sub(1)
+    } else {
+        inclusive_end(node.end_line, node.end_column, node.start_line)
+    }
 }
 
 pub fn render_node(
@@ -57,8 +129,80 @@ pub fn render_node(
     annotation: Option<&str>,
     detail: Detail,
 ) -> String {
-    let end = inclusive_end(node.end_line, node.end_column, node.start_line);
+    let end = display_end(node);
     let mut output = hunk(node.start_line, end, annotation);
+    output.push_str(&declaration(node, depth, detail));
+    output
+}
+
+/// A ranked hit is independent of neighboring hits: render its ancestors on
+/// every occurrence, but keep the hunk range anchored to the matching symbol.
+pub fn render_context(nodes: &[StructureNode], annotation: Option<&str>, detail: Detail) -> String {
+    let Some(matched) = nodes.last() else {
+        return String::new();
+    };
+    let mut output = hunk(matched.start_line, display_end(matched), annotation);
+    output.push_str(&render_declarations(nodes, detail));
+    output
+}
+
+pub fn render_declarations(nodes: &[StructureNode], detail: Detail) -> String {
+    let mut output = String::new();
+    for (depth, node) in nodes.iter().enumerate() {
+        output.push_str(&declaration(node, depth, detail));
+    }
+    output
+}
+
+pub fn ancestors(structure: &FileStructure, node: &StructureNode) -> Vec<StructureNode> {
+    let by_id: HashMap<_, _> = structure.nodes.iter().map(|node| (node.id, node)).collect();
+    let mut nodes = vec![node.clone()];
+    let mut parent = node.parent_id;
+    let mut visited = HashSet::new();
+    while let Some(id) = parent.filter(|id| visited.insert(*id)) {
+        let Some(node) = by_id.get(&id) else {
+            break;
+        };
+        nodes.push((*node).clone());
+        parent = node.parent_id;
+    }
+    nodes.reverse();
+    nodes
+}
+
+/// Markdown chunks may start at a heading or later in its section. Resolve the
+/// deepest enclosing heading with exactly the indexed heading path.
+pub fn heading_context(structure: &FileStructure, chunk: &Value) -> Vec<StructureNode> {
+    let Some(start) = chunk["startLine"].as_u64().map(|line| line as usize) else {
+        return Vec::new();
+    };
+    let path: Vec<_> = chunk["headingPath"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if path.is_empty() {
+        return Vec::new();
+    }
+    structure
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.kind == "heading"
+                && node.start_line <= start
+                && (start < node.end_line || start == node.end_line && node.end_column > 1)
+        })
+        .filter_map(|node| {
+            let chain = ancestors(structure, node);
+            (chain.iter().map(|n| n.name.as_str()).collect::<Vec<_>>() == path).then_some(chain)
+        })
+        .max_by_key(|chain| (chain.len(), chain.last().unwrap().start_line))
+        .unwrap_or_default()
+}
+
+fn declaration(node: &StructureNode, depth: usize, detail: Detail) -> String {
+    let mut output = String::new();
     let indent = "  ".repeat(depth);
     if detail != Detail::Compact {
         for attr in &node.attributes {
@@ -72,9 +216,11 @@ pub fn render_node(
         }
     }
     let signature = signature(node, detail);
-    output.push_str(&indent);
-    output.push_str(&signature);
-    output.push('\n');
+    for line in signature.lines() {
+        output.push_str(&indent);
+        output.push_str(line);
+        output.push('\n');
+    }
     output
 }
 
@@ -91,6 +237,9 @@ fn signature(node: &StructureNode, detail: Detail) -> String {
     } else {
         &node.signature
     };
+    if node.kind == "heading" {
+        return signature.to_owned();
+    }
     let mut signature = signature.replace('\r', "\\r").replace('\n', "\\n");
     if is_js(node) {
         let modifiers: Vec<_> = node
@@ -230,6 +379,53 @@ mod tests {
             !standard
                 .lines()
                 .any(|line| matches!(line, "export" | "default"))
+        );
+    }
+
+    #[test]
+    fn adjacent_methods_share_one_hunk_but_gaps_and_nesting_do_not() {
+        let source = "impl Writer {\n    fn write(&mut self) {\n        do_write();\n    }\n    fn flush(&mut self) {\n        do_flush();\n    }\n\n    fn close(&mut self) {\n        do_close();\n    }\n}\n";
+        let structure = crate::parse::parse("writer.rs", source).unwrap().structure;
+        let output = render_nodes(&structure.nodes, Some("writer.rs"));
+        assert!(
+            output.contains("@@ 2-7 @@\n  fn write(&mut self)\n  fn flush(&mut self)\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("@@ 9-11 @@\n  fn close(&mut self)\n"),
+            "{output}"
+        );
+        assert!(!output.contains("do_write") && !output.contains("do_flush"));
+        assert_eq!(output.matches("@@ 2-7 @@").count(), 1);
+    }
+
+    #[test]
+    fn markdown_outline_folds_headings_across_blank_lines_not_prose() {
+        let source = "# Guide\n\n## Setup\n\n### Details\nRead this.\n\n## More\nNext section.\n";
+        let structure = crate::parse::parse("guide.md", source).unwrap().structure;
+        let output = render_with_source(
+            &structure.nodes,
+            Some("guide.md"),
+            Detail::Compact,
+            Some(source),
+        );
+        assert!(
+            output.contains("@@ 1-5 @@\n# Guide\n  ## Setup\n    ### Details\n"),
+            "{output}"
+        );
+        assert!(output.contains("@@ 8 @@\n  ## More\n"), "{output}");
+        assert_eq!(output.matches("# Guide").count(), 1);
+        assert!(!output.contains("Read this") && !output.contains("Next section"));
+    }
+
+    #[test]
+    fn setext_heading_span_covers_its_two_source_lines() {
+        let source = "Guide\n=====\n\n## Setup\n";
+        let structure = crate::parse::parse("guide.md", source).unwrap().structure;
+        let output = render_with_source(&structure.nodes, None, Detail::Compact, Some(source));
+        assert!(
+            output.contains("@@ 1-4 @@\nGuide\n=====\n  ## Setup\n"),
+            "{output}"
         );
     }
 }

@@ -81,12 +81,14 @@ By default all available indexes are searched and ranked together.
 ```console
 $ slopdex search "keep the repository index synchronized"
 *** src/engine.rs
-@@ 914-1082 @@ score=0.4284 Engine.search
-pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>>
+@@ 914-1082 @@ score=0.4284
+impl Engine
+  pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>>
 
 *** src/engine.rs
-@@ 376-409 @@ score=0.4200 Engine.map
-pub fn map(&self, options: &Value) -> Result<Vec<Value>>
+@@ 376-409 @@ score=0.4200
+impl Engine
+  pub fn map(&self, options: &Value) -> Result<Vec<Value>>
 ...
 ```
 

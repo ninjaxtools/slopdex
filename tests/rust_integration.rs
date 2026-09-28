@@ -3206,6 +3206,41 @@ fn map_cli_defaults_to_terse_source_order_excerpts() -> Result<()> {
 }
 
 #[test]
+fn map_cli_folds_markdown_heading_paths_from_indexed_source() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write(
+        "guide.md",
+        "Guide\n=====\n\n## Setup\nBody.\n\n### Advanced\nMore prose.\n",
+    )?;
+    repo.cli_json(&["map"])?;
+    // An offline map should still use the saved source when deciding whether
+    // gaps between headings contain only whitespace.
+    repo.write("guide.md", "# Changed\n")?;
+    let output = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args(["--no-reindex", "map", "guide.md"])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    assert!(
+        text.contains("@@ 1-4 @@\nGuide\n=====\n  ## Setup\n"),
+        "{text}"
+    );
+    assert!(text.contains("@@ 7 @@\n    ### Advanced\n"), "{text}");
+    assert_eq!(text.matches("Guide").count(), 1);
+    assert!(!text.contains("Body.") && !text.contains("Changed"));
+    Ok(())
+}
+
+#[test]
 fn map_cli_warns_and_ignores_missing_paths() -> Result<()> {
     let repo = Repo::new()?;
     repo.write("src/api.ts", "export function api() {}\n")?;
