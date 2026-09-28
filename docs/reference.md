@@ -134,7 +134,10 @@ as context; a matching parent does not automatically include unmatched children.
 
 Text output prints declarations in source order using `*** path` file headers and
 `@@ start-end @@` source ranges. Adjacent code declarations of the same kind and
-scope share a hunk. Markdown headings share one when only blank lines separate
+scope share a hunk. A container and its members also share one when every
+indexed member is selected, adjacent, and fills the container's range; the
+hunk uses the parent range. Filters never fold across an omitted symbol.
+Markdown headings share one when only blank lines separate
 them, including parent and child headings. Prose or code between declarations
 starts a new hunk. In file order, each ancestor is printed once. Hunks contain only
 declaration signatures: no executable body, body braces, per-line number prefix,
@@ -290,9 +293,27 @@ Similarity is model-dependent, not a probability of duplication.
 
 Text is the default for `map`, `search`, `cross-search`, and `describe`.
 `--detail compact` (default) prints declaration signatures and scores only;
-`--detail standard` also shows declaration attributes;
-`--detail expanded` additionally shows full signatures, callable descriptions,
-Markdown chunk text, component scores, and observed cross-search cluster edges.
+`--detail standard` also shows declaration attributes, a 160-character
+Markdown body preview; `--detail expanded` additionally shows full signatures,
+saved file and callable descriptions, Markdown chunk text, component scores,
+and observed cross-search cluster edges. File descriptions are rendered as
+language-specific comments immediately after the file header. Callable
+descriptions are flattened into one language-specific comment on the
+declaration line. Explicit `search-descriptions` or `search --descriptions`
+shows both descriptions even at compact detail. For example:
+
+```text
+*** src/auth/session.rs
+// Session types and token validation.
+
+@@ 14-22 @@ score=0.9123
+impl SessionService
+  pub fn validate(&self, token: &str) -> Result<Session>  // Validates the token and returns its session.
+```
+
+Rust, JavaScript/TypeScript, Go, and Java use `//` comments; C uses `/* */`,
+Python uses `#`, and Markdown uses HTML comments. Descriptions are generated annotations,
+not lines from the indexed source; their line numbers are not part of hunk ranges.
 This setting affects text presentation, not which symbols are selected or the
 contents of JSON. Map's `-k` and `--private` remain selection filters.
 
@@ -310,9 +331,12 @@ reranked) on the hunk header. Every ranked code result includes its ancestor
 declarations above the match, even when another hit has the same ancestors;
 the hunk range still identifies the matched symbol. Markdown search likewise
 repeats the complete heading path for each result, since hits are not in file
-order. Its range identifies the matched chunk; expanded detail also prints
-the chunk text.
-Cross-search clusters use the same excerpts under a cluster header. The
+order. Its range identifies the matched chunk; expanded detail prints the full
+chunk text. Mixed search without an explicit description selector keeps saved
+descriptions at expanded detail.
+Cross-search clusters use the same excerpts under a cluster header, sharing a
+file header for consecutive members from the same index and file. Cross-index
+source and target roles remain distinct even when paths match. The
 similarity range belongs to observed edges, not individual members. With
 `--cohesion` or `--format text`, cross-search can instead print source/match
 groups with per-match scores and optional filesystem distance.
@@ -414,7 +438,10 @@ regenerate all existing descriptions.
 
 File descriptions use the complete file source. Each callable request is a
 separate request containing its source, symbol, path, and file-description
-context. There is no continuing per-file chat conversation. `status` reports
+context. File generation asks for one paragraph; callable generation asks for
+one sentence. Previously saved descriptions are reused until regenerated and
+multi-line callable descriptions are flattened for inline display. There is no
+continuing per-file chat conversation. `status` reports
 enabled state, profiles, description counts, and stale-file-description count.
 
 ### Native offline reuse and recovery

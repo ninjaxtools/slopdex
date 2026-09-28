@@ -36,6 +36,9 @@ const EXCLUDED: &[&str] = &[
     "target",
 ];
 
+const FILE_DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. Return exactly one concise paragraph about the file's purpose, responsibilities, and important relationships; use plain text without a heading, bullets, or a preamble.";
+const CALLABLE_DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. Return exactly one sentence describing what the callable does, including relevant inputs, outputs, or side effects; use plain text without a heading, bullets, or a preamble.";
+
 pub struct Engine {
     root: PathBuf,
     db: Database,
@@ -428,6 +431,16 @@ impl Engine {
         self.files.get(path).map(|file| file.source.as_str())
     }
 
+    pub fn presentation_file_description(&self, path: &str) -> Option<&str> {
+        self.files
+            .get(path)
+            .and_then(|file| file.description.as_deref())
+    }
+
+    pub fn presentation_symbol_descriptions(&self, path: &str) -> Result<HashMap<usize, String>> {
+        self.db.symbol_descriptions(path)
+    }
+
     fn parsed(&self, path: &str, source: &str) -> Result<parse::ParsedFile> {
         let key = hash(json!([STRUCTURE_PARSER_VERSION, path, hash(source)]).to_string());
         if let Some(cached) = self.db.cache("parse", &key)? {
@@ -483,14 +496,14 @@ impl Engine {
                 let key = hash(
                     json!([
                         self.providers.llm().profile(),
-                        "file",
+                        "file-paragraph-v1",
                         prepared.file.path,
                         prepared.file.hash
                     ])
                     .to_string(),
                 );
                 let prompt = format!(
-                    "Describe the purpose, responsibilities, and important relationships of this existing source file. Do not propose changes.\nFile: {}\n\n{}",
+                    "Describe the purpose, responsibilities, and important relationships of this existing source file in one paragraph. Do not propose changes.\nFile: {}\n\n{}",
                     prepared.file.path, prepared.file.source
                 );
                 if self.db.cache("description", &key)?.is_none() {
@@ -506,12 +519,7 @@ impl Engine {
             &jobs,
             self.parallelism()?,
             |_| 1,
-            |(_, prompt)| {
-                llm.describe(
-                    "You explain existing source code accurately and concisely. Return plain text, without a preamble.",
-                    prompt,
-                )
-            },
+            |(_, prompt)| llm.describe(FILE_DESCRIPTION_SYSTEM, prompt),
             |(key, _), description| self.db.cache_put("description", key, &description),
         )?;
         for (index, key) in file_assignments {
@@ -565,7 +573,7 @@ impl Engine {
                     let key = hash(
                         json!([
                             self.providers.llm().profile(),
-                            "function",
+                            "function-sentence-v1",
                             prepared.file.path,
                             callable.qualified_name,
                             callable.source_hash,
@@ -578,7 +586,7 @@ impl Engine {
                         .to_string(),
                     );
                     let prompt = format!(
-                        "Describe what this existing callable does, its inputs, outputs and side effects. Be concise; do not propose changes.\nFile: {}\nFile context: {}\nSymbol: {}\n\n{}",
+                        "Describe what this existing callable does in one sentence, covering relevant inputs, outputs and side effects. Do not propose changes.\nFile: {}\nFile context: {}\nSymbol: {}\n\n{}",
                         prepared.file.path,
                         prepared.file.description.as_deref().unwrap_or(""),
                         callable.qualified_name,
@@ -607,12 +615,7 @@ impl Engine {
             &jobs,
             self.parallelism()?,
             |_| 1,
-            |(_, prompt)| {
-                llm.describe(
-                    "You explain existing source code accurately and concisely. Return plain text, without a preamble.",
-                    prompt,
-                )
-            },
+            |(_, prompt)| llm.describe(CALLABLE_DESCRIPTION_SYSTEM, prompt),
             |(key, _), description| self.db.cache_put("description", key, &description),
         )?;
         for (file_index, callable_index, key) in description_assignments {

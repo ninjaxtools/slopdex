@@ -2666,6 +2666,47 @@ fn regression_descriptions_with_markdown_refresh_is_noop_and_keeps_query_caches(
 }
 
 #[test]
+fn generated_descriptions_request_a_sentence_for_callables_and_paragraph_for_files() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    repo.write("api.rs", "pub fn run() -> i32 { 42 }\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let requests = mock.requests("/responses");
+    let file = requests
+        .iter()
+        .find(|request| {
+            request.body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Describe the purpose"))
+        })
+        .unwrap();
+    let callable = requests
+        .iter()
+        .find(|request| {
+            request.body["input"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Describe what"))
+        })
+        .unwrap();
+    assert!(
+        file.body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one concise paragraph")
+    );
+    assert!(
+        callable.body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one sentence")
+    );
+    Ok(())
+}
+
+#[test]
 fn regression_description_model_change_retains_unchanged_and_regenerates_only_edited_callable()
 -> Result<()> {
     let mock = Mock::start()?;
@@ -3200,8 +3241,45 @@ fn map_cli_defaults_to_terse_source_order_excerpts() -> Result<()> {
         text.starts_with("*** api.rs\n\n@@ 1 @@\npub struct Api\n"),
         "{text}"
     );
-    assert!(text.contains("@@ 3 @@\n  pub fn run(&self)\n"), "{text}");
+    assert!(
+        text.contains("@@ 2-4 @@\nimpl Api\n  pub fn run(&self)\n"),
+        "{text}"
+    );
     assert!(!text.contains("secret") && !text.contains("implementation omitted"));
+    Ok(())
+}
+
+#[test]
+fn map_cli_does_not_fold_filtered_out_members_into_parent_range() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("pipe.ts", "export interface PipeAddress {\n  readonly read: string; readonly hidden: string\n  readonly write: string\n}\n")?;
+    let output = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args(["map", "pipe.ts", "-e", "^PipeAddress\\.(read|write)$"])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    assert!(
+        text.contains("@@ 1-4 @@\nexport interface PipeAddress\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@@ 2 @@\n  readonly read: string\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@@ 3 @@\n  readonly write: string\n"),
+        "{text}"
+    );
+    assert!(!text.contains("hidden"));
     Ok(())
 }
 

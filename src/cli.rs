@@ -65,7 +65,7 @@ struct Global {
     /// Text excerpts by default; cross-search uses clusters, cohesion uses source/match groups; cross JSON is JSONL
     #[arg(long, global = true, value_enum)]
     format: Option<Format>,
-    /// Declaration-only by default; standard adds attributes, expanded adds descriptions and Markdown text
+    /// Compact by default; expanded includes description comments; explicit description searches show them at any detail
     #[arg(long, global = true, value_enum, default_value = "compact")]
     detail: Detail,
     /// Reuse the existing index offline, without automatic refresh
@@ -663,6 +663,7 @@ pub fn run() -> Result<()> {
                 &rows,
                 format,
                 cli.global.detail,
+                args.descriptions,
                 &mut Presentation::new(&engine),
             )?;
         }
@@ -680,6 +681,7 @@ pub fn run() -> Result<()> {
                 &rows,
                 format,
                 cli.global.detail,
+                kind == "search-descriptions",
                 &mut Presentation::new(&engine),
             )?;
         }
@@ -702,6 +704,7 @@ pub fn run() -> Result<()> {
                         &references,
                         format,
                         cli.global.detail,
+                        false,
                         &mut Presentation::new(&engine),
                     )?;
                 }
@@ -1617,17 +1620,37 @@ fn print_map(
         let path = row["path"].as_str().context("map result is missing path")?;
         let nodes: Vec<StructureNode> = serde_json::from_value(row["nodes"].clone())
             .with_context(|| format!("decode map nodes for {path}"))?;
+        let full = engine
+            .map(|engine| engine.presentation_structure(path))
+            .transpose()?
+            .flatten();
+        let symbols = if detail == Detail::Expanded {
+            engine
+                .map(|engine| engine.presentation_symbol_descriptions(path))
+                .transpose()?
+        } else {
+            None
+        };
         if index > 0 {
             writeln!(out)?;
         }
         write!(
             out,
             "{}",
-            map::render_with_source(
+            map::render_with_descriptions(
                 &nodes,
                 Some(path),
                 detail.into(),
-                engine.and_then(|engine| engine.presentation_source(path))
+                engine.and_then(|engine| engine.presentation_source(path)),
+                full.as_ref(),
+                map::Descriptions {
+                    file: if detail == Detail::Expanded {
+                        engine.and_then(|engine| engine.presentation_file_description(path))
+                    } else {
+                        None
+                    },
+                    symbols: symbols.as_ref(),
+                },
             )
         )?;
     }
@@ -1741,9 +1764,44 @@ fn print_function(
     function: &Value,
     annotation: &str,
     detail: Detail,
+    show_description: bool,
     presentation: &mut Presentation<'_>,
 ) -> Result<()> {
-    write!(out, "{}", map::file_header(text(function, "path")))?;
+    print_function_with_header(
+        out,
+        function,
+        annotation,
+        detail,
+        show_description,
+        presentation,
+        true,
+    )
+}
+
+fn print_function_with_header(
+    out: &mut impl Write,
+    function: &Value,
+    annotation: &str,
+    detail: Detail,
+    show_description: bool,
+    presentation: &mut Presentation<'_>,
+    file_header: bool,
+) -> Result<()> {
+    if file_header {
+        write!(out, "{}", map::file_header(text(function, "path")))?;
+        if (detail == Detail::Expanded || show_description)
+            && let Some(description) = presentation
+                .engine
+                .and_then(|engine| engine.presentation_file_description(text(function, "path")))
+                .filter(|text| !text.trim().is_empty())
+        {
+            write!(
+                out,
+                "{}\n",
+                map::comment_block(text(function, "path"), description)
+            )?;
+        }
+    }
     let nodes = presentation.context(function)?;
     let qualified = nodes
         .last()
@@ -1755,11 +1813,23 @@ fn print_function(
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
+    let description = if detail == Detail::Expanded || show_description {
+        function["description"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+    } else {
+        None
+    };
     if !nodes.is_empty() {
         write!(
             out,
             "{}",
-            map::render_context(&nodes, Some(&annotation), detail.into())
+            map::render_context_with_description(
+                &nodes,
+                Some(&annotation),
+                detail.into(),
+                description
+            )
         )?;
     } else {
         let start = function["startLine"].as_u64().unwrap_or(1) as usize;
@@ -1767,14 +1837,22 @@ fn print_function(
         let name = function["qualifiedName"]
             .as_str()
             .unwrap_or_else(|| text(function, "name"));
-        write!(out, "{}{name}\n", map::hunk(start, end, Some(&annotation)))?;
-    }
-    if detail == Detail::Expanded
-        && let Some(description) = function["description"].as_str().filter(|s| !s.is_empty())
-    {
-        for line in description.lines() {
-            writeln!(out, "@ description: {line}")?;
-        }
+        let suffix = description
+            .map(|description| {
+                format!(
+                    "  {}",
+                    map::comment(
+                        text(function, "path"),
+                        &description.split_whitespace().collect::<Vec<_>>().join(" ")
+                    )
+                )
+            })
+            .unwrap_or_default();
+        write!(
+            out,
+            "{}{name}{suffix}\n",
+            map::hunk(start, end, Some(&annotation))
+        )?;
     }
     Ok(())
 }
@@ -1783,10 +1861,23 @@ fn print_markdown(
     out: &mut impl Write,
     row: &Value,
     detail: Detail,
+    show_description: bool,
     presentation: &mut Presentation<'_>,
 ) -> Result<()> {
     let chunk = &row["chunk"];
     write!(out, "{}", map::file_header(text(chunk, "path")))?;
+    if (detail == Detail::Expanded || show_description)
+        && let Some(description) = presentation
+            .engine
+            .and_then(|engine| engine.presentation_file_description(text(chunk, "path")))
+            .filter(|text| !text.trim().is_empty())
+    {
+        write!(
+            out,
+            "{}\n",
+            map::comment_block(text(chunk, "path"), description)
+        )?;
+    }
     let start = chunk["startLine"].as_u64().unwrap_or(1) as usize;
     let end = chunk["endLine"].as_u64().unwrap_or(start as u64) as usize;
     write!(out, "{}", map::hunk(start, end, Some(&rank(row))))?;
@@ -1822,7 +1913,7 @@ fn print_markdown(
         }
         last
     };
-    if detail == Detail::Expanded {
+    if detail != Detail::Compact {
         let content = text(chunk, "content");
         let body = if let Some(heading) = last_heading
             .as_deref()
@@ -1833,10 +1924,23 @@ fn print_markdown(
                 .unwrap()
                 .1
                 .trim_start_matches('\n')
+        } else if last_heading.is_none() {
+            // Without a heading, compact output already displays the first line.
+            content.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
         } else {
             content
         };
-        if !body.trim().is_empty() {
+        if detail == Detail::Standard {
+            let summary = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !summary.is_empty() {
+                let preview = if summary.chars().count() > 160 {
+                    format!("{}…", summary.chars().take(159).collect::<String>())
+                } else {
+                    summary
+                };
+                writeln!(out, "@ preview: {preview}")?;
+            }
+        } else if !body.trim().is_empty() {
             writeln!(out, "{body}")?;
         }
     }
@@ -1848,6 +1952,7 @@ fn print_search(
     rows: &[Value],
     format: Format,
     detail: Detail,
+    descriptions: bool,
     presentation: &mut Presentation<'_>,
 ) -> Result<()> {
     if format == Format::Json {
@@ -1861,7 +1966,7 @@ fn print_search(
             writeln!(out)?;
         }
         if row["type"] == "markdown" {
-            print_markdown(out, row, detail, presentation)?;
+            print_markdown(out, row, detail, descriptions, presentation)?;
         } else {
             let annotation = format!(
                 "{}{}",
@@ -1872,7 +1977,14 @@ fn print_search(
                     String::new()
                 }
             );
-            print_function(out, &row["function"], &annotation, detail, presentation)?;
+            print_function(
+                out,
+                &row["function"],
+                &annotation,
+                detail,
+                descriptions,
+                presentation,
+            )?;
         }
     }
     Ok(())
@@ -1954,7 +2066,7 @@ fn print_cross(
                 writeln!(out)?;
             }
             writeln!(out, "Source")?;
-            print_function(out, &row["source"], "", detail, source_presentation)?;
+            print_function(out, &row["source"], "", detail, false, source_presentation)?;
             for item in array(&row["matches"]) {
                 let distance = item["physicalDistance"]
                     .as_f64()
@@ -1972,13 +2084,14 @@ fn print_cross(
                     }
                 );
                 if let Some(target) = target_presentation.as_deref_mut() {
-                    print_function(out, &item["function"], &annotation, detail, target)?;
+                    print_function(out, &item["function"], &annotation, detail, false, target)?;
                 } else {
                     print_function(
                         out,
                         &item["function"],
                         &annotation,
                         detail,
+                        false,
                         source_presentation,
                     )?;
                 }
@@ -2168,16 +2281,38 @@ fn print_clusters(
                 writeln!(out, "@ match: {left} ↔ {right} score={similarity:.4}")?;
             }
         }
+        let mut previous_file = None;
         for member in &cluster.members {
-            writeln!(out)?;
+            let file = (member.role, text(&member.function, "path"));
+            let new_file = previous_file != Some(file);
+            if new_file {
+                writeln!(out)?;
+            }
             let role = if same_index { "" } else { member.role };
             if member.role == "target"
                 && let Some(target) = target_presentation.as_deref_mut()
             {
-                print_function(out, &member.function, role, detail, target)?;
+                print_function_with_header(
+                    out,
+                    &member.function,
+                    role,
+                    detail,
+                    false,
+                    target,
+                    new_file,
+                )?;
             } else {
-                print_function(out, &member.function, role, detail, source_presentation)?;
+                print_function_with_header(
+                    out,
+                    &member.function,
+                    role,
+                    detail,
+                    false,
+                    source_presentation,
+                    new_file,
+                )?;
             }
+            previous_file = Some(file);
         }
     }
     Ok(())
@@ -3527,6 +3662,7 @@ mod tests {
             &rows,
             Format::Json,
             Detail::Compact,
+            false,
             &mut Presentation::empty(),
         )
         .unwrap();
@@ -3538,6 +3674,7 @@ mod tests {
             &rows,
             Format::Summary,
             Detail::Compact,
+            false,
             &mut Presentation::empty(),
         )
         .unwrap();
@@ -3556,11 +3693,12 @@ mod tests {
             &rows,
             Format::Summary,
             Detail::Expanded,
+            false,
             &mut Presentation::empty(),
         )
         .unwrap();
         let expanded = String::from_utf8(out).unwrap();
-        assert!(expanded.contains("@ description: Purpose\n@ description: second line"));
+        assert!(expanded.contains("Service.run  // Purpose second line\n"));
         assert!(expanded.contains("Use `KEY`.\nNext step."));
         assert!(summary.len() < expanded.len());
     }
@@ -3584,6 +3722,7 @@ mod tests {
             &rows,
             Format::Summary,
             Detail::Compact,
+            false,
             &mut Presentation::new(&engine),
         )?;
         let output = String::from_utf8(output)?;
@@ -3605,6 +3744,7 @@ mod tests {
             &mut output,
             &row,
             Detail::Compact,
+            false,
             &mut Presentation::empty(),
         )
         .unwrap();
@@ -3612,6 +3752,154 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "*** guide.md\n@@ 8-14 @@ score=0.8000\n# Guide\n  ## Setup\n"
         );
+    }
+
+    #[test]
+    fn standard_search_detail_previews_markdown_and_explicit_descriptions() -> Result<()> {
+        let description = json!({"type":"function", "similarity":0.8,
+            "function":{"path":"api.rs", "name":"run", "description":"Handles requests.\nChecks permissions."}});
+        let mut output = Vec::new();
+        print_search(
+            &mut output,
+            &[description.clone()],
+            Format::Summary,
+            Detail::Standard,
+            true,
+            &mut Presentation::empty(),
+        )?;
+        assert!(
+            String::from_utf8(output)?.contains("run  // Handles requests. Checks permissions.\n")
+        );
+        let mut output = Vec::new();
+        print_search(
+            &mut output,
+            &[description],
+            Format::Summary,
+            Detail::Standard,
+            false,
+            &mut Presentation::empty(),
+        )?;
+        assert!(!String::from_utf8(output)?.contains("// Handles requests."));
+
+        let body = format!("{} extra material", "λ".repeat(170));
+        let row = json!({"type":"markdown", "similarity":0.8, "chunk":{
+            "path":"guide.md", "startLine":1, "endLine":8, "headingPath":["Guide"],
+            "content":format!("# Guide\n\n{body}")}});
+        let mut output = Vec::new();
+        print_markdown(
+            &mut output,
+            &row,
+            Detail::Standard,
+            false,
+            &mut Presentation::empty(),
+        )?;
+        let output = String::from_utf8(output)?;
+        let preview = output
+            .lines()
+            .find_map(|line| line.strip_prefix("@ preview: "))
+            .unwrap();
+        assert_eq!(preview.chars().count(), 160);
+        assert!(preview.ends_with('…') && !preview.contains("extra material"));
+        let mut expanded = Vec::new();
+        print_markdown(
+            &mut expanded,
+            &row,
+            Detail::Expanded,
+            false,
+            &mut Presentation::empty(),
+        )?;
+        assert!(String::from_utf8(expanded)?.contains(&body));
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_file_and_callable_descriptions_are_comments_at_the_requested_detail() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = "pub fn run() {}\n";
+        fs::write(dir.path().join("api.rs"), source)?;
+        let index = dir.path().join("index.sqlite");
+        let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+        engine.refresh_structure()?;
+        drop(engine);
+        let db = rusqlite::Connection::open(&index)?;
+        let (identity, data): (String, String) = db.query_row(
+            "SELECT identity,data FROM search_units WHERE path='api.rs' AND kind='function'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let data: Value = serde_json::from_str(&data)?;
+        db.execute("INSERT INTO descriptions(scope,path,identity,source_hash,text,embedding_key) VALUES('file','api.rs','',?,?,NULL)",
+            rusqlite::params![crate::hash(source), "Handles API requests.\nIncludes validation."])?;
+        db.execute("INSERT INTO descriptions(scope,path,identity,source_hash,text,embedding_key) VALUES('callable','api.rs',?,?,?,NULL)",
+            rusqlite::params![identity, data["sourceHash"].as_str(), "Runs work.\nReturns a result."])?;
+        drop(db);
+        let engine = Engine::open_map(dir.path(), &index, json!({}))?;
+        let rows = engine.map(&json!({}))?;
+        let mut compact = Vec::new();
+        print_map(
+            &mut compact,
+            &rows,
+            Format::Summary,
+            Detail::Compact,
+            Some(&engine),
+        )?;
+        assert!(!String::from_utf8(compact)?.contains("Handles API requests."));
+        let mut expanded = Vec::new();
+        print_map(
+            &mut expanded,
+            &rows,
+            Format::Summary,
+            Detail::Expanded,
+            Some(&engine),
+        )?;
+        let expanded = String::from_utf8(expanded)?;
+        assert!(
+            expanded
+                .starts_with("*** api.rs\n// Handles API requests.\n// Includes validation.\n\n@@"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("pub fn run()  // Runs work. Returns a result.\n"),
+            "{expanded}"
+        );
+
+        let result = json!({"type":"function", "similarity":0.8, "function":{
+            "path":"api.rs", "name":"run", "qualifiedName":"run", "startLine":1,"endLine":1,
+            "description":"Runs work.\nReturns a result."}});
+        let mut output = Vec::new();
+        print_search(
+            &mut output,
+            &[result.clone()],
+            Format::Summary,
+            Detail::Compact,
+            true,
+            &mut Presentation::new(&engine),
+        )?;
+        let output = String::from_utf8(output)?;
+        assert!(
+            output
+                .starts_with("*** api.rs\n// Handles API requests.\n// Includes validation.\n\n@@"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub fn run()  // Runs work. Returns a result.\n"),
+            "{output}"
+        );
+        let mut output = Vec::new();
+        print_search(
+            &mut output,
+            &[result],
+            Format::Summary,
+            Detail::Standard,
+            false,
+            &mut Presentation::new(&engine),
+        )?;
+        let output = String::from_utf8(output)?;
+        assert!(
+            !output.contains("Handles API requests.") && !output.contains("Runs work."),
+            "{output}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -3640,6 +3928,7 @@ mod tests {
             &rows,
             Format::Summary,
             Detail::Compact,
+            false,
             &mut Presentation::new(&engine),
         )?;
         let output = String::from_utf8(output)?;
@@ -3673,6 +3962,7 @@ mod tests {
             &[],
             Format::Json,
             Detail::Compact,
+            false,
             &mut Presentation::empty(),
         )
         .unwrap();
@@ -3686,6 +3976,7 @@ mod tests {
             &[],
             Format::Summary,
             Detail::Compact,
+            false,
             &mut Presentation::empty(),
         )
         .unwrap();
@@ -3917,6 +4208,25 @@ mod tests {
         let cluster = clusters(&rows, true).remove(0);
         assert_eq!(cluster.members[0].function["startLine"], 2);
         assert_eq!(cluster.members[1].function["startLine"], 10);
+        let mut output = Vec::new();
+        print_cross(
+            &mut output,
+            rows,
+            Format::Clusters,
+            true,
+            false,
+            None,
+            Detail::Compact,
+            &mut Presentation::empty(),
+            None,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("*** same.rs").count(), 1, "{output}");
+        assert!(
+            output.contains("@@ 2 @@\nfirst\n@@ 10 @@\nsecond\n"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -3938,6 +4248,7 @@ mod tests {
                     &[json!({"function": function("a")})],
                     format,
                     Detail::Compact,
+                    false,
                     &mut Presentation::empty()
                 )
                 .is_err()

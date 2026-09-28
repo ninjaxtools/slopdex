@@ -425,6 +425,34 @@ impl Database {
         read_structure(&self.conn, path)
     }
 
+    /// Saved callable descriptions keyed by their structural symbol, without
+    /// loading vectors or requiring a description provider for `map`.
+    pub fn symbol_descriptions(&self, path: &str) -> Result<HashMap<usize, String>> {
+        let mut stmt = self.conn.prepare("SELECT s.symbol_id,s.data,d.source_hash,d.text
+            FROM search_units s JOIN descriptions d ON d.scope='callable' AND d.path=s.path AND d.identity=s.identity
+            WHERE s.path=? AND s.kind='function' AND s.symbol_id IS NOT NULL ORDER BY s.id")?;
+        let rows = stmt.query_map([path], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut descriptions = HashMap::new();
+        for row in rows {
+            let (id, data, source_hash, description) = row?;
+            let data: Value = serde_json::from_str(&data)?;
+            if source_hash
+                .as_deref()
+                .is_some_and(|hash| Some(hash) == data["sourceHash"].as_str())
+            {
+                descriptions.insert(usize::try_from(id)?, description);
+            }
+        }
+        Ok(descriptions)
+    }
+
     /// A refresh commits live records and its generation together. Completed model
     /// and parse artifacts were already committed independently for retry reuse.
     pub fn apply(
