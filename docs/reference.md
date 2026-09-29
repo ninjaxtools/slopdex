@@ -105,7 +105,7 @@ use plain diagnostics without animations; result data on stdout retains its
 ## Structure map
 
 ```text
-slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--detail compact|standard|expanded] [--format text|json]
+slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--callers N] [--callees N] [--detail compact|standard|expanded] [--format text|json]
 ```
 
 With no paths, map selects the indexed repository. Paths select files or recursive
@@ -131,6 +131,26 @@ interfaces, traits, and enums. Other selectors include `imports`, `modules`,
 `consts`, `variables`, `fields`, `variants`, `impls`, `macros`, and `headings`.
 Kinds are ORed and intersect name regexes. Matching nodes retain their ancestors
 as context; a matching parent does not automatically include unmatched children.
+
+`--callers N` and `--callees N` each default to `0`. When positive, they expand
+selected callables by up to N call-graph edges in the specified direction. Related
+callables are shown even when they are outside the requested paths, glob, name,
+kind, visibility, or result limit. Expansion stops at cycles and deduplicates
+symbols. It is also available on `search`, `search-code`, `search-descriptions`,
+`search-md`, `describe`, and `cross-search`; Markdown-only results have no callable
+to expand. Cross-index results expand within their respective indexes. Calls are
+extracted from indexed source; only uniquely resolved static targets, including
+supported explicit imports, form edges. Dynamic receivers and unresolved calls
+do not create speculative links. Run without `--no-reindex` once after upgrading
+to build the new call metadata.
+
+In text output, a virtual language-specific comment directly below each caller
+identifies displayed callees by repository-relative file and qualified symbol,
+for example `# calls src/task.py :: execute`. These are annotations, not source
+lines. JSON adds `callDepth` and `callees` to expanded map nodes and
+`relatedCallables`/`callees` to callable search results when expansion is enabled.
+Cross-search adds the same information to source and match objects; describe adds
+it to returned functions. With both depths zero, existing output is unchanged.
 
 Text output prints declarations in source order using `*** path` file headers and
 `@@ start-end @@` source ranges. Adjacent code declarations of the same kind and

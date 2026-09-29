@@ -1,6 +1,6 @@
 //! Tree-sitter callable extraction and recoverable syntax diagnostics.
 
-use super::{Callable, Diagnostic, ParsedFile};
+use super::{CallSite, Callable, Diagnostic, ParsedFile};
 use crate::hash;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -48,6 +48,7 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
         structure: super::structure::extract(language, tree.root_node(), source),
         ..ParsedFile::default()
     };
+    collect_calls(tree.root_node(), source, language, &mut result.structure);
     for candidate in collector.candidates {
         if candidate.node.has_error() {
             continue;
@@ -62,6 +63,83 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
         }
     }
     Ok(result)
+}
+
+fn collect_calls(
+    node: Node<'_>,
+    source: &str,
+    language: &str,
+    structure: &mut super::FileStructure,
+) {
+    let callee = match node.kind() {
+        "call_expression" | "call" => node.child_by_field_name("function"),
+        "method_call_expression" => node.child_by_field_name("method"),
+        "method_invocation" => node.child_by_field_name("name"),
+        "new_expression" => node
+            .child_by_field_name("constructor")
+            .or_else(|| node.named_child(0)),
+        "object_creation_expression" => node.child_by_field_name("type"),
+        "command" if language == "bash" => node.named_child(0),
+        _ => None,
+    };
+    if let Some(callee) = callee {
+        let name = text(source, callee).trim_start_matches('#');
+        let (receiver, name) =
+            if matches!(node.kind(), "method_call_expression" | "method_invocation") {
+                (
+                    node.child_by_field_name("receiver")
+                        .or_else(|| node.child_by_field_name("object"))
+                        .map(|n| text(source, n)),
+                    name,
+                )
+            } else if let Some((receiver, name)) = name.rsplit_once("::") {
+                (Some(receiver), name)
+            } else if let Some((receiver, name)) = name.rsplit_once('.') {
+                (Some(receiver), name)
+            } else {
+                (None, name)
+            };
+        let (receiver, name) = if node.kind() == "new_expression" {
+            (Some(name), "constructor")
+        } else if node.kind() == "object_creation_expression" {
+            (Some(name), name)
+        } else {
+            (receiver, name)
+        };
+        let identifier = |word: &str| {
+            !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '#'))
+        };
+        if identifier(name)
+            && receiver.is_none_or(|r| identifier(r) || r.split("::").all(identifier))
+        {
+            let owner = structure
+                .nodes
+                .iter_mut()
+                .filter(|n| {
+                    matches!(
+                        n.kind.as_str(),
+                        "function" | "method" | "constructor" | "generator"
+                    ) && n.start_byte <= node.start_byte()
+                        && node.end_byte() <= n.end_byte
+                })
+                .min_by_key(|n| n.end_byte - n.start_byte);
+            if let Some(owner) = owner {
+                let site = CallSite {
+                    name: name.to_owned(),
+                    receiver: receiver.map(str::to_owned),
+                };
+                if !owner.calls.contains(&site) {
+                    owner.calls.push(site);
+                }
+            }
+        }
+    }
+    for child in children(node) {
+        collect_calls(child, source, language, structure);
+    }
 }
 
 fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {

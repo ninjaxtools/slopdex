@@ -3257,6 +3257,334 @@ fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens
 }
 
 #[test]
+fn map_call_graph_expands_cross_file_chains_and_rebuilds_after_edits() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write(
+        "a.py",
+        "from b import middle\n\ndef outer():\n    return middle()\n\ndef outermost():\n    return outer()\n",
+    )?;
+    repo.write(
+        "b.py",
+        "from c import leaf\n\ndef middle():\n    return leaf()\n",
+    )?;
+    repo.write(
+        "c.py",
+        "from d import deepest\n\ndef leaf():\n    return deepest()\n",
+    )?;
+    repo.write("d.py", "def deepest():\n    return 1\n")?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    let selected = json!({"kinds":["functions"],"regexp":["^middle$"]});
+    assert_eq!(map_names(&engine.map(&selected)?), strings(&["middle"]));
+    let options = json!({"kinds":["functions"],"regexp":["^middle$"],"glob":["b.py"],"callers":1,"callees":1});
+    let rows = engine.map(&options)?;
+    assert_eq!(map_names(&rows), strings(&["outer", "middle", "leaf"]));
+    let middle = rows
+        .iter()
+        .find(|row| row["path"] == "b.py")
+        .context("middle file")?;
+    assert_eq!(middle["nodes"][0]["callees"][0], "calls c.py :: leaf");
+    let outer = rows
+        .iter()
+        .find(|row| row["path"] == "a.py")
+        .context("outer file")?;
+    assert_eq!(outer["nodes"][0]["callees"][0], "calls b.py :: middle");
+    let two_levels = engine.map(&json!({"kinds":["functions"],"regexp":["^middle$"],"glob":["b.py"],"callers":2,"callees":2}))?;
+    assert_eq!(
+        map_names(&two_levels),
+        strings(&["outermost", "outer", "middle", "leaf", "deepest"])
+    );
+    drop(engine);
+    let json_rows = repo.cli_json(&[
+        "--no-reindex",
+        "map",
+        "b.py",
+        "-k",
+        "fns",
+        "-e",
+        "^middle$",
+        "--callers",
+        "1",
+        "--callees",
+        "1",
+    ])?;
+    assert_eq!(
+        map_names(json_rows.as_array().unwrap()),
+        strings(&["outer", "middle", "leaf"])
+    );
+    repo.write("b.py", "def middle():\n    return 2\n")?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    assert_eq!(
+        map_names(&engine.map(&options)?),
+        strings(&["outer", "middle"])
+    );
+    Ok(())
+}
+
+#[test]
+fn call_graph_depths_handle_cycles_and_ambiguous_calls() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("chain.py", "def first():\n    return second()\n\ndef second():\n    return third()\n\ndef third():\n    return first()\n")?;
+    repo.write("other.py", "def third():\n    return 0\n")?;
+    repo.write("unknown.py", "def unknown():\n    return third()\n")?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    let rows = engine.map(&json!({"regexp":["^first$"],"kinds":["fns"],"callees":2}))?;
+    assert_eq!(map_names(&rows), strings(&["first", "second", "third"]));
+    let unresolved = engine.map(&json!({"regexp":["^unknown$"],"kinds":["fns"],"callees":2}))?;
+    assert_eq!(map_names(&unresolved), strings(&["unknown"]));
+    assert_eq!(rows.len(), 1);
+    let rows = engine
+        .map(&json!({"regexp":["^third$"],"glob":["chain.py"],"kinds":["fns"],"callers":2}))?;
+    assert_eq!(map_names(&rows), strings(&["first", "second", "third"]));
+    drop(engine);
+    let rows = repo.cli_json(&[
+        "--no-reindex",
+        "map",
+        "chain.py",
+        "-e",
+        "^first$",
+        "-k",
+        "fns",
+        "--callees",
+        "1",
+    ])?;
+    assert_eq!(
+        map_names(rows.as_array().unwrap()),
+        strings(&["first", "second"])
+    );
+    Ok(())
+}
+
+#[test]
+fn call_graph_resolves_explicit_js_imports_and_rust_module_calls() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write(
+        "src/a.ts",
+        "import { run as execute } from './b';\nexport function entry() { execute(); }\n",
+    )?;
+    repo.write("src/b.ts", "export function run() { return 1; }\n")?;
+    repo.write(
+        "src/namespace.ts",
+        "import * as module from './b';\nexport function delegate() { module.run(); }\n",
+    )?;
+    repo.write(
+        "src/lib.rs",
+        "mod util;\nuse crate::util::work;\npub fn start() { work(); }\n",
+    )?;
+    repo.write("src/util.rs", "pub fn work() {}\n")?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    let js = engine.map(&json!({"kinds":["fns"],"regexp":["^entry$"],"callees":1}))?;
+    assert_eq!(map_names(&js), strings(&["entry", "run"]));
+    let namespace = engine.map(&json!({"kinds":["fns"],"regexp":["^delegate$"],"callees":1}))?;
+    assert_eq!(map_names(&namespace), strings(&["delegate", "run"]));
+    let rust = engine.map(&json!({"kinds":["fns"],"regexp":["^start$"],"callees":1}))?;
+    assert_eq!(map_names(&rust), strings(&["start", "work"]));
+    Ok(())
+}
+
+#[test]
+fn call_graph_ignores_type_only_overload_declarations() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("overloads.ts", "export function run(x: string): string;\nexport function run(x: string) { return x; }\nexport function main() { return run('a'); }\n")?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    let rows = engine.map(&json!({"kinds":["fns"],"regexp":["^main$"],"callees":1}))?;
+    assert_eq!(map_names(&rows), strings(&["main", "run"]));
+    assert_eq!(
+        rows[0]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["name"] == "run")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn call_graph_tracks_constructor_calls() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("classes.py", "class Worker:\n    def __init__(self):\n        pass\n\ndef build():\n    return Worker()\n")?;
+    repo.write(
+        "objects.ts",
+        "export class Box { constructor() {} }\nexport function create() { return new Box(); }\n",
+    )?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    let python = engine.map(&json!({"regexp":["^build$"],"kinds":["fns"],"callees":1}))?;
+    assert_eq!(
+        map_names(&python),
+        strings(&["build", "Worker", "__init__"])
+    );
+    let js = engine.map(&json!({"regexp":["^create$"],"kinds":["fns"],"callees":1}))?;
+    assert_eq!(map_names(&js), strings(&["create", "Box", "constructor"]));
+    Ok(())
+}
+
+#[test]
+fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write(
+        "a.py",
+        "from b import middle\n\ndef outer():\n    return middle()\n",
+    )?;
+    repo.write("b.py", "def middle():\n    return 1\n")?;
+    let rows = repo.cli_json(&[
+        "search-code",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+        "--callers",
+        "1",
+    ])?;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["relatedCallables"][0]["node"]["name"], "outer");
+    let output = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args([
+            "--no-reindex",
+            "search-code",
+            "middle",
+            "-e",
+            "^middle$",
+            "--threshold",
+            "-1",
+            "--callers",
+            "1",
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    assert!(
+        text.contains("*** a.py")
+            && text.contains("def outer():")
+            && text.contains("# calls b.py :: middle"),
+        "{text}"
+    );
+    assert!(
+        text.contains("*** b.py") && text.contains("def middle():"),
+        "{text}"
+    );
+    let map_text = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args([
+            "--no-reindex",
+            "map",
+            "b.py",
+            "-e",
+            "^middle$",
+            "-k",
+            "fns",
+            "--callers",
+            "1",
+        ])
+        .output()?;
+    ensure!(
+        map_text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&map_text.stderr)
+    );
+    let map_text = String::from_utf8(map_text.stdout)?;
+    assert!(map_text.contains("# calls b.py :: middle"), "{map_text}");
+    let describe = repo.cli_json(&[
+        "describe",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+        "--callers",
+        "1",
+    ])?;
+    assert!(
+        describe["functions"]
+            .as_array()
+            .is_some_and(|fs| fs.iter().any(|f| f["relatedCallables"]
+                .as_array()
+                .is_some_and(|related| related.iter().any(|r| r["node"]["name"] == "outer"))))
+    );
+    let cross = repo.cli(&[
+        "cross-search",
+        "--lines",
+        "1",
+        "--threshold",
+        "-1",
+        "--matches",
+        "1",
+        "--callers",
+        "1",
+    ])?;
+    ensure!(
+        cross.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cross.stderr)
+    );
+    let cross_rows: Vec<Value> = String::from_utf8(cross.stdout)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<serde_json::Result<_>>()?;
+    assert!(cross_rows.iter().any(|row| {
+        row["relatedCallables"]
+            .as_array()
+            .is_some_and(|related| !related.is_empty())
+            || row["matches"].as_array().is_some_and(|matches| {
+                matches.iter().any(|m| {
+                    m["relatedCallables"]
+                        .as_array()
+                        .is_some_and(|related| !related.is_empty())
+                })
+            })
+    }));
+    let cluster = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args([
+            "--no-reindex",
+            "cross-search",
+            "--lines",
+            "1",
+            "--threshold",
+            "-1",
+            "--matches",
+            "1",
+            "--callers",
+            "1",
+        ])
+        .output()?;
+    ensure!(
+        cluster.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cluster.stderr)
+    );
+    let cluster = String::from_utf8(cluster.stdout)?;
+    assert!(cluster.contains("# calls b.py :: middle"), "{cluster}");
+    Ok(())
+}
+
+#[test]
 fn map_filters_keep_ancestors_without_siblings_and_cli_combines_paths_kinds_and_repeated_filters()
 -> Result<()> {
     let repo = Repo::new()?;

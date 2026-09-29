@@ -2,6 +2,7 @@
 
 use crate::{
     cache,
+    callgraph::{CallGraph, Expansion, Key},
     engine::Engine,
     filter, map,
     parse::{FileStructure, StructureNode},
@@ -260,6 +261,24 @@ struct MapArgs {
     /// Include private and unexported symbols
     #[arg(long)]
     private: bool,
+    #[command(flatten)]
+    calls: CallArgs,
+}
+
+#[derive(Clone, Copy, Debug, Default, Args)]
+struct CallArgs {
+    /// Include this many levels of functions calling selected callables
+    #[arg(long, default_value_t = 0)]
+    callers: usize,
+    /// Include this many levels of functions called by selected callables
+    #[arg(long, default_value_t = 0)]
+    callees: usize,
+}
+
+impl CallArgs {
+    fn enabled(self) -> bool {
+        self.callers > 0 || self.callees > 0
+    }
 }
 
 impl MapArgs {
@@ -273,6 +292,10 @@ impl MapArgs {
         }
         if self.private {
             value["private"] = json!(true);
+        }
+        if self.calls.enabled() {
+            value["callers"] = json!(self.calls.callers);
+            value["callees"] = json!(self.calls.callees);
         }
         value
     }
@@ -321,6 +344,8 @@ struct QueryArgs {
     query: String,
     #[command(flatten)]
     filters: Filters,
+    #[command(flatten)]
+    calls: CallArgs,
 }
 
 #[derive(Debug, Args)]
@@ -352,6 +377,8 @@ struct DescribeArgs {
 struct CrossArgs {
     #[command(flatten)]
     filters: Filters,
+    #[command(flatten)]
+    calls: CallArgs,
     /// Matches kept per source function
     #[arg(long, default_value = "5", value_parser = positive)]
     matches: usize,
@@ -720,7 +747,7 @@ pub fn run() -> Result<()> {
                 format,
                 cli.global.detail,
                 args.descriptions,
-                &mut Presentation::new(&engine),
+                &mut Presentation::with_calls(&engine, args.query.calls)?,
             )?;
         }
         Command::SearchCode(args) | Command::SearchDescriptions(args) | Command::SearchMd(args) => {
@@ -753,16 +780,31 @@ pub fn run() -> Result<()> {
                 format,
                 cli.global.detail,
                 kind == "search-descriptions",
-                &mut Presentation::new(&engine),
+                &mut Presentation::with_calls(&engine, args.calls)?,
             )?;
         }
         Command::Describe(args) => {
             let mut options = args.query.filters.options();
             options["describeFullFileThreshold"] = json!(args.describe_full_file_threshold);
-            let result = ui::spin("Generating explanation", || {
+            if args.query.calls.enabled() {
+                options["callers"] = json!(args.query.calls.callers);
+                options["callees"] = json!(args.query.calls.callees);
+            }
+            let mut result = ui::spin("Generating explanation", || {
                 engine.describe(&args.query.query, &options)
             })?;
             if format == Format::Json {
+                if args.query.calls.enabled() {
+                    let presentation = Presentation::with_calls(&engine, args.query.calls)?;
+                    if let Some(functions) = result["functions"].as_array_mut() {
+                        for function in functions {
+                            let related = presentation.related_json(function);
+                            let outgoing = presentation.outgoing_json(function);
+                            function["relatedCallables"] = json!(related);
+                            function["callees"] = json!(outgoing);
+                        }
+                    }
+                }
                 print_json(&mut out, &result)?;
             } else {
                 writeln!(out, "Explanation\n{}", text(&result, "description"))?;
@@ -776,7 +818,7 @@ pub fn run() -> Result<()> {
                         format,
                         cli.global.detail,
                         false,
-                        &mut Presentation::new(&engine),
+                        &mut Presentation::with_calls(&engine, args.query.calls)?,
                     )?;
                 }
             }
@@ -828,8 +870,12 @@ pub fn run() -> Result<()> {
                     args.filters.limit,
                     cli.global.detail,
                 ),
-                &mut Presentation::new(&engine),
-                target.as_ref().map(Presentation::new).as_mut(),
+                &mut Presentation::with_calls(&engine, args.calls)?,
+                target
+                    .as_ref()
+                    .map(|target| Presentation::with_calls(target, args.calls))
+                    .transpose()?
+                    .as_mut(),
             )?;
         }
         Command::Status => print_json(&mut out, &engine.status()?)?,
@@ -1762,6 +1808,21 @@ fn print_map(
         let path = row["path"].as_str().context("map result is missing path")?;
         let nodes: Vec<StructureNode> = serde_json::from_value(row["nodes"].clone())
             .with_context(|| format!("decode map nodes for {path}"))?;
+        let comments: HashMap<usize, String> = array(&row["nodes"])
+            .iter()
+            .filter_map(|node| {
+                let id = usize::try_from(node["id"].as_u64()?).ok()?;
+                let calls = node["callees"].as_array()?;
+                Some((
+                    id,
+                    calls
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|call| format!("{}\n", map::comment(path, call)))
+                        .collect(),
+                ))
+            })
+            .collect();
         let full = engine
             .map(|engine| engine.presentation_structure(path))
             .transpose()?
@@ -1779,7 +1840,7 @@ fn print_map(
         write!(
             out,
             "{}",
-            map::render_with_descriptions(
+            map::render_with_hits(
                 &nodes,
                 Some(path),
                 detail.into(),
@@ -1792,6 +1853,10 @@ fn print_map(
                         None
                     },
                     symbols: symbols.as_ref(),
+                },
+                map::HitDetails {
+                    annotations: None,
+                    extras: Some(&comments),
                 },
             )
         )?;
@@ -1853,6 +1918,9 @@ fn score_details(row: &Value) -> String {
 struct Presentation<'a> {
     engine: Option<&'a Engine>,
     structures: HashMap<String, Option<FileStructure>>,
+    calls: CallArgs,
+    graph: Option<CallGraph>,
+    expanded: Option<Expansion>,
 }
 
 impl<'a> Presentation<'a> {
@@ -1860,7 +1928,76 @@ impl<'a> Presentation<'a> {
         Self {
             engine: Some(engine),
             structures: HashMap::new(),
+            calls: CallArgs::default(),
+            graph: None,
+            expanded: None,
         }
+    }
+
+    fn with_calls(engine: &'a Engine, calls: CallArgs) -> Result<Self> {
+        let mut presentation = Self::new(engine);
+        presentation.calls = calls;
+        if calls.enabled() {
+            presentation.graph = Some(engine.call_graph()?);
+        }
+        Ok(presentation)
+    }
+
+    fn key(&self, function: &Value) -> Option<Key> {
+        let path = function["path"].as_str()?;
+        let structure = self.graph.as_ref()?.files.get(path)?;
+        let node = map::matching_node(structure, function)?;
+        Some(Key {
+            path: path.to_owned(),
+            id: node.id,
+        })
+    }
+
+    fn prepare(&mut self, functions: &[&Value]) {
+        if let Some(graph) = &self.graph {
+            self.expanded = Some(graph.expand(
+                functions.iter().filter_map(|f| self.key(f)),
+                self.calls.callers,
+                self.calls.callees,
+            ));
+        }
+    }
+
+    fn call_comments(&self, path: &str, id: usize) -> Option<String> {
+        let key = Key {
+            path: path.to_owned(),
+            id,
+        };
+        self.expanded.as_ref()?.comments.get(&key).map(|calls| {
+            calls
+                .iter()
+                .map(|call| format!("{}\n", map::comment(path, call)))
+                .collect()
+        })
+    }
+
+    fn related_json(&self, function: &Value) -> Vec<Value> {
+        let (Some(graph), Some(key)) = (&self.graph, self.key(function)) else {
+            return Vec::new();
+        };
+        let expanded = graph.expand([key.clone()], self.calls.callers, self.calls.callees);
+        expanded.depths.iter().filter(|(other, _)| **other != key).filter_map(|(other, depth)| {
+            let node = graph.node(other)?;
+            let mut value = serde_json::to_value(node).ok()?;
+            value.as_object_mut()?.remove("calls");
+            Some(json!({"path":other.path,"node":value,"callDepth":depth,"callees":expanded.comments.get(other).cloned().unwrap_or_default()}))
+        }).collect()
+    }
+
+    fn outgoing_json(&self, function: &Value) -> Vec<String> {
+        let (Some(graph), Some(key)) = (&self.graph, self.key(function)) else {
+            return Vec::new();
+        };
+        graph
+            .expand([key.clone()], self.calls.callers, self.calls.callees)
+            .comments
+            .remove(&key)
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -1868,6 +2005,9 @@ impl<'a> Presentation<'a> {
         Self {
             engine: None,
             structures: HashMap::new(),
+            calls: CallArgs::default(),
+            graph: None,
+            expanded: None,
         }
     }
 
@@ -1981,6 +2121,11 @@ fn print_function_with_header(
             .unwrap_or_else(|| text(function, "name"));
         let suffix = map::inline_note(text(function, "path"), Some(&annotation), description);
         writeln!(out, "{}{name}{suffix}", map::hunk(start, end, None))?;
+    }
+    if let Some(key) = presentation.key(function)
+        && let Some(comments) = presentation.call_comments(&key.path, key.id)
+    {
+        write!(out, "{comments}")?;
     }
     Ok(())
 }
@@ -2127,12 +2272,46 @@ fn print_ranked_files(
     source: &mut Presentation<'_>,
     mut target: Option<&mut Presentation<'_>>,
 ) -> Result<()> {
+    source.prepare(
+        &hits
+            .iter()
+            .filter(|hit| !hit.target && !hit.markdown)
+            .map(|hit| hit.item)
+            .collect::<Vec<_>>(),
+    );
+    if let Some(target) = target.as_deref_mut() {
+        target.prepare(
+            &hits
+                .iter()
+                .filter(|hit| hit.target && !hit.markdown)
+                .map(|hit| hit.item)
+                .collect::<Vec<_>>(),
+        );
+    }
     let mut files: BTreeMap<(bool, String), Vec<RankedHit<'_>>> = BTreeMap::new();
     for hit in hits {
         files
             .entry((hit.target, text(hit.item, "path").to_owned()))
             .or_default()
             .push(hit);
+    }
+    for path in source
+        .expanded
+        .as_ref()
+        .into_iter()
+        .flat_map(|e| e.depths.keys().map(|key| key.path.clone()))
+    {
+        files.entry((false, path)).or_default();
+    }
+    if let Some(target) = target.as_deref() {
+        for path in target
+            .expanded
+            .as_ref()
+            .into_iter()
+            .flat_map(|e| e.depths.keys().map(|key| key.path.clone()))
+        {
+            files.entry((true, path)).or_default();
+        }
     }
     let mut files: Vec<_> = files.into_iter().collect();
     files.sort_by(|a, b| {
@@ -2218,6 +2397,20 @@ fn print_ranked_file(
             unmatched.push(hit);
         }
     }
+    if let (Some(graph), Some(expanded)) = (&presentation.graph, &presentation.expanded)
+        && let Some(structure) = graph.files.get(path)
+    {
+        for key in expanded.depths.keys().filter(|key| key.path == path) {
+            if let Some(node) = graph.node(key) {
+                for ancestor in map::ancestors(structure, node) {
+                    selected.entry(ancestor.id).or_insert(ancestor);
+                }
+                if let Some(comment) = presentation.call_comments(path, key.id) {
+                    extras.entry(key.id).or_insert(comment);
+                }
+            }
+        }
+    }
     let mut nodes: Vec<_> = selected.into_values().collect();
     nodes.sort_by_key(|node| (node.start_byte, node.id));
     unmatched.sort_by_key(|hit| {
@@ -2294,6 +2487,16 @@ fn print_search(
     presentation: &mut Presentation<'_>,
 ) -> Result<()> {
     if format == Format::Json {
+        if !presentation.calls.enabled() {
+            return print_json(out, &rows);
+        }
+        let mut rows = rows.to_vec();
+        for row in &mut rows {
+            if row["type"] == "function" {
+                row["relatedCallables"] = json!(presentation.related_json(&row["function"]));
+                row["callees"] = json!(presentation.outgoing_json(&row["function"]));
+            }
+        }
         return print_json(out, &rows);
     }
     if rows.is_empty() {
@@ -2336,7 +2539,12 @@ fn print_search(
 }
 
 /// Describe uses exactly the expanded text search presentation as its LLM context.
-pub(crate) fn describe_search_context(engine: &Engine, rows: &[Value]) -> Result<String> {
+pub(crate) fn describe_search_context(
+    engine: &Engine,
+    rows: &[Value],
+    callers: usize,
+    callees: usize,
+) -> Result<String> {
     let mut out = Vec::new();
     print_search(
         &mut out,
@@ -2344,7 +2552,7 @@ pub(crate) fn describe_search_context(engine: &Engine, rows: &[Value]) -> Result
         Format::Summary,
         Detail::Expanded,
         false,
-        &mut Presentation::new(engine),
+        &mut Presentation::with_calls(engine, CallArgs { callers, callees })?,
     )?;
     Ok(String::from_utf8(out)?)
 }
@@ -2421,6 +2629,19 @@ fn print_cross(
         detail,
     } = options;
     rows.retain(|row| !array(&row["matches"]).is_empty());
+    if format == Format::Json && source_presentation.calls.enabled() {
+        for row in &mut rows {
+            row["relatedCallables"] = json!(source_presentation.related_json(&row["source"]));
+            row["callees"] = json!(source_presentation.outgoing_json(&row["source"]));
+            for item in row["matches"].as_array_mut().into_iter().flatten() {
+                let view = target_presentation
+                    .as_deref()
+                    .unwrap_or(source_presentation);
+                item["relatedCallables"] = json!(view.related_json(&item["function"]));
+                item["callees"] = json!(view.outgoing_json(&item["function"]));
+            }
+        }
+    }
     if format == Format::Clusters {
         return print_clusters(
             out,
@@ -2689,6 +2910,24 @@ fn print_clusters(
         .take(limit.unwrap_or(usize::MAX))
         .enumerate()
     {
+        source_presentation.prepare(
+            &cluster
+                .members
+                .iter()
+                .filter(|m| m.role != "target")
+                .map(|m| &m.function)
+                .collect::<Vec<_>>(),
+        );
+        if let Some(target) = target_presentation.as_deref_mut() {
+            target.prepare(
+                &cluster
+                    .members
+                    .iter()
+                    .filter(|m| m.role == "target")
+                    .map(|m| &m.function)
+                    .collect::<Vec<_>>(),
+            );
+        }
         if index > 0 {
             writeln!(out)?;
         }
@@ -2746,6 +2985,57 @@ fn print_clusters(
             }
             previous_file = Some(file);
         }
+        print_cluster_related(
+            out,
+            cluster,
+            if same_index { "index" } else { "source" },
+            detail,
+            source_presentation,
+        )?;
+        if let Some(target) = target_presentation.as_deref_mut() {
+            print_cluster_related(out, cluster, "target", detail, target)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_cluster_related(
+    out: &mut impl Write,
+    cluster: &Cluster,
+    role: &str,
+    detail: Detail,
+    view: &mut Presentation<'_>,
+) -> Result<()> {
+    let original: HashSet<_> = cluster
+        .members
+        .iter()
+        .filter(|member| member.role == role)
+        .filter_map(|member| view.key(&member.function))
+        .collect();
+    let related: Vec<_> = view
+        .expanded
+        .as_ref()
+        .into_iter()
+        .flat_map(|e| e.depths.iter())
+        .filter(|(key, _)| !original.contains(*key))
+        .map(|(key, depth)| (key.clone(), *depth))
+        .collect();
+    for (key, depth) in related {
+        let Some(node) = view.graph.as_ref().and_then(|graph| graph.node(&key)) else {
+            continue;
+        };
+        let function = json!({"path":key.path,"name":node.name,"qualifiedName":node.qualified_name,
+            "startLine":node.start_line,"startColumn":node.start_column,"endLine":node.end_line});
+        let label = [
+            depth.caller.map(|n| format!("caller depth={n}")),
+            depth.callee.map(|n| format!("callee depth={n}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        writeln!(out)?;
+        print_function(out, &function, &label, detail, false, view)?;
     }
     Ok(())
 }

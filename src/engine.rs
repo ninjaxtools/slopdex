@@ -490,7 +490,9 @@ impl Engine {
             })
             .transpose()?
             .unwrap_or_default();
-        let mut result = Vec::new();
+        let callers = options["callers"].as_u64().unwrap_or(0) as usize;
+        let callees = options["callees"].as_u64().unwrap_or(0) as usize;
+        let mut selected = BTreeMap::<String, Vec<parse::StructureNode>>::new();
         for path in self.db.paths()? {
             if !selection.path_matches(&path)
                 || (!paths.is_empty() && !paths.iter().any(|p| under(&path, p)))
@@ -505,8 +507,64 @@ impl Engine {
             );
             let nodes = selection.select_structure(&self.db.structure(&path)?);
             if !nodes.is_empty() {
-                result.push(json!({"path":path,"nodes":nodes}));
+                selected.insert(path, nodes);
             }
+        }
+        let expansion = if callers > 0 || callees > 0 {
+            let graph = self.call_graph()?;
+            let seeds = selected.iter().flat_map(|(path, nodes)| {
+                nodes
+                    .iter()
+                    .filter(|node| {
+                        matches!(
+                            node.kind.as_str(),
+                            "function" | "method" | "constructor" | "generator"
+                        )
+                    })
+                    .map(|node| crate::callgraph::Key {
+                        path: path.clone(),
+                        id: node.id,
+                    })
+            });
+            let expanded = graph.expand(seeds, callers, callees);
+            for key in expanded.depths.keys() {
+                if let Some(structure) = graph.files.get(&key.path)
+                    && let Some(node) = graph.node(key)
+                {
+                    let nodes = selected.entry(key.path.clone()).or_default();
+                    for ancestor in crate::map::ancestors(structure, node) {
+                        if !nodes.iter().any(|existing| existing.id == ancestor.id) {
+                            nodes.push(ancestor);
+                        }
+                    }
+                }
+            }
+            Some(expanded)
+        } else {
+            None
+        };
+        let mut result = Vec::new();
+        for (path, mut nodes) in selected {
+            nodes.sort_by_key(|node| (node.start_byte, node.id));
+            let mut values = Vec::new();
+            for node in nodes {
+                let key = crate::callgraph::Key {
+                    path: path.clone(),
+                    id: node.id,
+                };
+                let mut value = serde_json::to_value(node)?;
+                value.as_object_mut().unwrap().remove("calls");
+                if let Some(expansion) = &expansion {
+                    if let Some(depth) = expansion.depths.get(&key) {
+                        value["callDepth"] = json!(depth);
+                    }
+                    if let Some(calls) = expansion.comments.get(&key) {
+                        value["callees"] = json!(calls);
+                    }
+                }
+                values.push(value);
+            }
+            result.push(json!({"path":path,"nodes":values}));
         }
         Ok(result)
     }
@@ -525,6 +583,10 @@ impl Engine {
             return Ok(None);
         }
         Ok(Some(self.db.structure(path)?))
+    }
+
+    pub fn call_graph(&self) -> Result<crate::callgraph::CallGraph> {
+        crate::callgraph::CallGraph::load(&self.db)
     }
 
     pub fn presentation_source(&self, path: &str) -> Option<&str> {
@@ -1536,7 +1598,12 @@ impl Engine {
             prompt.len() + DESCRIBE_SOURCE_SEPARATOR.len() + marker.len() <= DESCRIBE_PROMPT_BYTES,
             "Describe query exceeds the prompt size limit"
         );
-        let search = crate::cli::describe_search_context(self, &matches)?;
+        let search = crate::cli::describe_search_context(
+            self,
+            &matches,
+            options["callers"].as_u64().unwrap_or(0) as usize,
+            options["callees"].as_u64().unwrap_or(0) as usize,
+        )?;
         let search_budget = DESCRIBE_SEARCH_BYTES
             .min(DESCRIBE_PROMPT_BYTES - prompt.len() - DESCRIBE_SOURCE_SEPARATOR.len());
         if search.len() <= search_budget {

@@ -13,6 +13,15 @@ pub struct FileStructure {
     pub nodes: Vec<StructureNode>,
 }
 
+/// A syntactic call made within a callable. Resolution is deferred until all
+/// indexed files are available; dynamic receivers are deliberately omitted.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSite {
+    pub name: String,
+    pub receiver: Option<String>,
+}
+
 /// One imported binding; `path` is the fully expanded source path when known.
 /// `name` is the imported name, `alias` the local binding, and `source` the
 /// module specifier (without quotes). Side-effect imports have no name/alias.
@@ -51,6 +60,8 @@ pub struct StructureNode {
     pub attributes: Vec<String>,
     pub imports: Vec<ImportBinding>,
     pub heading_level: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<CallSite>,
 }
 
 pub(super) fn extract(language: &str, root: Node<'_>, source: &str) -> FileStructure {
@@ -277,6 +288,7 @@ impl Collector<'_> {
             attributes,
             imports: Vec::new(),
             heading_level: None,
+            calls: Vec::new(),
         });
         id
     }

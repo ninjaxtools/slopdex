@@ -218,7 +218,7 @@ Just put this in your `AGENTS.md` file and adjust as desired, no skill necessary
 ```
 - use `slopdex map -g "<glob>" -i -e "<regex>" <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads using the line numbers for implementation details. To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`.
 - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.5`; vary the search query if you get no results
-- when reviewing uncommitted code avoid introducing duplicates by looking for related matches: `slopdex cross-search --uncommitted --threshold 0.8`
+- when reviewing uncommitted code avoid introducing duplicates by looking for related matches: `slopdex cross-search --uncommitted --cross-file-only --threshold 0.8`
 - when tasked to do advanced codebase analysis, use `slopdex --help` first to see all options
 ```
 

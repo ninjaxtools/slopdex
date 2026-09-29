@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
-pub const STRUCTURE_PARSER_VERSION: &str = "structure-v3";
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v4-calls";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -711,7 +711,7 @@ fn write_file(conn: &Connection, file: &File) -> Result<()> {
 
 fn write_structure(conn: &Connection, path: &str, structure: &FileStructure) -> Result<()> {
     for (ordinal, node) in structure.nodes.iter().enumerate() {
-        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level});
+        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level,"calls":node.calls});
         conn.execute("INSERT INTO symbols(path,id,parent_id,ordinal,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![path, i64::try_from(node.id)?, node.parent_id.map(i64::try_from).transpose()?, i64::try_from(ordinal)?, node.language, node.kind, node.name, node.qualified_name,
                 node.signature, i64::try_from(node.start_byte)?, i64::try_from(node.end_byte)?, i64::try_from(node.start_line)?, i64::try_from(node.start_column)?, i64::try_from(node.end_line)?, i64::try_from(node.end_column)?, metadata.to_string()])?;
@@ -771,6 +771,8 @@ fn read_structure(conn: &Connection, path: &str) -> Result<FileStructure> {
             node.attributes = serde_json::from_value(metadata["attributes"].clone())?;
             node.imports = serde_json::from_value(metadata["imports"].clone())?;
             node.heading_level = serde_json::from_value(metadata["headingLevel"].clone())?;
+            node.calls =
+                serde_json::from_value(metadata.get("calls").cloned().unwrap_or(json!([])))?;
             node.names = names.remove(&node.id).unwrap_or_default();
             Ok(node)
         })

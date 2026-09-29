@@ -10,7 +10,7 @@ mod imports;
 mod markdown;
 mod structure;
 
-pub use structure::{FileStructure, ImportBinding, StructureNode};
+pub use structure::{CallSite, FileStructure, ImportBinding, StructureNode};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
