@@ -1,7 +1,8 @@
 //! Persistent cosine HNSW cache of caller-owned embeddings.
 //!
 //! `path` names the USearch binary; its manifest is `<path>.manifest.json`.
-//! The caller must hold its exclusive interprocess index lock throughout `open`.
+//! The caller must hold an exclusive interprocess index lock for `open`, or a
+//! shared lock for `open_readonly` (which never publishes sidecars).
 //! The supplied vectors are authoritative: sidecars can always be regenerated.
 
 use anyhow::{Context, Result, ensure};
@@ -119,6 +120,22 @@ impl VectorIndex {
         };
         persist(path, &index, &mut manifest)
             .with_context(|| format!("persist vector index {}", path.display()))?;
+        Ok(Self { index, dimensions })
+    }
+
+    /// Use the persisted index if it matches, otherwise rebuild in memory.
+    /// Multiple readers can do this without publishing sidecar files.
+    pub fn open_readonly(
+        path: &Path,
+        dimensions: usize,
+        generation: u64,
+        vectors: &[(u64, Vec<f32>)],
+    ) -> Result<Self> {
+        let manifest = Manifest::new(dimensions, generation, vectors)?;
+        let index = match load_cached(path, dimensions) {
+            Ok((index, old)) if old.fingerprint == manifest.fingerprint => index,
+            _ => build(dimensions, vectors)?,
+        };
         Ok(Self { index, dimensions })
     }
 

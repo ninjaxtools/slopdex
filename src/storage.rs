@@ -92,7 +92,19 @@ pub struct Item {
 
 impl Database {
     pub fn open(path: &Path, root: &Path, _profile: &Value, force: bool) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        Self::open_internal(path, root, force, false)
+    }
+
+    pub fn open_readonly(path: &Path, root: &Path) -> Result<Self> {
+        Self::open_internal(path, root, false, true)
+    }
+
+    fn open_internal(path: &Path, root: &Path, force: bool, readonly: bool) -> Result<Self> {
+        let conn = if readonly {
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?
+        } else {
+            Connection::open(path)?
+        };
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         // All compatibility checks precede even journal-mode changes. Force is
         // only a root reset, never permission to migrate an older schema.
@@ -166,6 +178,16 @@ impl Database {
             bail!(
                 "Incompatible index root. Use --force-reindex to rebuild live state (artifact caches are retained)."
             );
+        }
+        if readonly {
+            ensure!(
+                has_tables && identity.is_some() && version == 3,
+                "Index is not initialized; reopen for writing"
+            );
+            return Ok(Self {
+                conn,
+                path: path.to_owned(),
+            });
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let tx = conn.unchecked_transaction()?;

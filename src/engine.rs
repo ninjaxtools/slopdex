@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -61,9 +62,48 @@ pub struct Engine {
     complete_descriptions: bool,
     complete_code: bool,
     structural_only: bool,
-    // Held for the engine's lifetime: SQLite transactions and multi-file USearch
-    // publication must not interleave with another command using this index.
+    // Readers share a lock; writers hold it across SQLite and USearch publication.
     _lock: fs::File,
+    readonly: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct NeedsWrite;
+
+impl std::fmt::Display for NeedsWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Index needs an exclusive refresh")
+    }
+}
+
+impl std::error::Error for NeedsWrite {}
+
+fn lock_index(lock: &fs::File, readonly: bool) -> Result<()> {
+    lock_index_with_timeout(lock, readonly, Duration::from_secs(10))
+}
+
+fn lock_index_with_timeout(lock: &fs::File, readonly: bool, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let result = if readonly {
+            FileExt::try_lock_shared(lock)
+        } else {
+            FileExt::try_lock_exclusive(lock)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "Index is in use by another slopdex command (waited {:.2} seconds)",
+                        timeout.as_secs_f64()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("Lock index"),
+        }
+    }
 }
 
 struct PrepareInput {
@@ -90,11 +130,19 @@ struct PreparedFile {
 
 impl Engine {
     pub fn open(root: &Path, index: &Path, mut config: Value) -> Result<Self> {
-        Self::open_internal(root, index, config.take(), false)
+        Self::open_internal(root, index, config.take(), false, false)
     }
 
     pub fn open_map(root: &Path, index: &Path, config: Value) -> Result<Self> {
-        Self::open_internal(root, index, config, true)
+        Self::open_internal(root, index, config, true, false)
+    }
+
+    pub fn open_map_readonly(root: &Path, index: &Path, config: Value) -> Result<Self> {
+        Self::open_internal(root, index, config, true, true)
+    }
+
+    pub fn open_readonly(root: &Path, index: &Path, config: Value) -> Result<Self> {
+        Self::open_internal(root, index, config, false, true)
     }
 
     fn open_internal(
@@ -102,6 +150,7 @@ impl Engine {
         index: &Path,
         mut config: Value,
         structural_only: bool,
+        readonly: bool,
     ) -> Result<Self> {
         let root = root
             .canonicalize()
@@ -128,11 +177,14 @@ impl Engine {
             .read(true)
             .write(true)
             .open(PathBuf::from(lock_path))?;
-        lock.try_lock_exclusive()
-            .context("Index is in use by another slopdex command; retry when it completes")?;
-        let db = Database::open(&index, &root, &Value::Null, flag(&config, "forceReindex"))?;
+        lock_index(&lock, readonly)?;
+        let db = if readonly {
+            Database::open_readonly(&index, &root)?
+        } else {
+            Database::open(&index, &root, &Value::Null, flag(&config, "forceReindex"))?
+        };
         let artifacts = Artifacts::open(&config);
-        if artifacts.import_workspace(&db).is_err() {
+        if !readonly && artifacts.import_workspace(&db).is_err() {
             ui::warning("Could not import existing artifacts into the shared cache");
         }
         // Persisted description settings also apply when an index is moved to a
@@ -152,7 +204,7 @@ impl Engine {
         } else {
             &config
         })?;
-        if !structural_only {
+        if !structural_only && !readonly {
             db.set_projection_profile(&providers.vector().profile())?;
         }
         let enabled = config["descriptionsEnabled"]
@@ -173,6 +225,7 @@ impl Engine {
             complete_code: false,
             structural_only,
             _lock: lock,
+            readonly,
         };
         engine.load()?;
         Ok(engine)
@@ -207,6 +260,24 @@ impl Engine {
         }
         let mut paths: Vec<_> = paths.into_iter().collect();
         paths.sort();
+        let profile = self.providers.vector().profile().to_string();
+        let prepared = paths.is_empty()
+            && self.db.meta("active_embedding_profile")?.as_deref() == Some(&profile)
+            && self.db.meta("descriptions_enabled")?.as_deref()
+                == Some(if self.enabled { "true" } else { "false" })
+            && (!self.enabled
+                || self.db.meta("description_profile")?.as_deref()
+                    == Some(self.providers.llm().profile().to_string().as_str()));
+        if self.readonly && !prepared {
+            return Err(NeedsWrite.into());
+        }
+        if prepared {
+            return Ok(
+                json!({"filesUpdated":structure["filesUpdated"],"filesDeleted":structure["filesDeleted"],
+                "filesPrepared":0,"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),
+                "checkpoint":self.db.meta("checkpoint")?,"generation":self.db.generation()?}),
+            );
+        }
         let mut inputs = Vec::new();
         for path in paths {
             let file = &self.files[&path];
@@ -299,6 +370,9 @@ impl Engine {
             .filter(|p| !paths_set.contains(*p))
             .cloned()
             .collect();
+        if self.readonly && (!removed.is_empty() || self.db.meta("checkpoint")? != checkpoint) {
+            return Err(NeedsWrite.into());
+        }
         let mut changed = Vec::new();
         let indexing = ui::counted("Indexing files", paths.len());
         for path in paths {
@@ -348,6 +422,9 @@ impl Engine {
                 indexing.inc(1);
                 continue;
             }
+            if self.readonly {
+                return Err(NeedsWrite.into());
+            }
             let parsed = self.parsed(&path, &source)?;
             let file = File {
                 path: path.clone(),
@@ -364,6 +441,11 @@ impl Engine {
             indexing.inc(1);
         }
         indexing.finish();
+        if changed.is_empty() && removed.is_empty() && self.db.meta("checkpoint")? == checkpoint {
+            return Ok(
+                json!({"filesUpdated":0,"filesDeleted":0,"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
+            );
+        }
         // Never publish a mixture of snapshots if files changed while remote
         // providers were running. Their completed artifacts remain reusable.
         ensure!(
@@ -934,12 +1016,21 @@ impl Engine {
             let mut path = self.db.path.as_os_str().to_os_string();
             path.push(format!(".{kind}.usearch"));
             ui::progress(format_args!("Loading {kind} vector index"));
-            let index = VectorIndex::open(
-                &PathBuf::from(path),
-                dimensions * parts,
-                self.db.generation()?,
-                &vectors,
-            )?;
+            let index = if self.readonly {
+                VectorIndex::open_readonly(
+                    &PathBuf::from(path),
+                    dimensions * parts,
+                    self.db.generation()?,
+                    &vectors,
+                )?
+            } else {
+                VectorIndex::open(
+                    &PathBuf::from(path),
+                    dimensions * parts,
+                    self.db.generation()?,
+                    &vectors,
+                )?
+            };
             self.indexes.insert(kind.into(), index);
             loading.inc(1);
         }
@@ -1003,6 +1094,9 @@ impl Engine {
         );
         if let Some(results) = self.db.search_cache(&key)? {
             return Ok(results);
+        }
+        if self.readonly {
+            return Err(NeedsWrite.into());
         }
         let embedding_key = self.embed_one(query, true)?;
         let vector = self
@@ -1541,6 +1635,7 @@ impl Engine {
             if enabled { "true" } else { "false" },
         )?;
         self.refresh()?;
+        self.load()?;
         self.status()
     }
 
@@ -1774,6 +1869,24 @@ fn run_jobs<T: Sync, R: Send>(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn contended_writer_times_out_but_readers_can_share() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("index.lock");
+        let first = fs::File::create(&path)?;
+        let second = fs::File::open(&path)?;
+        lock_index(&first, true)?;
+        lock_index(&second, true)?;
+        let error = lock_index_with_timeout(&second, false, Duration::from_millis(60))
+            .expect_err("writer must wait for other readers");
+        assert!(error.to_string().contains("Index is in use"));
+        drop(first);
+        drop(second);
+        let writer = fs::File::open(&path)?;
+        lock_index(&writer, false)?;
+        Ok(())
+    }
 
     #[test]
     fn normalize_absolute_source_paths_through_symlinked_root() -> Result<()> {

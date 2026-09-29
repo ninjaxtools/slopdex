@@ -2578,7 +2578,7 @@ fn read_errors_are_persisted_and_clear_when_the_source_is_repaired() -> Result<(
 }
 
 #[test]
-fn open_enforces_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot() -> Result<()> {
+fn open_waits_for_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let config = mock.config();
@@ -2587,23 +2587,43 @@ fn open_enforces_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot(
     engine.refresh()?;
     let expected = engine.search("east", "search-code", &all())?;
     let status = engine.status()?;
-    let second = Engine::open(&repo.root, &repo.index, config.clone());
-    let error = match second {
-        Ok(_) => panic!("a live engine must retain exclusive index ownership"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("Index is in use"));
+    #[cfg(not(unix))]
+    let second_index = repo.index.clone();
     #[cfg(unix)]
-    {
+    let second_index = {
         let alias = repo.index.with_file_name("alias.sqlite");
         std::os::unix::fs::symlink(&repo.index, &alias)?;
-        let error = match Engine::open(&repo.root, &alias, config.clone()) {
-            Ok(_) => panic!("a symlink must share the canonical index lock"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("Index is in use"));
-    }
+        alias
+    };
+    let second_root = repo.root.clone();
+    let second_config = config.clone();
+    let waiter =
+        std::thread::spawn(move || Engine::open(&second_root, &second_index, second_config));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(
+        !waiter.is_finished(),
+        "a writer must wait while another owns the index"
+    );
     drop(engine);
+    drop(waiter.join().unwrap()?);
+
+    let shared_search = Engine::open_readonly(&repo.root, &repo.index, config.clone())?;
+    assert_eq!(
+        shared_search.search("east", "search-code", &all())?,
+        expected
+    );
+    assert!(
+        shared_search
+            .search("north", "search-code", &all())
+            .is_err()
+    );
+    drop(shared_search);
+
+    let first_reader = Engine::open_map_readonly(&repo.root, &repo.index, config.clone())?;
+    let second_reader = Engine::open_map_readonly(&repo.root, &repo.index, config.clone())?;
+    assert_eq!(first_reader.status()?, second_reader.status()?);
+    drop(first_reader);
+    drop(second_reader);
 
     let mut offline_config = config.clone();
     offline_config["noReindex"] = json!(true);
@@ -2625,6 +2645,53 @@ fn open_enforces_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot(
         names(&resumed.search("east", "search-code", &all())?),
         strings(&["not_indexed"])
     );
+    Ok(())
+}
+
+#[test]
+fn current_map_reads_share_the_lock_and_stale_maps_wait_for_writers() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("source.rs", "pub fn first() {}\n")?;
+    let mut writer = Engine::open_map(&repo.root, &repo.index, json!({}))?;
+    writer.refresh_structure()?;
+    drop(writer);
+
+    let mut reader = Engine::open_map_readonly(&repo.root, &repo.index, json!({}))?;
+    let generation = reader.status()?["generation"].clone();
+    assert_eq!(reader.refresh_structure()?["filesUpdated"], 0);
+    let output = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args(["map", "source.rs"])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8(output.stdout)?.contains("pub fn first()"));
+    assert_eq!(reader.status()?["generation"], generation);
+
+    repo.write("source.rs", "pub fn second() {}\n")?;
+    assert!(reader.refresh_structure().is_err());
+    drop(reader);
+    let output = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args(["map", "source.rs"])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8(output.stdout)?.contains("pub fn second()"));
     Ok(())
 }
 

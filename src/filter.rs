@@ -171,13 +171,33 @@ fn locally_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool
     }) {
         return true;
     }
+    // In languages without a `private` modifier, a leading underscore on a
+    // callable or variable conventionally marks implementation-only names.
+    // Explicit exports and Rust's `pub` visibility still take precedence.
+    let underscore_private = matches!(node.language.as_str(), "c" | "bash" | "javascript" | "jsx")
+        && matches!(
+            node.kind.as_str(),
+            "function" | "method" | "generator" | "variable" | "constant" | "field"
+        )
+        && !node.names.is_empty()
+        && node
+            .names
+            .iter()
+            .all(|name| name.starts_with('_') && name.len() > 1);
     match node.language.as_str() {
         "rust" => rust_private(node, parent),
-        "javascript" | "jsx" | "typescript" | "tsx" => javascript_private(node, parent),
+        "javascript" | "jsx" => {
+            javascript_private(node, parent)
+                || underscore_private
+                    && !node.attributes.iter().any(|attr| attr == "export")
+                    && !node.signature.trim_start().starts_with("export ")
+        }
+        "typescript" | "tsx" => javascript_private(node, parent),
         "python" => node.names.iter().all(|name| name.starts_with('_')),
         "go" => go_private(node),
         "java" => java_private(node, parent),
-        "c" => has_word(&node.signature, "static"),
+        "c" => has_word(&node.signature, "static") || underscore_private,
+        "bash" => underscore_private,
         _ => false,
     }
 }
@@ -540,6 +560,62 @@ mod tests {
                 .unwrap()
                 .select_structure(&structure);
             assert!(complete.iter().any(|node| node.name == private), "{path}");
+        }
+    }
+
+    #[test]
+    fn underscore_callables_and_variables_follow_languages_without_private_modifiers() {
+        for (path, source, public, private) in [
+            (
+                "example.c",
+                "void visible(void) {} void _helper(void) {}",
+                "visible",
+                "_helper",
+            ),
+            (
+                "example.sh",
+                "visible() { :; }\n_helper() { :; }\n",
+                "visible",
+                "_helper",
+            ),
+            (
+                "example.js",
+                "export class Service { visible() {} _helper() {} }",
+                "visible",
+                "_helper",
+            ),
+            (
+                "example.py",
+                "visible = 1\n_helper = 2\n",
+                "visible",
+                "_helper",
+            ),
+        ] {
+            let structure = crate::parse::parse(path, source).unwrap().structure;
+            let selected = Selection::compile(&json!({}))
+                .unwrap()
+                .select_structure(&structure);
+            assert!(selected.iter().any(|node| node.name == public), "{path}");
+            assert!(!selected.iter().any(|node| node.name == private), "{path}");
+            let complete = Selection::compile(&json!({"private": true}))
+                .unwrap()
+                .select_structure(&structure);
+            assert!(complete.iter().any(|node| node.name == private), "{path}");
+        }
+
+        for (path, source) in [
+            ("example.rs", "pub fn _exported() {}"),
+            ("example.ts", "export class Service { _exported() {} }"),
+            ("example.js", "export function _exported() {}"),
+        ] {
+            let structure = crate::parse::parse(path, source).unwrap().structure;
+            let selected = Selection::compile(&json!({}))
+                .unwrap()
+                .select_structure(&structure);
+            assert!(
+                selected.iter().any(|node| node.name == "_exported"),
+                "{path}"
+            );
         }
     }
 

@@ -619,8 +619,24 @@ pub fn run() -> Result<()> {
         config["descriptionsEnabled"] = json!(action.enabled());
     }
     let is_map = matches!(&cli.command, Command::Map(_));
+    let read_only_command = matches!(
+        &cli.command,
+        Command::Map(_)
+            | Command::Status
+            | Command::IndexErrors
+            | Command::Search(_)
+            | Command::SearchCode(_)
+            | Command::SearchDescriptions(_)
+            | Command::SearchMd(_)
+    );
+    let reader =
+        read_only_command && index.exists() && config["forceReindex"].as_bool() != Some(true);
     let mut engine = ui::spin("Opening index", || {
-        if is_map {
+        if reader && is_map {
+            Engine::open_map_readonly(&root, &index, config.clone())
+        } else if reader {
+            Engine::open_readonly(&root, &index, config.clone())
+        } else if is_map {
             Engine::open_map(&root, &index, config.clone())
         } else {
             Engine::open(&root, &index, config.clone())
@@ -634,10 +650,30 @@ pub fn run() -> Result<()> {
     let refreshed = if cli.global.no_reindex {
         None
     } else if is_map {
-        ui::spin("Refreshing structure", || engine.refresh_structure())?;
+        match ui::spin("Refreshing structure", || engine.refresh_structure()) {
+            Err(error) if error.is::<crate::engine::NeedsWrite>() => {
+                drop(engine);
+                engine = ui::spin("Opening index for update", || {
+                    Engine::open_map(&root, &index, config.clone())
+                })?;
+                ui::spin("Refreshing structure", || engine.refresh_structure())?;
+            }
+            result => {
+                result?;
+            }
+        }
         None
     } else {
-        Some(ui::spin("Refreshing index", || engine.refresh())?)
+        Some(match ui::spin("Refreshing index", || engine.refresh()) {
+            Err(error) if error.is::<crate::engine::NeedsWrite>() => {
+                drop(engine);
+                engine = ui::spin("Opening index for update", || {
+                    Engine::open(&root, &index, config.clone())
+                })?;
+                ui::spin("Refreshing index", || engine.refresh())?
+            }
+            result => result?,
+        })
     };
     warn_errors(
         &engine,
@@ -661,9 +697,23 @@ pub fn run() -> Result<()> {
                 options["descriptions"] = json!(args.descriptions);
                 options["md"] = json!(args.md);
             }
-            let rows = ui::spin("Searching index", || {
+            let rows = match ui::spin("Searching index", || {
                 engine.search(&args.query.query, "search", &options)
-            })?;
+            }) {
+                Err(error) if error.is::<crate::engine::NeedsWrite>() => {
+                    drop(engine);
+                    engine = ui::spin("Opening index for update", || {
+                        Engine::open(&root, &index, config.clone())
+                    })?;
+                    if !cli.global.no_reindex {
+                        ui::spin("Refreshing index", || engine.refresh())?;
+                    }
+                    ui::spin("Searching index", || {
+                        engine.search(&args.query.query, "search", &options)
+                    })?
+                }
+                result => result?,
+            };
             print_search(
                 &mut out,
                 &rows,
@@ -679,9 +729,24 @@ pub fn run() -> Result<()> {
                 Command::SearchDescriptions(_) => "search-descriptions",
                 _ => "search-md",
             };
-            let rows = ui::spin("Searching index", || {
-                engine.search(&args.query, kind, &args.filters.options())
-            })?;
+            let options = args.filters.options();
+            let rows = match ui::spin("Searching index", || {
+                engine.search(&args.query, kind, &options)
+            }) {
+                Err(error) if error.is::<crate::engine::NeedsWrite>() => {
+                    drop(engine);
+                    engine = ui::spin("Opening index for update", || {
+                        Engine::open(&root, &index, config.clone())
+                    })?;
+                    if !cli.global.no_reindex {
+                        ui::spin("Refreshing index", || engine.refresh())?;
+                    }
+                    ui::spin("Searching index", || {
+                        engine.search(&args.query, kind, &options)
+                    })?
+                }
+                result => result?,
+            };
             print_search(
                 &mut out,
                 &rows,
