@@ -18,6 +18,12 @@ pub struct Descriptions<'a> {
     pub symbols: Option<&'a HashMap<usize, String>>,
 }
 
+#[derive(Default)]
+pub struct HitDetails<'a> {
+    pub annotations: Option<&'a HashMap<usize, String>>,
+    pub extras: Option<&'a HashMap<usize, String>>,
+}
+
 /// Generated text is rendered as a language-appropriate comment, not source.
 pub fn comment(language: &str, description: &str) -> String {
     let description = description.trim();
@@ -92,6 +98,26 @@ pub fn render_with_descriptions(
     source: Option<&str>,
     full_structure: Option<&FileStructure>,
     descriptions: Descriptions<'_>,
+) -> String {
+    render_with_hits(
+        nodes,
+        path,
+        detail,
+        source,
+        full_structure,
+        descriptions,
+        HitDetails::default(),
+    )
+}
+
+pub fn render_with_hits(
+    nodes: &[StructureNode],
+    path: Option<&str>,
+    detail: Detail,
+    source: Option<&str>,
+    full_structure: Option<&FileStructure>,
+    descriptions: Descriptions<'_>,
+    hits: HitDetails<'_>,
 ) -> String {
     let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let mut ordered: Vec<_> = nodes.iter().collect();
@@ -197,14 +223,38 @@ pub fn render_with_descriptions(
                                 .is_none_or(|_| full_next.get(&previous.id) == Some(&node.id))
                     })
         });
-        if !adjacent_sibling && !group.is_empty() {
-            append_group(&mut output, &group, &by_id, detail, descriptions.symbols);
+        if (!adjacent_sibling
+            || hits.annotations.is_some_and(|scores| {
+                scores.contains_key(&node.id)
+                    || group
+                        .iter()
+                        .any(|previous| scores.contains_key(&previous.id))
+            }))
+            && !group.is_empty()
+        {
+            append_group(
+                &mut output,
+                &group,
+                &by_id,
+                detail,
+                descriptions.symbols,
+                hits.annotations,
+                hits.extras,
+            );
             group.clear();
         }
         group.push(node);
     }
     if !group.is_empty() {
-        append_group(&mut output, &group, &by_id, detail, descriptions.symbols);
+        append_group(
+            &mut output,
+            &group,
+            &by_id,
+            detail,
+            descriptions.symbols,
+            hits.annotations,
+            hits.extras,
+        );
     }
     output
 }
@@ -215,6 +265,8 @@ fn append_group(
     by_id: &HashMap<usize, &StructureNode>,
     detail: Detail,
     descriptions: Option<&HashMap<usize, String>>,
+    annotations: Option<&HashMap<usize, String>>,
+    extras: Option<&HashMap<usize, String>>,
 ) {
     if !output.is_empty() {
         output.push('\n');
@@ -232,7 +284,9 @@ fn append_group(
             .map(|node| display_end(node))
             .max()
             .unwrap_or(display_end(last)),
-        qualified,
+        annotations
+            .and_then(|annotations| annotations.get(&first.id).map(String::as_str))
+            .or(qualified),
     ));
     for node in group {
         output.push_str(&declaration(
@@ -241,6 +295,9 @@ fn append_group(
             detail,
             descriptions.and_then(|descriptions| descriptions.get(&node.id).map(String::as_str)),
         ));
+        if let Some(extra) = extras.and_then(|extras| extras.get(&node.id)) {
+            output.push_str(extra);
+        }
     }
 }
 

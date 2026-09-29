@@ -1934,6 +1934,7 @@ fn print_function_with_header(
     Ok(())
 }
 
+#[cfg(test)]
 fn print_markdown(
     out: &mut impl Write,
     row: &Value,
@@ -1941,9 +1942,23 @@ fn print_markdown(
     show_description: bool,
     presentation: &mut Presentation<'_>,
 ) -> Result<()> {
+    print_markdown_with_header(out, row, detail, show_description, presentation, true)
+}
+
+fn print_markdown_with_header(
+    out: &mut impl Write,
+    row: &Value,
+    detail: Detail,
+    show_description: bool,
+    presentation: &mut Presentation<'_>,
+    header: bool,
+) -> Result<()> {
     let chunk = &row["chunk"];
-    write!(out, "{}", map::file_header(text(chunk, "path")))?;
-    if (detail == Detail::Expanded || show_description)
+    if header {
+        write!(out, "{}", map::file_header(text(chunk, "path")))?;
+    }
+    if header
+        && (detail == Detail::Expanded || show_description)
         && let Some(description) = presentation
             .engine
             .and_then(|engine| engine.presentation_file_description(text(chunk, "path")))
@@ -1990,11 +2005,19 @@ fn print_markdown(
         }
         last
     };
+    write!(
+        out,
+        "{}",
+        markdown_extra(chunk, last_heading.as_deref(), detail)
+    )?;
+    Ok(())
+}
+
+fn markdown_extra(chunk: &Value, last_heading: Option<&str>, detail: Detail) -> String {
+    let mut output = String::new();
     if detail != Detail::Compact {
         let content = text(chunk, "content");
-        let body = if let Some(heading) = last_heading
-            .as_deref()
-            .filter(|heading| content.contains(*heading))
+        let body = if let Some(heading) = last_heading.filter(|heading| content.contains(*heading))
         {
             content
                 .split_once(heading)
@@ -2015,10 +2038,186 @@ fn print_markdown(
                 } else {
                     summary
                 };
-                writeln!(out, "@ preview: {preview}")?;
+                output.push_str(&format!("@ preview: {preview}\n"));
             }
         } else if !body.trim().is_empty() {
-            writeln!(out, "{body}")?;
+            output.push_str(body);
+            output.push('\n');
+        }
+    }
+    output
+}
+
+struct RankedHit<'a> {
+    item: &'a Value,
+    row: &'a Value,
+    annotation: String,
+    score: f64,
+    markdown: bool,
+    description: bool,
+    target: bool,
+}
+
+fn print_ranked_files(
+    out: &mut impl Write,
+    hits: Vec<RankedHit<'_>>,
+    detail: Detail,
+    source: &mut Presentation<'_>,
+    mut target: Option<&mut Presentation<'_>>,
+) -> Result<()> {
+    let mut files: BTreeMap<(bool, String), Vec<RankedHit<'_>>> = BTreeMap::new();
+    for hit in hits {
+        files
+            .entry((hit.target, text(hit.item, "path").to_owned()))
+            .or_default()
+            .push(hit);
+    }
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort_by(|a, b| {
+        let maximum = |hits: &Vec<RankedHit<'_>>| {
+            hits.iter()
+                .map(|hit| hit.score)
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        maximum(&b.1)
+            .total_cmp(&maximum(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    for (index, ((is_target, path), hits)) in files.into_iter().enumerate() {
+        if index > 0 {
+            writeln!(out)?;
+        }
+        if is_target && target.is_some() {
+            print_ranked_file(out, &path, &hits, detail, target.as_deref_mut().unwrap())?;
+        } else {
+            print_ranked_file(out, &path, &hits, detail, source)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_ranked_file(
+    out: &mut impl Write,
+    path: &str,
+    hits: &[RankedHit<'_>],
+    detail: Detail,
+    presentation: &mut Presentation<'_>,
+) -> Result<()> {
+    let structure = presentation.structure(path)?.cloned();
+    let mut selected = HashMap::<usize, StructureNode>::new();
+    let mut annotations: HashMap<usize, String> = HashMap::new();
+    let mut extras = HashMap::new();
+    let mut descriptions = HashMap::new();
+    let mut unmatched = Vec::new();
+    for hit in hits {
+        let chain = structure
+            .as_ref()
+            .map(|structure| {
+                if hit.markdown {
+                    map::heading_context(structure, hit.item)
+                } else {
+                    map::matching_node(structure, hit.item)
+                        .map(|node| map::ancestors(structure, node))
+                        .unwrap_or_default()
+                }
+            })
+            .unwrap_or_default();
+        if let Some(matched) = chain.last() {
+            if let Some(previous) = annotations.get_mut(&matched.id) {
+                if previous != &hit.annotation {
+                    previous.push_str(" | ");
+                    previous.push_str(&hit.annotation);
+                }
+                if hit.markdown {
+                    extras
+                        .entry(matched.id)
+                        .or_insert_with(String::new)
+                        .push_str(&markdown_extra(hit.item, Some(&matched.signature), detail));
+                }
+                continue;
+            }
+            annotations.insert(matched.id, hit.annotation.clone());
+            if hit.markdown {
+                extras.insert(
+                    matched.id,
+                    markdown_extra(hit.item, Some(&matched.signature), detail),
+                );
+            } else if (detail == Detail::Expanded || hit.description)
+                && let Some(description) = hit.item["description"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+            {
+                descriptions.insert(matched.id, description.to_owned());
+            }
+            for node in chain {
+                selected.insert(node.id, node);
+            }
+        } else {
+            unmatched.push(hit);
+        }
+    }
+    let mut nodes: Vec<_> = selected.into_values().collect();
+    nodes.sort_by_key(|node| (node.start_byte, node.id));
+    unmatched.sort_by_key(|hit| {
+        (
+            hit.item["startLine"].as_u64().unwrap_or(1),
+            hit.item["startColumn"].as_u64().unwrap_or(1),
+        )
+    });
+    if !nodes.is_empty() {
+        let file_description = (detail == Detail::Expanded
+            || hits.iter().any(|hit| hit.description))
+        .then(|| {
+            presentation
+                .engine
+                .and_then(|engine| engine.presentation_file_description(path))
+        })
+        .flatten();
+        write!(
+            out,
+            "{}",
+            map::render_with_hits(
+                &nodes,
+                Some(path),
+                detail.into(),
+                presentation
+                    .engine
+                    .and_then(|engine| engine.presentation_source(path)),
+                structure.as_ref(),
+                map::Descriptions {
+                    file: file_description,
+                    symbols: Some(&descriptions)
+                },
+                map::HitDetails {
+                    annotations: Some(&annotations),
+                    extras: Some(&extras)
+                },
+            )
+        )?;
+    }
+    for (fallback_index, hit) in unmatched.iter().enumerate() {
+        if !nodes.is_empty() || fallback_index > 0 {
+            writeln!(out)?;
+        }
+        if hit.markdown {
+            print_markdown_with_header(
+                out,
+                hit.row,
+                detail,
+                hit.description,
+                presentation,
+                nodes.is_empty() && fallback_index == 0,
+            )?;
+        } else {
+            print_function_with_header(
+                out,
+                hit.item,
+                &hit.annotation,
+                detail,
+                hit.description,
+                presentation,
+                nodes.is_empty() && fallback_index == 0,
+            )?;
         }
     }
     Ok(())
@@ -2038,33 +2237,40 @@ fn print_search(
     if rows.is_empty() {
         writeln!(out, "No matches.")?;
     }
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            writeln!(out)?;
-        }
-        if row["type"] == "markdown" {
-            print_markdown(out, row, detail, descriptions, presentation)?;
-        } else {
-            let annotation = format!(
-                "{}{}",
-                rank(row),
-                if detail == Detail::Expanded {
-                    score_details(row)
-                } else {
-                    String::new()
+    print_ranked_files(
+        out,
+        rows.iter()
+            .map(|row| {
+                let markdown = row["type"] == "markdown";
+                RankedHit {
+                    item: if markdown {
+                        &row["chunk"]
+                    } else {
+                        &row["function"]
+                    },
+                    row,
+                    annotation: format!(
+                        "{}{}",
+                        rank(row),
+                        if detail == Detail::Expanded {
+                            score_details(row)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    score: row["rerankScore"]
+                        .as_f64()
+                        .unwrap_or_else(|| number(row, "similarity")),
+                    markdown,
+                    description: descriptions,
+                    target: false,
                 }
-            );
-            print_function(
-                out,
-                &row["function"],
-                &annotation,
-                detail,
-                descriptions,
-                presentation,
-            )?;
-        }
-    }
-    Ok(())
+            })
+            .collect(),
+        detail,
+        presentation,
+        None,
+    )
 }
 
 fn print_errors(out: &mut impl Write, errors: &[Value], format: Format) -> Result<()> {
@@ -2163,6 +2369,49 @@ fn print_cross(
     }
     if rows.is_empty() && format == Format::Summary {
         writeln!(out, "No matches.")?;
+    }
+    if format == Format::Summary && !rows.is_empty() {
+        let mut hits = Vec::new();
+        for row in rows.iter().take(limit.unwrap_or(usize::MAX)) {
+            let matches = array(&row["matches"]);
+            hits.push(RankedHit {
+                item: &row["source"],
+                row,
+                annotation: "source".to_owned(),
+                score: matches
+                    .iter()
+                    .map(|item| number(item, "similarity"))
+                    .fold(f64::NEG_INFINITY, f64::max),
+                markdown: false,
+                description: false,
+                target: false,
+            });
+            for item in matches {
+                let distance = item["physicalDistance"]
+                    .as_f64()
+                    .map(|d| format!(" distance={d}"))
+                    .unwrap_or_default();
+                hits.push(RankedHit {
+                    item: &item["function"],
+                    row: item,
+                    annotation: format!(
+                        "{}{}{distance}{}",
+                        if same_index { "" } else { "target " },
+                        rank(item),
+                        if detail == Detail::Expanded {
+                            score_details(item)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    score: number(item, "similarity"),
+                    markdown: false,
+                    description: false,
+                    target: !same_index,
+                });
+            }
+        }
+        return print_ranked_files(out, hits, detail, source_presentation, target_presentation);
     }
     for (index, row) in rows.iter().take(limit.unwrap_or(usize::MAX)).enumerate() {
         if format == Format::Json {
@@ -3834,7 +4083,7 @@ mod tests {
         let output = String::from_utf8(output)?;
         assert_eq!(
             output,
-            "*** api.rs\n@@ 3 @@ score=0.9000\nimpl Api\n  pub fn run(&self)\n"
+            "*** api.rs\n\n@@ 2-4 @@\nimpl Api\n\n@@ 3 @@ score=0.9000\n  pub fn run(&self)\n"
         );
         assert!(!output.contains("secret") && !output.contains('{'));
         Ok(())
@@ -4020,7 +4269,7 @@ mod tests {
     }
 
     #[test]
-    fn ranked_hits_repeat_their_code_and_markdown_ancestors() -> Result<()> {
+    fn ranked_hits_group_files_and_emit_ancestors_once_in_source_order() -> Result<()> {
         let dir = tempfile::tempdir()?;
         fs::write(
             dir.path().join("api.rs"),
@@ -4049,25 +4298,99 @@ mod tests {
             &mut Presentation::new(&engine),
         )?;
         let output = String::from_utf8(output)?;
+        assert_eq!(output.matches("*** api.rs").count(), 1);
+        assert_eq!(output.matches("*** guide.md").count(), 1);
+        assert!(output.find("*** api.rs").unwrap() < output.find("*** guide.md").unwrap());
+        assert!(output.find("fn write(&self)").unwrap() < output.find("fn flush(&self)").unwrap());
+        assert!(output.find("## Setup").unwrap() < output.find("### Details").unwrap());
         assert!(
-            output.contains("@@ 3 @@ score=0.9000\nimpl Api\n  fn flush(&self)\n"),
+            output.contains("@@ 2 @@ score=0.7000\n  fn write(&self)"),
             "{output}"
         );
         assert!(
-            output.contains("@@ 2 @@ score=0.7000\nimpl Api\n  fn write(&self)\n"),
+            output.contains("@@ 3 @@ score=0.9000\n  fn flush(&self)"),
             "{output}"
         );
-        assert!(
-            output.contains("@@ 6-7 @@ score=0.8000\n# Guide\n  ## Setup\n    ### Details\n"),
-            "{output}"
-        );
-        assert!(
-            output.contains("@@ 3-4 @@ score=0.6000\n# Guide\n  ## Setup\n"),
-            "{output}"
-        );
-        assert_eq!(output.matches("impl Api").count(), 2);
-        assert_eq!(output.matches("# Guide").count(), 2);
+        assert_eq!(output.matches("impl Api").count(), 1);
+        assert_eq!(output.matches("# Guide").count(), 1);
         assert!(!output.contains("first()") && !output.contains("second()"));
+        Ok(())
+    }
+
+    #[test]
+    fn search_orders_files_by_best_rerank_score_and_keeps_individual_scores() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.rs"), "fn first() {}\nfn second() {}\n")?;
+        fs::write(dir.path().join("b.rs"), "fn other() {}\n")?;
+        let index = dir.path().join("index.sqlite");
+        let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+        engine.refresh_structure()?;
+        let rows = vec![
+            json!({"type":"function", "similarity":0.8, "rerankScore":0.9, "function":{"path":"a.rs", "name":"second", "qualifiedName":"second", "startLine":2, "endLine":2}}),
+            json!({"type":"function", "similarity":0.99, "rerankScore":0.7, "function":{"path":"b.rs", "name":"other", "qualifiedName":"other", "startLine":1, "endLine":1}}),
+            json!({"type":"function", "similarity":0.4, "rerankScore":0.5, "function":{"path":"a.rs", "name":"first", "qualifiedName":"first", "startLine":1, "endLine":1}}),
+        ];
+        let mut output = Vec::new();
+        print_search(
+            &mut output,
+            &rows,
+            Format::Summary,
+            Detail::Compact,
+            false,
+            &mut Presentation::new(&engine),
+        )?;
+        let output = String::from_utf8(output)?;
+        assert!(
+            output.find("*** a.rs").unwrap() < output.find("*** b.rs").unwrap(),
+            "{output}"
+        );
+        assert!(
+            output.find("fn first()").unwrap() < output.find("fn second()").unwrap(),
+            "{output}"
+        );
+        assert_eq!(output.matches("*** a.rs").count(), 1);
+        assert!(
+            output.contains("score=0.5000 similarity=0.4000"),
+            "{output}"
+        );
+        assert!(
+            output.contains("score=0.9000 similarity=0.8000"),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cross_summary_groups_sources_and_matches_from_the_same_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("api.rs"),
+            "impl Api {\n  fn first(&self) {}\n  fn second(&self) {}\n}\n",
+        )?;
+        let index = dir.path().join("index.sqlite");
+        let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+        engine.refresh_structure()?;
+        let first = json!({"path":"api.rs", "qualifiedName":"Api.first", "name":"first", "startLine":2,"endLine":2});
+        let second = json!({"path":"api.rs", "qualifiedName":"Api.second", "name":"second", "startLine":3,"endLine":3});
+        let rows =
+            vec![json!({"source":second, "matches":[{"function":first, "similarity":0.91}]})];
+        let mut output = Vec::new();
+        print_cross(
+            &mut output,
+            rows,
+            CrossOutput::new(Format::Summary, true, false, None, Detail::Compact),
+            &mut Presentation::new(&engine),
+            None,
+        )?;
+        let output = String::from_utf8(output)?;
+        assert_eq!(output.matches("*** api.rs").count(), 1, "{output}");
+        assert_eq!(output.matches("impl Api").count(), 1, "{output}");
+        assert!(
+            output.find("fn first(&self)").unwrap() < output.find("fn second(&self)").unwrap(),
+            "{output}"
+        );
+        assert!(output.contains("@@ 2 @@ score=0.9100"), "{output}");
+        assert!(output.contains("@@ 3 @@ source"), "{output}");
         Ok(())
     }
 
@@ -4184,7 +4507,14 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(out).unwrap();
-        assert!(output.starts_with("Source\n*** src/a.rs\n@@ 1 @@\na\n"));
+        assert!(
+            output.starts_with("*** src/a.rs\n@@ 1 @@ source\na\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("*** src/a.rs\n@@ 1 @@ source\na\n"),
+            "{output}"
+        );
         assert!(output.contains("*** src/b.rs\n@@ 1 @@ target score=0.8000"));
         assert!(output.contains("*** src/c.rs\n@@ 1 @@ target score=0.9000"));
         assert!(!output.contains("src/x.rs"));
