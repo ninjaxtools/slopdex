@@ -3328,11 +3328,7 @@ fn map_cli_does_not_fold_filtered_out_members_into_parent_range() -> Result<()> 
     );
     let text = String::from_utf8(output.stdout)?;
     assert!(
-        text.contains("@@ 1-4 @@\nexport interface PipeAddress\n"),
-        "{text}"
-    );
-    assert!(
-        text.contains("@@ 2 @@\n  readonly read: string\n"),
+        text.contains("@@ 1-4 @@\nexport interface PipeAddress\n  readonly read: string\n"),
         "{text}"
     );
     assert!(

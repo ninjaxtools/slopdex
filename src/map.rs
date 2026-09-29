@@ -138,12 +138,6 @@ pub fn render_with_hits(
     let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let mut ordered: Vec<_> = nodes.iter().collect();
     ordered.sort_by_key(|node| (node.start_byte, node.id));
-    let mut children: HashMap<usize, Vec<&StructureNode>> = HashMap::new();
-    for node in &ordered {
-        if let Some(parent_id) = node.parent_id {
-            children.entry(parent_id).or_default().push(node);
-        }
-    }
     let mut full_children: HashMap<Option<usize>, Vec<&StructureNode>> = HashMap::new();
     if let Some(structure) = full_structure {
         let mut full: Vec<_> = structure.nodes.iter().collect();
@@ -152,10 +146,6 @@ pub fn render_with_hits(
             full_children.entry(node.parent_id).or_default().push(node);
         }
     }
-    let indexed_children: HashMap<_, _> = full_children
-        .iter()
-        .filter_map(|(id, nodes)| id.map(|id| (id, nodes.clone())))
-        .collect();
     let full_next: HashMap<_, _> = full_children
         .values()
         .flat_map(|siblings| siblings.windows(2).map(|pair| (pair[0].id, pair[1].id)))
@@ -166,24 +156,6 @@ pub fn render_with_hits(
         .collect::<Vec<_>>()
         .windows(2)
         .map(|pair| (pair[0].id, pair[1].id))
-        .collect();
-    let foldable: HashSet<_> = ordered
-        .iter()
-        .filter(|node| {
-            foldable_parent(node, &children)
-                && full_structure.is_none_or(|_| {
-                    if !foldable_parent(node, &indexed_children) {
-                        return false;
-                    }
-                    let Some(full) = full_children.get(&Some(node.id)) else {
-                        return false;
-                    };
-                    children.get(&node.id).is_some_and(|selected| {
-                        selected.iter().map(|n| n.id).eq(full.iter().map(|n| n.id))
-                    })
-                })
-        })
-        .map(|node| node.id)
         .collect();
     let source_lines = source.map(|source| source.lines().collect::<Vec<_>>());
     let mut output = path.map(file_header).unwrap_or_default();
@@ -197,47 +169,38 @@ pub fn render_with_hits(
     }
     let mut group: Vec<&StructureNode> = Vec::new();
     for node in ordered {
-        let adjacent_sibling = group.last().is_some_and(|previous| {
+        let same_run = group.last().is_some_and(|previous| {
             let parent_present = node.parent_id.is_none_or(|id| by_id.contains_key(&id));
             let previous_parent_present =
                 previous.parent_id.is_none_or(|id| by_id.contains_key(&id));
-            let end = display_end(previous);
-            let nearby = end.checked_add(1) == Some(node.start_line)
-                || (matches!(node.start_line.checked_sub(end), Some(2..=5))
-                    && source_lines.as_ref().is_some_and(|lines| {
-                        lines
-                            .get(end..node.start_line - 1)
-                            .is_some_and(|gap| gap.iter().all(|line| line.trim().is_empty()))
-                    }));
-            let adjacent_child = group.first().is_some_and(|parent| {
-                foldable.contains(&parent.id)
-                    && node.parent_id == Some(parent.id)
-                    && (previous.id == parent.id || previous.parent_id == Some(parent.id))
-                    && if previous.id == parent.id {
-                        node.start_line == parent.start_line + 1
-                    } else {
-                        end.checked_add(1) == Some(node.start_line)
-                    }
-            });
-            adjacent_child
-                || (parent_present
-                    && previous_parent_present
-                    && previous.kind == node.kind
-                    && !foldable.contains(&node.id)
-                    && if node.kind == "heading" {
-                        end < node.start_line
-                            && nearby
-                            && full_structure.is_none_or(|_| {
-                                full_heading_next.get(&previous.id) == Some(&node.id)
-                            })
-                    } else {
-                        previous.parent_id == node.parent_id
-                            && nearby
-                            && full_structure
-                                .is_none_or(|_| full_next.get(&previous.id) == Some(&node.id))
+            let child = node.parent_id == Some(previous.id);
+            let end = if child {
+                declaration_line(previous)
+            } else {
+                display_end(previous)
+            };
+            let nearby = (child && end == node.start_line)
+                || blank_gap(end, node.start_line, source_lines.as_deref());
+            parent_present
+                && previous_parent_present
+                && nearby
+                && if child {
+                    full_structure.is_none_or(|_| {
+                        full_children
+                            .get(&Some(previous.id))
+                            .and_then(|children| children.first())
+                            .is_some_and(|first| first.id == node.id)
                     })
+                } else if previous.kind == "heading" && node.kind == "heading" {
+                    full_structure
+                        .is_none_or(|_| full_heading_next.get(&previous.id) == Some(&node.id))
+                } else {
+                    previous.parent_id == node.parent_id
+                        && full_structure
+                            .is_none_or(|_| full_next.get(&previous.id) == Some(&node.id))
+                }
         });
-        if !adjacent_sibling && !group.is_empty() {
+        if !same_run && !group.is_empty() {
             append_group(
                 &mut output,
                 &group,
@@ -306,31 +269,31 @@ fn append_group(
     }
 }
 
-/// Only collapse a container into its children when they occupy the lines
-/// immediately after its header and up to its closing line. Other declaration
-/// shapes keep their own ranges so an omitted body is not mistaken for context.
-fn foldable_parent(parent: &StructureNode, children: &HashMap<usize, Vec<&StructureNode>>) -> bool {
-    if !matches!(
-        parent.kind.as_str(),
-        "class" | "struct" | "union" | "enum" | "interface" | "trait" | "impl" | "module" | "type"
-    ) {
-        return false;
+/// Attributes can start a symbol's range before its declaration. For a child,
+/// compare against the parent's declaration rather than its enclosing body.
+fn declaration_line(node: &StructureNode) -> usize {
+    if node.kind == "heading" {
+        display_end(node)
+    } else if node.language == "rust" {
+        node.start_line
+            + node
+                .attributes
+                .iter()
+                .map(|attr| attr.lines().count())
+                .sum::<usize>()
+    } else {
+        node.start_line
     }
-    let Some(inside) = children.get(&parent.id).filter(|inside| !inside.is_empty()) else {
-        return false;
-    };
-    if inside.iter().any(|node| children.contains_key(&node.id)) {
-        return false;
-    }
-    let mut previous_end = parent.start_line;
-    for node in inside {
-        if previous_end.checked_add(1) != Some(node.start_line) {
-            return false;
-        }
-        previous_end = display_end(node);
-    }
-    let parent_end = display_end(parent);
-    parent_end == previous_end || previous_end.checked_add(1) == Some(parent_end)
+}
+
+fn blank_gap(end: usize, start: usize, source_lines: Option<&[&str]>) -> bool {
+    end.checked_add(1) == Some(start)
+        || (matches!(start.checked_sub(end), Some(2..=5))
+            && source_lines.is_some_and(|lines| {
+                lines
+                    .get(end..start - 1)
+                    .is_some_and(|gap| gap.iter().all(|line| line.trim().is_empty()))
+            }))
 }
 
 fn depth(node: &StructureNode, by_id: &HashMap<usize, &StructureNode>) -> usize {
@@ -611,11 +574,13 @@ mod tests {
         let structure = crate::parse::parse("x.rs", source).unwrap().structure;
         let output = render_nodes(&structure.nodes, Some("x.rs"));
         assert!(
-            output.starts_with("*** x.rs\n\n@@ 1 @@\nuse std::io\n"),
+            output.starts_with("*** x.rs\n\n@@ 1-3 @@\nuse std::io\npub struct S\n  pub x: i32\n"),
             "{output}"
         );
-        assert!(output.contains("@@ 2-3 @@\npub struct S\n"), "{output}");
-        assert!(output.contains("@@ 4 @@\n  pub fn go(&self)\n"), "{output}");
+        assert!(
+            output.contains("@@ 4 @@\nimpl S\n  pub fn go(&self)\n"),
+            "{output}"
+        );
         assert!(!output.contains("secret") && !output.contains("{") && !output.contains("[1]"));
         let expanded = render_with_detail(&structure.nodes, None, Detail::Standard);
         assert!(expanded.contains("#[derive(Clone)]"));
@@ -660,12 +625,14 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_methods_share_one_hunk_but_gaps_and_nesting_do_not() {
+    fn parent_and_adjacent_methods_share_hunk_but_unverified_gaps_do_not() {
         let source = "impl Writer {\n    fn write(&mut self) {\n        do_write();\n    }\n    fn flush(&mut self) {\n        do_flush();\n    }\n\n    fn close(&mut self) {\n        do_close();\n    }\n}\n";
         let structure = crate::parse::parse("writer.rs", source).unwrap().structure;
         let output = render_nodes(&structure.nodes, Some("writer.rs"));
         assert!(
-            output.contains("@@ 2-7 @@\n  fn write(&mut self)\n  fn flush(&mut self)\n"),
+            output.contains(
+                "@@ 1-12 @@\nimpl Writer\n  fn write(&mut self)\n  fn flush(&mut self)\n"
+            ),
             "{output}"
         );
         assert!(
@@ -673,7 +640,7 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("do_write") && !output.contains("do_flush"));
-        assert_eq!(output.matches("@@ 2-7 @@").count(), 1);
+        assert_eq!(output.matches("@@ 1-12 @@").count(), 1);
     }
 
     #[test]
@@ -735,10 +702,10 @@ mod tests {
             },
         );
         assert!(
-            output.contains("@@ 3-5 @@\n    fn open()  // score=open\n    fn frame()  // score=frame\n    fn close()  // score=close\n"),
+            output.contains("@@ 1-7 @@\nimpl Api\n  fn run(&self)\n    fn open()  // score=open\n    fn frame()  // score=frame\n    fn close()  // score=close\n"),
             "{output}"
         );
-        assert_eq!(output.matches("@@ 3-5 @@").count(), 1, "{output}");
+        assert_eq!(output.matches("@@").count(), 2, "{output}");
         assert_eq!(output.matches("fn run(&self)").count(), 1, "{output}");
     }
 
@@ -757,16 +724,69 @@ mod tests {
     }
 
     #[test]
+    fn markdown_chunk_and_fields_share_one_range() {
+        let source = include_str!("parse/mod.rs");
+        let structure = crate::parse::parse("src/parse/mod.rs", source)
+            .unwrap()
+            .structure;
+        let parent = structure
+            .nodes
+            .iter()
+            .find(|node| node.name == "MarkdownChunk" && node.kind == "struct")
+            .unwrap();
+        let selected: Vec<_> = structure
+            .nodes
+            .iter()
+            .filter(|node| node.id == parent.id || node.parent_id == Some(parent.id))
+            .cloned()
+            .collect();
+        let expected = "@@ 36-45 @@\npub struct MarkdownChunk\n  pub heading_path: Vec<String>\n  pub start_line: usize\n  pub end_line: usize\n  pub content: String\n  pub source_hash: String\n  pub embedding_input: String\n";
+        for output in [
+            render_with_structure(
+                &selected,
+                None,
+                Detail::Compact,
+                Some(source),
+                Some(&structure),
+            ),
+            render_nodes(&selected, None),
+        ] {
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn parent_and_child_share_a_range_across_four_blank_lines_not_five() {
+        for (blanks, shared) in [(4, true), (5, false)] {
+            let source = format!(
+                "struct Fields {{\n{}  first: i32,\n}}\n",
+                "\n".repeat(blanks)
+            );
+            let structure = crate::parse::parse("fields.rs", &source).unwrap().structure;
+            let output = render_with_structure(
+                &structure.nodes,
+                None,
+                Detail::Compact,
+                Some(&source),
+                Some(&structure),
+            );
+            assert_eq!(
+                output.matches("@@").count(),
+                if shared { 2 } else { 4 },
+                "{output}"
+            );
+            assert!(output.contains("struct Fields\n"), "{output}");
+            assert!(output.contains("  first: i32\n"), "{output}");
+        }
+    }
+
+    #[test]
     fn container_with_gaps_keeps_member_ranges_separate() {
         let source = "export interface PipeAddress {\n  readonly read: string\n\n  readonly write: string\n}\n";
         let structure = crate::parse::parse("pipe.ts", source).unwrap().structure;
         let output = render_nodes(&structure.nodes, None);
         assert!(
-            output.contains("@@ 1-5 @@\nexport interface PipeAddress\n"),
-            "{output}"
-        );
-        assert!(
-            output.contains("@@ 2 @@\n  readonly read: string\n"),
+            output.contains("@@ 1-5 @@\nexport interface PipeAddress\n  readonly read: string\n"),
             "{output}"
         );
         assert!(
@@ -793,11 +813,7 @@ mod tests {
             Some(&structure),
         );
         assert!(
-            output.contains("@@ 1-4 @@\nexport interface PipeAddress\n"),
-            "{output}"
-        );
-        assert!(
-            output.contains("@@ 2 @@\n  readonly read: string\n"),
+            output.contains("@@ 1-4 @@\nexport interface PipeAddress\n  readonly read: string\n"),
             "{output}"
         );
         assert!(
@@ -808,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_nested_declarations_keep_the_parent_hunk_separate() {
+    fn filtered_nested_declarations_join_their_adjacent_parent() {
         let source = "impl Service {\n  pub fn run(&self) {\n    fn helper() {}\n  }\n}\n";
         let structure = crate::parse::parse("service.rs", source).unwrap().structure;
         let selected = crate::filter::Selection::compile(&serde_json::json!({
@@ -823,11 +839,11 @@ mod tests {
             Some(source),
             Some(&structure),
         );
-        assert!(output.contains("@@ 1-5 @@\nimpl Service\n"), "{output}");
         assert!(
-            output.contains("@@ 2-4 @@\n  pub fn run(&self)\n"),
+            output.contains("@@ 1-5 @@\nimpl Service\n  pub fn run(&self)\n"),
             "{output}"
         );
+        assert_eq!(output.matches("@@").count(), 2, "{output}");
         assert!(!output.contains("helper"));
     }
 
