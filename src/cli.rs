@@ -2273,6 +2273,20 @@ fn print_search(
     )
 }
 
+/// Describe uses exactly the expanded text search presentation as its LLM context.
+pub(crate) fn describe_search_context(engine: &Engine, rows: &[Value]) -> Result<String> {
+    let mut out = Vec::new();
+    print_search(
+        &mut out,
+        rows,
+        Format::Summary,
+        Detail::Expanded,
+        false,
+        &mut Presentation::new(engine),
+    )?;
+    Ok(String::from_utf8(out)?)
+}
+
 fn print_errors(out: &mut impl Write, errors: &[Value], format: Format) -> Result<()> {
     if format == Format::Json {
         return print_json(out, &errors);

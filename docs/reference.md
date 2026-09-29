@@ -374,15 +374,21 @@ with `0`.
 
 ### Task explanations
 
-`describe` sends its query, ranked search matches (including callable source and
-Markdown content), and per-file descriptions to the configured description
-provider. Any match strictly above `--describe-full-file-threshold` (default `0.8`)
-also includes that file's complete **indexed** source from SQLite. The instruction
-asks for an explanation of existing code/docs with paths and symbols, not an
-implementation proposal.
+`describe` sends the query and the expanded text search output (file headers,
+declaration skeletons, scores, generated descriptions where available, and
+Markdown content) to the configured description provider. Below that output,
+`@@ Full source code for best matching files provided below @@` introduces
+complete **indexed** files, each headed by `*** <path>`. Files whose highest
+match similarity is strictly above `--describe-full-file-threshold` (default
+`0.8`) are considered in descending similarity order. The source section is
+limited to 96 KiB and the entire prompt to 128 KiB; files that do not fit are
+omitted from the source section while their search results remain in the first
+section. Expanded search output is limited to 64 KiB and marked if truncated.
+The instruction asks for an explanation of existing code/docs with paths and
+symbols, not an implementation proposal.
 
-The engine does not reread live files for this context or retry with whole-file
-content removed. Provider retries/failover still apply. JSON output contains
+The engine does not reread live files for this context. Provider retries/failover
+still apply. JSON output contains
 `query`, `description`, `files`, and `functions`; full source and embedding input
 are stripped from returned function metadata. Reranker order informs the prompt,
 but `rerankScore` is not copied to the returned `functions` array.

@@ -39,6 +39,13 @@ const EXCLUDED: &[&str] = &[
 
 const FILE_DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. Return exactly one concise paragraph about the file's purpose, responsibilities, and important relationships; use plain text without a heading, bullets, or a preamble.";
 const CALLABLE_DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. Return exactly one sentence describing what the callable does, including relevant inputs, outputs, or side effects; use plain text without a heading, bullets, or a preamble.";
+// A byte cap is deliberately conservative even for providers with different tokenizers.
+// Leave room for the task, expanded search context, and the model's response.
+const DESCRIBE_PROMPT_BYTES: usize = 128 * 1024;
+const DESCRIBE_SEARCH_BYTES: usize = 64 * 1024;
+const DESCRIBE_SOURCE_BYTES: usize = 96 * 1024;
+const DESCRIBE_SOURCE_SEPARATOR: &str =
+    "\n@@ Full source code for best matching files provided below @@\n";
 
 pub struct Engine {
     root: PathBuf,
@@ -1413,26 +1420,77 @@ impl Engine {
             };
             if let Some(path) = data["path"].as_str() {
                 let file = &self.files[path];
-                let entry = files.entry(path.into()).or_insert_with(
-                    || json!({"path":path,"description":file.description,"similarity":0.0}),
-                );
                 let similarity = score(item, "similarity");
+                let entry = files.entry(path.into()).or_insert_with(
+                    || json!({"path":path,"description":file.description,"similarity":similarity}),
+                );
                 if similarity > score(entry, "similarity") {
                     entry["similarity"] = json!(similarity);
                 }
-                if similarity > threshold {
-                    entry["content"] = json!(file.source);
-                }
             }
         }
-        let context =
-            json!({"query":query,"files":files.values().collect::<Vec<_>>(),"matches":matches});
+        let mut prompt = format!("Task: {query}\n\n");
+        let marker = "\n[Search results truncated to fit the prompt size limit]\n";
+        ensure!(
+            prompt.len() + DESCRIBE_SOURCE_SEPARATOR.len() + marker.len() <= DESCRIBE_PROMPT_BYTES,
+            "Describe query exceeds the prompt size limit"
+        );
+        let search = crate::cli::describe_search_context(self, &matches)?;
+        let search_budget = DESCRIBE_SEARCH_BYTES
+            .min(DESCRIBE_PROMPT_BYTES - prompt.len() - DESCRIBE_SOURCE_SEPARATOR.len());
+        if search.len() <= search_budget {
+            prompt.push_str(&search);
+        } else {
+            let mut end = search_budget.saturating_sub(marker.len());
+            while !search.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.push_str(&search[..end]);
+            prompt.push_str(marker);
+        }
+        let mut ranked: Vec<_> = files.values().collect();
+        ranked.sort_by(|a, b| {
+            score(b, "similarity")
+                .total_cmp(&score(a, "similarity"))
+                .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
+        });
+        let mut source_bytes = 0;
+        for entry in ranked {
+            if score(entry, "similarity") <= threshold {
+                continue;
+            }
+            let path = entry["path"].as_str().unwrap();
+            let source = &self.files[path].source;
+            let block = format!(
+                "{}{}{}",
+                crate::map::file_header(path),
+                source,
+                if source.ends_with('\n') { "" } else { "\n" }
+            );
+            let section = if source_bytes == 0 {
+                DESCRIBE_SOURCE_SEPARATOR.len()
+            } else {
+                1 // blank line between files
+            };
+            let bytes = block.len() + section;
+            if source_bytes + bytes > DESCRIBE_SOURCE_BYTES
+                || prompt.len() + bytes > DESCRIBE_PROMPT_BYTES
+            {
+                continue;
+            }
+            if source_bytes == 0 {
+                prompt.push_str(DESCRIBE_SOURCE_SEPARATOR);
+            } else {
+                prompt.push('\n');
+            }
+            prompt.push_str(&block);
+            source_bytes += bytes;
+        }
         ui::progress("Generating explanation from search results");
         let system = "Explain the existing code and documentation relevant to the user's task using only the supplied search context. Cite paths and symbols. Do not propose an implementation. If there is insufficient context, say so.";
-        let prompt = context.to_string();
         let key = hash(
             json!([
-                "explanation-v1",
+                "explanation-v2",
                 self.providers.llm().profile(),
                 self.config["descriptionBaseUrl"],
                 self.config["descriptionFallbackModel"],
@@ -1453,13 +1511,7 @@ impl Engine {
                 .put_text(&self.db, "explanation", &key, &description);
             description
         };
-        let files: Vec<_> = files
-            .into_values()
-            .map(|mut f| {
-                f.as_object_mut().unwrap().remove("content");
-                f
-            })
-            .collect();
+        let files: Vec<_> = files.into_values().collect();
         let functions: Vec<_> = matches
             .into_iter()
             .filter(|r| r["type"] == "function")

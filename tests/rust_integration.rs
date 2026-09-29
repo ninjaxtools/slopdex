@@ -2022,7 +2022,7 @@ fn description_lifecycle_fuses_scores_preserves_stale_files_and_reindexes_on_req
 }
 
 #[test]
-fn describe_sends_thresholded_indexed_context_and_returns_compact_provenance() -> Result<()> {
+fn describe_sends_expanded_search_and_thresholded_indexed_source() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let original = format!(
@@ -2058,20 +2058,76 @@ fn describe_sends_thresholded_indexed_context_and_returns_compact_provenance() -
         let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
             .as_str()
             .unwrap();
-        let context: Value = serde_json::from_str(prompt)?;
-        assert_eq!(context["files"][0].get("content").is_some(), includes_file);
+        assert!(prompt.starts_with("Task: east\n\n*** a.rs\n"), "{prompt}");
+        assert!(prompt.contains("@@ 2-"), "{prompt}");
+        assert!(prompt.contains("fn alpha"), "{prompt}");
+        let separator = "@@ Full source code for best matching files provided below @@";
+        assert_eq!(prompt.contains(separator), includes_file);
         if includes_file {
-            assert_eq!(context["files"][0]["content"], original);
+            assert!(prompt.ends_with(&format!("*** a.rs\n{original}")));
+            assert_eq!(prompt.matches("FILE_CONTEXT_SENTINEL").count(), 1);
         }
         assert!(!prompt.contains("not_indexed_yet"));
-        assert_eq!(context["matches"].as_array().unwrap().len(), 1);
-        assert!(
-            context["matches"][0]["function"]["source"]
-                .as_str()
-                .unwrap()
-                .contains("fn alpha")
-        );
+        assert!(!prompt.starts_with('{'));
     }
+    Ok(())
+}
+
+#[test]
+fn describe_bounds_full_sources_and_keeps_other_search_skeletons() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    for (path, name, size) in [
+        ("a.rs", "first", 90 * 1024),
+        ("b.rs", "second", 12 * 1024),
+        ("c.rs", "third", 2 * 1024),
+        ("z.rs", "oversized", 110 * 1024),
+    ] {
+        repo.write(
+            path,
+            &(function(name, "VECTOR_EAST") + &format!("// {}\n", "X".repeat(size))),
+        )?;
+    }
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    engine.describe("east", &json!({"minSimilarity":0.9}))?;
+    let requests = mock.requests("/responses");
+    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt.len() <= 128 * 1024, "{} bytes", prompt.len());
+    let (search, full) = prompt
+        .split_once("@@ Full source code for best matching files provided below @@")
+        .context("missing full source separator")?;
+    for name in ["first", "second", "third", "oversized"] {
+        assert!(search.contains(&format!("fn {name}")), "missing {name}");
+    }
+    assert!(full.contains("*** a.rs\n"));
+    assert!(full.contains("*** c.rs\n"));
+    assert!(!full.contains("*** b.rs\n"));
+    assert!(!full.contains("*** z.rs\n"));
+    Ok(())
+}
+
+#[test]
+fn describe_bounds_expanded_markdown_search_on_utf8_boundary() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let sections = (0..20)
+        .map(|index| format!("## Section {index}\nVECTOR_EAST {}\n", "📖".repeat(1100)))
+        .collect::<String>();
+    repo.write("guide.md", &format!("# Guide\n{sections}"))?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    engine.describe("east", &json!({"minSimilarity":0.9}))?;
+    let requests = mock.requests("/responses");
+    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt.len() <= 128 * 1024);
+    assert!(prompt.contains("*** guide.md\n"));
+    assert!(prompt.contains("## Section 0"));
+    assert!(prompt.contains("[Search results truncated to fit the prompt size limit]"));
     Ok(())
 }
 
@@ -3702,8 +3758,7 @@ fn schema3_file_columns_are_authoritative_for_saved_description_context() -> Res
     let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
         .as_str()
         .unwrap();
-    let context: Value = serde_json::from_str(prompt)?;
-    assert_eq!(context["files"][0]["content"], source);
+    assert!(prompt.ends_with(&format!("*** code.rs\n{source}")));
     Ok(())
 }
 
