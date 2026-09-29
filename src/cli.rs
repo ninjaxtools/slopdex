@@ -1761,9 +1761,9 @@ fn function_location(function: &Value) -> String {
 fn rank(row: &Value) -> String {
     let similarity = number(row, "similarity");
     if let Some(rerank) = row["rerankScore"].as_f64() {
-        format!("score={rerank:.4} similarity={similarity:.4}")
+        format!("score={rerank:.2} similarity={similarity:.2}")
     } else {
-        format!("score={similarity:.4}")
+        format!("score={similarity:.2}")
     }
 }
 
@@ -1775,10 +1775,10 @@ fn score_details(row: &Value) -> String {
         (Some(description), Some(file)) => {
             if let Some(code) = row["codeSimilarity"].as_f64() {
                 format!(
-                    "  [combined thirds; code {code:.4}, description {description:.4}, file {file:.4}]"
+                    "  [combined thirds; code {code:.2}, description {description:.2}, file {file:.2}]"
                 )
             } else {
-                format!("  [combined 50/50; description {description:.4}, file {file:.4}]")
+                format!("  [combined 50/50; description {description:.2}, file {file:.2}]")
             }
         }
         _ => String::new(),
@@ -1914,22 +1914,8 @@ fn print_function_with_header(
         let name = function["qualifiedName"]
             .as_str()
             .unwrap_or_else(|| text(function, "name"));
-        let suffix = description
-            .map(|description| {
-                format!(
-                    "  {}",
-                    map::comment(
-                        text(function, "path"),
-                        &description.split_whitespace().collect::<Vec<_>>().join(" ")
-                    )
-                )
-            })
-            .unwrap_or_default();
-        writeln!(
-            out,
-            "{}{name}{suffix}",
-            map::hunk(start, end, Some(&annotation))
-        )?;
+        let suffix = map::inline_note(text(function, "path"), Some(&annotation), description);
+        writeln!(out, "{}{name}{suffix}", map::hunk(start, end, None))?;
     }
     Ok(())
 }
@@ -1972,35 +1958,46 @@ fn print_markdown_with_header(
     }
     let start = chunk["startLine"].as_u64().unwrap_or(1) as usize;
     let end = chunk["endLine"].as_u64().unwrap_or(start as u64) as usize;
-    write!(out, "{}", map::hunk(start, end, Some(&rank(row))))?;
+    write!(out, "{}", map::hunk(start, end, None))?;
     let nodes = presentation.markdown_context(chunk)?;
+    let score = rank(row);
     let last_heading = if let Some(node) = nodes.last() {
-        write!(out, "{}", map::render_declarations(&nodes, detail.into()))?;
+        write!(
+            out,
+            "{}",
+            map::render_declarations_with_annotation(&nodes, detail.into(), Some(&score))
+        )?;
         Some(node.signature.clone())
     } else {
         let content = text(chunk, "content");
         let mut last = None;
-        for (depth, name) in array(&chunk["headingPath"])
+        let headings: Vec<_> = array(&chunk["headingPath"])
             .iter()
             .filter_map(Value::as_str)
-            .enumerate()
-        {
+            .collect();
+        for (depth, name) in headings.iter().enumerate() {
             let heading = content
                 .lines()
-                .find(|line| line.starts_with('#') && line.trim_start_matches('#').trim() == name)
+                .find(|line| line.starts_with('#') && line.trim_start_matches('#').trim() == *name)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("{} {name}", "#".repeat(depth + 1)));
-            writeln!(out, "{}{heading}", "  ".repeat(depth))?;
+            let suffix = if depth + 1 == headings.len() {
+                map::inline_note(text(chunk, "path"), Some(&score), None)
+            } else {
+                String::new()
+            };
+            writeln!(out, "{}{heading}{suffix}", "  ".repeat(depth))?;
             last = Some(heading);
         }
         if last.is_none() {
             writeln!(
                 out,
-                "{}",
+                "{}{}",
                 content
                     .lines()
                     .find(|line| !line.is_empty())
-                    .unwrap_or("(untitled)")
+                    .unwrap_or("(untitled)"),
+                map::inline_note(text(chunk, "path"), Some(&score), None)
             )?;
         }
         last
@@ -2631,9 +2628,9 @@ fn print_clusters(
             writeln!(out)?;
         }
         let range = if cluster.min == cluster.max {
-            format!("{:.4}", cluster.min)
+            format!("{:.2}", cluster.min)
         } else {
-            format!("{:.4}-{:.4}", cluster.min, cluster.max)
+            format!("{:.2}-{:.2}", cluster.min, cluster.max)
         };
         writeln!(
             out,
@@ -2648,7 +2645,7 @@ fn print_clusters(
         )?;
         if detail == Detail::Expanded {
             for (left, right, similarity) in &cluster.edges {
-                writeln!(out, "@ match: {left} ↔ {right} score={similarity:.4}")?;
+                writeln!(out, "@ match: {left} ↔ {right} score={similarity:.2}")?;
             }
         }
         let mut previous_file = None;
@@ -3180,7 +3177,7 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("Cluster 1 · 4 functions · similarity 0.9100-0.9500"));
+        assert!(output.contains("Cluster 1 · 4 functions · similarity 0.91-0.95"));
         assert!(output.contains("*** src/d.rs\n@@ 1 @@\nd"));
         assert!(!output.contains("Cluster 2"));
         assert_eq!(clusters(&[edge("a", "a", 0.9)], false)[0].members.len(), 2);
@@ -4051,9 +4048,9 @@ mod tests {
         assert_eq!(
             summary,
             concat!(
-                "*** src/λ.rs\n@@ 1 @@ score=0.9500 similarity=0.6000\nService.run\n",
-                "\n*** guide.md\n@@ 12 @@ score=0.7000\n# Setup\n  ## Credentials\n",
-                "\n*** other.rs\n@@ 1 @@ score=0.4000\nfallback\n"
+                "*** src/λ.rs\n@@ 1 @@\nService.run  // score=0.95 similarity=0.60\n",
+                "\n*** guide.md\n@@ 12 @@\n# Setup\n  ## Credentials  <!-- score=0.70 -->\n",
+                "\n*** other.rs\n@@ 1 @@\nfallback  // score=0.40\n"
             )
         );
         let mut out = Vec::new();
@@ -4067,9 +4064,30 @@ mod tests {
         )
         .unwrap();
         let expanded = String::from_utf8(out).unwrap();
-        assert!(expanded.contains("Service.run  // Purpose second line\n"));
+        assert!(
+            expanded.contains("Service.run  // score=0.95"),
+            "{expanded}"
+        );
+        assert!(expanded.contains(" | Purpose second line\n"), "{expanded}");
         assert!(expanded.contains("Use `KEY`.\nNext step."));
         assert!(summary.len() < expanded.len());
+    }
+
+    #[test]
+    fn displayed_scores_round_to_two_places() {
+        let row = json!({
+            "similarity": 0.4639,
+            "rerankScore": 0.5321,
+            "codeSimilarity": 0.416,
+            "descriptionSimilarity": 0.3925,
+            "fileDescriptionSimilarity": 0.971
+        });
+        assert_eq!(rank(&row), "score=0.53 similarity=0.46");
+        assert_eq!(
+            score_details(&row),
+            "  [combined thirds; code 0.42, description 0.39, file 0.97]"
+        );
+        assert_eq!(rank(&json!({"similarity": 0.996})), "score=1.00");
     }
 
     #[test]
@@ -4097,7 +4115,7 @@ mod tests {
         let output = String::from_utf8(output)?;
         assert_eq!(
             output,
-            "*** api.rs\n\n@@ 2-4 @@\nimpl Api\n\n@@ 3 @@ score=0.9000\n  pub fn run(&self)\n"
+            "*** api.rs\n\n@@ 2-4 @@\nimpl Api\n  pub fn run(&self)  // score=0.90\n"
         );
         assert!(!output.contains("secret") && !output.contains('{'));
         Ok(())
@@ -4119,7 +4137,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "*** guide.md\n@@ 8-14 @@ score=0.8000\n# Guide\n  ## Setup\n"
+            "*** guide.md\n@@ 8-14 @@\n# Guide\n  ## Setup  <!-- score=0.80 -->\n"
         );
     }
 
@@ -4137,7 +4155,8 @@ mod tests {
             &mut Presentation::empty(),
         )?;
         assert!(
-            String::from_utf8(output)?.contains("run  // Handles requests. Checks permissions.\n")
+            String::from_utf8(output)?
+                .contains("run  // score=0.80 | Handles requests. Checks permissions.\n")
         );
         let mut output = Vec::new();
         print_search(
@@ -4262,7 +4281,7 @@ mod tests {
             "{output}"
         );
         assert!(
-            output.contains("pub fn run()  // Runs work. Returns a result.\n"),
+            output.contains("pub fn run()  // score=0.80 | Runs work. Returns a result.\n"),
             "{output}"
         );
         let mut output = Vec::new();
@@ -4317,12 +4336,13 @@ mod tests {
         assert!(output.find("*** api.rs").unwrap() < output.find("*** guide.md").unwrap());
         assert!(output.find("fn write(&self)").unwrap() < output.find("fn flush(&self)").unwrap());
         assert!(output.find("## Setup").unwrap() < output.find("### Details").unwrap());
+        assert!(output.contains("## Setup  <!-- score=0.60 -->"), "{output}");
         assert!(
-            output.contains("@@ 2 @@ score=0.7000\n  fn write(&self)"),
+            output.contains("### Details  <!-- score=0.80 -->"),
             "{output}"
         );
         assert!(
-            output.contains("@@ 3 @@ score=0.9000\n  fn flush(&self)"),
+            output.contains("@@ 1-4 @@\nimpl Api\n  fn write(&self)  // score=0.70\n  fn flush(&self)  // score=0.90\n"),
             "{output}"
         );
         assert_eq!(output.matches("impl Api").count(), 1);
@@ -4363,14 +4383,8 @@ mod tests {
             "{output}"
         );
         assert_eq!(output.matches("*** a.rs").count(), 1);
-        assert!(
-            output.contains("score=0.5000 similarity=0.4000"),
-            "{output}"
-        );
-        assert!(
-            output.contains("score=0.9000 similarity=0.8000"),
-            "{output}"
-        );
+        assert!(output.contains("score=0.50 similarity=0.40"), "{output}");
+        assert!(output.contains("score=0.90 similarity=0.80"), "{output}");
         Ok(())
     }
 
@@ -4403,8 +4417,11 @@ mod tests {
             output.find("fn first(&self)").unwrap() < output.find("fn second(&self)").unwrap(),
             "{output}"
         );
-        assert!(output.contains("@@ 2 @@ score=0.9100"), "{output}");
-        assert!(output.contains("@@ 3 @@ source"), "{output}");
+        assert!(
+            output.contains("fn first(&self)  // score=0.91"),
+            "{output}"
+        );
+        assert!(output.contains("fn second(&self)  // source"), "{output}");
         Ok(())
     }
 
@@ -4522,15 +4539,15 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(out).unwrap();
         assert!(
-            output.starts_with("*** src/a.rs\n@@ 1 @@ source\na\n"),
+            output.starts_with("*** src/a.rs\n@@ 1 @@\na  // source\n"),
             "{output}"
         );
         assert!(
-            output.contains("*** src/a.rs\n@@ 1 @@ source\na\n"),
+            output.contains("*** src/a.rs\n@@ 1 @@\na  // source\n"),
             "{output}"
         );
-        assert!(output.contains("*** src/b.rs\n@@ 1 @@ target score=0.8000"));
-        assert!(output.contains("*** src/c.rs\n@@ 1 @@ target score=0.9000"));
+        assert!(output.contains("*** src/b.rs\n@@ 1 @@\nb  // target score=0.80"));
+        assert!(output.contains("*** src/c.rs\n@@ 1 @@\nc  // target score=0.90"));
         assert!(!output.contains("src/x.rs"));
     }
 
@@ -4573,9 +4590,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             concat!(
-                "Cluster 1 · 2 functions · similarity 0.7000\n",
-                "\n*** src/a.rs\n@@ 1 @@ source\na\n",
-                "\n*** src/a.rs\n@@ 1 @@ target\na\n"
+                "Cluster 1 · 2 functions · similarity 0.70\n",
+                "\n*** src/a.rs\n@@ 1 @@\na  // source\n",
+                "\n*** src/a.rs\n@@ 1 @@\na  // target\n"
             )
         );
     }

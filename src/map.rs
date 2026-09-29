@@ -45,6 +45,20 @@ pub fn comment_block(language: &str, description: &str) -> String {
         .collect()
 }
 
+pub fn inline_note(language: &str, annotation: Option<&str>, description: Option<&str>) -> String {
+    let notes: Vec<_> = annotation
+        .filter(|note| !note.is_empty())
+        .into_iter()
+        .chain(description.filter(|note| !note.trim().is_empty()))
+        .map(|note| note.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", comment(language, &notes.join(" | ")))
+    }
+}
+
 pub fn file_header(path: &str) -> String {
     format!("*** {path}\n")
 }
@@ -223,15 +237,7 @@ pub fn render_with_hits(
                                 .is_none_or(|_| full_next.get(&previous.id) == Some(&node.id))
                     })
         });
-        if (!adjacent_sibling
-            || hits.annotations.is_some_and(|scores| {
-                scores.contains_key(&node.id)
-                    || group
-                        .iter()
-                        .any(|previous| scores.contains_key(&previous.id))
-            }))
-            && !group.is_empty()
-        {
+        if !adjacent_sibling && !group.is_empty() {
             append_group(
                 &mut output,
                 &group,
@@ -284,9 +290,7 @@ fn append_group(
             .map(|node| display_end(node))
             .max()
             .unwrap_or(display_end(last)),
-        annotations
-            .and_then(|annotations| annotations.get(&first.id).map(String::as_str))
-            .or(qualified),
+        qualified,
     ));
     for node in group {
         output.push_str(&declaration(
@@ -294,6 +298,7 @@ fn append_group(
             depth(node, by_id),
             detail,
             descriptions.and_then(|descriptions| descriptions.get(&node.id).map(String::as_str)),
+            annotations.and_then(|scores| scores.get(&node.id).map(String::as_str)),
         ));
         if let Some(extra) = extras.and_then(|extras| extras.get(&node.id)) {
             output.push_str(extra);
@@ -357,8 +362,8 @@ pub fn render_node(
     detail: Detail,
 ) -> String {
     let end = display_end(node);
-    let mut output = hunk(node.start_line, end, annotation);
-    output.push_str(&declaration(node, depth, detail, None));
+    let mut output = hunk(node.start_line, end, None);
+    output.push_str(&declaration(node, depth, detail, None, annotation));
     output
 }
 
@@ -377,7 +382,7 @@ pub fn render_context_with_description(
     let Some(matched) = nodes.last() else {
         return String::new();
     };
-    let mut output = hunk(matched.start_line, display_end(matched), annotation);
+    let mut output = hunk(matched.start_line, display_end(matched), None);
     for (depth, node) in nodes.iter().enumerate() {
         output.push_str(&declaration(
             node,
@@ -388,15 +393,30 @@ pub fn render_context_with_description(
             } else {
                 None
             },
+            annotation.filter(|_| depth + 1 == nodes.len()),
         ));
     }
     output
 }
 
 pub fn render_declarations(nodes: &[StructureNode], detail: Detail) -> String {
+    render_declarations_with_annotation(nodes, detail, None)
+}
+
+pub fn render_declarations_with_annotation(
+    nodes: &[StructureNode],
+    detail: Detail,
+    annotation: Option<&str>,
+) -> String {
     let mut output = String::new();
     for (depth, node) in nodes.iter().enumerate() {
-        output.push_str(&declaration(node, depth, detail, None));
+        output.push_str(&declaration(
+            node,
+            depth,
+            detail,
+            None,
+            annotation.filter(|_| depth + 1 == nodes.len()),
+        ));
     }
     output
 }
@@ -453,6 +473,7 @@ fn declaration(
     depth: usize,
     detail: Detail,
     description: Option<&str>,
+    annotation: Option<&str>,
 ) -> String {
     let mut output = String::new();
     let indent = "  ".repeat(depth);
@@ -472,13 +493,8 @@ fn declaration(
     for (index, line) in signature.lines().enumerate() {
         output.push_str(&indent);
         output.push_str(line);
-        if index + 1 == line_count
-            && let Some(description) =
-                description.filter(|description| !description.trim().is_empty())
-        {
-            let flattened = description.split_whitespace().collect::<Vec<_>>().join(" ");
-            output.push_str("  ");
-            output.push_str(&comment(&node.language, &flattened));
+        if index + 1 == line_count {
+            output.push_str(&inline_note(&node.language, annotation, description));
         }
         output.push('\n');
     }
@@ -661,6 +677,47 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_scored_nested_symbols_share_a_hunk_with_individual_scores() {
+        let source = "impl Api {\n  fn run(&self) {\n    fn open() {}\n    fn frame() {}\n    fn close() {}\n  }\n}\n";
+        let structure = crate::parse::parse("api.rs", source).unwrap().structure;
+        let selected: Vec<_> = structure
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.name.as_str(),
+                    "Api" | "run" | "open" | "frame" | "close"
+                )
+            })
+            .cloned()
+            .collect();
+        let annotations: HashMap<_, _> = selected
+            .iter()
+            .filter(|node| matches!(node.name.as_str(), "open" | "frame" | "close"))
+            .map(|node| (node.id, format!("score={}", node.name)))
+            .collect();
+        assert_eq!(annotations.len(), 3);
+        let output = render_with_hits(
+            &selected,
+            Some("api.rs"),
+            Detail::Compact,
+            None,
+            Some(&structure),
+            Descriptions::default(),
+            HitDetails {
+                annotations: Some(&annotations),
+                extras: None,
+            },
+        );
+        assert!(
+            output.contains("@@ 3-5 @@\n    fn open()  // score=open\n    fn frame()  // score=frame\n    fn close()  // score=close\n"),
+            "{output}"
+        );
+        assert_eq!(output.matches("@@ 3-5 @@").count(), 1, "{output}");
+        assert_eq!(output.matches("fn run(&self)").count(), 1, "{output}");
+    }
+
+    #[test]
     fn interface_and_adjacent_members_share_its_single_source_range() {
         let source = format!(
             "{}export interface PipeAddress {{\n  readonly read: string\n  readonly write: string\n}}\n",
@@ -805,6 +862,33 @@ mod tests {
         assert_eq!(
             comment("x.rs", "Explains behavior."),
             "// Explains behavior."
+        );
+    }
+
+    #[test]
+    fn single_symbol_scores_follow_the_symbol_in_map_renderers() {
+        let structure = crate::parse::parse("x.rs", "fn run() {}\n")
+            .unwrap()
+            .structure;
+        let node = &structure.nodes[0];
+        assert_eq!(
+            render_node(node, 0, Some("score=0.90"), Detail::Compact),
+            "@@ 1 @@\nfn run()  // score=0.90\n"
+        );
+        assert_eq!(
+            render_with_hits(
+                &structure.nodes,
+                None,
+                Detail::Compact,
+                None,
+                Some(&structure),
+                Descriptions::default(),
+                HitDetails {
+                    annotations: Some(&HashMap::from([(node.id, "score=0.90".to_owned())])),
+                    extras: None,
+                },
+            ),
+            "@@ 1 @@\nfn run()  // score=0.90\n"
         );
     }
 }
