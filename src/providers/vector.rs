@@ -29,6 +29,7 @@ pub(super) struct Configuration {
     pub(super) dimensions: usize,
     pub(super) batch_size: usize,
     pub(super) url: String,
+    custom_endpoint: bool,
 }
 
 impl Configuration {
@@ -52,12 +53,17 @@ impl Configuration {
             dimensions,
             batch_size,
             url,
+            custom_endpoint: config["embeddingBaseUrl"].is_string(),
         })
     }
 
     pub(super) fn profile(&self, provider: &str) -> Value {
-        json!({"provider": provider, "model": self.model,
-            "dimensions": self.dimensions, "strategyVersion": "rust-v1"})
+        let mut profile = json!({"provider": provider, "model": self.model,
+            "dimensions": self.dimensions, "strategyVersion": "rust-v1"});
+        if self.custom_endpoint {
+            profile["endpoint"] = json!(self.url);
+        }
+        profile
     }
 
     pub(super) fn check_batch(&self, count: usize) -> Result<()> {

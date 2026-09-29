@@ -49,7 +49,9 @@ workspace. CLI options and output are implemented in Rust.
 exit through Clap, model listing fetches public catalogs, and configuration
 actions read/write JSON without opening SQLite. The root defaults to the process
 working directory, with no upward Git-root discovery. Default paths are
-`<root>/.slopdex/config.json` and `<root>/.slopdex/index.sqlite`. Explicit relative
+`<root>/.slopdex/config.json` and a per-workspace index under the user's XDG
+cache (canonical root SHA-256). A compatible old default index is copied with
+SQLite backup on first use, including committed WAL changes. Explicit relative
 config/index paths, including JSON `indexPath`, resolve against the working
 directory. CLI overrides are applied after canonicalizing supported config aliases.
 Config saves use a same-directory temporary file, `sync_all`, and rename.
@@ -97,7 +99,25 @@ search units, and diagnostics; the layout does not fully deduplicate payloads.
 | `diagnostics` | Per-file read/parse/extraction diagnostics with structured columns and compatibility data. |
 | `embeddings` | Content-addressed document/query embeddings stored as little-endian F32 blobs. |
 | `cache` | Durable parse and model-generated artifacts, keyed by kind and content-addressed cache key. |
+| `description_content` | Unique description generation inputs (system instructions, prompts, settings, profiles, and file-description context) keyed by their content hash; cached answer records reference these hashes. |
 | `search_cache` | Serialized query and cross-search result rows, separate from reusable model/parse artifacts. |
+
+`src/cache.rs` adds a second SQLite database under the per-user cache for
+content-addressed provider artifacts. On a workspace miss, it reads this shared
+cache and optionally S3 before a provider request, then hydrates the workspace
+SQLite database. Completed provider work is saved to the workspace first, then
+written to the shared local cache and S3 best effort. Remote lookups issue up to
+10 concurrent GETs at a time. Description records contain only the answer and
+content hashes; distinct generation inputs are stored once in the shared cache's
+`artifacts(kind='content')` rows and as S3 content-addressed objects. A remote
+hit fetches any missing content objects before publishing the answer locally.
+S3 uploads of content objects use conditional creation, avoiding duplicate object
+versions when another index has already uploaded the same input. All remote object
+values are zstd-compressed in the `v3` namespace; reads bound decompressed size
+before checking the uncompressed payload checksum. Workspace and shared SQLite
+values retain their existing representation.
+No remote object contains workspace item IDs or Git snapshot state. Map does not
+fetch remote artifacts.
 
 Callable identity hashes path, qualified name, kind, and same-name occurrence;
 Markdown identity hashes path and chunk ordinal. Reconciliation preserves item
@@ -107,9 +127,14 @@ and vector associations to the embedding table. Structure publication can create
 search units with no embeddings; canonical records do not depend on a model.
 
 Parse keys contain parser version, path, and source hash. Embedding keys contain
-the embedding profile, query/document operation, and full input. Description keys
-include the configured generator profile and file or callable source identity;
-explicit callable regeneration also includes the enclosing file hash. Completed
+the embedding profile, query/document operation, and full input. A file description
+key hashes only its content hash and system instruction; a callable description
+key hashes its qualified symbol name, source hash, file-description text, and
+system instruction. Cached answers carry their original path and hashes referencing
+the prompt (including source), system instruction, configured generator profile,
+and relevant settings as inspectable provenance outside the key. Those inputs are
+stored once per content hash. Renames and model changes can therefore
+reuse a matching description, including during explicit regeneration. Completed
 artifacts are persisted independently of the final live update and result cache,
 remaining reusable across generation changes and failed-refresh retries. The
 engine persists each successful embedding batch as it completes, so later

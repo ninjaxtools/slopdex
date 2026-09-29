@@ -56,7 +56,7 @@ $ slopdex search "validate an authenticated session"
 ...
 ```
 
-The index tracks the current git commit and is created or updated on every command and stored in `.slopdex/index.sqlite`. Add `.slopdex/` to your repository's `.gitignore` to prevent it from being committed.
+The index tracks the current Git commit and is created or updated on every command that uses it. Index data is stored in the current user's cache folder and project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
 
 ### Code map/skeleton
 
@@ -70,7 +70,7 @@ $ slopdex map -g '*.md' -e '^Guide\.Setup' -i --format json
 $ slopdex map --no-reindex
 ```
 
-The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains many of the structurally useful information that can act as an index into the source code. The resulting index output is most useful to conserve tokens and improve the agentic programming experience.
+The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains structurally useful information that can act as an index into the source code, which improves context usage.
 
 See the [selector reference](docs/reference.md#shared-selectors).
 
@@ -126,7 +126,7 @@ $ slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
 
 The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
 
-File and function descriptions are cached. Function descriptions will only be regenerated when functions change. File descriptions need to be regenerated explcitily with the `reindex-files` command.
+File and function descriptions are cached by source and description context, so renaming a file can reuse its descriptions. Function changes or a changed file-description context can require new callable descriptions. File descriptions after edits can be refreshed explicitly with `reindex-files`.
 
 ### Interactive Config
 
@@ -213,16 +213,14 @@ $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 ```
 ### Use with agents
 
-Just put this in your `AGENTS.md` file, no skill required:
+Just put this in your `AGENTS.md` file and adjust as desired, no skill necessary:
 
 ```
-- use `slopdex map -g <glob> <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads for implementation details. Line numbers are indicated in square brackets (e.g [5] means line 5, and [5-10] means lines 5 to 10). To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`. For example: `slopdex map -g "*.ts" -i -e "manager|main" src`.
-- use semantic code search to find code with: `slopdex search "..." --threshold 0.5`
+- use `slopdex map -g "<glob>" -i -e "<regex>" <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads using the line numbers for implementation details. To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`.
+- use semantic code search to find code with: `slopdex search "<query>" --threshold 0.5`; vary the search query if you get no results
 - when reviewing uncommitted code avoid introducing duplicates by looking for related matches: `slopdex cross-search --uncommitted --threshold 0.8`
-- don't use `*` as the glob since that circumvents the default ignore rules.
+- when tasked to do advanced codebase analysis, use `slopdex --help` first to see all options
 ```
-
-Any other use, like doing a full `cross-search` is probably better done interactively with the agent, in which case you can just ask the agent to run `slopdex --help` to get usage information.
 
 ### Reranking
 
@@ -240,9 +238,11 @@ $ slopdex config reranker cohere
 ```console
 $ slopdex cross-search \
   --target-root /path/to/other/repo \
-  --target-index /path/to/other/repo/.slopdex/index.sqlite \
+  --target-index /path/to/other/index.sqlite \
   --threshold 0.9
 ```
+
+Pass the target's `indexPath` from `slopdex --root /path/to/other/repo --format json status` (or a custom `--index` path) as `--target-index`.
 
 ### Inspect index health
 

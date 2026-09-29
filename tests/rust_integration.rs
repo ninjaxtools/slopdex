@@ -40,6 +40,7 @@ struct MockState {
 
 struct Mock {
     base: String,
+    cache: TempDir,
     state: Arc<Mutex<MockState>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -53,6 +54,7 @@ impl Mock {
     fn start_with(concurrent: Option<Arc<ConcurrentRequests>>) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let base = format!("http://{}/v1", listener.local_addr()?);
+        let cache = tempfile::tempdir()?;
         listener.set_nonblocking(true)?;
         let threaded = concurrent.is_some();
         let state = Arc::new(Mutex::new(MockState {
@@ -100,6 +102,7 @@ impl Mock {
         });
         Ok(Self {
             base,
+            cache,
             state,
             stop,
             worker: Some(worker),
@@ -116,6 +119,7 @@ impl Mock {
             "rerankerBaseUrl": self.base,
             "embeddingApiKey": TEST_KEY, "descriptionApiKey": TEST_KEY,
             "rerankerApiKey": TEST_KEY,
+            "artifactCachePath": self.cache.path().join("artifacts.sqlite"),
             "providerMaxRetries": 0, "retryDelayMs": 0, "providerTimeoutMs": 5000
         })
     }
@@ -352,7 +356,7 @@ impl ConcurrentWork {
         let sql = match self {
             Self::Embeddings => "SELECT count(*) FROM embeddings",
             Self::Callables => {
-                "SELECT count(*) FROM cache WHERE kind='description' AND value LIKE 'callable-summary:%'"
+                "SELECT count(*) FROM cache WHERE kind='description' AND json_extract(value,'$.text') LIKE 'callable-summary:%'"
             }
         };
         let count: i64 = db.query_row(sql, [], |row| row.get(0))?;
@@ -3700,5 +3704,518 @@ fn schema3_file_columns_are_authoritative_for_saved_description_context() -> Res
         .unwrap();
     let context: Value = serde_json::from_str(prompt)?;
     assert_eq!(context["files"][0]["content"], source);
+    Ok(())
+}
+
+#[test]
+fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Result<()> {
+    let mock = Mock::start()?;
+    let temp = tempfile::tempdir()?;
+    let cache = temp.path().join("shared.sqlite");
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    config["artifactCachePath"] = json!(cache);
+    let source = function("shared", "VECTOR_EAST");
+    let roots: Vec<_> = ["first", "second"]
+        .into_iter()
+        .map(|name| temp.path().join(name))
+        .collect();
+    for root in &roots {
+        fs::create_dir(root)?;
+        fs::write(root.join("api.rs"), &source)?;
+    }
+    let first = roots[0].join("index.sqlite");
+    let second = roots[1].join("index.sqlite");
+    let mut engine = Engine::open(&roots[0], &first, config.clone())?;
+    engine.refresh()?;
+    let calls = mock.count();
+    assert!(
+        calls >= 3,
+        "file and callable descriptions plus code vectors"
+    );
+    drop(engine);
+
+    let mut engine = Engine::open(&roots[1], &second, config.clone())?;
+    engine.refresh()?;
+    assert_eq!(
+        mock.count(),
+        calls,
+        "second workspace must reuse all paid provider output"
+    );
+    assert_eq!(engine.status()?["fileDescriptionCount"], 1);
+    assert_eq!(engine.status()?["descriptionCount"], 1);
+    assert_ne!(first, second);
+    let results = engine.search("east", "search-code", &all())?;
+    assert!(!results.is_empty());
+    assert_eq!(
+        mock.count(),
+        calls + 1,
+        "new query still needs its own embedding"
+    );
+    drop(engine);
+
+    let other = Mock::start()?;
+    let mut other_config = other.config();
+    other_config["artifactCachePath"] = json!(cache);
+    let third = roots[1].join("other-index.sqlite");
+    let mut engine = Engine::open(&roots[1], &third, other_config)?;
+    engine.refresh()?;
+    assert!(
+        !other.embedding_inputs().is_empty(),
+        "different endpoint must not reuse vectors"
+    );
+    Ok(())
+}
+
+/// Run with SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 against MinIO.
+#[test]
+fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> Result<()> {
+    let Ok(endpoint) = std::env::var("SLOPDEX_MINIO_ENDPOINT") else {
+        return Ok(());
+    };
+    let region = s3::Region::Custom {
+        region: "us-east-1".into(),
+        endpoint: endpoint.clone(),
+    };
+    let credentials =
+        s3::creds::Credentials::new(Some("minioadmin"), Some("minioadmin"), None, None, None)?;
+    let bucket = format!("slopdex-test-{}", std::process::id());
+    let created = s3::Bucket::create_with_path_style(
+        &bucket,
+        region,
+        credentials,
+        s3::BucketConfiguration::default(),
+    )?;
+    ensure!(
+        (200..300).contains(&created.response_code),
+        "MinIO bucket creation failed"
+    );
+    let mock = Mock::start()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    config.as_object_mut().unwrap().remove("artifactCachePath");
+    config["artifactS3"] =
+        json!({"bucket": bucket, "endpoint": endpoint, "region": "us-east-1", "prefix":"tests"});
+    let mut repos = Vec::new();
+    for ordinal in 0..3 {
+        let repo = Repo::new()?;
+        repo.write(
+            if ordinal == 1 { "renamed.rs" } else { "api.rs" },
+            &function("shared", "VECTOR_EAST"),
+        )?;
+        repo.write(".slopdex/config.json", &config.to_string())?;
+        repos.push(repo);
+    }
+    let run = |repo: &Repo, unavailable: bool| -> Result<()> {
+        let mut command = repo.child(env!("CARGO_BIN_EXE_slopdex"));
+        command
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--format")
+            .arg("json")
+            .arg("update")
+            .env("XDG_CACHE_HOME", repo.home.join("cache"))
+            .env("AWS_ACCESS_KEY_ID", "minioadmin")
+            .env("AWS_SECRET_ACCESS_KEY", "minioadmin");
+        if unavailable {
+            let mut offline = config.clone();
+            offline["artifactS3"]["endpoint"] = json!("http://127.0.0.1:1");
+            fs::write(repo.root.join(".slopdex/config.json"), offline.to_string())?;
+        }
+        let output = command.output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    run(&repos[0], false)?;
+    let paid = mock.count();
+    ensure!(paid >= 3, "expected provider requests on cold cache");
+    run(&repos[1], false)?;
+    assert_eq!(mock.count(), paid, "second machine must reuse S3 artifacts");
+    let first_index = repos[0]
+        .home
+        .join("cache/slopdex/workspaces")
+        .join(slopdex::hash(
+            repos[0].root.canonicalize()?.as_os_str().as_encoded_bytes(),
+        ))
+        .join("index.sqlite");
+    let index = Connection::open(first_index)?;
+    let (file_key, record): (String, String) = index.query_row(
+        "SELECT key,value FROM cache WHERE kind='description' AND json_extract(value,'$.generation.scope')='file'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let metadata: Value = serde_json::from_str(&record)?;
+    let system_hash = metadata["generation"]["system_hash"].as_str().unwrap();
+    let description_object = format!("/tests/v3/description/{}/{file_key}", &file_key[..2]);
+    let remote_record = created.bucket.get_object(description_object)?;
+    assert_eq!(remote_record.status_code(), 200);
+    assert_eq!(&remote_record.as_slice()[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+    let decoded = zstd::stream::decode_all(remote_record.as_slice())?;
+    assert_eq!(&decoded[65..], record.as_bytes());
+    assert!(!record.contains("Describe existing source code accurately"));
+    let content_object = format!("/tests/v3/content/{}/{system_hash}", &system_hash[..2]);
+    let remote_content = created.bucket.get_object(&content_object)?;
+    assert_eq!(remote_content.status_code(), 200);
+    let stored_system: String = index.query_row(
+        "SELECT content FROM description_content WHERE hash=?",
+        [system_hash],
+        |row| row.get(0),
+    )?;
+    let decoded = zstd::stream::decode_all(remote_content.as_slice())?;
+    assert_eq!(&decoded[65..], stored_system.as_bytes());
+    let removed = created.bucket.delete_object(content_object)?;
+    ensure!(
+        (200..300).contains(&removed.status_code()),
+        "could not remove a remote context object"
+    );
+    let missing = Repo::new()?;
+    missing.write("moved.rs", &function("shared", "VECTOR_EAST"))?;
+    missing.write(".slopdex/config.json", &config.to_string())?;
+    run(&missing, false)?;
+    assert!(
+        mock.count() > paid,
+        "missing context must trigger provider fallback"
+    );
+    let paid_after_missing = mock.count();
+    let profile = slopdex::providers::Providers::new(&config)?.embedding_profile();
+    let key = slopdex::storage::Database::embedding_key(&profile, true, "uncached-query");
+    let zero = [0_u8; 16];
+    let mut corrupt = format!("{}\n", slopdex::hash(zero)).into_bytes();
+    corrupt.extend_from_slice(&zero);
+    let object = format!("/tests/v3/embedding/{}/{key}", &key[..2]);
+    let uploaded = created
+        .bucket
+        .put_object(object, &zstd::stream::encode_all(corrupt.as_slice(), 3)?)?;
+    ensure!(
+        (200..300).contains(&uploaded.status_code()),
+        "could not stage invalid vector"
+    );
+    let searched = repos[1]
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repos[1].root)
+        .args([
+            "--no-reindex",
+            "--format",
+            "json",
+            "search-code",
+            "uncached-query",
+        ])
+        .env("XDG_CACHE_HOME", repos[1].home.join("cache"))
+        .env("AWS_ACCESS_KEY_ID", "minioadmin")
+        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .output()?;
+    ensure!(
+        searched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+    assert_eq!(
+        mock.count(),
+        paid_after_missing + 1,
+        "invalid remote vector must fall back to provider"
+    );
+    run(&repos[2], true)?;
+    assert!(
+        mock.count() > paid_after_missing + 1,
+        "outage must fall back to provider without failing"
+    );
+    let existing = Repo::new()?;
+    let other = Repo::new()?;
+    let mut backfill = config.clone();
+    backfill.as_object_mut().unwrap().remove("artifactS3");
+    existing.write("api.rs", &function("backfill", "VECTOR_WEST"))?;
+    existing.write(".slopdex/config.json", &backfill.to_string())?;
+    run(&existing, false)?;
+    let already_paid = mock.count();
+    backfill["artifactS3"] = config["artifactS3"].clone();
+    backfill["artifactS3"]["prefix"] = json!("backfill");
+    existing.write(".slopdex/config.json", &backfill.to_string())?;
+    run(&existing, false)?;
+    assert_eq!(
+        mock.count(),
+        already_paid,
+        "enabling S3 must export existing artifacts without provider calls"
+    );
+    other.write("api.rs", &function("backfill", "VECTOR_WEST"))?;
+    other.write(".slopdex/config.json", &backfill.to_string())?;
+    run(&other, false)?;
+    assert_eq!(
+        mock.count(),
+        already_paid,
+        "a second machine must reuse exported artifacts"
+    );
+    Ok(())
+}
+
+#[test]
+fn default_xdg_index_migrates_legacy_sqlite_without_discarding_wal_data() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write("api.rs", &function("saved", "VECTOR_EAST"))?;
+    let legacy = repo.root.join(".slopdex/index.sqlite");
+    let mut engine = Engine::open(&repo.root, &legacy, config)?;
+    engine.refresh()?;
+    let generation = engine.status()?["generation"].clone();
+    drop(engine);
+    let calls = mock.count();
+    let xdg = repo.home.join("xdg-cache");
+    let output = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--no-reindex")
+        .args(["--format", "json", "status"])
+        .env("XDG_CACHE_HOME", &xdg)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout)?;
+    let expected = xdg
+        .join("slopdex/workspaces")
+        .join(slopdex::hash(
+            repo.root.canonicalize()?.as_os_str().as_encoded_bytes(),
+        ))
+        .join("index.sqlite");
+    assert_eq!(status["indexPath"], json!(expected));
+    assert_eq!(status["generation"], generation);
+    assert_eq!(status["fileCount"], 1);
+    assert!(legacy.exists() && expected.exists());
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn existing_workspace_vectors_seed_new_shared_cache_without_provider_calls() -> Result<()> {
+    let mock = Mock::start()?;
+    let temp = tempfile::tempdir()?;
+    let source = function("saved", "VECTOR_EAST");
+    let roots: Vec<_> = ["original", "other"]
+        .into_iter()
+        .map(|name| temp.path().join(name))
+        .collect();
+    for root in &roots {
+        fs::create_dir(root)?;
+        fs::write(root.join("api.rs"), &source)?;
+    }
+    let mut config = mock.config();
+    let original = roots[0].join("index.sqlite");
+    // Like Repo::open, tolerate brief flock inheritance by concurrent test children.
+    let open = |root: &PathBuf, index: &PathBuf, config: Value| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match Engine::open(root, index, config.clone()) {
+                Err(error)
+                    if error.to_string().starts_with("Index is in use")
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                result => break result,
+            }
+        }
+    };
+    let mut engine = open(&roots[0], &original, config.clone())?;
+    engine.refresh()?;
+    drop(engine);
+    let calls = mock.count();
+    config["artifactCachePath"] = json!(temp.path().join("fresh-shared.sqlite"));
+    drop(open(&roots[0], &original, config.clone())?);
+    let mut other = open(&roots[1], &roots[1].join("index.sqlite"), config)?;
+    other.refresh()?;
+    assert_eq!(
+        mock.count(),
+        calls,
+        "existing paid vectors must seed the shared cache"
+    );
+    Ok(())
+}
+
+#[test]
+fn description_keys_reuse_renames_and_models_while_retaining_generation_context() -> Result<()> {
+    let mock = Mock::start()?;
+    let first = Repo::new()?;
+    let second = Repo::new()?;
+    let source = function("shared", "VECTOR_EAST");
+    let shared = first.home.join("artifacts.sqlite");
+    let mut config = mock.config();
+    config["artifactCachePath"] = json!(shared);
+    config["descriptionsEnabled"] = json!(true);
+    first.write("src/old.rs", &source)?;
+    let mut engine = first.open(&config)?;
+    engine.refresh()?;
+    let description = file_record(&first, "src/old.rs")?["description"].clone();
+    let callable: String = first.db()?.query_row(
+        "SELECT text FROM descriptions WHERE scope='callable' AND path='src/old.rs'",
+        [],
+        |row| row.get(0),
+    )?;
+    let rows: Vec<(String, Value)> = first
+        .db()?
+        .prepare("SELECT key,value FROM cache WHERE kind='description'")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .map(|row| {
+            let (key, text) = row?;
+            Ok((key, serde_json::from_str(&text)?))
+        })
+        .collect::<Result<_>>()?;
+    assert_eq!(rows.len(), 2);
+    let db = first.db()?;
+    for (key, artifact) in &rows {
+        let generation = &artifact["generation"];
+        let content = |field: &str| -> Result<String> {
+            let content_hash = generation[field].as_str().context("missing content hash")?;
+            let text: String = db.query_row(
+                "SELECT content FROM description_content WHERE hash=?",
+                [content_hash],
+                |row| row.get(0),
+            )?;
+            assert_eq!(slopdex::hash(&text), content_hash);
+            Ok(text)
+        };
+        let system = content("system_hash")?;
+        let expected = if generation["scope"] == "file" {
+            slopdex::hash(json!([slopdex::hash(&source), system]).to_string())
+        } else {
+            slopdex::hash(
+                json!([
+                    "shared",
+                    generation["source_hash"],
+                    description.as_str().unwrap(),
+                    system
+                ])
+                .to_string(),
+            )
+        };
+        assert_eq!(*key, expected);
+        assert_eq!(generation["path"], "src/old.rs");
+        let profile: Value = serde_json::from_str(&content("profile_hash")?)?;
+        assert_eq!(profile["model"], "integration-description");
+        let prompt = content("prompt_hash")?;
+        assert!(prompt.contains("File: src/old.rs"));
+        assert!(prompt.contains("VECTOR_EAST"));
+        assert!(artifact["generation"].get("prompt").is_none());
+        assert!(artifact["generation"].get("system").is_none());
+        assert!(
+            !artifact.to_string().contains(TEST_KEY),
+            "credentials must not be stored"
+        );
+    }
+    drop(db);
+    let calls = mock.requests("/responses").len();
+    fs::rename(first.root.join("src/old.rs"), first.root.join("src/new.rs"))?;
+    engine.refresh()?;
+    assert_eq!(mock.requests("/responses").len(), calls);
+    assert_eq!(
+        file_record(&first, "src/new.rs")?["description"],
+        description
+    );
+    assert_eq!(
+        first.db()?.query_row::<String, _, _>(
+            "SELECT text FROM descriptions WHERE scope='callable' AND path='src/new.rs'",
+            [],
+            |row| row.get(0)
+        )?,
+        callable
+    );
+    drop(engine);
+
+    second.write("src/another.rs", &source)?;
+    let mut different_model = config.clone();
+    different_model["descriptionModel"] = json!("alternate-description-model");
+    different_model["descriptionFallbackModel"] = json!("fallback-model");
+    let mut engine = second.open(&different_model)?;
+    engine.refresh()?;
+    assert_eq!(mock.requests("/responses").len(), calls);
+    assert_eq!(
+        file_record(&second, "src/another.rs")?["description"],
+        description
+    );
+    assert_eq!(
+        second.db()?.query_row::<String, _, _>(
+            "SELECT text FROM descriptions WHERE scope='callable' AND path='src/another.rs'",
+            [],
+            |row| row.get(0)
+        )?,
+        callable
+    );
+    Ok(())
+}
+
+#[test]
+fn description_context_is_stored_once_by_hash_across_callable_artifacts() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    let source: String = (0..8)
+        .map(|i| function(&format!("method_{i}"), "VECTOR_EAST"))
+        .collect();
+    repo.write("api.rs", &source)?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let db = repo.db()?;
+    let rows: Vec<Value> = db
+        .prepare("SELECT value FROM cache WHERE kind='description'")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .map(|row| Ok(serde_json::from_str(&row?)?))
+        .collect::<Result<_>>()?;
+    assert_eq!(rows.len(), 9);
+    let refs: Vec<_> = rows.iter().map(|row| &row["generation"]).collect();
+    let unique = |field: &str| -> BTreeSet<String> {
+        refs.iter()
+            .filter_map(|row| row[field].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(unique("system_hash").len(), 2);
+    assert_eq!(unique("prompt_hash").len(), 9);
+    assert_eq!(unique("profile_hash").len(), 1);
+    assert_eq!(unique("settings_hash").len(), 1);
+    assert_eq!(unique("file_description_hash").len(), 1);
+    let all_hashes: BTreeSet<_> = [
+        "system_hash",
+        "prompt_hash",
+        "profile_hash",
+        "settings_hash",
+        "file_description_hash",
+    ]
+    .into_iter()
+    .flat_map(unique)
+    .collect();
+    let count: i64 = db.query_row("SELECT count(*) FROM description_content", [], |row| {
+        row.get(0)
+    })?;
+    assert_eq!(count as usize, all_hashes.len());
+    for content_hash in &all_hashes {
+        let text: String = db.query_row(
+            "SELECT content FROM description_content WHERE hash=?",
+            [content_hash],
+            |row| row.get(0),
+        )?;
+        assert_eq!(slopdex::hash(&text), *content_hash);
+    }
+    assert!(rows.iter().all(|row| {
+        !row.to_string().contains("VECTOR_EAST")
+            && !row
+                .to_string()
+                .contains("Describe existing source code accurately")
+    }));
+    let local = Connection::open(mock.cache.path().join("artifacts.sqlite"))?;
+    let local_count: i64 = local.query_row(
+        "SELECT count(*) FROM artifacts WHERE kind='content'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(local_count, count);
     Ok(())
 }

@@ -232,7 +232,7 @@ slopdex cross-search --changed-since origin/main --threshold 0.9
 slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 0.9
 slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 slopdex cross-search --target-root /path/to/other/repo \
-  --target-index /path/to/other/repo/.slopdex/index.sqlite --threshold 0.9
+  --target-index /path/to/other/index.sqlite --threshold 0.9
 ```
 
 ### Git source selection
@@ -394,12 +394,14 @@ format and wording are not deterministic.
 
 ### SQLite authority and USearch sidecars
 
-The default database is `<root>/.slopdex/index.sqlite`. SQLite is authoritative
+The default database is `$XDG_CACHE_HOME/slopdex/workspaces/<root-hash>/index.sqlite`
+(normally `~/.cache/slopdex/...`; `<root-hash>` is SHA-256 of the canonical
+workspace path). Distinct worktrees have independent indexes. SQLite is authoritative
 for file snapshots, callable/chunk records, provenance, diagnostics, descriptions,
 document/query vectors, reusable artifacts, metadata, and cached search results.
 Native schema **3** has normalized `files`, `symbols`, `symbol_names`,
 `search_units`, `unit_embeddings`, `descriptions`, and `diagnostics` tables, plus
-`cache`, `embeddings`, `metadata`, and `search_cache`. Compatibility JSON snapshots
+`cache`, `description_content`, `embeddings`, `metadata`, and `search_cache`. Compatibility JSON snapshots
 remain alongside columns; this is not a fully deduplicated representation.
 Canonical structure and search units exist independently of semantic embeddings.
 After a map-only refresh, a semantic command's normal refresh prepares missing
@@ -410,6 +412,71 @@ of live generations and search-result caches. Completed description/embedding
 work is persisted before final live publication, so retries after an interrupted
 refresh can reuse it. Live changes update the generation and invalidate search
 results without discarding those reusable artifacts.
+
+### Shared provider artifacts
+
+An additional per-user SQLite cache at `$XDG_CACHE_HOME/slopdex/artifacts-v2.sqlite`
+shares provider artifacts across local workspaces, even when their workspace indexes
+are different. An optional S3-compatible bucket shares embeddings, file/callable
+descriptions, rerankings, and generated explanations between machines. A lookup
+checks the workspace index, then the per-user cache, then S3 (if configured),
+before calling a provider. Hits are validated and copied into the workspace index.
+The bucket stores global content-addressed objects, independent of repository
+identity. A description answer records hashes for its original system instruction,
+generation prompt, configured model profile, settings, and file-description context.
+Each distinct input is stored once by content hash in the per-user SQLite cache
+and as an S3 content object. A remote hit fetches missing referenced objects
+before using the answer; a missing object is a cache miss. S3 content objects
+are created conditionally, so repeated uploads do not create new versions of
+an existing prompt. The prompt contains
+source text (a whole file for file descriptions), so anyone with bucket access
+can read these content objects and vectors. Git metadata, search results, and USearch files are
+not uploaded.
+
+S3 is best effort: missing objects, outages, and failed uploads cannot prevent
+provider work. Missing keys are fetched with bounded concurrency (up to 10), one
+GET per object; S3 has no portable multi-key GET. Uploads follow each successful
+local write. All S3 objects under `<prefix>/v3/<kind>/<first-two-key-characters>/<key>`
+are zstd-compressed frames containing the SHA-256 checksum of the uncompressed
+payload, a newline, and the payload. This includes embeddings, description
+records and their referenced content, rerankings, and explanations; the local
+SQLite caches remain uncompressed. Earlier `v2` S3 objects are not read, and
+existing workspace artifacts can be republished under `v3` on refresh. Embedding identities distinguish
+query/document inputs, provider/model/dimensions, and custom endpoints. Description
+keys intentionally exclude paths and model settings: file keys include only the
+source-content hash and system instruction; callable keys include qualified symbol
+name, callable source hash, file-description text, and system instruction. The
+path and content hashes are saved alongside the cached answer for inspection and
+future invalidation policy. Thus a rename or model-setting change can reuse a
+matching answer, even when the prompt for a new request would differ. Existing live descriptions
+retain their normal reuse/staleness policy. Map never contacts S3. An uncached
+semantic query with `--no-reindex` may consult S3 before its provider call.
+Opening an existing workspace index also imports its valid provider artifacts into
+the per-user cache. When S3 is enabled later, the next successful semantic refresh
+uploads existing paid artifacts best effort. Legacy description keys do not match
+these relaxed keys; there is no legacy description-cache import policy.
+
+Example `.slopdex/config.json` fields (credentials come from standard AWS
+environment variables or credentials files, not this JSON):
+
+```json
+{
+  "artifactS3": {
+    "bucket": "my-slopdex-cache",
+    "region": "us-east-1",
+    "endpoint": "http://127.0.0.1:9000",
+    "pathStyle": true,
+    "prefix": "slopdex"
+  }
+}
+```
+
+`endpoint` is optional for AWS S3. S3-compatible services such as MinIO
+typically need `pathStyle: true` (the default when `endpoint` is provided).
+`artifactCachePath` optionally overrides the per-user shared SQLite cache path.
+To run the MinIO integration test against a local server with
+`minioadmin`/`minioadmin` credentials, set `SLOPDEX_MINIO_ENDPOINT` (for example,
+`SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 cargo test --test rust_integration minio_shares_artifacts`).
 
 Persistent derived indexes sit beside the database:
 `<index>.code.usearch`, `<index>.markdown.usearch`, and, when descriptions are
@@ -431,9 +498,9 @@ file/callable descriptions and saves the enabled setting; disabling stops their
 automatic generation and use in scoring while preserving reusable artifacts.
 Unchanged callable descriptions are reused. Ordinary edits refresh changed
 callables but retain existing file descriptions, which can become stale.
-`reindex-files` refreshes stale file descriptions; `--callables` also regenerates
-callable descriptions in those files. Matching cached regeneration artifacts can
-still be reused. Merely changing the configured description model does not
+`reindex-files` refreshes stale file descriptions; `--callables` also prepares
+callable descriptions in those files. Matching cached artifacts are reused,
+including when the configured model has changed. Merely changing that model does not
 regenerate all existing descriptions.
 
 File descriptions use the complete file source. Each callable request is a
@@ -479,12 +546,16 @@ rejected with instructions to remove the existing SQLite index and rebuild, or
 choose a new index path. There is no legacy import or migration, and neither
 `--force-reindex` nor `--no-reindex` bypasses old-layout rejection.
 
-For the default database, stop any Slopdex process using the index, then run from
-the repository root:
+For an old explicit database, stop any Slopdex process using it, then remove
+that database and its `-wal`/`-shm` companions. A schema-3 index at the former
+default `.slopdex/index.sqlite` is copied automatically to the new XDG default
+location on first use; older incompatible layouts are skipped and rebuilt at
+the new location. To rebuild at a fresh default location, remove the current
+index path reported by `slopdex status --format json` and its WAL/SHM companions.
+Alternatively, select a new path:
 
 ```bash
-rm -f .slopdex/index.sqlite .slopdex/index.sqlite-wal .slopdex/index.sqlite-shm
-slopdex update
+slopdex --index /path/to/new-index.sqlite update
 ```
 
 For a custom database, remove that SQLite file and its `-wal`/`-shm` companions,
@@ -538,7 +609,7 @@ The root defaults to the current directory; select another with `--root`. There
 is no automatic climb to a Git/project root. The default config is
 `<root>/.slopdex/config.json`, a JSON object; a missing file means defaults.
 `--config` selects another file. `--index` overrides `indexPath`, otherwise the
-index defaults to `<root>/.slopdex/index.sqlite`. Explicit relative config/index
+index defaults to the per-workspace XDG cache path described above. Explicit relative config/index
 paths and relative JSON `indexPath` resolve from **the process working directory**,
 not the root or config's directory.
 
@@ -577,6 +648,7 @@ Example `.slopdex/config.json`:
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel` | Disabled by default; models default to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, OpenAI `gpt-5.6-luna`. |
 | `rerankerCandidates` | OpenAI candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
+| `artifactCachePath`, `artifactS3` | Shared local cache override and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`; larger configured values are capped. Interactive setup defaults to `32`. |
 | `embeddingBaseUrl`, `descriptionBaseUrl`, `rerankerBaseUrl` | Operation-specific HTTP(S) endpoint overrides; JSON only. Include the API version, e.g. `http://localhost:8080/v1`. |
 | `providerTimeoutMs` | Positive request timeout, default `60000`, capped at `300000`; connect timeout is 10 seconds. |

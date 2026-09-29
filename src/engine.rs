@@ -10,6 +10,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::{Value, json};
 
 use crate::{
+    cache::{Artifacts, DescriptionArtifact, DescriptionGeneration},
     filter::Selection,
     git, hash, parse,
     providers::Providers,
@@ -42,6 +43,7 @@ const CALLABLE_DESCRIPTION_SYSTEM: &str = "Describe existing source code accurat
 pub struct Engine {
     root: PathBuf,
     db: Database,
+    artifacts: Artifacts,
     config: Value,
     providers: Providers,
     enabled: bool,
@@ -122,6 +124,10 @@ impl Engine {
         lock.try_lock_exclusive()
             .context("Index is in use by another slopdex command; retry when it completes")?;
         let db = Database::open(&index, &root, &Value::Null, flag(&config, "forceReindex"))?;
+        let artifacts = Artifacts::open(&config);
+        if artifacts.import_workspace(&db).is_err() {
+            ui::warning("Could not import existing artifacts into the shared cache");
+        }
         // Persisted description settings also apply when an index is moved to a
         // caller without a config file. Explicit settings still take precedence.
         if config.get("descriptionProvider").is_none()
@@ -148,6 +154,7 @@ impl Engine {
         let mut engine = Self {
             root,
             db,
+            artifacts,
             config,
             providers,
             enabled,
@@ -229,6 +236,7 @@ impl Engine {
             )?;
         }
         self.load()?;
+        self.artifacts.backfill_remote(&self.db);
         Ok(
             json!({"filesUpdated":structure["filesUpdated"],"filesDeleted":structure["filesDeleted"],
             "filesPrepared":changed.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),
@@ -493,41 +501,54 @@ impl Engine {
                 && (prepared.file.description.is_none() || prepared.regenerate_file)
                 && prepared.file.language != "markdown"
             {
-                let key = hash(
-                    json!([
-                        self.providers.llm().profile(),
-                        "file-paragraph-v1",
-                        prepared.file.path,
-                        prepared.file.hash
-                    ])
-                    .to_string(),
-                );
+                let key = hash(json!([prepared.file.hash, FILE_DESCRIPTION_SYSTEM]).to_string());
                 let prompt = format!(
                     "Describe the purpose, responsibilities, and important relationships of this existing source file in one paragraph. Do not propose changes.\nFile: {}\n\n{}",
                     prepared.file.path, prepared.file.source
                 );
-                if self.db.cache("description", &key)?.is_none() {
-                    file_jobs.insert(key.clone(), prompt);
-                }
+                file_jobs
+                    .entry(key.clone())
+                    .or_insert_with(|| DescriptionGeneration {
+                        scope: "file".into(),
+                        path: prepared.file.path.clone(),
+                        symbol: None,
+                        source_hash: prepared.file.hash.clone(),
+                        file_hash: prepared.file.hash.clone(),
+                        file_description: None,
+                        profile: self.providers.llm().profile(),
+                        settings: description_settings(&self.config),
+                        system: FILE_DESCRIPTION_SYSTEM.into(),
+                        prompt,
+                        regenerate: prepared.regenerate_file,
+                    });
                 file_assignments.push((index, key));
             }
         }
-        let jobs: Vec<_> = file_jobs.into_iter().collect();
+        self.artifacts
+            .hydrate_descriptions(&self.db, &file_jobs.keys().cloned().collect::<Vec<_>>())?;
+        let jobs = missing_jobs(&self.db, "description", file_jobs)?;
         let llm = self.providers.llm();
         run_jobs(
             "Generating file descriptions",
             &jobs,
             self.parallelism()?,
             |_| 1,
-            |(_, prompt)| llm.describe(FILE_DESCRIPTION_SYSTEM, prompt),
-            |(key, _), description| self.db.cache_put("description", key, &description),
+            |(_, generation)| llm.describe(&generation.system, &generation.prompt),
+            |(key, generation), description| {
+                let (artifact, contents) = DescriptionArtifact::new(description, generation)?;
+                let encoded = serde_json::to_string(&artifact)?;
+                self.db.put_description_artifact(key, &encoded, &contents)?;
+                self.artifacts
+                    .put_description(&self.db, key, &encoded, &contents);
+                Ok(())
+            },
         )?;
         for (index, key) in file_assignments {
-            let description = self
+            let artifact = self
                 .db
                 .cache("description", &key)?
                 .context("Missing generated file description")?;
-            prepared[index].file.description = Some(description);
+            prepared[index].file.description = Some(DescriptionArtifact::decode(&artifact)?.text);
             prepared[index].file.description_hash = Some(prepared[index].file.hash.clone());
         }
 
@@ -572,16 +593,10 @@ impl Engine {
                 {
                     let key = hash(
                         json!([
-                            self.providers.llm().profile(),
-                            "function-sentence-v1",
-                            prepared.file.path,
                             callable.qualified_name,
                             callable.source_hash,
-                            if prepared.regenerate_callables {
-                                Some(prepared.file.hash.as_str())
-                            } else {
-                                None
-                            }
+                            prepared.file.description.as_deref().unwrap_or(""),
+                            CALLABLE_DESCRIPTION_SYSTEM,
                         ])
                         .to_string(),
                     );
@@ -592,9 +607,21 @@ impl Engine {
                         callable.qualified_name,
                         callable.source
                     );
-                    if self.db.cache("description", &key)?.is_none() {
-                        description_jobs.insert(key.clone(), prompt);
-                    }
+                    description_jobs
+                        .entry(key.clone())
+                        .or_insert_with(|| DescriptionGeneration {
+                            scope: "callable".into(),
+                            path: prepared.file.path.clone(),
+                            symbol: Some(callable.qualified_name.clone()),
+                            source_hash: callable.source_hash.clone(),
+                            file_hash: prepared.file.hash.clone(),
+                            file_description: prepared.file.description.clone(),
+                            profile: self.providers.llm().profile(),
+                            settings: description_settings(&self.config),
+                            system: CALLABLE_DESCRIPTION_SYSTEM.into(),
+                            prompt,
+                            regenerate: prepared.regenerate_callables,
+                        });
                     description_assignments.push((file_index, prepared.callables.len(), key));
                 } else if !self.enabled
                     && old.is_some_and(|item| item.data["sourceHash"] != data["sourceHash"])
@@ -609,21 +636,33 @@ impl Engine {
                 });
             }
         }
-        let jobs: Vec<_> = description_jobs.into_iter().collect();
+        self.artifacts.hydrate_descriptions(
+            &self.db,
+            &description_jobs.keys().cloned().collect::<Vec<_>>(),
+        )?;
+        let jobs = missing_jobs(&self.db, "description", description_jobs)?;
         run_jobs(
             "Generating callable descriptions",
             &jobs,
             self.parallelism()?,
             |_| 1,
-            |(_, prompt)| llm.describe(CALLABLE_DESCRIPTION_SYSTEM, prompt),
-            |(key, _), description| self.db.cache_put("description", key, &description),
+            |(_, generation)| llm.describe(&generation.system, &generation.prompt),
+            |(key, generation), description| {
+                let (artifact, contents) = DescriptionArtifact::new(description, generation)?;
+                let encoded = serde_json::to_string(&artifact)?;
+                self.db.put_description_artifact(key, &encoded, &contents)?;
+                self.artifacts
+                    .put_description(&self.db, key, &encoded, &contents);
+                Ok(())
+            },
         )?;
         for (file_index, callable_index, key) in description_assignments {
-            let description = self
+            let artifact = self
                 .db
                 .cache("description", &key)?
                 .context("Missing generated callable description")?;
-            prepared[file_index].callables[callable_index].data["description"] = json!(description);
+            prepared[file_index].callables[callable_index].data["description"] =
+                json!(DescriptionArtifact::decode(&artifact)?.text);
         }
 
         let mut embedding_groups = Vec::with_capacity(prepared.len());
@@ -718,9 +757,16 @@ impl Engine {
     fn ensure_embedding_groups(&self, groups: Vec<Vec<String>>, query: bool) -> Result<()> {
         let vector = self.providers.vector();
         let profile = vector.profile();
+        let dimensions = vector.dimensions();
         let batch = vector.batch_limit();
         let mut seen = HashSet::new();
         let mut batches = Vec::new();
+        let keys: Vec<_> = groups
+            .iter()
+            .flatten()
+            .map(|input| (Database::embedding_key(&profile, query, input), dimensions))
+            .collect();
+        self.artifacts.hydrate_embeddings(&self.db, &keys)?;
         for inputs in groups {
             let mut pending = BTreeMap::new();
             for input in inputs {
@@ -748,6 +794,7 @@ impl Engine {
                 );
                 for ((key, _), vector) in entries.iter().zip(vectors) {
                     self.db.put_embedding(key, &vector)?;
+                    self.artifacts.put_embedding(&self.db, key, &vector);
                 }
                 Ok(())
             },
@@ -1064,15 +1111,29 @@ impl Engine {
                 ])
                 .to_string(),
             );
-            let ranking: Vec<(usize, f64)> =
-                if let Some(cached) = self.db.cache("rerank", &ranking_key)? {
-                    serde_json::from_str(&cached).context("Corrupt reranking artifact")?
-                } else {
-                    let ranking = self.providers.reranker()?.rerank(query, &documents)?;
-                    self.db
-                        .cache_put("rerank", &ranking_key, &serde_json::to_string(&ranking)?)?;
-                    ranking
-                };
+            self.artifacts
+                .hydrate_text(&self.db, "rerank", std::slice::from_ref(&ranking_key))?;
+            let cached: Option<Vec<(usize, f64)>> = self
+                .db
+                .cache("rerank", &ranking_key)?
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .filter(|rank: &Vec<(usize, f64)>| {
+                    rank.len() == results.len()
+                        && rank
+                            .iter()
+                            .all(|(id, score)| *id < results.len() && score.is_finite())
+                        && rank.iter().map(|(id, _)| id).collect::<HashSet<_>>().len() == rank.len()
+                });
+            let ranking: Vec<(usize, f64)> = if let Some(cached) = cached {
+                cached
+            } else {
+                let ranking = self.providers.reranker()?.rerank(query, &documents)?;
+                let text = serde_json::to_string(&ranking)?;
+                self.db.cache_put("rerank", &ranking_key, &text)?;
+                self.artifacts
+                    .put_text(&self.db, "rerank", &ranking_key, &text);
+                ranking
+            };
             results = ranking
                 .into_iter()
                 .map(|(index, score)| {
@@ -1381,11 +1442,15 @@ impl Engine {
             ])
             .to_string(),
         );
+        self.artifacts
+            .hydrate_text(&self.db, "explanation", std::slice::from_ref(&key))?;
         let description = if let Some(cached) = self.db.cache("explanation", &key)? {
             cached
         } else {
             let description = self.providers.llm().describe(system, &prompt)?;
             self.db.cache_put("explanation", &key, &description)?;
+            self.artifacts
+                .put_text(&self.db, "explanation", &key, &description);
             description
         };
         let files: Vec<_> = files
@@ -1480,6 +1545,19 @@ impl Engine {
 fn flag(value: &Value, key: &str) -> bool {
     value[key].as_bool().unwrap_or(false)
 }
+
+fn description_settings(config: &Value) -> Value {
+    json!({
+        "descriptionProvider": config["descriptionProvider"],
+        "descriptionModel": config["descriptionModel"],
+        "descriptionFallbackModel": config["descriptionFallbackModel"],
+        "fallbackModel": config["fallbackModel"],
+        "descriptionBaseUrl": config["descriptionBaseUrl"],
+        "providerTimeoutMs": config["providerTimeoutMs"],
+        "providerMaxRetries": config["providerMaxRetries"],
+        "retryDelayMs": config["retryDelayMs"],
+    })
+}
 fn heading_name(data: &Value) -> String {
     data["headingPath"]
         .as_array()
@@ -1523,6 +1601,19 @@ fn globs(value: &Value) -> Result<GlobSet> {
         }
     }
     Ok(builder.build()?)
+}
+
+fn missing_jobs<T>(
+    db: &Database,
+    kind: &str,
+    jobs: BTreeMap<String, T>,
+) -> Result<Vec<(String, T)>> {
+    jobs.into_iter()
+        .filter_map(|(key, job)| match db.cache(kind, &key) {
+            Ok(Some(_)) => None,
+            other => Some(other.map(|_| (key, job))),
+        })
+        .collect()
 }
 fn concatenate(parts: &[&[f32]]) -> Result<Vec<f32>> {
     let mut values = Vec::new();

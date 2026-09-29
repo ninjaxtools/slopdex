@@ -20,6 +20,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS embeddings(key TEXT PRIMARY KEY,vector BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS cache(kind TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(kind,key));
+CREATE TABLE IF NOT EXISTS description_content(hash TEXT PRIMARY KEY,content TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(
  path TEXT PRIMARY KEY,source TEXT NOT NULL,hash TEXT NOT NULL,language TEXT NOT NULL,
  source_mode TEXT NOT NULL,parser_version TEXT,structure_hash TEXT,data TEXT NOT NULL);
@@ -230,6 +231,42 @@ impl Database {
 
     pub fn cache_put(&self, kind: &str, key: &str, value: &str) -> Result<()> {
         self.conn.execute("INSERT INTO cache VALUES(?,?,?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value", params![kind,key,value])?;
+        Ok(())
+    }
+
+    pub(crate) fn description_content(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content FROM description_content WHERE hash=?",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn put_description_content(&self, key: &str, value: &str) -> Result<()> {
+        ensure!(hash(value) == key, "Description content hash mismatch");
+        self.conn.execute("INSERT INTO description_content VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET content=excluded.content WHERE content<>excluded.content", params![key,value])?;
+        Ok(())
+    }
+
+    pub(crate) fn put_description_artifact(
+        &self,
+        key: &str,
+        value: &str,
+        contents: &[(String, String)],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (content_hash, content) in contents {
+            ensure!(
+                hash(content) == *content_hash,
+                "Description content hash mismatch"
+            );
+            tx.execute("INSERT INTO description_content VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET content=excluded.content WHERE content<>excluded.content", params![content_hash,content])?;
+        }
+        tx.execute("INSERT INTO cache VALUES('description',?,?) ON CONFLICT(kind,key) DO UPDATE SET value=excluded.value", params![key,value])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -905,7 +942,7 @@ fn write_units(
     Ok(())
 }
 
-fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
+pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
     ensure!(
         !bytes.is_empty() && bytes.len().is_multiple_of(4),
         "Invalid stored vector length"
@@ -1355,6 +1392,7 @@ mod tests {
             tables,
             [
                 "cache",
+                "description_content",
                 "descriptions",
                 "diagnostics",
                 "embeddings",

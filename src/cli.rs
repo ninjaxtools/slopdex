@@ -1,6 +1,7 @@
 //! Command-line parsing, configuration, and presentation. Engine operations live in engine.rs.
 
 use crate::{
+    cache,
     engine::Engine,
     filter, map,
     parse::{FileStructure, StructureNode},
@@ -9,6 +10,8 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -39,7 +42,7 @@ struct Global {
     /// Config file (default: <root>/.slopdex/config.json); explicit paths are relative to cwd
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Index file; overrides config indexPath; explicit paths are relative to cwd
+    /// Index file (default: XDG cache per workspace); overrides config indexPath
     #[arg(long, global = true)]
     index: Option<PathBuf>,
     /// Embedding provider (default: openai)
@@ -609,6 +612,9 @@ pub fn run() -> Result<()> {
 
     let mut config = effective_config(&cli.global, &config_file)?;
     let index = index_path(&root, cli.global.index.as_deref(), &config)?;
+    if cli.global.index.is_none() && config["indexPath"].is_null() {
+        migrate_legacy_index(&root, &index)?;
+    }
     if let Command::Descriptions { action } = &cli.command {
         config["descriptionsEnabled"] = json!(action.enabled());
     }
@@ -815,12 +821,65 @@ fn config_path(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn index_path(root: &Path, explicit: Option<&Path>, config: &Value) -> Result<PathBuf> {
-    absolute(
-        &explicit
-            .map(Path::to_owned)
-            .or_else(|| config["indexPath"].as_str().map(PathBuf::from))
-            .unwrap_or_else(|| root.join(".slopdex/index.sqlite")),
-    )
+    if let Some(path) = explicit.or_else(|| config["indexPath"].as_str().map(Path::new)) {
+        return absolute(path);
+    }
+    let root = root
+        .canonicalize()
+        .context("Repository root does not exist")?;
+    Ok(cache::directory()?
+        .join("workspaces")
+        .join(crate::hash(root.as_os_str().as_encoded_bytes()))
+        .join("index.sqlite"))
+}
+
+/// Migrate a compatible snapshot with SQLite backup so committed WAL data is included.
+fn migrate_legacy_index(root: &Path, index: &Path) -> Result<()> {
+    let old = root.join(".slopdex/index.sqlite");
+    if index.exists() || !old.exists() || same_path(&old, index)? {
+        return Ok(());
+    }
+    let parent = index.parent().context("Index path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut lock_path = index.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(PathBuf::from(lock_path))?;
+    lock.lock_exclusive()?;
+    if index.exists() {
+        return Ok(());
+    }
+    let source = Connection::open_with_flags(&old, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let identity: String = match source.query_row(
+        "SELECT value FROM metadata WHERE key='identity'",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    if serde_json::from_str::<Value>(&identity)? != json!({"schema":3,"root":root.canonicalize()?})
+    {
+        return Ok(());
+    }
+    let temporary = parent.join(format!(".index.sqlite.migrate-{}", std::process::id()));
+    let copied = (|| -> Result<()> {
+        let mut target = Connection::open(&temporary)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut target)?;
+        backup.run_to_completion(256, std::time::Duration::from_millis(20), None)?;
+        drop(backup);
+        drop(target);
+        fs::rename(&temporary, index)?;
+        Ok(())
+    })();
+    if copied.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    copied
 }
 
 fn canonical_identity(path: &Path) -> Result<PathBuf> {
@@ -953,6 +1012,7 @@ fn validate_config(config: &Value) -> Result<()> {
     for key in [
         "model",
         "indexPath",
+        "artifactCachePath",
         "descriptionModel",
         "descriptionFallbackModel",
     ] {
@@ -1016,6 +1076,21 @@ fn validate_config(config: &Value) -> Result<()> {
                 count.as_u64().is_some_and(|n| (1..=100).contains(&n)),
                 "rerankerCandidates must be between 1 and 100"
             );
+        }
+    }
+    if let Some(s3) = config.get("artifactS3") {
+        ensure!(s3.is_object(), "artifactS3 must be an object");
+        for key in ["bucket", "endpoint", "region", "prefix"] {
+            if let Some(value) = s3.get(key) {
+                ensure!(
+                    value.as_str().is_some_and(|text| !text.trim().is_empty()),
+                    "artifactS3.{key} must be a non-empty string"
+                );
+            }
+        }
+        ensure!(s3["bucket"].is_string(), "artifactS3.bucket is required");
+        if let Some(value) = s3.get("pathStyle") {
+            ensure!(value.is_boolean(), "artifactS3.pathStyle must be a boolean");
         }
     }
     Ok(())
@@ -2903,13 +2978,20 @@ mod tests {
         write_config(&path, &config).unwrap();
         assert_eq!(read_config(&path).unwrap(), config);
         let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
         assert_eq!(
             index_path(&root, Some(Path::new("custom.sqlite")), &config).unwrap(),
             std::env::current_dir().unwrap().join("custom.sqlite")
         );
         assert_eq!(
             index_path(&root, None, &config).unwrap(),
-            root.join(".slopdex/index.sqlite")
+            cache::directory()
+                .unwrap()
+                .join("workspaces")
+                .join(crate::hash(
+                    root.canonicalize().unwrap().as_os_str().as_encoded_bytes()
+                ))
+                .join("index.sqlite")
         );
     }
 
@@ -3857,7 +3939,18 @@ mod tests {
         db.execute("INSERT INTO descriptions(scope,path,identity,source_hash,text,embedding_key) VALUES('callable','api.rs',?,?,?,NULL)",
             rusqlite::params![identity, data["sourceHash"].as_str(), "Runs work.\nReturns a result."])?;
         drop(db);
-        let engine = Engine::open_map(dir.path(), &index, json!({}))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let engine = loop {
+            match Engine::open_map(dir.path(), &index, json!({})) {
+                Err(error)
+                    if error.to_string().starts_with("Index is in use")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result?,
+            }
+        };
         let rows = engine.map(&json!({}))?;
         let mut compact = Vec::new();
         print_map(

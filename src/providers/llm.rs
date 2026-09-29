@@ -78,8 +78,15 @@ impl Configured {
 
     /// The profile identifies the configured primary, even while fallback is active.
     pub(super) fn profile<A: Adapter>(&self) -> Value {
-        json!({"provider": A::PROVIDER, "model": self.models[0],
-            "strategyVersion": "callable-purpose-v2"})
+        let mut profile = json!({"provider": A::PROVIDER, "model": self.models[0],
+            "strategyVersion": "callable-purpose-v2"});
+        if self.context.config["descriptionBaseUrl"].is_string() {
+            profile["endpoint"] = json!(self.base);
+        }
+        if self.models.len() > 1 {
+            profile["fallbackModel"] = json!(self.models[1]);
+        }
+        profile
     }
 
     /// Successful fallback remains active across calls; a failure switches back.
