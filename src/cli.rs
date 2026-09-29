@@ -4354,13 +4354,16 @@ mod tests {
     #[test]
     fn search_orders_files_by_best_rerank_score_and_keeps_individual_scores() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        fs::write(dir.path().join("a.rs"), "fn first() {}\nfn second() {}\n")?;
+        fs::write(
+            dir.path().join("a.rs"),
+            "fn first() {}\n\n\n\n\nfn second() {}\n",
+        )?;
         fs::write(dir.path().join("b.rs"), "fn other() {}\n")?;
         let index = dir.path().join("index.sqlite");
         let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
         engine.refresh_structure()?;
         let rows = vec![
-            json!({"type":"function", "similarity":0.8, "rerankScore":0.9, "function":{"path":"a.rs", "name":"second", "qualifiedName":"second", "startLine":2, "endLine":2}}),
+            json!({"type":"function", "similarity":0.8, "rerankScore":0.9, "function":{"path":"a.rs", "name":"second", "qualifiedName":"second", "startLine":6, "endLine":6}}),
             json!({"type":"function", "similarity":0.99, "rerankScore":0.7, "function":{"path":"b.rs", "name":"other", "qualifiedName":"other", "startLine":1, "endLine":1}}),
             json!({"type":"function", "similarity":0.4, "rerankScore":0.5, "function":{"path":"a.rs", "name":"first", "qualifiedName":"first", "startLine":1, "endLine":1}}),
         ];
@@ -4380,6 +4383,10 @@ mod tests {
         );
         assert!(
             output.find("fn first()").unwrap() < output.find("fn second()").unwrap(),
+            "{output}"
+        );
+        assert!(
+            output.contains("@@ 1-6 @@\nfn first()  // score=0.50 similarity=0.40\nfn second()  // score=0.90 similarity=0.80\n"),
             "{output}"
         );
         assert_eq!(output.matches("*** a.rs").count(), 1);

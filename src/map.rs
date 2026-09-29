@@ -183,11 +183,7 @@ pub fn render_with_hits(
         })
         .map(|node| node.id)
         .collect();
-    let source_lines = if nodes.first().is_some_and(|node| node.kind == "heading") {
-        source.map(|source| source.lines().collect::<Vec<_>>())
-    } else {
-        None
-    };
+    let source_lines = source.map(|source| source.lines().collect::<Vec<_>>());
     let mut output = path.map(file_header).unwrap_or_default();
     if let (Some(path), Some(description)) = (
         path,
@@ -204,6 +200,13 @@ pub fn render_with_hits(
             let previous_parent_present =
                 previous.parent_id.is_none_or(|id| by_id.contains_key(&id));
             let end = display_end(previous);
+            let nearby = end.checked_add(1) == Some(node.start_line)
+                || (matches!(node.start_line.checked_sub(end), Some(2..=5))
+                    && source_lines.as_ref().is_some_and(|lines| {
+                        lines
+                            .get(end..node.start_line - 1)
+                            .is_some_and(|gap| gap.iter().all(|line| line.trim().is_empty()))
+                    }));
             let adjacent_child = group.first().is_some_and(|parent| {
                 foldable.contains(&parent.id)
                     && node.parent_id == Some(parent.id)
@@ -221,18 +224,13 @@ pub fn render_with_hits(
                     && !foldable.contains(&node.id)
                     && if node.kind == "heading" {
                         end < node.start_line
-                            && (end + 1 == node.start_line
-                                || source_lines.as_ref().is_some_and(|lines| {
-                                    lines.get(end..node.start_line - 1).is_some_and(|gap| {
-                                        gap.iter().all(|line| line.trim().is_empty())
-                                    })
-                                }))
+                            && nearby
                             && full_structure.is_none_or(|_| {
                                 full_heading_next.get(&previous.id) == Some(&node.id)
                             })
                     } else {
                         previous.parent_id == node.parent_id
-                            && end.checked_add(1) == Some(node.start_line)
+                            && nearby
                             && full_structure
                                 .is_none_or(|_| full_next.get(&previous.id) == Some(&node.id))
                     })
@@ -677,6 +675,31 @@ mod tests {
     }
 
     #[test]
+    fn up_to_four_blank_lines_join_siblings_but_five_or_a_comment_do_not() {
+        let source = "fn first() {}\n  \nfn second() {}\n\n\nfn third() {}\n\n\n  \n\nfn fourth() {}\n\n\n\n\n\nfn fifth() {}\n// separator\nfn sixth() {}\n";
+        let structure = crate::parse::parse("api.rs", source).unwrap().structure;
+        let output = render_with_structure(
+            &structure.nodes,
+            Some("api.rs"),
+            Detail::Compact,
+            Some(source),
+            Some(&structure),
+        );
+        assert!(
+            output.contains("@@ 1-11 @@\nfn first()\nfn second()\nfn third()\nfn fourth()\n"),
+            "{output}"
+        );
+        assert!(output.contains("@@ 17 @@\nfn fifth()\n"), "{output}");
+        assert!(output.contains("@@ 19 @@\nfn sixth()\n"), "{output}");
+        assert_eq!(output.matches("@@").count(), 6, "{output}");
+
+        // Without the indexed source, the skipped line cannot be assumed blank.
+        let without_source = render_nodes(&structure.nodes, None);
+        assert!(without_source.contains("@@ 1 @@\nfn first()\n"));
+        assert!(without_source.contains("@@ 3 @@\nfn second()\n"));
+    }
+
+    #[test]
     fn adjacent_scored_nested_symbols_share_a_hunk_with_individual_scores() {
         let source = "impl Api {\n  fn run(&self) {\n    fn open() {}\n    fn frame() {}\n    fn close() {}\n  }\n}\n";
         let structure = crate::parse::parse("api.rs", source).unwrap().structure;
@@ -823,6 +846,24 @@ mod tests {
         assert!(output.contains("@@ 8 @@\n  ## More\n"), "{output}");
         assert_eq!(output.matches("# Guide").count(), 1);
         assert!(!output.contains("Read this") && !output.contains("Next section"));
+    }
+
+    #[test]
+    fn markdown_headings_follow_the_four_blank_line_limit() {
+        let source = "# First\n\n\n\n\n# Second\n\n\n\n\n\n# Third\n";
+        let structure = crate::parse::parse("guide.md", source).unwrap().structure;
+        let output = render_with_structure(
+            &structure.nodes,
+            Some("guide.md"),
+            Detail::Compact,
+            Some(source),
+            Some(&structure),
+        );
+        assert!(
+            output.contains("@@ 1-6 @@\n# First\n# Second\n"),
+            "{output}"
+        );
+        assert!(output.contains("@@ 12 @@\n# Third\n"), "{output}");
     }
 
     #[test]
