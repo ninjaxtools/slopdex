@@ -24,7 +24,7 @@ use std::{
 #[command(
     name = "slopdex",
     version,
-    about = "Semantic code and Markdown search",
+    about = "Semantic code, documentation, and configuration search",
     after_help = "Examples:\n  slopdex search \"validate an authenticated session\"\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nIndex commands refresh automatically. --no-reindex reuses the index offline."
 )]
 struct Cli {
@@ -2238,7 +2238,7 @@ fn print_search(
         out,
         rows.iter()
             .map(|row| {
-                let markdown = row["type"] == "markdown";
+                let markdown = row["type"] == "markdown" || row["type"] == "document";
                 RankedHit {
                     item: if markdown {
                         &row["chunk"]

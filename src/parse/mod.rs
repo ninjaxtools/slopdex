@@ -5,6 +5,7 @@
 //! parser initialization/failure is returned as an error.
 
 mod code;
+mod data;
 mod imports;
 mod markdown;
 mod structure;
@@ -78,17 +79,24 @@ pub fn language_for_path(path: &str) -> Option<&'static str> {
         "java" => "java",
         "c" | "h" => "c",
         "md" | "markdown" => "markdown",
+        "json" => "json",
+        "tf" | "tfvars" | "hcl" => "terraform",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "xml" | "svg" | "xsd" | "xsl" | "xslt" => "xml",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "sh" | "bash" | "zsh" => "bash",
         _ => return None,
     })
 }
 
 pub fn parse(path: &str, source: &str) -> Result<ParsedFile> {
     match language_for_path(path) {
-        Some("markdown") => Ok(ParsedFile {
-            chunks: markdown::parse(source),
-            structure: markdown::structure(source),
-            ..ParsedFile::default()
-        }),
+        Some("markdown") => markdown::parse(source),
+        Some(language @ ("json" | "terraform" | "yaml" | "toml" | "xml" | "html" | "css")) => {
+            data::parse(language, path, source)
+        }
         Some(language) => code::parse(language, path, source),
         None => Ok(ParsedFile::default()),
     }
@@ -116,6 +124,9 @@ mod tests {
             ("java", "java"),
             ("c", "c"),
             ("h", "c"),
+            ("sh", "bash"),
+            ("bash", "bash"),
+            ("zsh", "bash"),
             ("md", "markdown"),
             ("markdown", "markdown"),
         ] {
@@ -155,6 +166,7 @@ mod tests {
             ("empty.go", "// func fake() {}"),
             ("empty.java", "/* class Fake { void fake() {} } */"),
             ("empty.c", "/* int fake(void) { return 0; } */"),
+            ("empty.sh", "# function fake() { :; }"),
             ("empty.md", "<!--\n# Fake\n```\n-->"),
         ] {
             for source in ["", " \t\r\n\n", comment] {
@@ -164,7 +176,7 @@ mod tests {
                 assert!(parsed.errors.is_empty(), "{path}: {:?}", parsed.errors);
             }
         }
-        let unsupported = parse("data.json", "\0💥 function broken(").unwrap();
+        let unsupported = parse("data.txt", "\0💥 function broken(").unwrap();
         assert!(unsupported.callables.is_empty());
         assert!(unsupported.chunks.is_empty());
         assert!(unsupported.errors.is_empty());

@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
-pub const STRUCTURE_PARSER_VERSION: &str = "structure-v1";
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v3";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -786,14 +786,19 @@ fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
         });
     }
     for (ordinal, chunk) in parsed.chunks.iter().enumerate() {
+        let kind = if file.language == "markdown" {
+            "markdown"
+        } else {
+            "document"
+        };
         let mut data = serde_json::to_value(chunk)?;
         data["path"] = json!(file.path);
         data["sourceMode"] = json!(file.source_mode);
         items.push(Item {
             id: 0,
             path: file.path.clone(),
-            identity: hash(json!([file.path, "markdown", ordinal]).to_string()),
-            kind: "markdown".into(),
+            identity: hash(json!([file.path, kind, ordinal]).to_string()),
+            kind: kind.into(),
             data,
             embedding: String::new(),
             description_embedding: None,
@@ -803,6 +808,9 @@ fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
 }
 
 fn symbol_for(item: &Item, structure: &FileStructure) -> Option<usize> {
+    if item.kind == "document" {
+        return None;
+    }
     if item.kind != "markdown" {
         return map::matching_node(structure, &item.data).map(|node| node.id);
     }

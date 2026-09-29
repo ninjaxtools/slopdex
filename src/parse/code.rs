@@ -15,6 +15,7 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
         "go" => tree_sitter_go::LANGUAGE.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),
         "c" => tree_sitter_c::LANGUAGE.into(),
+        "bash" => tree_sitter_bash::LANGUAGE.into(),
         _ => tree_sitter_javascript::LANGUAGE.into(),
     };
     let mut parser = Parser::new();
@@ -548,6 +549,12 @@ impl<'tree> Collector<'_, 'tree> {
                     .child_by_field_name("declarator")
                     .and_then(|n| c_function_name(source, n))
                 {
+                    self.add_native(node, name, "function", scope, false);
+                }
+                return;
+            }
+            ("bash", "function_definition") => {
+                if let Some(name) = field(source, node, "name") {
                     self.add_native(node, name, "function", scope, false);
                 }
                 return;
@@ -1216,6 +1223,32 @@ int fallback(void) { return 0; }
             assert_eq!(
                 parsed.callables[1].signature.as_deref(),
                 Some("int (*factory(void))(int)")
+            );
+        }
+    }
+
+    #[test]
+    fn shell_functions_are_searchable_and_structured() {
+        for path in ["script.sh", "script.bash", "script.zsh"] {
+            let source =
+                "#!/bin/bash\nload() {\n  echo ready\n  nested() { :; }\n}\nfunction save { :; }\n";
+            let parsed = clean(path, source);
+            assert_eq!(
+                symbols(&parsed),
+                [
+                    ("load", "function"),
+                    ("load.nested", "function"),
+                    ("save", "function")
+                ]
+            );
+            assert_eq!(
+                parsed
+                    .structure
+                    .nodes
+                    .iter()
+                    .map(|node| node.qualified_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["load", "load.nested", "save"]
             );
         }
     }

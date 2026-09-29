@@ -1,7 +1,9 @@
-//! Heading-aware Markdown chunking.
+//! Tree-sitter Markdown headings and heading-aware search chunks.
 
-use super::{FileStructure, MarkdownChunk, StructureNode};
+use super::{FileStructure, MarkdownChunk, ParsedFile, StructureNode};
 use crate::hash;
+use anyhow::{Context, Result};
+use tree_sitter::{Node, Parser};
 
 const MARKDOWN_MAX_BYTES: usize = 8192;
 const MARKDOWN_MAX_LINES: usize = 120;
@@ -11,48 +13,162 @@ struct Heading {
     level: usize,
     title: String,
     source: String,
+    start_byte: usize,
+    start_row: usize,
+    end_row: usize,
 }
 
-fn markdown_indent(line: &str) -> Option<&str> {
-    let spaces = line.bytes().take_while(|b| *b == b' ').count();
-    (spaces <= 3).then(|| &line[spaces..])
+fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
+    source.get(node.byte_range()).unwrap_or("")
 }
 
-fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
-    let line = markdown_indent(line)?;
-    let marker = *line.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
+fn blocks(root: Node<'_>, source: &str) -> (Vec<Heading>, Vec<(usize, usize)>) {
+    let mut headings = Vec::new();
+    let mut comments = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "atx_heading" | "setext_heading" if !node.has_error() => {
+                let atx = node.kind() == "atx_heading";
+                let marker = node.named_child(0);
+                let level = if atx {
+                    marker.and_then(|m| {
+                        m.kind()
+                            .strip_prefix("atx_h")?
+                            .strip_suffix("_marker")?
+                            .parse()
+                            .ok()
+                    })
+                } else {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor)
+                        .find_map(|child| match child.kind() {
+                            "setext_h1_underline" => Some(1),
+                            "setext_h2_underline" => Some(2),
+                            _ => None,
+                        })
+                };
+                if let Some(level) = level {
+                    let content = node
+                        .child_by_field_name("heading_content")
+                        .map(|content| text(source, content).trim())
+                        .unwrap_or("");
+                    let title = if atx {
+                        let without_hashes = content.trim_end_matches('#');
+                        if without_hashes.is_empty() || without_hashes.ends_with([' ', '\t']) {
+                            without_hashes.trim_end()
+                        } else {
+                            content
+                        }
+                    } else {
+                        content
+                    };
+                    let signature = if atx {
+                        text(source, node)
+                            .trim_start_matches(' ')
+                            .trim_end_matches(['\r', '\n'])
+                            .to_owned()
+                    } else {
+                        let raw = text(source, node).trim_end_matches(['\r', '\n']);
+                        format!(
+                            "{title}\n{}",
+                            raw.rsplit('\n').next().unwrap_or("").trim_end_matches('\r')
+                        )
+                    };
+                    let end = node.end_position();
+                    headings.push(Heading {
+                        level,
+                        title: title.to_owned(),
+                        source: signature,
+                        start_byte: node.start_byte(),
+                        start_row: node.start_position().row,
+                        end_row: end.row.saturating_sub(usize::from(
+                            end.column == 0 && end.row > node.start_position().row,
+                        )),
+                    });
+                }
+                continue;
+            }
+            "html_block" if text(source, node).trim_start().starts_with("<!--") => {
+                let end = node.end_position();
+                let last = end.row.saturating_sub(usize::from(
+                    end.column == 0 && end.row > node.start_position().row,
+                ));
+                comments.push((node.start_position().row, last));
+                continue;
+            }
+            "fenced_code_block" | "indented_code_block" => continue,
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
     }
-    let length = line.bytes().take_while(|b| *b == marker).count();
-    (length >= 3).then(|| (marker, length, &line[length..]))
+    headings.sort_by_key(|heading| heading.start_byte);
+    (headings, comments)
 }
 
-fn markdown_heading(line: &str) -> Option<Heading> {
-    let source = markdown_indent(line)?;
-    let level = source.bytes().take_while(|b| *b == b'#').count();
-    if !(1..=6).contains(&level) {
-        return None;
-    }
-    let rest = &source[level..];
-    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
-        return None;
-    }
-    let title = rest.trim();
-    let without_hashes = title.trim_end_matches('#');
-    let title = if without_hashes.is_empty() || without_hashes.ends_with([' ', '\t']) {
-        without_hashes.trim_end()
-    } else {
-        title
-    };
-    Some(Heading {
-        level,
-        title: title.to_owned(),
-        source: source.to_owned(),
-    })
+/// Bounded text search units for structured data, without interpreting `#` as headings.
+pub(super) fn parse_plain(source: &str) -> Vec<MarkdownChunk> {
+    let lines: Vec<_> = source
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let mut chunks = Vec::new();
+    flush_markdown(&lines, 0, lines.len(), 0, &[], &mut chunks);
+    chunks
 }
 
-pub(super) fn parse(source: &str) -> Vec<MarkdownChunk> {
+pub(super) fn parse(source: &str) -> Result<ParsedFile> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_md_025::LANGUAGE.into())
+        .context("Cannot initialize Markdown parser")?;
+    let mut tree = parser
+        .parse(source, None)
+        .context("Cannot parse Markdown: tree-sitter returned no tree")?;
+    // The block grammar accepts a closing fence indented four columns beyond
+    // its opener. CommonMark treats it as code. Mask only those false closers
+    // and reparse with identical byte offsets, as for TypeScript grammar gaps.
+    let mut masked = source.as_bytes().to_vec();
+    loop {
+        let mut changed = false;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "fenced_code_block" {
+                let mut cursor = node.walk();
+                let fences: Vec<_> = node
+                    .children(&mut cursor)
+                    .filter(|child| child.kind() == "fenced_code_block_delimiter")
+                    .collect();
+                if let Some(closer) = fences.get(1) {
+                    let line_start = source[..closer.start_byte()]
+                        .rfind('\n')
+                        .map_or(0, |i| i + 1);
+                    let indent = source[line_start..closer.start_byte()]
+                        .bytes()
+                        .take_while(|b| *b == b' ')
+                        .count();
+                    if indent > node.start_position().column + 3
+                        && masked[closer.start_byte()] != b'X'
+                    {
+                        masked[closer.start_byte()] = b'X';
+                        changed = true;
+                    }
+                }
+                continue;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        if !changed {
+            break;
+        }
+        tree = parser
+            .parse(&masked, None)
+            .context("Cannot recover Markdown fence: tree-sitter returned no tree")?;
+    }
+    let (detected, comments) = blocks(tree.root_node(), source);
+    let structure = structure(source, &detected);
     let mut lines: Vec<&str> = source
         .split('\n')
         .map(|l| l.strip_suffix('\r').unwrap_or(l))
@@ -61,65 +177,26 @@ pub(super) fn parse(source: &str) -> Vec<MarkdownChunk> {
     let mut headings: Vec<Heading> = Vec::new();
     let mut section_start = 0;
     let mut body_start = 0;
-    let mut fence: Option<(u8, usize)> = None;
-    let mut html_comment = false;
-    // Use the same heading decisions as the canonical structure, including
-    // setext headings. Chunk size/content hashing rules remain independent.
-    let structure = structure(source);
-    let mut structural_headings = structure.nodes.iter().peekable();
-    for index in 0..lines.len() {
-        let line = lines[index];
-        if let Some((marker, length)) = fence {
-            if fence_marker(line).is_some_and(|(m, n, rest)| {
-                m == marker && n >= length && rest.trim_matches([' ', '\t']).is_empty()
-            }) {
-                fence = None;
-            }
-            continue;
+    for (start, end) in comments {
+        for line in lines.iter_mut().take(end + 1).skip(start) {
+            *line = "";
         }
-        if html_comment {
-            lines[index] = "";
-            if line.contains("-->") {
-                html_comment = false;
-            }
-            continue;
+    }
+    for heading in detected {
+        flush_markdown(
+            &lines,
+            body_start,
+            heading.start_row,
+            section_start,
+            &headings,
+            &mut chunks,
+        );
+        while headings.last().is_some_and(|h| h.level >= heading.level) {
+            headings.pop();
         }
-        if markdown_indent(line).is_some_and(|l| l.starts_with("<!--")) {
-            lines[index] = "";
-            html_comment = !line.contains("-->");
-            continue;
-        }
-        if let Some((marker, length, rest)) = fence_marker(line)
-            && (marker != b'`' || !rest.contains('`'))
-        {
-            fence = Some((marker, length));
-            continue;
-        }
-        if structural_headings.peek().is_some_and(|heading| {
-            heading.start_line + heading.signature.lines().count() - 2 == index
-        }) {
-            let node = structural_headings.next().unwrap();
-            let heading_start = node.start_line - 1;
-            let heading = Heading {
-                level: node.heading_level.unwrap(),
-                title: node.name.clone(),
-                source: node.signature.clone(),
-            };
-            flush_markdown(
-                &lines,
-                body_start,
-                heading_start,
-                section_start,
-                &headings,
-                &mut chunks,
-            );
-            while headings.last().is_some_and(|h| h.level >= heading.level) {
-                headings.pop();
-            }
-            headings.push(heading);
-            section_start = heading_start;
-            body_start = index + 1;
-        }
+        section_start = heading.start_row;
+        body_start = heading.end_row + 1;
+        headings.push(heading);
     }
     flush_markdown(
         &lines,
@@ -129,102 +206,56 @@ pub(super) fn parse(source: &str) -> Vec<MarkdownChunk> {
         &headings,
         &mut chunks,
     );
-    chunks
+    Ok(ParsedFile {
+        chunks,
+        structure,
+        ..ParsedFile::default()
+    })
 }
 
 /// Structural headings are independent of embedding chunks: no size limits,
 /// continuation chunks, or synthetic headings are introduced into this model.
-pub(super) fn structure(source: &str) -> FileStructure {
+fn structure(source: &str, headings: &[Heading]) -> FileStructure {
     let mut result = FileStructure::default();
     let mut stack: Vec<usize> = Vec::new();
-    let mut fence = None;
-    let mut html_comment = false;
-    let mut offset = 0;
-    let lines: Vec<_> = source.split_inclusive('\n').collect();
-    let mut previous: Option<(usize, usize, &str)> = None;
-    for (row, raw) in lines.iter().enumerate() {
-        let line = raw.trim_end_matches(['\r', '\n']);
-        let start_byte = offset;
-        offset += raw.len();
-        if let Some((marker, length)) = fence {
-            if fence_marker(line).is_some_and(|(m, n, rest)| {
-                m == marker && n >= length && rest.trim_matches([' ', '\t']).is_empty()
-            }) {
-                fence = None;
-            }
-            previous = None;
-            continue;
-        }
-        if html_comment {
-            if line.contains("-->") {
-                html_comment = false;
-            }
-            previous = None;
-            continue;
-        }
-        if markdown_indent(line).is_some_and(|s| s.starts_with("<!--")) {
-            html_comment = !line.contains("-->");
-            previous = None;
-            continue;
-        }
-        if let Some((marker, length, rest)) = fence_marker(line)
-            && (marker != b'`' || !rest.contains('`'))
+    for heading in headings {
+        let Heading {
+            level,
+            title,
+            source: signature,
+            start_byte: byte,
+            start_row: heading_row,
+            ..
+        } = heading;
+        while stack
+            .last()
+            .is_some_and(|id| result.nodes[*id].heading_level.unwrap() >= *level)
         {
-            fence = Some((marker, length));
-            previous = None;
-            continue;
+            let id = stack.pop().unwrap();
+            set_heading_end(&mut result.nodes[id], *byte, heading_row + 1, 1);
         }
-        let atx = markdown_heading(line).map(|h| (h.level, h.title, h.source, start_byte, row));
-        let setext = markdown_indent(line).and_then(|s| {
-            let s = s.trim_end();
-            if s.is_empty() || !s.bytes().all(|b| b == b'=') && !s.bytes().all(|b| b == b'-') {
-                return None;
-            }
-            let (byte, previous_row, title) = previous?;
-            Some((
-                if s.starts_with('=') { 1 } else { 2 },
-                title.trim().to_owned(),
-                format!("{}\n{line}", title.trim()),
-                byte,
-                previous_row,
-            ))
+        let parent_id = stack.last().copied();
+        let qualified_name = parent_id.map_or_else(
+            || title.clone(),
+            |p| format!("{}.{}", result.nodes[p].qualified_name, title),
+        );
+        let id = result.nodes.len();
+        result.nodes.push(StructureNode {
+            id,
+            parent_id,
+            language: "markdown".into(),
+            kind: "heading".into(),
+            name: title.clone(),
+            names: vec![title.clone()],
+            qualified_name,
+            signature: signature.clone(),
+            start_byte: *byte,
+            start_line: heading_row + 1,
+            start_column: 1,
+            heading_level: Some(*level),
+            ..StructureNode::default()
         });
-        if let Some((level, title, signature, byte, heading_row)) = atx.or(setext) {
-            while stack
-                .last()
-                .is_some_and(|id| result.nodes[*id].heading_level.unwrap() >= level)
-            {
-                let id = stack.pop().unwrap();
-                set_heading_end(&mut result.nodes[id], byte, heading_row + 1, 1);
-            }
-            let parent_id = stack.last().copied();
-            let qualified_name = parent_id.map_or_else(
-                || title.clone(),
-                |p| format!("{}.{}", result.nodes[p].qualified_name, title),
-            );
-            let id = result.nodes.len();
-            result.nodes.push(StructureNode {
-                id,
-                parent_id,
-                language: "markdown".into(),
-                kind: "heading".into(),
-                name: title.clone(),
-                names: vec![title],
-                qualified_name,
-                signature,
-                start_byte: byte,
-                start_line: heading_row + 1,
-                start_column: 1,
-                heading_level: Some(level),
-                ..StructureNode::default()
-            });
-            stack.push(id);
-            previous = None;
-        } else {
-            previous = markdown_indent(line)
-                .filter(|s| !s.trim().is_empty() && !s.starts_with(['>', '-', '*', '+']))
-                .map(|_| (start_byte, row, line));
-        }
+        stack.push(id);
     }
     let end_line = source.bytes().filter(|b| *b == b'\n').count() + 1;
     let end_column = source.rsplit('\n').next().unwrap_or("").len() + 1;
@@ -413,6 +444,20 @@ mod tests {
             .unwrap()
             .chunks;
         assert_eq!(chunks[0].heading_path, [""]);
+    }
+
+    #[test]
+    fn html_blocks_do_not_produce_headings() {
+        let source = "<div>\n# Hidden\n</div>\n\n# Visible\nBody\n";
+        let parsed = parse("page.md", source).unwrap();
+        let names: Vec<_> = parsed
+            .structure
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(names, ["Visible"]);
+        assert_eq!(parsed.chunks.last().unwrap().heading_path, ["Visible"]);
     }
 
     #[test]

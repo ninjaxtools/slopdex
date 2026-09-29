@@ -3671,6 +3671,55 @@ fn shared_search_globs_precede_limit_and_markdown_regexes_match_heading_paths() 
 }
 
 #[test]
+fn configuration_markup_and_shell_are_indexed_end_to_end() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(
+        "config/app.json",
+        "{\"service\": {\"port\": 8080}, \"marker\": \"VECTOR_NORTH\"}\n",
+    )?;
+    repo.write("web/index.html", "<main><h1>VECTOR_EAST</h1></main>\n")?;
+    repo.write("scripts/deploy.sh", "deploy() { echo VECTOR_MID; }\n")?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let map = engine.map(&json!({}))?;
+    assert!(map.iter().any(|file| {
+        file["path"] == "config/app.json"
+            && file["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["qualifiedName"] == "service.port")
+    }));
+    assert!(map.iter().any(|file| {
+        file["path"] == "web/index.html"
+            && file["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["qualifiedName"] == "main.h1")
+    }));
+    let results = engine.search(
+        "north",
+        "search",
+        &json!({"minSimilarity":-1,"glob":["config/**"]}),
+    )?;
+    assert!(
+        results
+            .iter()
+            .any(|row| row["type"] == "document" && row["chunk"]["path"] == "config/app.json")
+    );
+    assert!(
+        engine
+            .search("north", "search-md", &json!({"minSimilarity":-1}))?
+            .is_empty()
+    );
+    let code = engine.search("mid", "search-code", &json!({"minSimilarity":-1}))?;
+    assert_eq!(names(&code), strings(&["deploy"]));
+    Ok(())
+}
+
+#[test]
 fn shared_cross_filters_select_sources_without_filtering_targets() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;

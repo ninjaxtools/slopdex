@@ -22,7 +22,7 @@ The main supported functions are
 - `slopdex map [PATH]...`
    <br/>show a map/skeleton of the code structure
 
-`search` does a vector searche of code, and markdown, and when enabled generated code descriptions.
+`search` does a vector search of code, Markdown, configuration and markup files, and, when enabled, generated code descriptions. `map` also shows keys, blocks, elements and CSS rules in JSON, Terraform/HCL, YAML, TOML, XML, HTML and CSS; shell functions are searchable as code. See the [coverage reference](docs/reference.md#coverage-and-failures) for extensions.
 
 `cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
 

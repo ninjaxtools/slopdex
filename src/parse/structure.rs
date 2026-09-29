@@ -817,6 +817,10 @@ impl Collector<'_> {
                 "preproc_def" | "preproc_function_def" => "macro",
                 _ => return None,
             },
+            "bash" => match syntax {
+                "function_definition" => "function",
+                _ => return None,
+            },
             _ => return None,
         };
         if matches!(

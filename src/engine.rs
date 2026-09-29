@@ -279,6 +279,9 @@ impl Engine {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
+            if index_artifact(entry.path(), &self.db.path) {
+                continue;
+            }
             let relative = relative(&self.root, entry.path())?;
             if parse::language_for_path(&relative).is_none()
                 || exclude.is_match(&relative)
@@ -738,7 +741,12 @@ impl Engine {
             for (ordinal, chunk) in prepared.parsed.chunks.into_iter().enumerate() {
                 let embedding =
                     Database::embedding_key(&vector_profile, false, &chunk.embedding_input);
-                let identity = hash(json!([prepared.file.path, "markdown", ordinal]).to_string());
+                let kind = if prepared.file.language == "markdown" {
+                    "markdown"
+                } else {
+                    "document"
+                };
+                let identity = hash(json!([prepared.file.path, kind, ordinal]).to_string());
                 let mut data = serde_json::to_value(chunk)?;
                 data["path"] = json!(prepared.file.path);
                 data["sourceMode"] = json!(prepared.file.source_mode);
@@ -746,7 +754,7 @@ impl Engine {
                     id: 0,
                     path: prepared.file.path.clone(),
                     identity,
-                    kind: "markdown".into(),
+                    kind: kind.into(),
                     data,
                     embedding,
                     description_embedding: None,
@@ -910,7 +918,7 @@ impl Engine {
                 .iter()
                 .filter(|i| {
                     if kind == "markdown" {
-                        i.kind == "markdown"
+                        matches!(i.kind.as_str(), "markdown" | "document")
                     } else {
                         i.kind == "function"
                     }
@@ -1084,7 +1092,7 @@ impl Engine {
                 .items
                 .iter()
                 .filter(|i| {
-                    i.kind == "markdown"
+                    (i.kind == "markdown" || kind == "search" && !explicit && i.kind == "document")
                         && selection.path_matches(&i.path)
                         && selection.name_matches(&heading_name(&i.data))
                 })
@@ -1093,9 +1101,8 @@ impl Engine {
             for (id, similarity) in
                 self.neighbors("markdown", &vector, &allowed, candidate_limit, options)?
             {
-                results.push(
-                    json!({"type":"markdown","chunk":self.item(id)?.data,"similarity":similarity}),
-                );
+                let item = self.item(id)?;
+                results.push(json!({"type":item.kind,"chunk":item.data,"similarity":similarity}));
             }
             searching.inc(1);
         }
@@ -1413,7 +1420,7 @@ impl Engine {
         let threshold = options["describeFullFileThreshold"].as_f64().unwrap_or(0.8);
         let mut files = BTreeMap::<String, Value>::new();
         for item in &matches {
-            let data = if item["type"] == "markdown" {
+            let data = if item["type"] == "markdown" || item["type"] == "document" {
                 &item["chunk"]
             } else {
                 &item["function"]
@@ -1592,6 +1599,30 @@ impl Engine {
             .to_string_lossy()
             .replace('\\', "/"))
     }
+}
+
+/// The index may live inside the scanned root; its vector manifests are JSON.
+fn index_artifact(path: &Path, index: &Path) -> bool {
+    if path == index {
+        return true;
+    }
+    if path.parent() != index.parent() {
+        return false;
+    }
+    let Some(suffix) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(index.file_name()?.to_str()?))
+    else {
+        return false;
+    };
+    suffix == ".lock"
+        || ["code", "markdown", "descriptions", "combined"]
+            .iter()
+            .any(|role| {
+                suffix == format!(".{role}.usearch.manifest.json")
+                    || suffix == format!(".{role}.usearch")
+            })
 }
 
 fn flag(value: &Value, key: &str) -> bool {

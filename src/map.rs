@@ -28,12 +28,14 @@ pub struct HitDetails<'a> {
 pub fn comment(language: &str, description: &str) -> String {
     let description = description.trim();
     match crate::parse::language_for_path(language).unwrap_or(language) {
-        "python" => format!("# {description}"),
+        "python" | "bash" => format!("# {description}"),
         "markdown" => {
             // `--` is invalid inside HTML comments, including generated descriptions.
             format!("<!-- {} -->", description.replace("--", "- -"))
         }
-        "c" => format!("/* {description} */"),
+        "c" | "css" => format!("/* {description} */"),
+        "terraform" | "yaml" | "toml" => format!("# {description}"),
+        "xml" | "html" => format!("<!-- {} -->", description.replace("--", "- -")),
         _ => format!("// {description}"),
     }
 }

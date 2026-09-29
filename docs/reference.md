@@ -584,9 +584,16 @@ provider calls; semantic refresh can prepare embeddings later.
 ### Coverage and failures
 
 Supported extensions: TS/TSX (`ts`, `mts`, `cts`, `tsx`), JS/JSX (`js`, `mjs`,
-`cjs`, `jsx`), Python (`py`, `pyw`), Rust, Go, Java, C (`c`, `h`), and Markdown
-(`md`, `markdown`). Only recognized callables are code-search entries; Markdown
-uses bounded heading-aware chunks.
+`cjs`, `jsx`), Python (`py`, `pyw`), Rust, Go, Java, C (`c`, `h`), shell
+(`sh`, `bash`, `zsh`), Markdown
+(`md`, `markdown`), JSON (`json`), Terraform/HCL (`tf`, `tfvars`, `hcl`),
+YAML (`yaml`, `yml`), TOML (`toml`), XML (`xml`, `svg`, `xsd`, `xsl`, `xslt`),
+HTML (`html`, `htm`), and CSS (`css`). Code search indexes recognized
+callables; Markdown search uses bounded heading-aware chunks. General `search`
+also indexes bounded content chunks from configuration and markup files (JSON
+result type `document`, with `chunk` content). `search-md` / `--md` selects
+Markdown only. `map` exposes keys, sections, blocks, elements, and CSS rules
+and declarations for these formats.
 
 The ignore walker uses current root/nested `.gitignore`, Git exclude/global
 rules, and ignore-file rules, including without a Git repository. Config
