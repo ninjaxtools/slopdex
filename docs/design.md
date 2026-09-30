@@ -74,22 +74,3 @@ provider caches accelerate work but do not define the live repository snapshot.
    indexed callables, while `describe` sends search context to an LLM. `map.rs`
    renders declaration excerpts, and `callgraph.rs` expands conservatively
    resolved caller/callee context from saved structure.
-
-## Design assessment
-
-- **Good separation of authority and accelerators.** SQLite transactions publish
-  live snapshots; sidecars can be rebuilt from stored vectors, and paid model
-  artifacts survive failed refreshes. The structure-only path remains usable
-  without credentials.
-- **The engine is the coordination hotspot.** `engine.rs` owns scanning, semantic
-  preparation, vector loading, and query behavior. This keeps snapshot decisions
-  in one place, but changes to refresh or scoring need careful end-to-end review.
-- **Explicit tradeoffs.** Filesystem/HEAD validation is optimistic rather than an
-  atomic snapshot; HNSW retrieval is approximate even with exact cosine fusion.
-  Description artifact keys favor reuse across renames and model changes, so a
-  model-setting change alone does not guarantee regenerated prose. Shared remote
-  artifacts can contain source-bearing prompts, so bucket access matters.
-
-See the [command reference](reference.md) for behavior and configuration, and
-[implementation and distribution](implementation.md) for schema, cache, and
-release details.

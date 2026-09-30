@@ -88,7 +88,8 @@ fn lock_index_with_timeout(lock: &fs::File, readonly: bool, timeout: Duration) -
         };
         match result {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            // Windows reports ERROR_LOCK_VIOLATION rather than WouldBlock.
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                 if start.elapsed() >= timeout {
                     anyhow::bail!(
                         "Index is in use by another slopdex command (waited {:.2} seconds)",
@@ -1915,30 +1916,42 @@ fn run_jobs<T: Sync, R: Send>(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     #[test]
     fn contended_writer_times_out_but_readers_can_share() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("index.lock");
-        let first = fs::File::create(&path)?;
-        let second = fs::File::open(&path)?;
+        let first = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let second = OpenOptions::new().read(true).write(true).open(&path)?;
+        let writer = OpenOptions::new().read(true).write(true).open(&path)?;
         lock_index(&first, true)?;
         lock_index(&second, true)?;
-        let error = lock_index_with_timeout(&second, false, Duration::from_millis(60))
+        let error = lock_index_with_timeout(&writer, false, Duration::from_millis(60))
             .expect_err("writer must wait for other readers");
         assert!(error.to_string().contains("Index is in use"));
         drop(first);
         drop(second);
-        let writer = fs::File::open(&path)?;
         lock_index(&writer, false)?;
+        let reader = OpenOptions::new().read(true).write(true).open(&path)?;
+        let error = lock_index_with_timeout(&reader, true, Duration::from_millis(60))
+            .expect_err("reader must wait for a writer");
+        assert!(error.to_string().contains("Index is in use"));
+        drop(writer);
+        lock_index(&reader, true)?;
         Ok(())
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_absolute_source_paths_through_symlinked_root() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("repo");
