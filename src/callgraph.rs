@@ -177,6 +177,26 @@ impl CallGraph {
         }
         result
     }
+
+    /// Nodes reached by an actual edge within the requested code depths. A
+    /// node can be a seed and still be another seed's caller or callee.
+    pub fn code_keys(
+        &self,
+        expansion: &Expansion,
+        callers: usize,
+        callees: usize,
+    ) -> BTreeSet<Key> {
+        let mut result = BTreeSet::new();
+        for (key, depth) in &expansion.depths {
+            if depth.caller.is_some_and(|n| n < callers) {
+                result.extend(self.reverse.get(key).into_iter().flatten().cloned());
+            }
+            if depth.callee.is_some_and(|n| n < callees) {
+                result.extend(self.edges.get(key).into_iter().flatten().cloned());
+            }
+        }
+        result
+    }
 }
 
 fn resolve(

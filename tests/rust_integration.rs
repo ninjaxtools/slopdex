@@ -2022,7 +2022,7 @@ fn description_lifecycle_fuses_scores_preserves_stale_files_and_reindexes_on_req
 }
 
 #[test]
-fn describe_sends_expanded_search_and_thresholded_indexed_source() -> Result<()> {
+fn describe_uses_indexed_search_context_without_whole_files() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let original = format!(
@@ -2035,46 +2035,36 @@ fn describe_sends_expanded_search_and_thresholded_indexed_source() -> Result<()>
     engine.refresh()?;
     // describe must use its indexed snapshot, not a fresh read of the working tree.
     repo.write("a.rs", "fn not_indexed_yet() {}\n")?;
-    for (threshold, includes_file) in [(0.9, true), (1.0, false)] {
-        let answer = engine.describe(
-            "east",
-            &json!({"minSimilarity": 0.9,
-            "describeFullFileThreshold": threshold}),
-        )?;
-        assert!(
-            answer["description"]
-                .as_str()
-                .unwrap()
-                .starts_with("answer grounded")
-        );
-        assert_eq!(answer["query"], "east");
-        assert_eq!(answer["files"].as_array().unwrap().len(), 1);
-        assert_eq!(answer["files"][0]["path"], "a.rs");
-        assert!(answer["files"][0].get("content").is_none());
-        assert_eq!(answer["functions"][0]["qualifiedName"], "alpha");
-        assert!(answer["functions"][0].get("source").is_none());
-        assert!(answer["functions"][0].get("embeddingInput").is_none());
-        let requests = mock.requests("/responses");
-        let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+    let answer = engine.describe("east", &json!({"minSimilarity": 0.9}))?;
+    assert!(
+        answer["description"]
             .as_str()
-            .unwrap();
-        assert!(prompt.starts_with("Task: east\n\n*** a.rs\n"), "{prompt}");
-        assert!(prompt.contains("@@ 2-"), "{prompt}");
-        assert!(prompt.contains("fn alpha"), "{prompt}");
-        let separator = "@@ Full source code for best matching files provided below @@";
-        assert_eq!(prompt.contains(separator), includes_file);
-        if includes_file {
-            assert!(prompt.ends_with(&format!("*** a.rs\n{original}")));
-            assert_eq!(prompt.matches("FILE_CONTEXT_SENTINEL").count(), 1);
-        }
-        assert!(!prompt.contains("not_indexed_yet"));
-        assert!(!prompt.starts_with('{'));
-    }
+            .unwrap()
+            .starts_with("answer grounded")
+    );
+    assert_eq!(answer["query"], "east");
+    assert_eq!(answer["files"].as_array().unwrap().len(), 1);
+    assert_eq!(answer["files"][0]["path"], "a.rs");
+    assert!(answer["files"][0].get("content").is_none());
+    assert_eq!(answer["functions"][0]["qualifiedName"], "alpha");
+    assert!(answer["functions"][0].get("source").is_none());
+    assert!(answer["functions"][0].get("embeddingInput").is_none());
+    let requests = mock.requests("/responses");
+    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt.starts_with("Task: east\n\n*** a.rs\n"), "{prompt}");
+    assert!(prompt.contains("@@ 2-"), "{prompt}");
+    assert!(prompt.contains("fn alpha"), "{prompt}");
+    assert!(!prompt.contains("FILE_CONTEXT_SENTINEL"), "{prompt}");
+    assert!(!prompt.contains("Full source code for best matching files"));
+    assert!(!prompt.contains("not_indexed_yet"));
+    assert!(!prompt.starts_with('{'));
     Ok(())
 }
 
 #[test]
-fn describe_bounds_full_sources_and_keeps_other_search_skeletons() -> Result<()> {
+fn describe_keeps_search_skeletons_without_appending_large_files() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     for (path, name, size) in [
@@ -2096,16 +2086,11 @@ fn describe_bounds_full_sources_and_keeps_other_search_skeletons() -> Result<()>
         .as_str()
         .unwrap();
     assert!(prompt.len() <= 128 * 1024, "{} bytes", prompt.len());
-    let (search, full) = prompt
-        .split_once("@@ Full source code for best matching files provided below @@")
-        .context("missing full source separator")?;
     for name in ["first", "second", "third", "oversized"] {
-        assert!(search.contains(&format!("fn {name}")), "missing {name}");
+        assert!(prompt.contains(&format!("fn {name}")), "missing {name}");
     }
-    assert!(full.contains("*** a.rs\n"));
-    assert!(full.contains("*** c.rs\n"));
-    assert!(!full.contains("*** b.rs\n"));
-    assert!(!full.contains("*** z.rs\n"));
+    assert!(!prompt.contains(&"X".repeat(100)), "{prompt}");
+    assert!(!prompt.contains("Full source code for best matching files"));
     Ok(())
 }
 
@@ -2114,7 +2099,7 @@ fn describe_bounds_expanded_markdown_search_on_utf8_boundary() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let sections = (0..20)
-        .map(|index| format!("## Section {index}\nVECTOR_EAST {}\n", "📖".repeat(1100)))
+        .map(|index| format!("## Section {index}\nVECTOR_EAST {}\n", "📖".repeat(1800)))
         .collect::<String>();
     repo.write("guide.md", &format!("# Guide\n{sections}"))?;
     let mut engine = repo.open(&mock.config())?;
@@ -3323,6 +3308,287 @@ fn map_call_graph_expands_cross_file_chains_and_rebuilds_after_edits() -> Result
 }
 
 #[test]
+fn expanded_call_depths_force_code_only_within_their_own_levels() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write("a.py", "from b import middle\n\ndef outer():\n    return middle()\n\ndef outermost():\n    return outer()\n")?;
+    repo.write(
+        "b.py",
+        "from c import leaf\n\ndef middle():\n    return leaf()\n",
+    )?;
+    repo.write(
+        "c.py",
+        "from d import deepest\n\ndef leaf():\n    return deepest()\n",
+    )?;
+    repo.write("d.py", "def deepest():\n    return 1\n")?;
+    let mut engine = repo.open_map(&json!({}))?;
+    engine.refresh_structure()?;
+    let just_expanded = engine
+        .map(&json!({"kinds":["fns"],"regexp":["^middle$"],"expandCallers":2,"expandCallees":1}))?;
+    assert_eq!(
+        map_names(&just_expanded),
+        strings(&["outermost", "outer", "middle", "leaf"])
+    );
+    drop(engine);
+
+    let text = |command: &str, extra: &[&str]| -> Result<String> {
+        let output = repo
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .args(["--no-reindex", "--expand-code-threshold", "1"])
+            .arg(command)
+            .args(extra)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    let map = text(
+        "map",
+        &[
+            "b.py",
+            "-k",
+            "fns",
+            "-e",
+            "^middle$",
+            "--callers",
+            "2",
+            "--expand-callers",
+            "1",
+            "--callees",
+            "2",
+            "--expand-callees",
+            "1",
+        ],
+    )?;
+    for name in ["outermost", "outer", "middle", "leaf", "deepest"] {
+        assert!(map.contains(&format!("def {name}():")), "{map}");
+    }
+    assert!(map.contains("@ code:\ndef outer():"), "{map}");
+    assert!(map.contains("@ code:\ndef leaf():"), "{map}");
+    for name in ["outermost", "middle", "deepest"] {
+        assert!(!map.contains(&format!("@ code:\ndef {name}():")), "{map}");
+    }
+    let reversed = text(
+        "map",
+        &[
+            "b.py",
+            "-k",
+            "fns",
+            "-e",
+            "^middle$",
+            "--callers",
+            "1",
+            "--expand-callers",
+            "2",
+            "--callees",
+            "0",
+            "--expand-callees",
+            "1",
+        ],
+    )?;
+    assert!(reversed.contains("@ code:\ndef outermost():"), "{reversed}");
+    assert!(reversed.contains("@ code:\ndef leaf():"), "{reversed}");
+    assert!(!reversed.contains("def deepest():"), "{reversed}");
+    let overlapping_roots = repo.cli_json(&[
+        "map",
+        "-k",
+        "fns",
+        "-e",
+        "^outer$",
+        "-e",
+        "^middle$",
+        "--callers",
+        "0",
+        "--expand-callees",
+        "1",
+    ])?;
+    let middle = overlapping_roots
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == "b.py")
+        .context("middle file")?;
+    assert_eq!(middle["nodes"][0]["callDepth"]["callee"], 0);
+    assert_eq!(middle["nodes"][0]["expandedCode"], true);
+    assert!(
+        middle["nodes"][0]["source"]
+            .as_str()
+            .unwrap()
+            .contains("return leaf()")
+    );
+
+    repo.cli_json(&[
+        "search-code",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+    ])?;
+    let related = repo.cli_json(&[
+        "--expand-code-threshold",
+        "1",
+        "search-code",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+        "--expand-callers",
+        "1",
+        "--expand-callees",
+        "1",
+    ])?;
+    let related = related[0]["relatedCallables"].as_array().unwrap();
+    assert!(related.iter().any(|item| {
+        item["node"]["name"] == "outer"
+            && item["node"]["expandedCode"] == true
+            && item["node"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("return middle()")
+    }));
+    assert!(related.iter().any(|item| {
+        item["node"]["name"] == "leaf"
+            && item["node"]["expandedCode"] == true
+            && item["node"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("return deepest()")
+    }));
+    let search = text(
+        "search-code",
+        &[
+            "middle",
+            "-e",
+            "^middle$",
+            "--threshold",
+            "-1",
+            "--callers",
+            "2",
+            "--expand-callers",
+            "1",
+            "--callees",
+            "2",
+            "--expand-callees",
+            "1",
+        ],
+    )?;
+    assert!(search.contains("@ code:\ndef outer():"), "{search}");
+    assert!(search.contains("@ code:\ndef leaf():"), "{search}");
+    assert!(!search.contains("@ code:\ndef middle():"), "{search}");
+    assert!(!search.contains("@ code:\ndef outermost():"), "{search}");
+    assert!(!search.contains("@ code:\ndef deepest():"), "{search}");
+
+    let clusters = text(
+        "cross-search",
+        &[
+            "--lines",
+            "1",
+            "--threshold",
+            "-1",
+            "--matches",
+            "1",
+            "--expand-callers",
+            "1",
+            "--expand-callees",
+            "1",
+        ],
+    )?;
+    assert!(clusters.contains("@ code:"), "{clusters}");
+    repo.cli_json(&[
+        "describe",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+        "--expand-callers",
+        "1",
+        "--callees",
+        "0",
+        "--expand-code-threshold",
+        "1",
+    ])?;
+    let responses = mock.requests("/responses");
+    let prompt = responses.last().unwrap().body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt.contains("@ code:\ndef outer():"), "{prompt}");
+    assert!(!prompt.contains("@ code:\ndef middle():"), "{prompt}");
+    Ok(())
+}
+
+#[test]
+fn describe_prompt_defaults_to_two_expanded_call_levels_with_explicit_overrides() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write("a.py", "from b import middle\n\ndef outer():\n    return middle()\n\ndef outermost():\n    return outer()\n")?;
+    repo.write(
+        "b.py",
+        "from c import leaf\n\ndef middle():\n    return leaf()\n",
+    )?;
+    repo.write(
+        "c.py",
+        "from d import deepest\n\ndef leaf():\n    return deepest()\n",
+    )?;
+    repo.write("d.py", "def deepest():\n    return 1\n")?;
+    let base = [
+        "describe",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+        "--expand-code-threshold",
+        "1",
+    ];
+    let result = repo.cli_json(&base)?;
+    assert!(result["functions"][0].get("relatedCallables").is_none());
+    let requests = mock.requests("/responses");
+    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    for name in ["outer", "outermost", "leaf", "deepest"] {
+        assert!(
+            prompt.contains(&format!("@ code:\ndef {name}():")),
+            "{prompt}"
+        );
+    }
+    assert!(!prompt.contains("@ code:\ndef middle():"), "{prompt}");
+
+    let mut disabled = base.to_vec();
+    disabled.extend(["--expand-callers", "0", "--expand-callables", "0"]);
+    repo.cli_json(&disabled)?;
+    let requests = mock.requests("/responses");
+    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!prompt.contains("@ code:"), "{prompt}");
+
+    let mut one_callee = base.to_vec();
+    one_callee.extend(["--expand-callers", "0", "--expand-callables", "1"]);
+    repo.cli_json(&one_callee)?;
+    let requests = mock.requests("/responses");
+    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt.contains("@ code:\ndef leaf():"), "{prompt}");
+    assert!(!prompt.contains("@ code:\ndef deepest():"), "{prompt}");
+    assert!(!prompt.contains("@ code:\ndef outer():"), "{prompt}");
+    Ok(())
+}
+
+#[test]
 fn call_graph_depths_handle_cycles_and_ambiguous_calls() -> Result<()> {
     let repo = Repo::new()?;
     repo.write("chain.py", "def first():\n    return second()\n\ndef second():\n    return third()\n\ndef third():\n    return first()\n")?;
@@ -4333,7 +4599,11 @@ fn schema3_file_columns_are_authoritative_for_saved_description_context() -> Res
     let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(prompt.ends_with(&format!("*** code.rs\n{source}")));
+    assert!(
+        prompt.contains(&format!("@ code:\n{}", source.trim_end())),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("Full source code for best matching files"));
     Ok(())
 }
 

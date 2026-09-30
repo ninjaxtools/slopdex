@@ -43,10 +43,6 @@ const CALLABLE_DESCRIPTION_SYSTEM: &str = "Describe existing source code accurat
 // A byte cap is deliberately conservative even for providers with different tokenizers.
 // Leave room for the task, expanded search context, and the model's response.
 const DESCRIBE_PROMPT_BYTES: usize = 128 * 1024;
-const DESCRIBE_SEARCH_BYTES: usize = 64 * 1024;
-const DESCRIBE_SOURCE_BYTES: usize = 96 * 1024;
-const DESCRIBE_SOURCE_SEPARATOR: &str =
-    "\n@@ Full source code for best matching files provided below @@\n";
 
 pub struct Engine {
     root: PathBuf,
@@ -490,8 +486,14 @@ impl Engine {
             })
             .transpose()?
             .unwrap_or_default();
-        let callers = options["callers"].as_u64().unwrap_or(0) as usize;
-        let callees = options["callees"].as_u64().unwrap_or(0) as usize;
+        let callers = options["callers"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(options["expandCallers"].as_u64().unwrap_or(0)) as usize;
+        let callees = options["callees"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(options["expandCallees"].as_u64().unwrap_or(0)) as usize;
         let mut selected = BTreeMap::<String, Vec<parse::StructureNode>>::new();
         for path in self.db.paths()? {
             if !selection.path_matches(&path)
@@ -512,6 +514,8 @@ impl Engine {
         }
         let expansion = if callers > 0 || callees > 0 {
             let graph = self.call_graph()?;
+            let expand_callers = options["expandCallers"].as_u64().unwrap_or(0) as usize;
+            let expand_callees = options["expandCallees"].as_u64().unwrap_or(0) as usize;
             let seeds = selected.iter().flat_map(|(path, nodes)| {
                 nodes
                     .iter()
@@ -527,6 +531,7 @@ impl Engine {
                     })
             });
             let expanded = graph.expand(seeds, callers, callees);
+            let code_keys = graph.code_keys(&expanded, expand_callers, expand_callees);
             for key in expanded.depths.keys() {
                 if let Some(structure) = graph.files.get(&key.path)
                     && let Some(node) = graph.node(key)
@@ -539,7 +544,7 @@ impl Engine {
                     }
                 }
             }
-            Some(expanded)
+            Some((expanded, code_keys))
         } else {
             None
         };
@@ -552,14 +557,23 @@ impl Engine {
                     path: path.clone(),
                     id: node.id,
                 };
-                let mut value = serde_json::to_value(node)?;
+                let mut value = serde_json::to_value(&node)?;
                 value.as_object_mut().unwrap().remove("calls");
-                if let Some(expansion) = &expansion {
+                if let Some((expansion, code_keys)) = &expansion {
                     if let Some(depth) = expansion.depths.get(&key) {
                         value["callDepth"] = json!(depth);
                     }
                     if let Some(calls) = expansion.comments.get(&key) {
                         value["callees"] = json!(calls);
+                    }
+                    if code_keys.contains(&key) {
+                        value["expandedCode"] = json!(true);
+                        if let Some(code) = self
+                            .presentation_source(&path)
+                            .and_then(|source| source.get(node.start_byte..node.end_byte))
+                        {
+                            value["source"] = json!(code);
+                        }
                     }
                 }
                 values.push(value);
@@ -1573,7 +1587,6 @@ impl Engine {
 
     pub fn describe(&self, query: &str, options: &Value) -> Result<Value> {
         let matches = self.search(query, "search", options)?;
-        let threshold = options["describeFullFileThreshold"].as_f64().unwrap_or(0.8);
         let mut files = BTreeMap::<String, Value>::new();
         for item in &matches {
             let data = if item["type"] == "markdown" || item["type"] == "document" {
@@ -1595,18 +1608,25 @@ impl Engine {
         let mut prompt = format!("Task: {query}\n\n");
         let marker = "\n[Search results truncated to fit the prompt size limit]\n";
         ensure!(
-            prompt.len() + DESCRIBE_SOURCE_SEPARATOR.len() + marker.len() <= DESCRIBE_PROMPT_BYTES,
+            prompt.len() + marker.len() <= DESCRIBE_PROMPT_BYTES,
             "Describe query exceeds the prompt size limit"
         );
         let search = crate::cli::describe_search_context(
             self,
             &matches,
-            options["callers"].as_u64().unwrap_or(0) as usize,
-            options["callees"].as_u64().unwrap_or(0) as usize,
+            (options["callers"]
+                .as_u64()
+                .unwrap_or(0)
+                .max(options["expandCallers"].as_u64().unwrap_or(2))) as usize,
+            (options["callees"]
+                .as_u64()
+                .unwrap_or(0)
+                .max(options["expandCallees"].as_u64().unwrap_or(2))) as usize,
+            options["expandCallers"].as_u64().unwrap_or(2) as usize,
+            options["expandCallees"].as_u64().unwrap_or(2) as usize,
             options["expandCodeThreshold"].as_f64().unwrap_or(0.9),
         )?;
-        let search_budget = DESCRIBE_SEARCH_BYTES
-            .min(DESCRIBE_PROMPT_BYTES - prompt.len() - DESCRIBE_SOURCE_SEPARATOR.len());
+        let search_budget = DESCRIBE_PROMPT_BYTES - prompt.len();
         if search.len() <= search_budget {
             prompt.push_str(&search);
         } else {
@@ -1616,44 +1636,6 @@ impl Engine {
             }
             prompt.push_str(&search[..end]);
             prompt.push_str(marker);
-        }
-        let mut ranked: Vec<_> = files.values().collect();
-        ranked.sort_by(|a, b| {
-            score(b, "similarity")
-                .total_cmp(&score(a, "similarity"))
-                .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
-        });
-        let mut source_bytes = 0;
-        for entry in ranked {
-            if score(entry, "similarity") <= threshold {
-                continue;
-            }
-            let path = entry["path"].as_str().unwrap();
-            let source = &self.files[path].source;
-            let block = format!(
-                "{}{}{}",
-                crate::map::file_header(path),
-                source,
-                if source.ends_with('\n') { "" } else { "\n" }
-            );
-            let section = if source_bytes == 0 {
-                DESCRIBE_SOURCE_SEPARATOR.len()
-            } else {
-                1 // blank line between files
-            };
-            let bytes = block.len() + section;
-            if source_bytes + bytes > DESCRIBE_SOURCE_BYTES
-                || prompt.len() + bytes > DESCRIBE_PROMPT_BYTES
-            {
-                continue;
-            }
-            if source_bytes == 0 {
-                prompt.push_str(DESCRIBE_SOURCE_SEPARATOR);
-            } else {
-                prompt.push('\n');
-            }
-            prompt.push_str(&block);
-            source_bytes += bytes;
         }
         ui::progress("Generating explanation from search results");
         let system = "Explain the existing code and documentation relevant to the user's task using only the supplied search context. Cite paths and symbols. Do not propose an implementation. If there is insufficient context, say so.";

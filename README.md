@@ -144,7 +144,7 @@ The intention of the `describe` command is to use a low-cost model to summarise 
 $ slopdex describe "I want to implement a new rpc endpoint"
 ```
 
-The LLM receives expanded text search results followed by full-file source for matches above `--describe-full-file-threshold` (default `0.8`).
+The LLM receives expanded text search results with indexed code from callers and callees up to two edges away by default; it does not receive whole-file source.
 
 ### Find duplicate code
 

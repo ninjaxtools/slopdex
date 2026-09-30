@@ -15,7 +15,7 @@ use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::{self, IsTerminal, Write},
     path::{Component, Path, PathBuf},
@@ -276,15 +276,34 @@ struct CallArgs {
     /// Include this many levels of functions called by selected callables (expanded default: 1)
     #[arg(long)]
     callees: Option<usize>,
+    /// Include this many caller levels with full indexed code in text output
+    #[arg(long)]
+    expand_callers: Option<usize>,
+    /// Include this many callee levels with full indexed code in text output
+    #[arg(long, visible_alias = "expand-callables")]
+    expand_callees: Option<usize>,
 }
 
 impl CallArgs {
     fn resolve(self, detail: Detail) -> CallDepths {
         let default = usize::from(detail == Detail::Expanded);
+        let expand_callers = self.expand_callers.unwrap_or(0);
+        let expand_callees = self.expand_callees.unwrap_or(0);
         CallDepths {
-            callers: self.callers.unwrap_or(default),
-            callees: self.callees.unwrap_or(default),
+            callers: self.callers.unwrap_or(default).max(expand_callers),
+            callees: self.callees.unwrap_or(default).max(expand_callees),
+            expand_callers,
+            expand_callees,
         }
+    }
+
+    fn resolve_describe_context(self) -> CallDepths {
+        Self {
+            expand_callers: Some(self.expand_callers.unwrap_or(2)),
+            expand_callees: Some(self.expand_callees.unwrap_or(2)),
+            ..self
+        }
+        .resolve(Detail::Expanded)
     }
 }
 
@@ -292,6 +311,8 @@ impl CallArgs {
 struct CallDepths {
     callers: usize,
     callees: usize,
+    expand_callers: usize,
+    expand_callees: usize,
 }
 
 impl CallDepths {
@@ -321,6 +342,12 @@ impl MapArgs {
         if calls.enabled() {
             value["callers"] = json!(calls.callers);
             value["callees"] = json!(calls.callees);
+        }
+        if calls.expand_callers > 0 {
+            value["expandCallers"] = json!(calls.expand_callers);
+        }
+        if calls.expand_callees > 0 {
+            value["expandCallees"] = json!(calls.expand_callees);
         }
         value
     }
@@ -392,9 +419,6 @@ struct SearchArgs {
 struct DescribeArgs {
     #[command(flatten)]
     query: QueryArgs,
-    /// Use complete indexed files strictly above this similarity
-    #[arg(long, default_value = "0.8", allow_hyphen_values = true, value_parser = similarity)]
-    describe_full_file_threshold: f64,
 }
 
 #[derive(Debug, Args)]
@@ -818,12 +842,12 @@ pub fn run() -> Result<()> {
         }
         Command::Describe(args) => {
             let mut options = args.query.filters.options();
-            options["describeFullFileThreshold"] = json!(args.describe_full_file_threshold);
             let calls = args.query.calls.resolve(cli.global.detail);
-            if calls.enabled() {
-                options["callers"] = json!(calls.callers);
-                options["callees"] = json!(calls.callees);
-            }
+            let context = args.query.calls.resolve_describe_context();
+            options["callers"] = json!(context.callers);
+            options["callees"] = json!(context.callees);
+            options["expandCallers"] = json!(context.expand_callers);
+            options["expandCallees"] = json!(context.expand_callees);
             options["expandCodeThreshold"] = json!(cli.global.expand_code_threshold);
             let mut result = ui::spin("Generating explanation", || {
                 engine.describe(&args.query.query, &options)
@@ -1844,6 +1868,11 @@ fn print_json(out: &mut impl Write, value: &impl serde::Serialize) -> Result<()>
     Ok(())
 }
 
+fn source_code(source: &str, node: &StructureNode) -> Option<String> {
+    let code = source.get(node.start_byte..node.end_byte)?;
+    (!code.trim().is_empty()).then(|| format!("@ code:\n{code}\n"))
+}
+
 fn print_map(
     out: &mut impl Write,
     rows: &[Value],
@@ -1858,7 +1887,7 @@ fn print_map(
         let path = row["path"].as_str().context("map result is missing path")?;
         let nodes: Vec<StructureNode> = serde_json::from_value(row["nodes"].clone())
             .with_context(|| format!("decode map nodes for {path}"))?;
-        let comments: HashMap<usize, String> = array(&row["nodes"])
+        let mut extras: HashMap<usize, String> = array(&row["nodes"])
             .iter()
             .filter_map(|node| {
                 let id = usize::try_from(node["id"].as_u64()?).ok()?;
@@ -1873,6 +1902,15 @@ fn print_map(
                 ))
             })
             .collect();
+        if let Some(source) = engine.and_then(|engine| engine.presentation_source(path)) {
+            for (node, value) in nodes.iter().zip(array(&row["nodes"])) {
+                if value["expandedCode"] == true
+                    && let Some(code) = source_code(source, node)
+                {
+                    extras.entry(node.id).or_default().push_str(&code);
+                }
+            }
+        }
         let full = engine
             .map(|engine| engine.presentation_structure(path))
             .transpose()?
@@ -1906,7 +1944,7 @@ fn print_map(
                 },
                 map::HitDetails {
                     annotations: None,
-                    extras: Some(&comments),
+                    extras: Some(&extras),
                 },
             )
         )?;
@@ -1972,6 +2010,7 @@ struct Presentation<'a> {
     expand_code_threshold: f64,
     graph: Option<CallGraph>,
     expanded: Option<Expansion>,
+    force_code: BTreeSet<Key>,
 }
 
 impl<'a> Presentation<'a> {
@@ -1983,6 +2022,7 @@ impl<'a> Presentation<'a> {
             expand_code_threshold: 0.9,
             graph: None,
             expanded: None,
+            force_code: BTreeSet::new(),
         }
     }
 
@@ -2012,11 +2052,17 @@ impl<'a> Presentation<'a> {
 
     fn prepare(&mut self, functions: &[&Value]) {
         if let Some(graph) = &self.graph {
-            self.expanded = Some(graph.expand(
+            let expanded = graph.expand(
                 functions.iter().filter_map(|f| self.key(f)),
                 self.calls.callers,
                 self.calls.callees,
-            ));
+            );
+            self.force_code = graph.code_keys(
+                &expanded,
+                self.calls.expand_callers,
+                self.calls.expand_callees,
+            );
+            self.expanded = Some(expanded);
         }
     }
 
@@ -2040,12 +2086,18 @@ impl<'a> Presentation<'a> {
         similarity: Option<f64>,
         detail: Detail,
     ) -> Option<String> {
-        if detail != Detail::Expanded || similarity? <= self.expand_code_threshold {
+        let forced = self.force_code.contains(&Key {
+            path: path.to_owned(),
+            id: node.id,
+        });
+        if !forced
+            && (detail != Detail::Expanded
+                || !similarity.is_some_and(|s| s > self.expand_code_threshold))
+        {
             return None;
         }
         let source = self.engine?.presentation_source(path)?;
-        let code = source.get(node.start_byte..node.end_byte)?;
-        (!code.trim().is_empty()).then(|| format!("@ code:\n{code}\n"))
+        source_code(source, node)
     }
 
     fn related_json(&self, function: &Value) -> Vec<Value> {
@@ -2053,10 +2105,22 @@ impl<'a> Presentation<'a> {
             return Vec::new();
         };
         let expanded = graph.expand([key.clone()], self.calls.callers, self.calls.callees);
+        let code_keys = graph.code_keys(
+            &expanded,
+            self.calls.expand_callers,
+            self.calls.expand_callees,
+        );
         expanded.depths.iter().filter(|(other, _)| **other != key).filter_map(|(other, depth)| {
             let node = graph.node(other)?;
             let mut value = serde_json::to_value(node).ok()?;
             value.as_object_mut()?.remove("calls");
+            if code_keys.contains(other) {
+                value["expandedCode"] = json!(true);
+                if let Some(code) = self.engine.and_then(|engine| engine.presentation_source(&other.path))
+                    .and_then(|source| source.get(node.start_byte..node.end_byte)) {
+                    value["source"] = json!(code);
+                }
+            }
             Some(json!({"path":other.path,"node":value,"callDepth":depth,"callees":expanded.comments.get(other).cloned().unwrap_or_default()}))
         }).collect()
     }
@@ -2081,6 +2145,7 @@ impl<'a> Presentation<'a> {
             expand_code_threshold: 0.9,
             graph: None,
             expanded: None,
+            force_code: BTreeSet::new(),
         }
     }
 
@@ -2512,6 +2577,12 @@ fn print_ranked_file(
                         .or_insert_with(String::new)
                         .push_str(&comment);
                 }
+                if let Some(code) = presentation.code(path, node, None, detail) {
+                    let extra = extras.entry(key.id).or_insert_with(String::new);
+                    if !extra.contains("@ code:\n") {
+                        extra.push_str(&code);
+                    }
+                }
             }
         }
     }
@@ -2651,6 +2722,8 @@ pub(crate) fn describe_search_context(
     rows: &[Value],
     callers: usize,
     callees: usize,
+    expand_callers: usize,
+    expand_callees: usize,
     expand_code_threshold: f64,
 ) -> Result<String> {
     let mut out = Vec::new();
@@ -2662,7 +2735,12 @@ pub(crate) fn describe_search_context(
         false,
         &mut Presentation::with_calls(
             engine,
-            CallDepths { callers, callees },
+            CallDepths {
+                callers,
+                callees,
+                expand_callers,
+                expand_callees,
+            },
             expand_code_threshold,
         )?,
     )?;
@@ -3585,24 +3663,16 @@ mod tests {
                 assert!(Cli::try_parse_from(["slopdex", "cross-search", option, value]).is_err());
             }
         }
-        for value in ["NaN", "1.1", "-1.1"] {
-            assert!(
-                Cli::try_parse_from([
-                    "slopdex",
-                    "describe",
-                    "query",
-                    "--describe-full-file-threshold",
-                    value
-                ])
-                .is_err()
-            );
-        }
-        parse(&[
-            "describe",
-            "query",
-            "--describe-full-file-threshold",
-            "-0.5",
-        ]);
+        assert!(
+            Cli::try_parse_from([
+                "slopdex",
+                "describe",
+                "query",
+                "--describe-full-file-threshold",
+                "0.8"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

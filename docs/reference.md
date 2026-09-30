@@ -105,7 +105,7 @@ use plain diagnostics without animations; result data on stdout retains its
 ## Structure map
 
 ```text
-slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--callers N] [--callees N] [--detail compact|standard|expanded] [--format text|json]
+slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--format text|json]
 ```
 
 With no paths, map selects the indexed repository. Paths select files or recursive
@@ -145,6 +145,18 @@ extracted from indexed source; only uniquely resolved static targets, including
 supported explicit imports, form edges. Dynamic receivers and unresolved calls
 do not create speculative links. Run without `--no-reindex` once after upgrading
 to build the new call metadata.
+
+`--expand-callers N` and `--expand-callees N` also traverse up to N edges, and
+include the full indexed code of related callables at those depths in text output,
+regardless of `--detail` or `--expand-code-threshold`. The corresponding
+`--callers`/`--callees` depth can be higher: levels beyond the expanded depth
+still show declarations. The larger depth wins when both flags are given; a root
+that is also another root's caller or callee can receive forced code. These flags
+work wherever `--callers` and `--callees` work, including describe context and
+cross-search clusters. Map JSON and related callable JSON nodes include indexed
+`source` and `expandedCode: true` at forced-code depths alongside their existing
+`callDepth` metadata.
+`--expand-callables` is an alias for `--expand-callees`.
 
 In text output, a virtual language-specific comment directly below each caller
 identifies displayed callees by repository-relative file and qualified symbol,
@@ -404,14 +416,14 @@ with `0`.
 
 `describe` sends the query and the expanded text search output (file headers,
 declaration skeletons, scores, generated descriptions where available, and
-Markdown content) to the configured description provider. Below that output,
-`@@ Full source code for best matching files provided below @@` introduces
-complete **indexed** files, each headed by `*** <path>`. Files whose highest
-match similarity is strictly above `--describe-full-file-threshold` (default
-`0.8`) are considered in descending similarity order. The source section is
-limited to 96 KiB and the entire prompt to 128 KiB; files that do not fit are
-omitted from the source section while their search results remain in the first
-section. Expanded search output is limited to 64 KiB and marked if truncated.
+Markdown content) to the configured description provider. The prompt includes
+indexed code for callers and callees up to two edges away
+by default, even below `--expand-code-threshold`. Use `--expand-callers N` and
+`--expand-callees N` (or `--expand-callables N`) to override either depth;
+explicit `0` disables that direction's automatic code expansion. These defaults
+apply to the LLM context, not describe's JSON result or text references.
+The entire prompt is limited to 128 KiB; expanded search output is marked if
+truncated on a UTF-8 boundary. Complete files are not appended to the prompt.
 The instruction asks for an explanation of existing code/docs with paths and
 symbols, not an implementation proposal.
 

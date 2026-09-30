@@ -283,7 +283,7 @@ capped at 32. Jina uses `code.query`/`code.passage`, server truncation, and a ca
 configured dimensions per input; vectors are normalized before persistence.
 Descriptions use separate file/callable requests, with model-family protocol
 routing for OpenCode. Task explanations include saved search context and optionally
-whole indexed files; there is no whole-file-removal retry path.
+related callable code from indexed snapshots, within the prompt byte limit.
 
 Ordinary HTTP calls retry retryable transport/read failures and statuses
 408/409/425/429/500/502/503/504/529. Defaults are two retries, a 60-second request
