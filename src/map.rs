@@ -625,6 +625,17 @@ mod tests {
     }
 
     #[test]
+    fn typescript_union_branches_render_with_their_members() {
+        let source = "export type Result =\n  | { compacted: false; events: Event[] }\n  | { compacted: true; summary: string };";
+        let structure = crate::parse::parse("result.ts", source).unwrap().structure;
+        let output = render_nodes(&structure.nodes, Some("result.ts"));
+        assert_eq!(
+            output,
+            "*** result.ts\n\n@@ 1-3 @@\nexport type Result = | { compacted: false; events: Event[] } | { compacted: true; summary: string }\n"
+        );
+    }
+
+    #[test]
     fn parent_and_adjacent_methods_share_hunk_but_unverified_gaps_do_not() {
         let source = "impl Writer {\n    fn write(&mut self) {\n        do_write();\n    }\n    fn flush(&mut self) {\n        do_flush();\n    }\n\n    fn close(&mut self) {\n        do_close();\n    }\n}\n";
         let structure = crate::parse::parse("writer.rs", source).unwrap().structure;

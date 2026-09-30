@@ -346,6 +346,16 @@ impl Collector<'_> {
 
     fn walk(&mut self, node: Node<'_>, parent: Option<usize>, in_callable: bool) {
         let syntax = node.kind();
+        // These members are already present in the containing type signature.
+        // Treating them as children of the alias loses their branch context.
+        if matches!(self.language, "typescript" | "tsx")
+            && syntax == "object_type"
+            && node
+                .parent()
+                .is_some_and(|p| matches!(p.kind(), "union_type" | "intersection_type"))
+        {
+            return;
+        }
         if matches!(
             syntax,
             "comment"
@@ -1032,6 +1042,10 @@ impl Collector<'_> {
         if node != root
             && matches!(syntax, "object_type" | "interface_type" | "struct_type")
             && container(kind)
+            // Only a direct object alias has its members rendered as separate
+            // declarations. An object inside a union/intersection (or another
+            // type expression) is part of the type signature itself.
+            && (syntax != "object_type" || node.parent() == Some(root))
         {
             if let Some(body) = node.child_by_field_name("body") {
                 edits.push((body.start_byte(), body.end_byte()));

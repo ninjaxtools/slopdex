@@ -109,6 +109,36 @@ fn typescript_overloads_fields_namespaces_type_members_and_initializers() {
 }
 
 #[test]
+fn typescript_union_object_branches_remain_in_type_signatures() {
+    let source = "export type Result =\n  | { compacted: false; events: Event[] }\n  | { compacted: true; summary: string };\nexport type Event = Metadata & (\n  | { kind: 'tool'; call: TypedToolCall<Tools> }\n  | { kind: 'text'; text: string }\n);\nexport type Box = { value: { left: number } | { right: string } };\nexport type Combined = { left: number } & { right: string };";
+    for path in ["x.ts", "x.tsx"] {
+        let s = structure(path, source);
+        assert_eq!(
+            named(&s, "Result").signature,
+            "type Result = | { compacted: false; events: Event[] } | { compacted: true; summary: string }"
+        );
+        assert_eq!(
+            named(&s, "Event").signature,
+            "type Event = Metadata & ( | { kind: 'tool'; call: TypedToolCall<Tools> } | { kind: 'text'; text: string } )"
+        );
+        assert_eq!(named(&s, "Box").signature, "type Box =");
+        assert_eq!(
+            named(&s, "Box.value").signature,
+            "value: { left: number } | { right: string }"
+        );
+        assert_eq!(
+            named(&s, "Combined").signature,
+            "type Combined = { left: number } & { right: string }"
+        );
+        assert!(s.nodes.iter().all(|node| {
+            node.parent_id != Some(named(&s, "Result").id)
+                && node.parent_id != Some(named(&s, "Event").id)
+                && node.parent_id != Some(named(&s, "Combined").id)
+        }));
+    }
+}
+
+#[test]
 fn javascript_jsx_tsx_and_bound_functions() {
     for path in ["x.js", "x.jsx", "x.tsx"] {
         let s = structure(
