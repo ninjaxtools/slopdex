@@ -145,7 +145,7 @@ The intention of the `describe` command is to use a low-cost model to summarise 
 $ slopdex describe "I want to implement a new rpc endpoint"
 ```
 
-First a `search` is performed with `--detail expanded` and `--expanded-callers 2` and `--expanded-callees 2` which expands generated descriptions and function implementations in the result, which is then given to an LLM which is asked to interpret the result, and the final output will be the result of the LLM interpretation as well as the `--detail compact` results from the earlier search. This provides both a compact search result with a tailored description for the specific query based on the `expanded` search results.
+First a `search` is performed with `--detail expanded` and `--expanded-callers 2` and `--expanded-callees 2` which expands generated descriptions and function implementations in the result, which is then given to an LLM which is asked to interpret the result, and the final output will be the result of the LLM interpretation as well as the `compact` results from the earlier search. This provides a tailored description for the specific query based on the `expanded` search results as well as the `compact` version of those results.
 
 ### Find duplicate code
 
