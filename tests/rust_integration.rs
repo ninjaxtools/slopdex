@@ -3080,7 +3080,7 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
          WHEN NEW.path='code.rs' BEGIN SELECT RAISE(ABORT, 'fixture forced reindex failure'); END;",
     )?;
     drop(engine);
-    let failed = repo.cli(&["--no-reindex", "reindex-files", "--callables"])?;
+    let failed = repo.cli(&["--no-reindex", "index", "reindex-files", "--callables"])?;
     assert!(!failed.status.success());
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(
@@ -3109,7 +3109,7 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
     let calls = mock.count();
     drop(engine);
     assert_eq!(
-        repo.cli_json(&["--no-reindex", "reindex-files", "--callables"])?["filesReindexed"],
+        repo.cli_json(&["--no-reindex", "index", "reindex-files", "--callables"])?["filesReindexed"],
         1
     );
     assert_eq!(

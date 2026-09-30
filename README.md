@@ -112,21 +112,22 @@ $ export OPENAI_API_KEY="your-api-key"
 # Or
 # opencode auth login                    # use stored credentials instead of env variables
 
-$ slopdex descriptions enable
+$ slopdex config set descriptionsEnabled true
 $ slopdex search-descriptions "keep the repository index synchronized"
 ```
 
 You can list and configure one of OpenCode's models like this (or use the interactive config):
 
 ```console
-$ slopdex models opencode-go
-$ slopdex config model opencode-go/gpt-5.6-luna
-$ slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
+$ slopdex help models opencode-go
+$ slopdex config set descriptionProvider opencode-go
+$ slopdex config set descriptionModel gpt-5.6-luna
+$ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
 ```
 
 The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
 
-File and function descriptions are cached by source and description context, so renaming a file can reuse its descriptions. Function changes or a changed file-description context can require new callable descriptions. File descriptions after edits can be refreshed explicitly with `reindex-files`.
+File and function descriptions are cached by source and description context, so renaming a file can reuse its descriptions. Function changes or a changed file-description context can require new callable descriptions. File descriptions after edits can be refreshed explicitly with `index reindex-files`.
 
 ### Interactive Config
 
@@ -228,9 +229,10 @@ Optionally a second-stage reranker can be enabled for all query-search commands:
 
 ```console
 $ export COHERE_API_KEY="your-api-key"
-$ slopdex config reranker cohere
-# Or: export JINA_API_KEY="your-api-key" && slopdex config reranker jina
-# Or use an LLM: export OPENAI_API_KEY="your-api-key" && slopdex config reranker openai
+$ slopdex config set rerankerProvider cohere
+$ slopdex config set rerankingEnabled true
+# Or: export JINA_API_KEY="your-api-key" && slopdex config set rerankerProvider jina
+# Or use an LLM: export OPENAI_API_KEY="your-api-key" && slopdex config set rerankerProvider openai
 ```
 
 ### Compare repositories
@@ -246,11 +248,11 @@ Pass the target's `indexPath` from `slopdex --root /path/to/other/repo --format 
 
 ### Inspect index health
 
-If some functions can't be indexed a warning is printed. Index errors can be investigated and fixed with the `index-errors` command to ensure the index is complete.
+If some functions can't be indexed a warning is printed. Index errors can be investigated and fixed with the `index errors` command to ensure the index is complete.
 
 ```console
 $ slopdex status
-$ slopdex index-errors --format summary
+$ slopdex index errors --format summary
 $ slopdex --version
 ```
 

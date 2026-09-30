@@ -208,7 +208,7 @@ still write metadata or, for semantic operations, repair sidecars; it is not
 read-only. Map reads saved structure without provider or sidecar work.
 Offline status/cross-search use the saved native snapshot, while uncached query
 embedding/reranking and task descriptions still call providers. The CLI sets
-`noReindex` from `--no-reindex`, overriding a JSON value. `reindex-files` is an
+`noReindex` from `--no-reindex`, overriding a JSON value. `index reindex-files` is an
 explicit operation on saved source snapshots, not a new filesystem scan after
 the automatic refresh.
 

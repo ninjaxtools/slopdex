@@ -36,47 +36,45 @@ can also follow the command. Quote multiword queries.
 | --- | --- | --- |
 | `search <query>` | Search callable code, complete enabled descriptions, and Markdown together. | Summary |
 | `search-code <query>` | Search callable code. | Summary |
-| `search-descriptions <query>` | Search callable/file description fusion; descriptions must be enabled and complete. Alias: `search-description`. | Ranked declaration excerpts |
+| `search-descriptions <query>` | Search callable/file description fusion; descriptions must be enabled and complete. | Ranked declaration excerpts |
 | `search-md <query>` | Search heading-aware `.md`/`.markdown` chunks. | Ranked heading paths |
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Refresh local structure and show code declarations/Markdown headings without providers or vector sidecars. | Summary |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
-| `index-errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
-| `update` | Explicitly refresh the current working tree and Git HEAD, when available. Alias: `refresh`; `--target` accepts only `HEAD`. | JSON refresh statistics |
-| `descriptions <enable\|disable>` | Apply description state to the index and save it in config; retain reusable caches. | JSON status |
-| `reindex-files [--callables]` | Regenerate stale file descriptions from indexed source; optionally regenerate their callable descriptions too. Requires enabled descriptions. | JSON statistics |
-| `models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
-| `config [action]` | Edit root-selected configuration without opening an index; no action starts interactive setup. | Updated-setting summary |
+| `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
+| `update` | Explicitly refresh the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
+| `index reindex-files [--callables]` | Regenerate stale file descriptions from indexed source; optionally regenerate their callable descriptions too. Requires enabled descriptions. | JSON statistics |
+| `help models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
+| `config [prefix]` | Configure matching settings interactively without opening an index. | Updated-setting summary |
+| `config set <key> <value>` | Set a configuration value directly; JSON literals support booleans, numbers, arrays and objects. | Updated-setting summary |
 
-Configuration actions:
+Configuration examples:
 
 ```bash
 slopdex config
-slopdex models opencode-go
-slopdex config model opencode-go/gpt-5.6-luna
-slopdex config fallback-model opencode-go/muse-spark-1.3-contributor
-slopdex config descriptions enable
-slopdex config reranker cohere
-slopdex config reranker jina
-slopdex config reranker openai --reranker-candidates 10
-slopdex config reranker disable
-slopdex config parallelism 10
+slopdex config description
+slopdex help models opencode-go
+slopdex config set descriptionProvider opencode-go
+slopdex config set descriptionModel gpt-5.6-luna
+slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
+slopdex config set descriptionsEnabled true
+slopdex config set rerankerProvider cohere
+slopdex config set rerankingEnabled true
+slopdex config set parallelism 10
 ```
 
-`config model` and `config fallback-model` validate against published OpenCode
-catalogs. Bare IDs must resolve unambiguously; the fallback must use the configured
-description provider. `config model` changes description settings, whereas the
-global `--model` selects the embedding model. `config reranker <provider> [model]`
-accepts an optional model. `config descriptions` defers index work until the next
-index command. Interactive configuration requires terminal stdin/stderr; it asks
+`config set` validates configuration values before writing; values that are not JSON
+literals are saved as strings. The global `--model` selects the embedding model.
+Setting `descriptionsEnabled` defers index work until the next index command.
+Interactive configuration requires terminal stdin/stderr; it asks
 about descriptions, reranking, embeddings, paths, filters, and common settings.
 Use arrow keys and Enter to select providers and models; typing in an OpenCode
 model menu filters the published catalog. Saved values are preselected, numeric
 inputs validate inline, and Esc/Ctrl-C cancels without saving partial changes.
 The wizard and its saved-settings summary render on stderr, so `--format json`
 can write the resulting configuration to redirected stdout.
-Advanced endpoint/HTTP settings are edited in JSON.
+Advanced endpoint/HTTP settings can be set with `config set`.
 
 Help, version, configuration, and model-catalog commands do not refresh the index.
 Other commands open it and normally refresh before doing their work.
@@ -262,10 +260,11 @@ Examples:
 slopdex search "keep the repository index synchronized"
 slopdex search-code "configure the embedding provider"
 slopdex search-md "configure the embedding provider"
-slopdex descriptions enable --description-provider opencode-go
+slopdex config set descriptionProvider opencode-go
+slopdex config set descriptionsEnabled true
 slopdex search-descriptions "keep the repository index synchronized"
 slopdex describe "I want to implement a new rpc endpoint"
-slopdex reindex-files --callables
+slopdex index reindex-files --callables
 slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 slopdex cross-search --uncommitted --cross-file-only --threshold 0.9
 slopdex cross-search --changed-since origin/main --threshold 0.9
@@ -539,12 +538,12 @@ for transaction and sidecar publication details.
 
 ### Descriptions
 
-Descriptions are disabled initially. `descriptions enable` generates missing
+Descriptions are disabled initially. `config set descriptionsEnabled true` generates missing
 file/callable descriptions and saves the enabled setting; disabling stops their
 automatic generation and use in scoring while preserving reusable artifacts.
 Unchanged callable descriptions are reused. Ordinary edits refresh changed
 callables but retain existing file descriptions, which can become stale.
-`reindex-files` refreshes stale file descriptions; `--callables` also prepares
+`index reindex-files` refreshes stale file descriptions; `--callables` also prepares
 callable descriptions in those files. Matching cached artifacts are reused,
 including when the configured model has changed. Merely changing that model does not
 regenerate all existing descriptions.
@@ -645,7 +644,7 @@ pruned directories. Refresh removes deleted/newly excluded entries.
 
 Read/UTF-8/size failures and parser diagnostics are saved; healthy callable
 siblings remain searchable where parsing permits. `maxFileSize` defaults to
-1 MiB. `index-errors` reports path, message, source mode, and available line
+1 MiB. `index errors` reports path, message, source mode, and available line
 locations. `status` reports `indexingErrorCount` and `failedFileCount`.
 Index-using commands warn about saved errors, including with `--no-reindex` and
 for separate cross-search targets. `--ignore-errors` silences warnings without
@@ -707,7 +706,7 @@ Example `.slopdex/config.json`:
 | `providerTimeoutMs` | Positive request timeout, default `60000`, capped at `300000`; connect timeout is 10 seconds. |
 | `providerMaxRetries` | Integer `0..5`, default `2`, for ordinary retryable HTTP failures. |
 | `retryDelayMs` | Nonnegative exponential-backoff base, default `250`; delays and numeric `Retry-After` are capped at 5 seconds. |
-| `parallelism` | Defaults to `10`; bounds concurrent embedding batches and callable descriptions within each file (also `config parallelism`). File descriptions run first, files are processed serially, and each successful HTTP result is cached immediately. |
+| `parallelism` | Defaults to `10`; bounds concurrent embedding batches and callable descriptions within each file (also `config set parallelism`). File descriptions run first, files are processed serially, and each successful HTTP result is cached immediately. |
 | `verbose` | External model-call notices go to stderr once per kind/provider/model per process by default; `true` (also `--verbose`) reports every outgoing attempt, including retries. Kinds are `vectors`, `descriptions`, and `reranking`; notices identify the actual model, including fallback, without credentials, URLs, or input. Construction and cache hits produce no model-call notices. |
 
 Aliases `embeddingProvider`, `embeddingModel`, `embeddingDimensions`, and
@@ -721,7 +720,7 @@ Embedding URLs may already end in `/embeddings`; Cohere/Jina reranking URLs may
 end in `/rerank`. Description and OpenAI reranking bases receive the required
 protocol path. OpenAI descriptions use Responses; OpenCode protocol routing is
 model-dependent (Responses, Chat Completions, Messages, or Gemini). Overrides
-must serve the selected protocol. Live `models`/config catalog validation uses
+must serve the selected protocol. Live `help models`/interactive config catalog selection uses
 the public OpenCode endpoints, independently of these overrides.
 
 Credentials are resolved only when needed, in this order:

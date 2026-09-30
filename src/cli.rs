@@ -25,6 +25,7 @@ use std::{
 #[command(
     name = "slopdex",
     version,
+    disable_help_subcommand = true,
     about = "Semantic code, documentation, and configuration search",
     after_help = "Examples:\n  slopdex search \"validate an authenticated session\"\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nIndex commands refresh automatically. --no-reindex reuses the index offline."
 )]
@@ -127,7 +128,6 @@ enum Command {
     /// Search callable code only
     SearchCode(QueryArgs),
     /// Search enabled callable and file descriptions
-    #[command(alias = "search-description")]
     SearchDescriptions(QueryArgs),
     /// Search heading-aware Markdown chunks
     SearchMd(QueryArgs),
@@ -139,62 +139,40 @@ enum Command {
     Map(MapArgs),
     /// Refresh and show index metadata, counts, and profiles as JSON
     Status,
-    /// Refresh and inspect saved file/function indexing failures
-    IndexErrors,
-    /// Refresh the current working tree and Git HEAD; alias: refresh
-    #[command(alias = "refresh")]
+    /// Inspect and regenerate indexed data
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+    /// Refresh the current working tree and Git HEAD
     Update(UpdateArgs),
-    /// Enable/disable generated descriptions; preserves cached descriptions
-    Descriptions { action: Toggle },
+    /// Show command help or fetch published model catalogs
+    Help {
+        #[command(subcommand)]
+        topic: Option<HelpTopic>,
+    },
+    /// Edit configuration without opening an index; optional prefix filters interactive prompts
+    Config { args: Vec<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum IndexAction {
+    /// Refresh and inspect saved file/function indexing failures
+    Errors,
     /// Regenerate stale file descriptions, optionally including their callables
     ReindexFiles {
         #[arg(long)]
         callables: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum HelpTopic {
     /// Fetch published OpenCode model catalogs without opening an index
     Models {
         #[arg(value_parser = ["opencode", "opencode-go"])]
         provider: Option<String>,
     },
-    /// Edit configuration without opening an index; no action starts interactive setup
-    Config {
-        #[command(subcommand)]
-        action: Option<ConfigAction>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ConfigAction {
-    /// Validate and save a published OpenCode description model (bare IDs must be unambiguous)
-    Model { model: Option<String> },
-    /// Validate and save a fallback model on the configured description provider
-    FallbackModel { model: Option<String> },
-    /// Set the description state applied by the next index command
-    Descriptions { action: Toggle },
-    /// Enable a hosted/LLM reranker or disable reranking
-    Reranker {
-        #[arg(value_parser = ["cohere", "jina", "openai", "disable"])]
-        provider: String,
-        #[arg(value_parser = nonempty)]
-        model: Option<String>,
-    },
-    /// Set the positive concurrent provider-request limit
-    Parallelism {
-        #[arg(value_parser = positive)]
-        count: usize,
-    },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Toggle {
-    Enable,
-    Disable,
-}
-
-impl Toggle {
-    fn enabled(self) -> bool {
-        matches!(self, Self::Enable)
-    }
 }
 
 #[derive(Debug, Args)]
@@ -608,36 +586,11 @@ impl Cli {
                 "clusters format is only available for cross-search without --cohesion; use summary or json"
             );
         }
-        match &self.command {
-            Command::Config {
-                action: Some(ConfigAction::Model { model }),
-            } => {
-                model_reference(model.as_deref(), self.global.description_model.as_deref())?;
-            }
-            Command::Config {
-                action: Some(ConfigAction::FallbackModel { model }),
-            } => {
-                model_reference(
-                    model.as_deref(),
-                    self.global.description_fallback_model.as_deref(),
-                )?;
-            }
-            Command::Config {
-                action: Some(ConfigAction::Reranker { provider, model }),
-            } => {
-                ensure!(
-                    provider != "disable" || model.is_none(),
-                    "config reranker disable does not accept a model"
-                );
-                ensure!(
-                    provider == "openai" || self.global.reranker_candidates.is_none(),
-                    "--reranker-candidates requires config reranker openai"
-                );
-            }
-            Command::Models { provider } => {
-                self.models_provider(provider.as_deref())?;
-            }
-            _ => {}
+        if let Command::Help {
+            topic: Some(HelpTopic::Models { provider }),
+        } = &self.command
+        {
+            self.models_provider(provider.as_deref())?;
         }
         Ok(())
     }
@@ -668,7 +621,10 @@ pub fn run() -> Result<()> {
     cli.validate()?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    if let Command::Models { provider } = &cli.command {
+    if let Command::Help {
+        topic: Some(HelpTopic::Models { provider }),
+    } = &cli.command
+    {
         let models = ui::spin("Fetching published models", || {
             Providers::models(cli.models_provider(provider.as_deref())?)
         })?;
@@ -680,26 +636,30 @@ pub fn run() -> Result<()> {
         }
         return Ok(());
     }
+    if let Command::Help { topic: None } = &cli.command {
+        use clap::CommandFactory;
+        Cli::command().print_long_help()?;
+        return Ok(());
+    }
     let root = absolute(cli.global.root.as_deref().unwrap_or(Path::new(".")))?;
     let config_file = config_path(&root, cli.global.config.as_deref())?;
-    if let Command::Config { action } = &cli.command {
-        return run_config(&cli.global, &config_file, action.as_ref(), &mut out);
+    if let Command::Config { args } = &cli.command {
+        return run_config(&cli.global, &config_file, args, &mut out);
     }
 
-    let mut config = effective_config(&cli.global, &config_file)?;
+    let config = effective_config(&cli.global, &config_file)?;
     let index = index_path(&root, cli.global.index.as_deref(), &config)?;
     if cli.global.index.is_none() && config["indexPath"].is_null() {
         migrate_legacy_index(&root, &index)?;
-    }
-    if let Command::Descriptions { action } = &cli.command {
-        config["descriptionsEnabled"] = json!(action.enabled());
     }
     let is_map = matches!(&cli.command, Command::Map(_));
     let read_only_command = matches!(
         &cli.command,
         Command::Map(_)
             | Command::Status
-            | Command::IndexErrors
+            | Command::Index {
+                action: IndexAction::Errors
+            }
             | Command::Search(_)
             | Command::SearchCode(_)
             | Command::SearchDescriptions(_)
@@ -953,36 +913,22 @@ pub fn run() -> Result<()> {
             )?;
         }
         Command::Status => print_json(&mut out, &engine.status()?)?,
-        Command::IndexErrors => print_errors(&mut out, &engine.errors()?, format)?,
+        Command::Index {
+            action: IndexAction::Errors,
+        } => print_errors(&mut out, &engine.errors()?, format)?,
         Command::Update(_) => print_json(
             &mut out,
             &refreshed.unwrap_or(json!({"refreshed": false, "noReindex": true})),
         )?,
-        Command::Descriptions { action } => {
-            let result = ui::spin("Updating descriptions", || {
-                engine.set_descriptions(action.enabled())
-            })?;
-            let mut saved = read_config(&config_file)?;
-            saved["descriptionsEnabled"] = json!(action.enabled());
-            for key in [
-                "descriptionProvider",
-                "descriptionModel",
-                "descriptionFallbackModel",
-            ] {
-                if let Some(value) = config.get(key) {
-                    saved[key] = value.clone();
-                }
-            }
-            write_config(&config_file, &saved)?;
-            print_json(&mut out, &result)?;
-        }
-        Command::ReindexFiles { callables } => {
+        Command::Index {
+            action: IndexAction::ReindexFiles { callables },
+        } => {
             let result = ui::spin("Regenerating file descriptions", || {
                 engine.reindex_files(*callables)
             })?;
             print_json(&mut out, &result)?
         }
-        Command::Config { .. } | Command::Models { .. } => unreachable!(),
+        Command::Config { .. } | Command::Help { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -1311,65 +1257,6 @@ fn write_config(path: &Path, config: &Value) -> Result<()> {
     result.with_context(|| format!("save config {}", path.display()))
 }
 
-fn model_reference<'a>(positional: Option<&'a str>, option: Option<&'a str>) -> Result<&'a str> {
-    ensure!(
-        positional.is_none() || option.is_none() || positional == option,
-        "model argument and description-model option must match"
-    );
-    let reference = positional
-        .or(option)
-        .context("provide a model ID or provider/model reference")?;
-    ensure!(!reference.trim().is_empty(), "model ID must not be empty");
-    Ok(reference)
-}
-
-fn resolve_model(
-    reference: &str,
-    explicit: Option<&str>,
-    default: Option<&str>,
-) -> Result<(String, String)> {
-    let (provider, model) = if let Some((provider, model)) = reference.split_once('/') {
-        ensure!(
-            explicit.is_none_or(|explicit| explicit == provider),
-            "model reference and --description-provider must match"
-        );
-        (Some(provider), model)
-    } else {
-        (explicit.or(default), reference)
-    };
-    ensure!(!model.trim().is_empty(), "model ID must not be empty");
-    ensure!(
-        provider.is_none() || matches!(provider, Some("opencode" | "opencode-go")),
-        "config model/fallback-model catalog provider must be opencode or opencode-go"
-    );
-    let catalog = ui::spin("Fetching published models", || Providers::models(provider))?;
-    resolve_catalog_model(&catalog, provider, model)
-}
-
-fn resolve_catalog_model(
-    catalog: &Value,
-    provider: Option<&str>,
-    model: &str,
-) -> Result<(String, String)> {
-    let matches: Vec<_> = array(catalog)
-        .iter()
-        .filter(|entry| {
-            text(entry, "model") == model
-                && provider.is_none_or(|provider| text(entry, "provider") == provider)
-        })
-        .collect();
-    ensure!(
-        !matches.is_empty(),
-        "unknown published model: {}{model}",
-        provider.map(|p| format!("{p}/")).unwrap_or_default()
-    );
-    ensure!(
-        matches.len() == 1,
-        "model {model} is available from multiple providers; use provider/model"
-    );
-    Ok((text(matches[0], "provider").to_owned(), model.to_owned()))
-}
-
 fn reranker_default(provider: &str) -> &'static str {
     match provider {
         "jina" => "jina-reranker-v3.5",
@@ -1378,125 +1265,67 @@ fn reranker_default(provider: &str) -> &'static str {
     }
 }
 
-fn run_config(
-    global: &Global,
-    path: &Path,
-    action: Option<&ConfigAction>,
-    out: &mut impl Write,
-) -> Result<()> {
+fn run_config(global: &Global, path: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     let mut config = read_config(path)?;
-    let changed = match action {
-        None => {
-            ensure!(
-                io::stdin().is_terminal() && ui::terminal(),
-                "config without an action requires an interactive terminal"
-            );
-            cliclack::intro("slopdex configuration")?;
-            if let Err(error) = configure_interactively(&mut config, &mut CliclackPrompts) {
-                // cliclack 0.5.6 returns Interrupted for Esc/Ctrl-C; it does not exit.
-                if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                    matches!(
-                        error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof
-                    )
-                }) {
-                    cliclack::outro_cancel("Configuration cancelled; no settings saved")?;
-                    return Ok(());
-                }
-                cliclack::outro_cancel("Configuration failed; no settings saved")?;
-                return Err(error);
-            }
-            config.clone()
-        }
-        Some(ConfigAction::Model { model }) => {
-            let reference = model_reference(model.as_deref(), global.description_model.as_deref())?;
-            let (provider, model) =
-                resolve_model(reference, global.description_provider.as_deref(), None)?;
-            if config["descriptionProvider"].as_str().unwrap_or("openai") != provider {
-                config
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("descriptionFallbackModel");
-            }
-            config["descriptionProvider"] = json!(provider);
-            config["descriptionModel"] = json!(model);
-            json!({"descriptionProvider": provider, "descriptionModel": model})
-        }
-        Some(ConfigAction::FallbackModel { model }) => {
-            let reference = model_reference(
-                model.as_deref(),
-                global.description_fallback_model.as_deref(),
-            )?;
-            let (provider, model) = resolve_model(
-                reference,
-                global.description_provider.as_deref(),
-                config["descriptionProvider"].as_str(),
-            )?;
-            ensure!(
-                config["descriptionProvider"]
-                    .as_str()
-                    .is_none_or(|saved| saved == provider),
-                "fallback model provider must match the configured description provider"
-            );
-            config["descriptionProvider"] = json!(provider);
-            config["descriptionFallbackModel"] = json!(model);
-            json!({"descriptionProvider": provider, "descriptionFallbackModel": model})
-        }
-        Some(ConfigAction::Descriptions { action }) => {
-            config["descriptionsEnabled"] = json!(action.enabled());
-            json!({"descriptionsEnabled": action.enabled()})
-        }
-        Some(ConfigAction::Parallelism { count }) => {
-            config["parallelism"] = json!(count);
-            json!({"parallelism": count})
-        }
-        Some(ConfigAction::Reranker { provider, model }) => {
-            config["rerankingEnabled"] = json!(provider != "disable");
-            if provider == "disable" {
-                json!({"rerankingEnabled": false})
+    let interactive = args.first().is_none_or(|arg| arg != "set");
+    let changed = if !interactive {
+        ensure!(args.len() == 3, "usage: slopdex config set <key> <value>");
+        let key = &args[1];
+        ensure!(
+            key.split('.').all(|part| !part.is_empty()),
+            "config set expects a non-empty key path"
+        );
+        let value = serde_json::from_str::<Value>(&args[2]).unwrap_or_else(|_| json!(args[2]));
+        let mut target = &mut config;
+        let mut parts = key.split('.').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                target[part] = value.clone();
             } else {
-                let same = config["rerankerProvider"] == provider.as_str();
-                let model = model
-                    .as_deref()
-                    .or_else(|| {
-                        if same {
-                            config["rerankerModel"].as_str()
-                        } else {
-                            None
-                        }
-                    })
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or(reranker_default(provider))
-                    .to_owned();
-                let count = global
-                    .reranker_candidates
-                    .or_else(|| {
-                        if same {
-                            config["rerankerCandidates"].as_u64().map(|n| n as usize)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(10);
-                config["rerankerProvider"] = json!(provider);
-                config["rerankerModel"] = json!(model);
-                let mut changed = json!({"rerankingEnabled": true, "rerankerProvider": provider, "rerankerModel": model});
-                if provider == "openai" {
-                    ensure!(
-                        (1..=100).contains(&count),
-                        "rerankerCandidates must be between 1 and 100"
-                    );
-                    config["rerankerCandidates"] = json!(count);
-                    changed["rerankerCandidates"] = json!(count);
-                } else {
-                    config.as_object_mut().unwrap().remove("rerankerCandidates");
+                if target.get(part).is_none() {
+                    target[part] = json!({});
                 }
-                changed
+                ensure!(
+                    target[part].is_object(),
+                    "{part} must be an object to set {key}"
+                );
+                target = &mut target[part];
             }
         }
+        json!({key: value})
+    } else {
+        ensure!(args.len() <= 1, "usage: slopdex config [prefix]");
+        let prefix = args.first().map(String::as_str);
+        ensure!(
+            prefix.is_none_or(|prefix| CONFIG_KEYS.iter().any(|key| key.starts_with(prefix))),
+            "no configuration keys start with {}",
+            prefix.unwrap_or_default()
+        );
+        ensure!(
+            io::stdin().is_terminal() && ui::terminal(),
+            "interactive config requires a terminal"
+        );
+        cliclack::intro("slopdex configuration")?;
+        if let Err(error) =
+            configure_interactively_filtered(&mut config, &mut CliclackPrompts, prefix)
+        {
+            // cliclack 0.5.6 returns Interrupted for Esc/Ctrl-C; it does not exit.
+            if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof
+                )
+            }) {
+                cliclack::outro_cancel("Configuration cancelled; no settings saved")?;
+                return Ok(());
+            }
+            cliclack::outro_cancel("Configuration failed; no settings saved")?;
+            return Err(error);
+        }
+        config.clone()
     };
     write_config(path, &config)?;
-    if action.is_none() {
+    if interactive {
         let summary = [
             "descriptionsEnabled",
             "descriptionProvider",
@@ -1669,37 +1498,94 @@ impl Prompts for CliclackPrompts {
     }
 }
 
+const CONFIG_KEYS: &[&str] = &[
+    "descriptionsEnabled",
+    "descriptionProvider",
+    "descriptionModel",
+    "descriptionFallbackModel",
+    "rerankingEnabled",
+    "rerankerProvider",
+    "rerankerModel",
+    "rerankerCandidates",
+    "provider",
+    "model",
+    "dimensions",
+    "indexPath",
+    "include",
+    "exclude",
+    "maxFileSize",
+    "embeddingBatchSize",
+    "parallelism",
+    "verbose",
+];
+
+fn selected(prefix: Option<&str>, key: &str) -> bool {
+    prefix.is_none_or(|prefix| key.starts_with(prefix))
+}
+
+#[cfg(test)]
 fn configure_interactively(saved: &mut Value, prompts: &mut impl Prompts) -> Result<()> {
+    configure_interactively_filtered(saved, prompts, None)
+}
+
+fn configure_interactively_filtered(
+    saved: &mut Value,
+    prompts: &mut impl Prompts,
+    prefix: Option<&str>,
+) -> Result<()> {
     // Stage even alias migration locally so cancellation and validation failures
     // leave the caller's configuration untouched.
     let mut config = saved.clone();
     normalize_config_aliases(&mut config);
     let existing = config.clone();
-    let enabled = prompts.yes(
-        "Generate file and function descriptions with an LLM?",
-        existing["descriptionsEnabled"].as_bool().unwrap_or(false),
-    )?;
-    config["descriptionsEnabled"] = json!(enabled);
-    if enabled {
-        let provider = prompts.choice(
-            "Description provider",
+    if selected(prefix, "descriptionsEnabled") {
+        config["descriptionsEnabled"] = json!(prompts.yes(
+            "Generate file and function descriptions with an LLM?",
+            existing["descriptionsEnabled"].as_bool().unwrap_or(false),
+        )?);
+    }
+    if (config["descriptionsEnabled"] == true && prefix.is_none())
+        || prefix.is_some_and(|p| {
+            [
+                "descriptionProvider",
+                "descriptionModel",
+                "descriptionFallbackModel",
+            ]
+            .iter()
+            .any(|key| key.starts_with(p))
+        })
+    {
+        let provider = if selected(prefix, "descriptionProvider") {
+            prompts.choice(
+                "Description provider",
+                existing["descriptionProvider"]
+                    .as_str()
+                    .unwrap_or("opencode-go"),
+                &["opencode-go", "opencode", "openai"],
+            )?
+        } else {
             existing["descriptionProvider"]
                 .as_str()
-                .unwrap_or("opencode-go"),
-            &["opencode-go", "opencode", "openai"],
-        )?;
+                .unwrap_or("opencode-go")
+                .to_owned()
+        };
         let same = existing["descriptionProvider"] == provider;
         let current = if same {
             text(&existing, "descriptionModel")
         } else {
             ""
         };
-        let catalog = if provider == "openai" {
+        let catalog = if provider == "openai"
+            || !selected(prefix, "descriptionModel")
+                && !selected(prefix, "descriptionFallbackModel")
+        {
             None
         } else {
             Some(prompts.catalog(&provider)?)
         };
-        let model = if let Some(catalog) = &catalog {
+        let model = if !selected(prefix, "descriptionModel") {
+            current.to_owned()
+        } else if let Some(catalog) = &catalog {
             prompts.published(catalog, &provider, "Description model", current, None)?
         } else {
             prompts.required(
@@ -1711,12 +1597,18 @@ fn configure_interactively(saved: &mut Value, prompts: &mut impl Prompts) -> Res
                 },
             )?
         };
-        config["descriptionProvider"] = json!(provider);
-        config["descriptionModel"] = json!(model);
-        if prompts.yes(
-            "Configure a fallback description model?",
-            existing.get("descriptionFallbackModel").is_some(),
-        )? {
+        if selected(prefix, "descriptionProvider") {
+            config["descriptionProvider"] = json!(provider);
+        }
+        if selected(prefix, "descriptionModel") {
+            config["descriptionModel"] = json!(model);
+        }
+        if selected(prefix, "descriptionFallbackModel")
+            && prompts.yes(
+                "Configure a fallback description model?",
+                existing.get("descriptionFallbackModel").is_some(),
+            )?
+        {
             let current = if same {
                 text(&existing, "descriptionFallbackModel")
             } else {
@@ -1734,24 +1626,43 @@ fn configure_interactively(saved: &mut Value, prompts: &mut impl Prompts) -> Res
                 prompts.required("Fallback description model", current)?
             };
             config["descriptionFallbackModel"] = json!(fallback);
-        } else {
+        } else if selected(prefix, "descriptionFallbackModel") {
             config
                 .as_object_mut()
                 .unwrap()
                 .remove("descriptionFallbackModel");
         }
     }
-    let reranking = prompts.yes(
-        "Enable second-stage reranking for searches?",
-        existing["rerankingEnabled"].as_bool().unwrap_or(false),
-    )?;
-    config["rerankingEnabled"] = json!(reranking);
-    if reranking {
-        let provider = prompts.choice(
-            "Reranker provider",
-            existing["rerankerProvider"].as_str().unwrap_or("cohere"),
-            &["cohere", "jina", "openai"],
-        )?;
+    let reranking = if selected(prefix, "rerankingEnabled") {
+        prompts.yes(
+            "Enable second-stage reranking for searches?",
+            existing["rerankingEnabled"].as_bool().unwrap_or(false),
+        )?
+    } else {
+        existing["rerankingEnabled"].as_bool().unwrap_or(false)
+    };
+    if selected(prefix, "rerankingEnabled") {
+        config["rerankingEnabled"] = json!(reranking);
+    }
+    if (reranking && prefix.is_none())
+        || prefix.is_some_and(|p| {
+            ["rerankerProvider", "rerankerModel", "rerankerCandidates"]
+                .iter()
+                .any(|key| key.starts_with(p))
+        })
+    {
+        let provider = if selected(prefix, "rerankerProvider") {
+            prompts.choice(
+                "Reranker provider",
+                existing["rerankerProvider"].as_str().unwrap_or("cohere"),
+                &["cohere", "jina", "openai"],
+            )?
+        } else {
+            existing["rerankerProvider"]
+                .as_str()
+                .unwrap_or("cohere")
+                .to_owned()
+        };
         let same = existing["rerankerProvider"] == provider;
         let default = if same {
             existing["rerankerModel"]
@@ -1760,28 +1671,38 @@ fn configure_interactively(saved: &mut Value, prompts: &mut impl Prompts) -> Res
         } else {
             reranker_default(&provider)
         };
-        config["rerankerModel"] = json!(prompts.required("Reranker model", default)?);
-        config["rerankerProvider"] = json!(provider);
-        if provider == "openai" {
+        if selected(prefix, "rerankerModel") {
+            config["rerankerModel"] = json!(prompts.required("Reranker model", default)?);
+        }
+        if selected(prefix, "rerankerProvider") {
+            config["rerankerProvider"] = json!(provider);
+        }
+        if provider == "openai" || (prefix.is_some() && selected(prefix, "rerankerCandidates")) {
             let default = if same {
                 existing["rerankerCandidates"].as_u64().unwrap_or(10)
             } else {
                 10
             };
-            config["rerankerCandidates"] = json!(prompts.number(
-                "Embedding-ranked reranker candidates",
-                default,
-                Some(100)
-            )?);
-        } else {
+            if selected(prefix, "rerankerCandidates") {
+                config["rerankerCandidates"] = json!(prompts.number(
+                    "Embedding-ranked reranker candidates",
+                    default,
+                    Some(100)
+                )?);
+            }
+        } else if selected(prefix, "rerankerProvider") {
             config.as_object_mut().unwrap().remove("rerankerCandidates");
         }
     }
-    let provider = prompts.choice(
-        "Embedding provider",
-        existing["provider"].as_str().unwrap_or("openai"),
-        &["openai", "jina"],
-    )?;
+    let provider = if selected(prefix, "provider") {
+        prompts.choice(
+            "Embedding provider",
+            existing["provider"].as_str().unwrap_or("openai"),
+            &["openai", "jina"],
+        )?
+    } else {
+        existing["provider"].as_str().unwrap_or("openai").to_owned()
+    };
     let same = existing["provider"].as_str().unwrap_or("openai") == provider;
     let (model, dimensions) = if provider == "jina" {
         ("jina-embeddings-v4", 1024)
@@ -1798,22 +1719,33 @@ fn configure_interactively(saved: &mut Value, prompts: &mut impl Prompts) -> Res
     } else {
         dimensions
     };
-    config["provider"] = json!(provider);
-    config["model"] = json!(prompts.required("Embedding model", model)?);
-    config["dimensions"] = json!(prompts.number("Embedding dimensions", dimensions, None)?);
-    let index = prompts.ask(
-        "Index path (enter '-' for default)",
-        text(&existing, "indexPath"),
-    )?;
-    if index.is_empty() || index == "-" {
-        config.as_object_mut().unwrap().remove("indexPath");
-    } else {
-        config["indexPath"] = json!(index);
+    if selected(prefix, "provider") {
+        config["provider"] = json!(provider);
+    }
+    if selected(prefix, "model") {
+        config["model"] = json!(prompts.required("Embedding model", model)?);
+    }
+    if selected(prefix, "dimensions") {
+        config["dimensions"] = json!(prompts.number("Embedding dimensions", dimensions, None)?);
+    }
+    if selected(prefix, "indexPath") {
+        let index = prompts.ask(
+            "Index path (enter '-' for default)",
+            text(&existing, "indexPath"),
+        )?;
+        if index.is_empty() || index == "-" {
+            config.as_object_mut().unwrap().remove("indexPath");
+        } else {
+            config["indexPath"] = json!(index);
+        }
     }
     for (key, label) in [
         ("include", "Include globs"),
         ("exclude", "Additional exclude globs"),
     ] {
+        if !selected(prefix, key) {
+            continue;
+        }
         let default = array(&existing[key])
             .iter()
             .filter_map(Value::as_str)
@@ -1836,13 +1768,18 @@ fn configure_interactively(saved: &mut Value, prompts: &mut impl Prompts) -> Res
         ("embeddingBatchSize", "Embedding batch size", 32),
         ("parallelism", "Concurrent provider request limit", 10),
     ] {
+        if !selected(prefix, key) {
+            continue;
+        }
         config[key] =
             json!(prompts.number(label, existing[key].as_u64().unwrap_or(default), None)?);
     }
-    config["verbose"] = json!(prompts.yes(
-        "Log every external model request?",
-        existing["verbose"].as_bool().unwrap_or(false)
-    )?);
+    if selected(prefix, "verbose") {
+        config["verbose"] = json!(prompts.yes(
+            "Log every external model request?",
+            existing["verbose"].as_bool().unwrap_or(false)
+        )?);
+    }
     validate_config(&config)?;
     *saved = config;
     Ok(())
@@ -1853,7 +1790,7 @@ fn warn_errors(engine: &Engine, index: &Path, ignore: bool) -> Result<()> {
         let errors = engine.errors()?;
         if !errors.is_empty() {
             ui::warning(format!(
-                "slopdex: {} saved indexing error(s) in {}; inspect with index-errors",
+                "slopdex: {} saved indexing error(s) in {}; inspect with index errors",
                 errors.len(),
                 index.display()
             ));
@@ -3437,17 +3374,18 @@ mod tests {
             vec!["search", "keep the repository index synchronized"],
             vec!["search-code", "configure the embedding provider"],
             vec!["search-md", "configure the embedding provider"],
-            vec!["descriptions", "enable"],
+            vec!["config", "set", "descriptionsEnabled", "true"],
             vec![
                 "search-descriptions",
                 "keep the repository index synchronized",
             ],
-            vec!["models", "opencode-go"],
-            vec!["config", "model", "opencode-go/gpt-5.6-luna"],
+            vec!["help", "models", "opencode-go"],
+            vec!["config", "set", "descriptionModel", "gpt-5.6-luna"],
             vec![
                 "config",
-                "fallback-model",
-                "opencode-go/muse-spark-1.3-contributor",
+                "set",
+                "descriptionFallbackModel",
+                "muse-spark-1.3-contributor",
             ],
             vec!["config"],
             vec!["describe", "I want to implement a new rpc endpoint"],
@@ -3501,9 +3439,9 @@ mod tests {
             ],
             vec!["search", "...", "--threshold", "0.5"],
             vec!["cross-search", "--uncommitted", "--threshold", "0.8"],
-            vec!["config", "reranker", "cohere"],
-            vec!["config", "reranker", "jina"],
-            vec!["config", "reranker", "openai"],
+            vec!["config", "set", "rerankerProvider", "cohere"],
+            vec!["config", "set", "rerankerProvider", "jina"],
+            vec!["config", "set", "rerankerProvider", "openai"],
             vec![
                 "cross-search",
                 "--target-root",
@@ -3514,7 +3452,7 @@ mod tests {
                 "0.9",
             ],
             vec!["status"],
-            vec!["index-errors", "--format", "summary"],
+            vec!["index", "errors", "--format", "summary"],
         ] {
             parse(&args);
         }
@@ -3690,9 +3628,7 @@ mod tests {
             vec!["search", "query", "--format", "clusters"],
             vec!["map", "--format", "clusters"],
             vec!["cross-search", "--cohesion", "--format", "clusters"],
-            vec!["config", "model"],
-            vec!["config", "fallback-model"],
-            vec!["config", "reranker", "disable", "unexpected-model"],
+            vec!["help", "models", "--description-provider", "openai"],
         ] {
             let cli = Cli::try_parse_from(std::iter::once("slopdex").chain(args)).unwrap();
             assert!(cli.validate().is_err());
@@ -3706,27 +3642,14 @@ mod tests {
             "--format",
             "json",
         ]);
-        parse(&[
-            "config",
-            "model",
-            "--description-provider",
-            "opencode-go",
-            "--description-model",
-            "model",
-        ]);
-        parse(&[
-            "config",
-            "reranker",
-            "openai",
-            "--reranker-candidates",
-            "100",
-        ]);
+        parse(&["config", "set", "descriptionModel", "model"]);
+        parse(&["config", "set", "rerankerCandidates", "100"]);
         parse(&[
             "update",
             "--force-reindex",
             "--yes-really-rebuild-the-index",
         ]);
-        parse(&["reindex-files", "--callables"]);
+        parse(&["index", "reindex-files", "--callables"]);
         parse(&["search", "query", "--code", "--md", "--regex", "foo"]);
     }
 
@@ -3790,27 +3713,6 @@ mod tests {
         let row: Value = serde_json::from_str(output.trim()).unwrap();
         assert_eq!(row["matches"][0]["function"]["id"], "d");
         assert_eq!(row["matches"][1]["function"]["id"], "c");
-    }
-
-    #[test]
-    fn catalog_resolution_rejects_unknown_and_ambiguous_models() {
-        let catalog = json!([
-            {"provider": "opencode", "model": "shared"},
-            {"provider": "opencode-go", "model": "shared"},
-            {"provider": "opencode-go", "model": "unique"}
-        ]);
-        assert!(resolve_catalog_model(&catalog, None, "shared").is_err());
-        assert!(resolve_catalog_model(&catalog, None, "missing").is_err());
-        assert_eq!(
-            resolve_catalog_model(&catalog, None, "unique").unwrap(),
-            ("opencode-go".into(), "unique".into())
-        );
-        assert_eq!(
-            resolve_catalog_model(&catalog, Some("opencode"), "shared")
-                .unwrap()
-                .0,
-            "opencode"
-        );
     }
 
     #[test]
@@ -4210,25 +4112,74 @@ mod tests {
     }
 
     #[test]
-    fn config_subcommands_keep_json_stdout_machine_readable() {
+    fn config_set_keeps_json_stdout_machine_readable() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.json");
         write_config(&path, &json!({"custom": "keep"})).unwrap();
         for args in [
-            vec!["config", "descriptions", "enable", "--format", "json"],
-            vec!["config", "parallelism", "4", "--format", "json"],
-            vec!["config", "reranker", "openai", "--format", "json"],
+            vec![
+                "config",
+                "set",
+                "descriptionsEnabled",
+                "true",
+                "--format",
+                "json",
+            ],
+            vec!["config", "set", "parallelism", "4", "--format", "json"],
+            vec![
+                "config",
+                "set",
+                "rerankerProvider",
+                "openai",
+                "--format",
+                "json",
+            ],
         ] {
             let cli = parse(&args);
-            let Command::Config { action } = cli.command else {
+            let Command::Config { args } = cli.command else {
                 panic!()
             };
             let mut out = Vec::new();
-            run_config(&cli.global, &path, action.as_ref(), &mut out).unwrap();
+            run_config(&cli.global, &path, &args, &mut out).unwrap();
             let result: Value = serde_json::from_slice(&out).unwrap();
             assert_eq!(result["configPath"], json!(path));
             assert_eq!(read_config(&path).unwrap()["custom"], "keep");
         }
+    }
+
+    #[test]
+    fn filtered_config_prompts_only_matching_keys() {
+        let mut config =
+            json!({"descriptionProvider": "openai", "descriptionModel": "old", "parallelism": 3});
+        let mut prompts = ScriptedPrompts::new("new\n");
+        configure_interactively_filtered(&mut config, &mut prompts, Some("descriptionModel"))
+            .unwrap();
+        assert_eq!(config["descriptionModel"], "new");
+        assert_eq!(config["descriptionProvider"], "openai");
+        assert_eq!(config["parallelism"], 3);
+        let mut prompts = ScriptedPrompts::new("7\n");
+        configure_interactively_filtered(&mut config, &mut prompts, Some("parallel")).unwrap();
+        assert_eq!(config["parallelism"], 7);
+    }
+
+    #[test]
+    fn config_set_supports_nested_values_and_rejects_invalid_values_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        let result =
+            config_action_json(&path, &["config", "set", "artifactS3.bucket", "my-bucket"]);
+        assert_eq!(result["artifactS3.bucket"], "my-bucket");
+        assert_eq!(
+            read_config(&path).unwrap()["artifactS3"]["bucket"],
+            "my-bucket"
+        );
+        let original = fs::read(&path).unwrap();
+        let cli = parse(&["config", "set", "parallelism", "0"]);
+        let Command::Config { args } = cli.command else {
+            panic!()
+        };
+        assert!(run_config(&cli.global, &path, &args, &mut Vec::new()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]
@@ -4260,8 +4211,15 @@ mod tests {
     fn invalid_config_settings_cannot_partially_persist_a_config_action() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.json");
-        let cli = parse(&["config", "descriptions", "enable", "--format", "json"]);
-        let Command::Config { action } = cli.command else {
+        let cli = parse(&[
+            "config",
+            "set",
+            "descriptionsEnabled",
+            "true",
+            "--format",
+            "json",
+        ]);
+        let Command::Config { args } = cli.command else {
             panic!()
         };
         let mut cases = Vec::new();
@@ -4314,7 +4272,7 @@ mod tests {
             let original = serde_json::to_vec(&config).unwrap();
             fs::write(&path, &original).unwrap();
             let mut out = Vec::new();
-            let error = run_config(&cli.global, &path, action.as_ref(), &mut out).unwrap_err();
+            let error = run_config(&cli.global, &path, &args, &mut out).unwrap_err();
             assert!(format!("{error:#}").contains(key), "{key}: {error:#}");
             assert!(out.is_empty(), "reported success for invalid {key}");
             assert_eq!(fs::read(&path).unwrap(), original, "modified invalid {key}");
@@ -4345,11 +4303,11 @@ mod tests {
 
     fn config_action_json(path: &Path, args: &[&str]) -> Value {
         let cli = parse(&[args, &["--format", "json"]].concat());
-        let Command::Config { action } = cli.command else {
+        let Command::Config { args } = cli.command else {
             panic!()
         };
         let mut out = Vec::new();
-        run_config(&cli.global, path, action.as_ref(), &mut out).unwrap();
+        run_config(&cli.global, path, &args, &mut out).unwrap();
         serde_json::from_slice(&out).unwrap()
     }
 
@@ -4370,6 +4328,7 @@ mod tests {
             &path,
             &[
                 "config",
+                "set",
                 "parallelism",
                 "4",
                 "--provider",
@@ -4388,7 +4347,7 @@ mod tests {
         // Inspect raw JSON: read_config would hide aliases accidentally left on disk.
         let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved, expected);
-        config_action_json(&path, &["config", "parallelism", "4"]);
+        config_action_json(&path, &["config", "set", "parallelism", "4"]);
         assert_eq!(
             serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
             expected
@@ -4400,7 +4359,7 @@ mod tests {
     }
 
     #[test]
-    fn reranker_config_transitions_retain_same_provider_settings_and_reset_on_switch() {
+    fn config_set_preserves_other_settings_and_accepts_json_values() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.json");
         write_config(
@@ -4410,24 +4369,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config_action_json(&path, &["config", "reranker", "disable"]),
+            config_action_json(&path, &["config", "set", "rerankingEnabled", "false"]),
             json!({"configPath": path, "rerankingEnabled": false})
         );
         let disabled = read_config(&path).unwrap();
         assert_eq!(disabled["rerankerModel"], "custom-model");
         assert_eq!(disabled["rerankerCandidates"], 37);
-        let enabled = config_action_json(&path, &["config", "reranker", "openai"]);
-        assert_eq!(enabled["rerankingEnabled"], true);
-        assert_eq!(enabled["rerankerModel"], "custom-model");
-        assert_eq!(enabled["rerankerCandidates"], 37);
-        config_action_json(&path, &["config", "reranker", "jina"]);
-        let switched = read_config(&path).unwrap();
-        assert_eq!(switched["rerankerModel"], "jina-reranker-v3.5");
-        assert!(switched.get("rerankerCandidates").is_none());
-        config_action_json(&path, &["config", "reranker", "openai", "replacement"]);
+        config_action_json(&path, &["config", "set", "include", "[\"src/**\"]"]);
+        config_action_json(&path, &["config", "set", "rerankerModel", "replacement"]);
         let restored = read_config(&path).unwrap();
         assert_eq!(restored["rerankerModel"], "replacement");
-        assert_eq!(restored["rerankerCandidates"], 10);
+        assert_eq!(restored["rerankerCandidates"], 37);
+        assert_eq!(restored["include"], json!(["src/**"]));
         assert_eq!(restored["custom"], "keep");
     }
 
@@ -4513,14 +4466,10 @@ mod tests {
             vec!["search", " \n\t"],
             vec!["status", "--model", " "],
             vec!["status", "--dimensions", "18446744073709551616"],
-            vec!["config", "parallelism", "0"],
-            vec![
-                "config",
-                "reranker",
-                "openai",
-                "--reranker-candidates",
-                "101",
-            ],
+            vec!["index-errors"],
+            vec!["reindex-files"],
+            vec!["descriptions", "enable"],
+            vec!["models"],
             vec!["search-code", "query", "--regexp", "(?=lookahead)"],
             vec!["search-code", "query", "--regexp", r"(a)\1"],
         ] {
@@ -4531,6 +4480,7 @@ mod tests {
         for (args, message) in [
             (
                 vec![
+                    "help",
                     "models",
                     "opencode",
                     "--description-provider",
@@ -4539,27 +4489,8 @@ mod tests {
                 "must match",
             ),
             (
-                vec!["models", "--description-provider", "openai"],
+                vec!["help", "models", "--description-provider", "openai"],
                 "opencode or opencode-go",
-            ),
-            (
-                vec!["config", "model", "first", "--description-model", "second"],
-                "must match",
-            ),
-            (
-                vec![
-                    "config",
-                    "fallback-model",
-                    "first",
-                    "--description-fallback-model",
-                    "second",
-                ],
-                "must match",
-            ),
-            (vec!["config", "model", " \t"], "must not be empty"),
-            (
-                vec!["config", "reranker", "jina", "--reranker-candidates", "10"],
-                "requires config reranker openai",
             ),
         ] {
             let cli = Cli::try_parse_from(std::iter::once("slopdex").chain(args.iter().copied()))
@@ -4569,23 +4500,22 @@ mod tests {
                 "{args:?}"
             );
         }
-        parse(&["models", "opencode", "--description-provider", "opencode"]);
-        parse(&["config", "model", "same", "--description-model", "same"]);
         parse(&[
-            "config",
-            "fallback-model",
-            "same",
-            "--description-fallback-model",
-            "same",
+            "help",
+            "models",
+            "opencode",
+            "--description-provider",
+            "opencode",
         ]);
+        parse(&["config", "set", "descriptionModel", "same"]);
         parse(&[
-            "refresh",
+            "update",
             "--target",
             "HEAD",
             "--rebuild-on-divergence",
             "--yes-really-rebuild-the-index",
         ]);
-        let cli = parse(&["search-description", "--", "--literal query"]);
+        let cli = parse(&["search-descriptions", "--", "--literal query"]);
         let Command::SearchDescriptions(args) = cli.command else {
             panic!()
         };
