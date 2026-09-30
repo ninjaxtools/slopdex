@@ -1082,7 +1082,7 @@ fn cross_search_default_separates_strong_groups_and_explicit_thresholds_can_brid
         let text = String::from_utf8(output.stdout)?;
         assert_eq!(
             text.lines()
-                .filter(|line| line.starts_with("Cluster "))
+                .filter(|line| line.starts_with("*** Cluster "))
                 .count(),
             cluster_count,
             "{args:?}: {text}"
@@ -3503,7 +3503,8 @@ fn expanded_call_depths_force_code_only_within_their_own_levels() -> Result<()> 
             "1",
         ],
     )?;
-    assert!(clusters.contains("@ code:"), "{clusters}");
+    assert!(clusters.contains("a.py:3-4:outer"), "{clusters}");
+    assert!(!clusters.contains("@ code:"), "{clusters}");
     repo.cli_json(&[
         "describe",
         "middle",
@@ -3846,7 +3847,9 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
         String::from_utf8_lossy(&cluster.stderr)
     );
     let cluster = String::from_utf8(cluster.stdout)?;
-    assert!(cluster.contains("# calls b.py :: middle"), "{cluster}");
+    assert!(cluster.contains("a.py:3-4:outer"), "{cluster}");
+    assert!(cluster.contains("b.py:1-2:middle"), "{cluster}");
+    assert!(!cluster.contains("# calls"), "{cluster}");
     Ok(())
 }
 

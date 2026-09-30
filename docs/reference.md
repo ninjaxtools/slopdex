@@ -335,7 +335,7 @@ Text is the default for `map`, `search`, `cross-search`, and `describe`.
 `--detail standard` also shows declaration attributes, a 160-character
 Markdown body preview; `--detail expanded` additionally shows full signatures,
 saved file and callable descriptions, Markdown chunk text, component scores,
-and observed cross-search cluster edges. File descriptions are rendered as
+for file-oriented output. Clusters always print compact symbol locations. File descriptions are rendered as
 language-specific comments immediately after the file header. Callable
 descriptions are flattened into one language-specific comment on the
 declaration line. Explicit `search-descriptions` or `search --descriptions`
@@ -373,10 +373,18 @@ repeats the complete heading path for each result, since hits are not in file
 order. Its range identifies the matched chunk; expanded detail prints the full
 chunk text. Mixed search without an explicit description selector keeps saved
 descriptions at expanded detail.
-Cross-search clusters use the same excerpts under a cluster header, sharing a
-file header for consecutive members from the same index and file. Cross-index
-source and target roles remain distinct even when paths match. The
-similarity range belongs to observed edges, not individual members. With
+Cross-search clusters print one `path:start-end:qualifiedName` location per
+multiline symbol, or `path:line:qualifiedName` for a single-line symbol, under
+a cluster header. For example:
+
+```text
+*** Cluster 1 · 2 symbols · similarity 0.91-0.95
+src/api/routes.ts:12:validateSession
+src/auth/session.ts:5-10:Session.validate
+```
+
+Cross-index members append `[source]` or `[target]` so identical paths remain
+distinct. The similarity range belongs to observed edges, not individual members. With
 `--cohesion` or `--format text`, cross-search can instead print source/match
 groups with per-match scores and optional filesystem distance.
 

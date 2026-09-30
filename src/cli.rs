@@ -2770,15 +2770,7 @@ fn print_cross(
         }
     }
     if format == Format::Clusters {
-        return print_clusters(
-            out,
-            &rows,
-            same_index,
-            limit,
-            detail,
-            source_presentation,
-            target_presentation,
-        );
+        return print_clusters(out, &rows, same_index, limit);
     }
     if cohesion {
         for row in &mut rows {
@@ -2911,20 +2903,32 @@ fn print_cross(
 #[derive(Debug)]
 struct Cluster {
     members: Vec<ClusterMember>,
-    edges: Vec<(String, String, f64)>,
     min: f64,
     max: f64,
-    combined: bool,
 }
 
 #[derive(Clone, Debug)]
 struct ClusterMember {
     function: Value,
     role: &'static str,
-    score: f64,
 }
 
 impl ClusterMember {
+    fn location(&self) -> String {
+        let function = &self.function;
+        let start = function["startLine"].as_u64().unwrap_or(1);
+        let end = function["endLine"].as_u64().unwrap_or(start);
+        let range = if end > start {
+            format!("{start}-{end}")
+        } else {
+            start.to_string()
+        };
+        let name = function["qualifiedName"]
+            .as_str()
+            .unwrap_or_else(|| text(function, "name"));
+        format!("{}:{range}:{name}", text(function, "path"))
+    }
+
     fn label(&self) -> String {
         format!(
             "{}{}",
@@ -2961,7 +2965,7 @@ fn node_key(function: &Value, role: &str) -> String {
 
 fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
     let mut nodes = BTreeMap::<String, ClusterMember>::new();
-    let mut neighbors = HashMap::<String, Vec<(String, f64, bool)>>::new();
+    let mut neighbors = HashMap::<String, Vec<(String, f64)>>::new();
     for row in rows {
         let source = &row["source"];
         let left = node_key(source, if same_index { "index" } else { "source" });
@@ -2972,31 +2976,22 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
                 continue;
             }
             let score = number(item, "similarity");
-            nodes
-                .entry(left.clone())
-                .and_modify(|member: &mut ClusterMember| member.score = member.score.max(score))
-                .or_insert_with(|| ClusterMember {
-                    function: source.clone(),
-                    role: if same_index { "index" } else { "source" },
-                    score,
-                });
-            nodes
-                .entry(right.clone())
-                .and_modify(|member: &mut ClusterMember| member.score = member.score.max(score))
-                .or_insert_with(|| ClusterMember {
-                    function: function.clone(),
-                    role: if same_index { "index" } else { "target" },
-                    score,
-                });
-            let combined = item["descriptionSimilarity"].is_number();
+            nodes.entry(left.clone()).or_insert_with(|| ClusterMember {
+                function: source.clone(),
+                role: if same_index { "index" } else { "source" },
+            });
+            nodes.entry(right.clone()).or_insert_with(|| ClusterMember {
+                function: function.clone(),
+                role: if same_index { "index" } else { "target" },
+            });
             neighbors
                 .entry(left.clone())
                 .or_default()
-                .push((right.clone(), score, combined));
+                .push((right.clone(), score));
             neighbors
                 .entry(right)
                 .or_default()
-                .push((left.clone(), score, combined));
+                .push((left.clone(), score));
         }
     }
     let mut seen = HashSet::new();
@@ -3008,22 +3003,14 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
         let mut pending = vec![start.clone()];
         let mut cluster = Cluster {
             members: Vec::new(),
-            edges: Vec::new(),
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
-            combined: false,
         };
         while let Some(key) = pending.pop() {
             cluster.members.push(nodes[&key].clone());
-            for (neighbor, score, combined) in &neighbors[&key] {
-                if key < *neighbor {
-                    cluster
-                        .edges
-                        .push((nodes[&key].label(), nodes[neighbor].label(), *score));
-                }
+            for (neighbor, score) in &neighbors[&key] {
                 cluster.min = cluster.min.min(*score);
                 cluster.max = cluster.max.max(*score);
-                cluster.combined |= combined;
                 if seen.insert(neighbor.clone()) {
                     pending.push(neighbor.clone());
                 }
@@ -3032,12 +3019,6 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
         cluster
             .members
             .sort_by(|a, b| a.source_key().cmp(&b.source_key()));
-        cluster.edges.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.2.total_cmp(&b.2))
-        });
-        cluster.edges.dedup();
         result.push(cluster);
     }
     result.sort_by(|a, b| {
@@ -3054,9 +3035,6 @@ fn print_clusters(
     rows: &[Value],
     same_index: bool,
     limit: Option<usize>,
-    detail: Detail,
-    source_presentation: &mut Presentation<'_>,
-    mut target_presentation: Option<&mut Presentation<'_>>,
 ) -> Result<()> {
     let clusters = clusters(rows, same_index);
     if clusters.is_empty() {
@@ -3067,24 +3045,6 @@ fn print_clusters(
         .take(limit.unwrap_or(usize::MAX))
         .enumerate()
     {
-        source_presentation.prepare(
-            &cluster
-                .members
-                .iter()
-                .filter(|m| m.role != "target")
-                .map(|m| &m.function)
-                .collect::<Vec<_>>(),
-        );
-        if let Some(target) = target_presentation.as_deref_mut() {
-            target.prepare(
-                &cluster
-                    .members
-                    .iter()
-                    .filter(|m| m.role == "target")
-                    .map(|m| &m.function)
-                    .collect::<Vec<_>>(),
-            );
-        }
         if index > 0 {
             writeln!(out)?;
         }
@@ -3095,120 +3055,17 @@ fn print_clusters(
         };
         writeln!(
             out,
-            "Cluster {} · {} functions · similarity {range}{}",
+            "*** Cluster {} · {} symbols · similarity {range}",
             index + 1,
             cluster.members.len(),
-            if cluster.combined && detail == Detail::Expanded {
-                ", combined code + callable description + file description"
-            } else {
-                ""
-            }
         )?;
-        if detail == Detail::Expanded {
-            for (left, right, similarity) in &cluster.edges {
-                writeln!(out, "@ match: {left} ↔ {right} score={similarity:.2}")?;
-            }
-        }
-        let mut previous_file = None;
         for member in &cluster.members {
-            let file = (member.role, text(&member.function, "path"));
-            let new_file = previous_file != Some(file);
-            if new_file {
-                writeln!(out)?;
-            }
-            let role = if same_index { "" } else { member.role };
-            if member.role == "target"
-                && let Some(target) = target_presentation.as_deref_mut()
-            {
-                print_function_with_header(
-                    out,
-                    &member.function,
-                    role,
-                    detail,
-                    FunctionDisplay {
-                        description: false,
-                        similarity: Some(member.score),
-                    },
-                    target,
-                    new_file,
-                )?;
+            if same_index {
+                writeln!(out, "{}", member.location())?;
             } else {
-                print_function_with_header(
-                    out,
-                    &member.function,
-                    role,
-                    detail,
-                    FunctionDisplay {
-                        description: false,
-                        similarity: Some(member.score),
-                    },
-                    source_presentation,
-                    new_file,
-                )?;
+                writeln!(out, "{} [{}]", member.location(), member.role)?;
             }
-            previous_file = Some(file);
         }
-        print_cluster_related(
-            out,
-            cluster,
-            if same_index { "index" } else { "source" },
-            detail,
-            source_presentation,
-        )?;
-        if let Some(target) = target_presentation.as_deref_mut() {
-            print_cluster_related(out, cluster, "target", detail, target)?;
-        }
-    }
-    Ok(())
-}
-
-fn print_cluster_related(
-    out: &mut impl Write,
-    cluster: &Cluster,
-    role: &str,
-    detail: Detail,
-    view: &mut Presentation<'_>,
-) -> Result<()> {
-    let original: HashSet<_> = cluster
-        .members
-        .iter()
-        .filter(|member| member.role == role)
-        .filter_map(|member| view.key(&member.function))
-        .collect();
-    let related: Vec<_> = view
-        .expanded
-        .as_ref()
-        .into_iter()
-        .flat_map(|e| e.depths.iter())
-        .filter(|(key, _)| !original.contains(*key))
-        .map(|(key, depth)| (key.clone(), *depth))
-        .collect();
-    for (key, depth) in related {
-        let Some(node) = view.graph.as_ref().and_then(|graph| graph.node(&key)) else {
-            continue;
-        };
-        let function = json!({"path":key.path,"name":node.name,"qualifiedName":node.qualified_name,
-            "startLine":node.start_line,"startColumn":node.start_column,"endLine":node.end_line});
-        let label = [
-            depth.caller.map(|n| format!("caller depth={n}")),
-            depth.callee.map(|n| format!("callee depth={n}")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ");
-        writeln!(out)?;
-        print_function(
-            out,
-            &function,
-            &label,
-            detail,
-            FunctionDisplay {
-                description: false,
-                similarity: None,
-            },
-            view,
-        )?;
     }
     Ok(())
 }
@@ -3683,8 +3540,8 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("Cluster 1 · 4 functions · similarity 0.91-0.95"));
-        assert!(output.contains("*** src/d.rs\n@@ 1 @@\nd"));
+        assert!(output.contains("*** Cluster 1 · 4 symbols · similarity 0.91-0.95"));
+        assert!(output.contains("src/d.rs:1:d\n"));
         assert!(!output.contains("Cluster 2"));
         assert_eq!(clusters(&[edge("a", "a", 0.9)], false)[0].members.len(), 2);
     }
@@ -5110,9 +4967,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             concat!(
-                "Cluster 1 · 2 functions · similarity 0.70\n",
-                "\n*** src/a.rs\n@@ 1 @@\na  // source\n",
-                "\n*** src/a.rs\n@@ 1 @@\na  // target\n"
+                "*** Cluster 1 · 2 symbols · similarity 0.70\n",
+                "src/a.rs:1:a [source]\n",
+                "src/a.rs:1:a [target]\n"
             )
         );
     }
@@ -5153,9 +5010,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(
+        assert_eq!(
             String::from_utf8_lossy(&expected)
-                .contains("combined code + callable description + file description")
+                .matches("same.rs:4:overload")
+                .count(),
+            2
         );
         let mut reversed = rows;
         reversed.reverse();
@@ -5192,11 +5051,38 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert_eq!(output.matches("*** same.rs").count(), 1, "{output}");
-        assert!(
-            output.contains("@@ 2 @@\nfirst\n@@ 10 @@\nsecond\n"),
-            "{output}"
+        assert_eq!(
+            output,
+            "*** Cluster 1 · 2 symbols · similarity 0.90\nsame.rs:2:first\nsame.rs:10:second\n"
         );
+    }
+
+    #[test]
+    fn cluster_locations_use_ranges_only_for_multiline_symbols() {
+        let rows = vec![json!({"source": {"id": 1, "path": "src/auth/session.ts",
+            "qualifiedName": "Session.validate", "startLine": 5, "endLine": 10},
+            "matches": [{"function": {"id": 2, "path": "src/api/routes.ts",
+                "qualifiedName": "validateSession", "startLine": 12, "endLine": 12},
+                "similarity": 0.91}]})];
+        for detail in [Detail::Compact, Detail::Expanded] {
+            let mut out = Vec::new();
+            print_cross(
+                &mut out,
+                rows.clone(),
+                CrossOutput::new(Format::Clusters, true, false, None, detail),
+                &mut Presentation::empty(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                concat!(
+                    "*** Cluster 1 · 2 symbols · similarity 0.91\n",
+                    "src/api/routes.ts:12:validateSession\n",
+                    "src/auth/session.ts:5-10:Session.validate\n"
+                )
+            );
+        }
     }
 
     #[test]
