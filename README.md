@@ -153,28 +153,14 @@ Compare functions across files, exclude short wrappers, and group matches into c
 
 ```console
 $ slopdex cross-search --cross-file-only --lines 4 --threshold 0.9
-Cluster 1 · 3 functions · similarity 0.9124-0.9568
-
-*** src/auth/session.ts
-@@ 18-29 @@
-export function validateSession(token: string): Session
-
-*** src/http/middleware.ts
-@@ 42-57 @@
-export function authenticate(req: Request): Session
-
-*** src/users/user-service.ts
-@@ 27-48 @@ UserService.authenticate
-authenticate(token: string): Session
+*** Cluster 1 · 3 symbols · similarity 0.91-0.96
+src/auth/session.ts:18-29:validateSession
+src/http/middleware.ts:42-57:authenticate
+src/users/user-service.ts:27-48:UserService.authenticate
 ...
 ```
 
 Using `--cross-file-only` is useful to exclude similar code in the same file.
-
-Cross-search defaults to `--threshold 0.8` (query search defaults to `0.3`).
-Clusters join matches transitively, so a low threshold can connect many groups
-into one large cluster. Use `0.9` for stricter duplicate detection, or explicitly
-pass `--threshold 0.3` for the pre-rewrite default.
 
 You can use threshold and line-count ranges as well. Range starts are inclusive
 and ends are exclusive, so `--lines 4-20` selects functions with 4 through 19
@@ -219,7 +205,7 @@ Just put this in your `AGENTS.md` file and adjust as desired, no skill necessary
 ```
 - use `slopdex map -g "<glob>" -i -e "<regex>" <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads using the line numbers for implementation details. To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`.
 - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.5`; vary the search query if you get no results
-- when reviewing uncommitted code avoid introducing duplicates by looking for related matches: `slopdex cross-search --uncommitted --cross-file-only --threshold 0.8`
+- when reviewing uncommitted determine if similar code elsewhere warrants a refactor: `slopdex cross-search --uncommitted --cross-file-only --threshold 0.8`
 - when tasked to do advanced codebase analysis, use `slopdex --help` first to see all options
 ```
 
