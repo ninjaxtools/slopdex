@@ -74,6 +74,13 @@ The `map` command can be used to generate a source code skeleton that strips mos
 
 See the [selector reference](docs/reference.md#shared-selectors).
 
+> [!NOTE]
+> Add this to your `AGENTS.md`:
+>
+> ```text
+> - use `slopdex map -g "<glob>" -i -e "<regex>" <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads using the line numbers for implementation details. To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`.
+> ```
+
 ### Search
 
 By default all available indexes are searched and ranked together.
@@ -91,6 +98,13 @@ impl Engine
   pub fn map(&self, options: &Value) -> Result<Vec<Value>>
 ...
 ```
+
+> [!NOTE]
+> Add this to your `AGENTS.md`:
+>
+> ```text
+> - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.5`; vary the search query if you get no results
+> ```
 
 To search code/docs individually:
 
@@ -170,6 +184,12 @@ lines:
 $ slopdex cross-search --cross-file-only --lines 4 --threshold 0.9
 $ slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 ```
+> [!NOTE]
+> Add this to your `AGENTS.md`:
+>
+> ```text
+> - when reviewing uncommitted determine if similar code elsewhere warrants a refactor: `slopdex cross-search --uncommitted --cross-file-only --threshold 0.8`
+> ```
 
 ### Restrict functions used in the cross-search
 
@@ -197,16 +217,6 @@ When code is similar but not actually duplicated, then `--cohesion` can help fin
 
 ```console
 $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
-```
-### Use with agents
-
-Just put this in your `AGENTS.md` file and adjust as desired, no skill necessary:
-
-```
-- use `slopdex map -g "<glob>" -i -e "<regex>" <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads using the line numbers for implementation details. To filter for specific symbols, use `-e`. To only include specific kinds of symbols use `-k` with `imports`, `fns`, `consts`, `types`, or `classes`.
-- use semantic code search to find code with: `slopdex search "<query>" --threshold 0.5`; vary the search query if you get no results
-- when reviewing uncommitted determine if similar code elsewhere warrants a refactor: `slopdex cross-search --uncommitted --cross-file-only --threshold 0.8`
-- when tasked to do advanced codebase analysis, use `slopdex --help` first to see all options
 ```
 
 ### Reranking
