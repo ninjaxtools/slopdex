@@ -69,9 +69,12 @@ struct Global {
     /// Text excerpts by default; cross-search uses clusters, cohesion uses source/match groups; cross JSON is JSONL
     #[arg(long, global = true, value_enum)]
     format: Option<Format>,
-    /// Compact by default; expanded includes description comments; explicit description searches show them at any detail
+    /// Compact by default; expanded includes descriptions and high-similarity callable code
     #[arg(long, global = true, value_enum, default_value = "compact")]
     detail: Detail,
+    /// Show full callable code in expanded text output when similarity is strictly above this value
+    #[arg(long, global = true, default_value = "0.9", allow_hyphen_values = true, value_parser = similarity)]
+    expand_code_threshold: f64,
     /// Reuse the existing index offline, without automatic refresh
     #[arg(long, global = true, conflicts_with = "force_reindex")]
     no_reindex: bool,
@@ -267,22 +270,43 @@ struct MapArgs {
 
 #[derive(Clone, Copy, Debug, Default, Args)]
 struct CallArgs {
-    /// Include this many levels of functions calling selected callables
-    #[arg(long, default_value_t = 0)]
-    callers: usize,
-    /// Include this many levels of functions called by selected callables
-    #[arg(long, default_value_t = 0)]
-    callees: usize,
+    /// Include this many levels of functions calling selected callables (expanded default: 1)
+    #[arg(long)]
+    callers: Option<usize>,
+    /// Include this many levels of functions called by selected callables (expanded default: 1)
+    #[arg(long)]
+    callees: Option<usize>,
 }
 
 impl CallArgs {
+    fn resolve(self, detail: Detail) -> CallDepths {
+        let default = usize::from(detail == Detail::Expanded);
+        CallDepths {
+            callers: self.callers.unwrap_or(default),
+            callees: self.callees.unwrap_or(default),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CallDepths {
+    callers: usize,
+    callees: usize,
+}
+
+impl CallDepths {
     fn enabled(self) -> bool {
         self.callers > 0 || self.callees > 0
     }
 }
 
 impl MapArgs {
+    #[cfg(test)]
     fn options(&self) -> Value {
+        self.options_for(Detail::Compact)
+    }
+
+    fn options_for(&self, detail: Detail) -> Value {
         let mut value = self.selection.options();
         if !self.paths.is_empty() {
             value["paths"] = json!(self.paths);
@@ -293,16 +317,17 @@ impl MapArgs {
         if self.private {
             value["private"] = json!(true);
         }
-        if self.calls.enabled() {
-            value["callers"] = json!(self.calls.callers);
-            value["callees"] = json!(self.calls.callees);
+        let calls = self.calls.resolve(detail);
+        if calls.enabled() {
+            value["callers"] = json!(calls.callers);
+            value["callees"] = json!(calls.callees);
         }
         value
     }
 
-    fn existing_options(&self, root: &Path) -> Result<Option<Value>> {
+    fn existing_options(&self, root: &Path, detail: Detail) -> Result<Option<Value>> {
         if self.paths.is_empty() {
-            return Ok(Some(self.options()));
+            return Ok(Some(self.options_for(detail)));
         }
         let mut paths = Vec::new();
         for path in &self.paths {
@@ -332,7 +357,7 @@ impl MapArgs {
         if paths.is_empty() {
             return Ok(None);
         }
-        let mut options = self.options();
+        let mut options = self.options_for(detail);
         options["paths"] = json!(paths);
         Ok(Some(options))
     }
@@ -670,7 +695,7 @@ pub fn run() -> Result<()> {
         }
     })?;
     let map_options = if let Command::Map(args) = &cli.command {
-        args.existing_options(&root)?
+        args.existing_options(&root, cli.global.detail)?
     } else {
         None
     };
@@ -747,7 +772,11 @@ pub fn run() -> Result<()> {
                 format,
                 cli.global.detail,
                 args.descriptions,
-                &mut Presentation::with_calls(&engine, args.query.calls)?,
+                &mut Presentation::with_calls(
+                    &engine,
+                    args.query.calls.resolve(cli.global.detail),
+                    cli.global.expand_code_threshold,
+                )?,
             )?;
         }
         Command::SearchCode(args) | Command::SearchDescriptions(args) | Command::SearchMd(args) => {
@@ -780,22 +809,29 @@ pub fn run() -> Result<()> {
                 format,
                 cli.global.detail,
                 kind == "search-descriptions",
-                &mut Presentation::with_calls(&engine, args.calls)?,
+                &mut Presentation::with_calls(
+                    &engine,
+                    args.calls.resolve(cli.global.detail),
+                    cli.global.expand_code_threshold,
+                )?,
             )?;
         }
         Command::Describe(args) => {
             let mut options = args.query.filters.options();
             options["describeFullFileThreshold"] = json!(args.describe_full_file_threshold);
-            if args.query.calls.enabled() {
-                options["callers"] = json!(args.query.calls.callers);
-                options["callees"] = json!(args.query.calls.callees);
+            let calls = args.query.calls.resolve(cli.global.detail);
+            if calls.enabled() {
+                options["callers"] = json!(calls.callers);
+                options["callees"] = json!(calls.callees);
             }
+            options["expandCodeThreshold"] = json!(cli.global.expand_code_threshold);
             let mut result = ui::spin("Generating explanation", || {
                 engine.describe(&args.query.query, &options)
             })?;
             if format == Format::Json {
-                if args.query.calls.enabled() {
-                    let presentation = Presentation::with_calls(&engine, args.query.calls)?;
+                if calls.enabled() {
+                    let presentation =
+                        Presentation::with_calls(&engine, calls, cli.global.expand_code_threshold)?;
                     if let Some(functions) = result["functions"].as_array_mut() {
                         for function in functions {
                             let related = presentation.related_json(function);
@@ -818,7 +854,11 @@ pub fn run() -> Result<()> {
                         format,
                         cli.global.detail,
                         false,
-                        &mut Presentation::with_calls(&engine, args.query.calls)?,
+                        &mut Presentation::with_calls(
+                            &engine,
+                            calls,
+                            cli.global.expand_code_threshold,
+                        )?,
                     )?;
                 }
             }
@@ -870,10 +910,20 @@ pub fn run() -> Result<()> {
                     args.filters.limit,
                     cli.global.detail,
                 ),
-                &mut Presentation::with_calls(&engine, args.calls)?,
+                &mut Presentation::with_calls(
+                    &engine,
+                    args.calls.resolve(cli.global.detail),
+                    cli.global.expand_code_threshold,
+                )?,
                 target
                     .as_ref()
-                    .map(|target| Presentation::with_calls(target, args.calls))
+                    .map(|target| {
+                        Presentation::with_calls(
+                            target,
+                            args.calls.resolve(cli.global.detail),
+                            cli.global.expand_code_threshold,
+                        )
+                    })
                     .transpose()?
                     .as_mut(),
             )?;
@@ -1918,7 +1968,8 @@ fn score_details(row: &Value) -> String {
 struct Presentation<'a> {
     engine: Option<&'a Engine>,
     structures: HashMap<String, Option<FileStructure>>,
-    calls: CallArgs,
+    calls: CallDepths,
+    expand_code_threshold: f64,
     graph: Option<CallGraph>,
     expanded: Option<Expansion>,
 }
@@ -1928,15 +1979,21 @@ impl<'a> Presentation<'a> {
         Self {
             engine: Some(engine),
             structures: HashMap::new(),
-            calls: CallArgs::default(),
+            calls: CallDepths::default(),
+            expand_code_threshold: 0.9,
             graph: None,
             expanded: None,
         }
     }
 
-    fn with_calls(engine: &'a Engine, calls: CallArgs) -> Result<Self> {
+    fn with_calls(
+        engine: &'a Engine,
+        calls: CallDepths,
+        expand_code_threshold: f64,
+    ) -> Result<Self> {
         let mut presentation = Self::new(engine);
         presentation.calls = calls;
+        presentation.expand_code_threshold = expand_code_threshold;
         if calls.enabled() {
             presentation.graph = Some(engine.call_graph()?);
         }
@@ -1976,6 +2033,21 @@ impl<'a> Presentation<'a> {
         })
     }
 
+    fn code(
+        &self,
+        path: &str,
+        node: &StructureNode,
+        similarity: Option<f64>,
+        detail: Detail,
+    ) -> Option<String> {
+        if detail != Detail::Expanded || similarity? <= self.expand_code_threshold {
+            return None;
+        }
+        let source = self.engine?.presentation_source(path)?;
+        let code = source.get(node.start_byte..node.end_byte)?;
+        (!code.trim().is_empty()).then(|| format!("@ code:\n{code}\n"))
+    }
+
     fn related_json(&self, function: &Value) -> Vec<Value> {
         let (Some(graph), Some(key)) = (&self.graph, self.key(function)) else {
             return Vec::new();
@@ -2005,7 +2077,8 @@ impl<'a> Presentation<'a> {
         Self {
             engine: None,
             structures: HashMap::new(),
-            calls: CallArgs::default(),
+            calls: CallDepths::default(),
+            expand_code_threshold: 0.9,
             graph: None,
             expanded: None,
         }
@@ -2041,12 +2114,18 @@ impl<'a> Presentation<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FunctionDisplay {
+    description: bool,
+    similarity: Option<f64>,
+}
+
 fn print_function(
     out: &mut impl Write,
     function: &Value,
     annotation: &str,
     detail: Detail,
-    show_description: bool,
+    display: FunctionDisplay,
     presentation: &mut Presentation<'_>,
 ) -> Result<()> {
     print_function_with_header(
@@ -2054,7 +2133,7 @@ fn print_function(
         function,
         annotation,
         detail,
-        show_description,
+        display,
         presentation,
         true,
     )
@@ -2065,13 +2144,13 @@ fn print_function_with_header(
     function: &Value,
     annotation: &str,
     detail: Detail,
-    show_description: bool,
+    display: FunctionDisplay,
     presentation: &mut Presentation<'_>,
     file_header: bool,
 ) -> Result<()> {
     if file_header {
         write!(out, "{}", map::file_header(text(function, "path")))?;
-        if (detail == Detail::Expanded || show_description)
+        if (detail == Detail::Expanded || display.description)
             && let Some(description) = presentation
                 .engine
                 .and_then(|engine| engine.presentation_file_description(text(function, "path")))
@@ -2095,7 +2174,7 @@ fn print_function_with_header(
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let description = if detail == Detail::Expanded || show_description {
+    let description = if detail == Detail::Expanded || display.description {
         function["description"]
             .as_str()
             .filter(|text| !text.trim().is_empty())
@@ -2126,6 +2205,12 @@ fn print_function_with_header(
         && let Some(comments) = presentation.call_comments(&key.path, key.id)
     {
         write!(out, "{comments}")?;
+    }
+    if let Some(node) = nodes.last()
+        && let Some(code) =
+            presentation.code(text(function, "path"), node, display.similarity, detail)
+    {
+        write!(out, "{code}")?;
     }
     Ok(())
 }
@@ -2374,6 +2459,13 @@ fn print_ranked_file(
                         .entry(matched.id)
                         .or_insert_with(String::new)
                         .push_str(&markdown_extra(hit.item, Some(&matched.signature), detail));
+                } else if let Some(code) =
+                    presentation.code(path, matched, hit.row["similarity"].as_f64(), detail)
+                {
+                    let extra = extras.entry(matched.id).or_insert_with(String::new);
+                    if !extra.contains("@ code:\n") {
+                        extra.push_str(&code);
+                    }
                 }
                 continue;
             }
@@ -2389,6 +2481,15 @@ fn print_ranked_file(
                     .filter(|s| !s.trim().is_empty())
             {
                 descriptions.insert(matched.id, description.to_owned());
+            }
+            if !hit.markdown
+                && let Some(code) =
+                    presentation.code(path, matched, hit.row["similarity"].as_f64(), detail)
+            {
+                extras
+                    .entry(matched.id)
+                    .or_insert_with(String::new)
+                    .push_str(&code);
             }
             for node in chain {
                 selected.insert(node.id, node);
@@ -2406,7 +2507,10 @@ fn print_ranked_file(
                     selected.entry(ancestor.id).or_insert(ancestor);
                 }
                 if let Some(comment) = presentation.call_comments(path, key.id) {
-                    extras.entry(key.id).or_insert(comment);
+                    extras
+                        .entry(key.id)
+                        .or_insert_with(String::new)
+                        .push_str(&comment);
                 }
             }
         }
@@ -2469,7 +2573,10 @@ fn print_ranked_file(
                 hit.item,
                 &hit.annotation,
                 detail,
-                hit.description,
+                FunctionDisplay {
+                    description: hit.description,
+                    similarity: hit.row["similarity"].as_f64(),
+                },
                 presentation,
                 nodes.is_empty() && fallback_index == 0,
             )?;
@@ -2544,6 +2651,7 @@ pub(crate) fn describe_search_context(
     rows: &[Value],
     callers: usize,
     callees: usize,
+    expand_code_threshold: f64,
 ) -> Result<String> {
     let mut out = Vec::new();
     print_search(
@@ -2552,7 +2660,11 @@ pub(crate) fn describe_search_context(
         Format::Summary,
         Detail::Expanded,
         false,
-        &mut Presentation::with_calls(engine, CallArgs { callers, callees })?,
+        &mut Presentation::with_calls(
+            engine,
+            CallDepths { callers, callees },
+            expand_code_threshold,
+        )?,
     )?;
     Ok(String::from_utf8(out)?)
 }
@@ -2719,7 +2831,21 @@ fn print_cross(
                 writeln!(out)?;
             }
             writeln!(out, "Source")?;
-            print_function(out, &row["source"], "", detail, false, source_presentation)?;
+            let source_score = array(&row["matches"])
+                .iter()
+                .filter_map(|item| item["similarity"].as_f64())
+                .reduce(f64::max);
+            print_function(
+                out,
+                &row["source"],
+                "",
+                detail,
+                FunctionDisplay {
+                    description: false,
+                    similarity: source_score,
+                },
+                source_presentation,
+            )?;
             for item in array(&row["matches"]) {
                 let distance = item["physicalDistance"]
                     .as_f64()
@@ -2737,14 +2863,27 @@ fn print_cross(
                     }
                 );
                 if let Some(target) = target_presentation.as_deref_mut() {
-                    print_function(out, &item["function"], &annotation, detail, false, target)?;
+                    print_function(
+                        out,
+                        &item["function"],
+                        &annotation,
+                        detail,
+                        FunctionDisplay {
+                            description: false,
+                            similarity: item["similarity"].as_f64(),
+                        },
+                        target,
+                    )?;
                 } else {
                     print_function(
                         out,
                         &item["function"],
                         &annotation,
                         detail,
-                        false,
+                        FunctionDisplay {
+                            description: false,
+                            similarity: item["similarity"].as_f64(),
+                        },
                         source_presentation,
                     )?;
                 }
@@ -2767,6 +2906,7 @@ struct Cluster {
 struct ClusterMember {
     function: Value,
     role: &'static str,
+    score: f64,
 }
 
 impl ClusterMember {
@@ -2816,21 +2956,23 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
             if left == right {
                 continue;
             }
-            nodes.insert(
-                left.clone(),
-                ClusterMember {
+            let score = number(item, "similarity");
+            nodes
+                .entry(left.clone())
+                .and_modify(|member: &mut ClusterMember| member.score = member.score.max(score))
+                .or_insert_with(|| ClusterMember {
                     function: source.clone(),
                     role: if same_index { "index" } else { "source" },
-                },
-            );
-            nodes.insert(
-                right.clone(),
-                ClusterMember {
+                    score,
+                });
+            nodes
+                .entry(right.clone())
+                .and_modify(|member: &mut ClusterMember| member.score = member.score.max(score))
+                .or_insert_with(|| ClusterMember {
                     function: function.clone(),
                     role: if same_index { "index" } else { "target" },
-                },
-            );
-            let score = number(item, "similarity");
+                    score,
+                });
             let combined = item["descriptionSimilarity"].is_number();
             neighbors
                 .entry(left.clone())
@@ -2968,7 +3110,10 @@ fn print_clusters(
                     &member.function,
                     role,
                     detail,
-                    false,
+                    FunctionDisplay {
+                        description: false,
+                        similarity: Some(member.score),
+                    },
                     target,
                     new_file,
                 )?;
@@ -2978,7 +3123,10 @@ fn print_clusters(
                     &member.function,
                     role,
                     detail,
-                    false,
+                    FunctionDisplay {
+                        description: false,
+                        similarity: Some(member.score),
+                    },
                     source_presentation,
                     new_file,
                 )?;
@@ -3035,7 +3183,17 @@ fn print_cluster_related(
         .collect::<Vec<_>>()
         .join(" ");
         writeln!(out)?;
-        print_function(out, &function, &label, detail, false, view)?;
+        print_function(
+            out,
+            &function,
+            &label,
+            detail,
+            FunctionDisplay {
+                description: false,
+                similarity: None,
+            },
+            view,
+        )?;
     }
     Ok(())
 }

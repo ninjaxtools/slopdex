@@ -132,7 +132,9 @@ interfaces, traits, and enums. Other selectors include `imports`, `modules`,
 Kinds are ORed and intersect name regexes. Matching nodes retain their ancestors
 as context; a matching parent does not automatically include unmatched children.
 
-`--callers N` and `--callees N` each default to `0`. When positive, they expand
+`--callers N` and `--callees N` each default to `0` in compact and standard
+detail, or `1` with `--detail expanded`. An explicit `0` disables that direction
+even in expanded mode. When positive, they expand
 selected callables by up to N call-graph edges in the specified direction. Related
 callables are shown even when they are outside the requested paths, glob, name,
 kind, visibility, or result limit. Expansion stops at cycles and deduplicates
@@ -151,6 +153,12 @@ lines. JSON adds `callDepth` and `callees` to expanded map nodes and
 `relatedCallables`/`callees` to callable search results when expansion is enabled.
 Cross-search adds the same information to source and match objects; describe adds
 it to returned functions. With both depths zero, existing output is unchanged.
+In expanded text output, `--expand-code-threshold` (default `0.9`) adds the actual
+indexed source code of a matched callable when its similarity is **strictly above**
+the threshold. The option accepts a finite value in `[-1,1]`; it does not change
+search filtering, result limits, or JSON output. For cross-search, a source or
+cluster member uses its highest displayed match similarity. Unscored map entries
+and call-graph-only neighbors remain declaration-only.
 
 Text output prints declarations in source order using `*** path` file headers and
 `@@ start-end @@` source ranges. Adjacent code declarations of the same kind and

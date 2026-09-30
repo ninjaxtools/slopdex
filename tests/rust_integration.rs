@@ -3585,6 +3585,141 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
 }
 
 #[test]
+fn expanded_detail_defaults_to_one_edge_and_includes_high_similarity_code() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write(
+        "a.py",
+        "from b import middle\n\ndef outer():\n    return middle()\n",
+    )?;
+    repo.write("b.py", "def middle():\n    return 42\n")?;
+
+    let expanded = repo.cli_json(&[
+        "--detail", "expanded", "map", "b.py", "-e", "^middle$", "-k", "fns",
+    ])?;
+    assert!(
+        expanded
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["path"] == "a.py")
+    );
+    let disabled = repo.cli_json(&[
+        "--detail",
+        "expanded",
+        "map",
+        "b.py",
+        "-e",
+        "^middle$",
+        "-k",
+        "fns",
+        "--callers",
+        "0",
+        "--callees",
+        "0",
+    ])?;
+    assert_eq!(disabled.as_array().unwrap().len(), 1);
+
+    let query = [
+        "search-code",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+    ];
+    let compact = repo.cli_json(&query)?;
+    assert!(compact[0].get("relatedCallables").is_none());
+    let expanded_json = repo.cli_json(&[
+        "--detail",
+        "expanded",
+        "search-code",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+    ])?;
+    assert_eq!(
+        expanded_json[0]["relatedCallables"][0]["node"]["name"],
+        "outer"
+    );
+    let run = |threshold: &str| -> Result<String> {
+        let output = repo
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .args([
+                "--detail",
+                "expanded",
+                "--expand-code-threshold",
+                threshold,
+                "search-code",
+                "middle",
+                "-e",
+                "^middle$",
+                "--threshold",
+                "-1",
+            ])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    let with_code = run("-1")?;
+    assert!(
+        with_code.contains("@ code:\ndef middle():\n    return 42"),
+        "{with_code}"
+    );
+    assert!(with_code.contains("# calls b.py :: middle"), "{with_code}");
+    let without_code = run("1")?;
+    assert!(!without_code.contains("@ code:"), "{without_code}");
+    let score = expanded_json[0]["similarity"].as_f64().unwrap();
+    let at_score = run(&score.to_string())?;
+    assert!(!at_score.contains("@ code:"), "{at_score}");
+    let cross = |threshold: &str| -> Result<String> {
+        let output = repo
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .args([
+                "--detail",
+                "expanded",
+                "--expand-code-threshold",
+                threshold,
+                "--format",
+                "text",
+                "cross-search",
+                "--cohesion",
+                "--lines",
+                "1",
+                "--threshold",
+                "-1",
+                "--matches",
+                "1",
+            ])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    assert!(cross("-1")?.contains("@ code:"));
+    assert!(!cross("1")?.contains("@ code:"));
+    Ok(())
+}
+
+#[test]
 fn map_filters_keep_ancestors_without_siblings_and_cli_combines_paths_kinds_and_repeated_filters()
 -> Result<()> {
     let repo = Repo::new()?;

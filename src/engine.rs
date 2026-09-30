@@ -1603,6 +1603,7 @@ impl Engine {
             &matches,
             options["callers"].as_u64().unwrap_or(0) as usize,
             options["callees"].as_u64().unwrap_or(0) as usize,
+            options["expandCodeThreshold"].as_f64().unwrap_or(0.9),
         )?;
         let search_budget = DESCRIBE_SEARCH_BYTES
             .min(DESCRIBE_PROMPT_BYTES - prompt.len() - DESCRIBE_SOURCE_SEPARATOR.len());
