@@ -4887,7 +4887,8 @@ fn default_xdg_index_migrates_legacy_sqlite_without_discarding_wal_data() -> Res
         .join(slopdex::hash(
             repo.root.canonicalize()?.as_os_str().as_encoded_bytes(),
         ))
-        .join("index.sqlite");
+        .join("index.sqlite")
+        .canonicalize()?;
     assert_eq!(status["indexPath"], json!(expected));
     assert_eq!(status["generation"], generation);
     assert_eq!(status["fileCount"], 1);
