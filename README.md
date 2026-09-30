@@ -99,13 +99,6 @@ impl Engine
 ...
 ```
 
-> [!NOTE]
-> Add this to your `AGENTS.md` to use semantic code search with your agent:
->
-> ```text
-> - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.5`; vary the search query if you get no results
-> ```
-
 To search code/docs individually:
 
 ```console
@@ -142,6 +135,13 @@ $ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
 The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
 
 File and function descriptions are cached by source and description context, so renaming a file can reuse its descriptions. Function changes or a changed file-description context can require new callable descriptions. File descriptions after edits can be refreshed explicitly with `index reindex-files`.
+
+> [!NOTE]
+> Add this to your `AGENTS.md` to use semantic code search with your agent:
+>
+> ```text
+> - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.5`; vary the search query if you get no results
+> ```
 
 ### Interactive Config
 
