@@ -177,12 +177,15 @@ indexed member is selected, adjacent, and fills the container's range; the
 hunk uses the parent range. Filters never fold across an omitted symbol.
 Markdown headings share one when only blank lines separate
 them, including parent and child headings. Prose or code between declarations
-starts a new hunk. In file order, each ancestor is printed once. Hunks contain only
+starts a new hunk. In file order, each ancestor is printed once. Code hunks contain
 declaration signatures: no executable body, body braces, per-line number prefix,
-or omission marker is printed. Nested declarations are indented. Code ranges
-cover original declarations; Markdown map ranges cover heading lines, not whole
-sections. The renderer uses indexed declaration metadata (and remains offline with
-`--no-reindex`). Long signatures are truncated at the default detail level.
+or omission marker is printed unless explicitly expanded. Nested declarations are
+indented. Code ranges cover original declarations; Markdown map ranges cover full
+sections, including subsections. With `--detail expanded`, Markdown maps also print
+the full body beneath each selected heading, without repeating nested sections.
+Headings included only as ancestor context remain heading-only, and filters omit
+unmatched section bodies. The renderer uses indexed source and declaration metadata
+(and remains offline with `--no-reindex`). Long signatures are truncated at the default detail level.
 JSON is an array of
 file objects with `path` and `nodes`, retaining full selected metadata: file-local
 `id`/`parentId`, kind, names, `qualifiedName`, signature, attributes, import
@@ -334,7 +337,8 @@ Text is the default for `map`, `search`, `cross-search`, and `describe`.
 `--detail compact` (default) prints declaration signatures and scores only;
 `--detail standard` also shows declaration attributes, a 160-character
 Markdown body preview; `--detail expanded` additionally shows full signatures,
-saved file and callable descriptions, Markdown chunk text, component scores,
+saved file and callable descriptions, Markdown body text (full selected bodies for
+map, matched chunks for search), component scores,
 for file-oriented output. Clusters always print compact symbol locations. File descriptions are rendered as
 language-specific comments immediately after the file header. Callable
 descriptions are flattened into one language-specific comment on the

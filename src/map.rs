@@ -174,7 +174,9 @@ pub fn render_with_hits(
             let previous_parent_present =
                 previous.parent_id.is_none_or(|id| by_id.contains_key(&id));
             let child = node.parent_id == Some(previous.id);
-            let end = if child {
+            // Fold headings only across gaps after their declarations, not
+            // across the section bodies covered by their displayed ranges.
+            let end = if child || previous.kind == "heading" {
                 declaration_line(previous)
             } else {
                 display_end(previous)
@@ -269,11 +271,11 @@ fn append_group(
     }
 }
 
-/// Attributes can start a symbol's range before its declaration. For a child,
-/// compare against the parent's declaration rather than its enclosing body.
+/// Compare against a declaration rather than its enclosing body: the last line
+/// of a Markdown heading, or the first declaration line after Rust attributes.
 fn declaration_line(node: &StructureNode) -> usize {
     if node.kind == "heading" {
-        display_end(node)
+        node.start_line + node.signature.lines().count().saturating_sub(1)
     } else if node.language == "rust" {
         node.start_line
             + node
@@ -311,11 +313,7 @@ fn depth(node: &StructureNode, by_id: &HashMap<usize, &StructureNode>) -> usize 
 }
 
 fn display_end(node: &StructureNode) -> usize {
-    if node.kind == "heading" {
-        node.start_line + node.signature.lines().count().saturating_sub(1)
-    } else {
-        inclusive_end(node.end_line, node.end_column, node.start_line)
-    }
+    inclusive_end(node.end_line, node.end_column, node.start_line)
 }
 
 pub fn render_node(
@@ -869,10 +867,10 @@ mod tests {
             Some(source),
         );
         assert!(
-            output.contains("@@ 1-5 @@\n# Guide\n  ## Setup\n    ### Details\n"),
+            output.contains("@@ 1-9 @@\n# Guide\n  ## Setup\n    ### Details\n"),
             "{output}"
         );
-        assert!(output.contains("@@ 8 @@\n  ## More\n"), "{output}");
+        assert!(output.contains("@@ 8-9 @@\n  ## More\n"), "{output}");
         assert_eq!(output.matches("# Guide").count(), 1);
         assert!(!output.contains("Read this") && !output.contains("Next section"));
     }
@@ -889,7 +887,7 @@ mod tests {
             Some(&structure),
         );
         assert!(
-            output.contains("@@ 1-6 @@\n# First\n# Second\n"),
+            output.contains("@@ 1-11 @@\n# First\n# Second\n"),
             "{output}"
         );
         assert!(output.contains("@@ 12 @@\n# Third\n"), "{output}");
@@ -904,6 +902,38 @@ mod tests {
             output.contains("@@ 1-4 @@\nGuide\n=====\n  ## Setup\n"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn markdown_heading_ranges_cover_sections_until_peers_or_eof() {
+        let source = "# Root\nIntro\n### Child\nBody\n\nPeer\n----\nPeer body\n# Last\nLast body";
+        for source in [
+            source.to_owned(),
+            format!("{source}\n"),
+            format!("{source}\n").replace('\n', "\r\n"),
+        ] {
+            let structure = crate::parse::parse("guide.md", &source).unwrap().structure;
+            let expected = [
+                "@@ 1-8 @@\n# Root\n",
+                "@@ 3-5 @@\n### Child\n",
+                "@@ 6-8 @@\nPeer\n----\n",
+                "@@ 9-10 @@\n# Last\n",
+            ];
+            for (node, expected) in structure.nodes.iter().zip(expected) {
+                assert_eq!(render_node(node, 0, None, Detail::Compact), expected);
+            }
+            let output = render_with_structure(
+                &structure.nodes,
+                None,
+                Detail::Compact,
+                Some(&source),
+                Some(&structure),
+            );
+            assert_eq!(
+                output,
+                "@@ 1-8 @@\n# Root\n\n@@ 3-5 @@\n  ### Child\n\n@@ 6-8 @@\n  Peer\n  ----\n\n@@ 9-10 @@\n# Last\n"
+            );
+        }
     }
 
     #[test]

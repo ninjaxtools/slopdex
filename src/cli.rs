@@ -724,7 +724,18 @@ pub fn run() -> Result<()> {
             } else {
                 Vec::new()
             };
-            print_map(&mut out, &rows, format, cli.global.detail, Some(&engine))?;
+            let selection = map_options
+                .as_ref()
+                .map(filter::Selection::compile)
+                .transpose()?;
+            print_map(
+                &mut out,
+                &rows,
+                format,
+                cli.global.detail,
+                Some(&engine),
+                selection.as_ref(),
+            )?;
         }
         Command::Search(args) => {
             let mut options = args.query.filters.options();
@@ -1810,12 +1821,37 @@ fn source_code(source: &str, node: &StructureNode) -> Option<String> {
     (!code.trim().is_empty()).then(|| format!("@ code:\n{code}\n"))
 }
 
+/// Only the body immediately following each heading: child sections are rendered
+/// under their own headings, and omitted headings still delimit filtered bodies.
+fn markdown_map_bodies(source: &str, structure: &FileStructure) -> HashMap<usize, String> {
+    let lines: Vec<_> = source.lines().collect();
+    let mut headings: Vec<_> = structure
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "heading")
+        .collect();
+    headings.sort_by_key(|node| node.start_line);
+    headings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let start = node.start_line - 1 + node.signature.lines().count();
+            let end = headings
+                .get(index + 1)
+                .map_or(lines.len(), |next| next.start_line - 1);
+            let body = lines.get(start..end)?.join("\n");
+            (!body.trim().is_empty()).then(|| (node.id, format!("{}\n", body.trim_matches('\n'))))
+        })
+        .collect()
+}
+
 fn print_map(
     out: &mut impl Write,
     rows: &[Value],
     format: Format,
     detail: Detail,
     engine: Option<&Engine>,
+    selection: Option<&filter::Selection>,
 ) -> Result<()> {
     if format == Format::Json {
         return print_json(out, &rows);
@@ -1852,6 +1888,22 @@ fn print_map(
             .map(|engine| engine.presentation_structure(path))
             .transpose()?
             .flatten();
+        if detail == Detail::Expanded
+            && let Some(source) = engine.and_then(|engine| engine.presentation_source(path))
+            && let Some(structure) = &full
+        {
+            let bodies = markdown_map_bodies(source, structure);
+            for node in &nodes {
+                if node.kind == "heading"
+                    && selection.is_none_or(|selection| {
+                        selection.kind_matches(&node.kind) && selection.symbol_matches(node)
+                    })
+                    && let Some(body) = bodies.get(&node.id)
+                {
+                    extras.entry(node.id).or_default().push_str(body);
+                }
+            }
+        }
         let symbols = if detail == Detail::Expanded {
             engine
                 .map(|engine| engine.presentation_symbol_descriptions(path))
@@ -3209,18 +3261,34 @@ mod tests {
         .structure;
         let rows = vec![json!({"path": "example.rs", "nodes": structure.nodes})];
         let mut json_output = Vec::new();
-        print_map(&mut json_output, &rows, Format::Json, Detail::Compact, None).unwrap();
+        print_map(
+            &mut json_output,
+            &rows,
+            Format::Json,
+            Detail::Compact,
+            None,
+            None,
+        )
+        .unwrap();
         let decoded: Value = serde_json::from_slice(&json_output).unwrap();
         assert_eq!(decoded, json!(rows));
         assert!(decoded[0]["nodes"][0].get("startByte").is_some());
         let mut summary = Vec::new();
-        print_map(&mut summary, &rows, Format::Summary, Detail::Compact, None).unwrap();
+        print_map(
+            &mut summary,
+            &rows,
+            Format::Summary,
+            Detail::Compact,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(summary).unwrap(),
             map::render_nodes(&structure.nodes, Some("example.rs"))
         );
         let mut empty = Vec::new();
-        print_map(&mut empty, &[], Format::Json, Detail::Compact, None).unwrap();
+        print_map(&mut empty, &[], Format::Json, Detail::Compact, None, None).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&empty).unwrap(), json!([]));
     }
 
@@ -4611,6 +4679,7 @@ mod tests {
             Format::Summary,
             Detail::Compact,
             Some(&engine),
+            None,
         )?;
         assert!(!String::from_utf8(compact)?.contains("Handles API requests."));
         let mut expanded = Vec::new();
@@ -4620,6 +4689,7 @@ mod tests {
             Format::Summary,
             Detail::Expanded,
             Some(&engine),
+            None,
         )?;
         let expanded = String::from_utf8(expanded)?;
         assert!(

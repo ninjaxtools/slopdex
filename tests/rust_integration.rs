@@ -4217,12 +4217,72 @@ fn map_cli_folds_markdown_heading_paths_from_indexed_source() -> Result<()> {
     );
     let text = String::from_utf8(output.stdout)?;
     assert!(
-        text.contains("@@ 1-4 @@\nGuide\n=====\n  ## Setup\n"),
+        text.contains("@@ 1-8 @@\nGuide\n=====\n  ## Setup\n"),
         "{text}"
     );
-    assert!(text.contains("@@ 7 @@\n    ### Advanced\n"), "{text}");
+    assert!(text.contains("@@ 7-8 @@\n    ### Advanced\n"), "{text}");
     assert_eq!(text.matches("Guide").count(), 1);
     assert!(!text.contains("Body.") && !text.contains("Changed"));
+    Ok(())
+}
+
+#[test]
+fn map_cli_expanded_markdown_prints_indexed_bodies_once_and_respects_filters() -> Result<()> {
+    let repo = Repo::new()?;
+    let long_body = format!("{}End of long body.", "Café 🚀 ".repeat(1500));
+    let source = format!(
+        "Guide\n=====\nGuide intro.\n\n## Setup\n{long_body}\n\n### Details\n```md\n# Literal heading\n```\nDetails body.\n\n## Other\nOther body."
+    );
+    repo.write("guide.md", &source.replace('\n', "\r\n"))?;
+    repo.cli_json(&["map"])?;
+    repo.write("guide.md", "# Changed\nChanged body.\n")?;
+
+    let render = |args: &[&str]| -> Result<String> {
+        let output = repo
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .args(["--no-reindex", "map", "guide.md"])
+            .args(args)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    for detail in ["compact", "standard"] {
+        let text = render(&["--detail", detail])?;
+        assert!(!text.contains("Guide intro.") && !text.contains("End of long body."));
+    }
+    let expanded = render(&["--detail", "expanded"])?;
+    assert!(expanded.contains(&long_body));
+    for text in [
+        "Guide\n=====",
+        "Guide intro.",
+        "## Setup",
+        "End of long body.",
+        "### Details",
+        "```md\n# Literal heading\n```\nDetails body.",
+        "## Other",
+        "Other body.",
+    ] {
+        assert_eq!(expanded.matches(text).count(), 1, "{text}");
+    }
+    assert!(!expanded.contains("Changed"));
+    let filtered = render(&["--detail", "expanded", "-e", "^Guide\\.Setup$"])?;
+    assert!(filtered.contains("Guide\n=====") && filtered.contains(&long_body));
+    for omitted in [
+        "Guide intro.",
+        "### Details",
+        "Details body.",
+        "Other body.",
+    ] {
+        assert!(!filtered.contains(omitted), "{omitted}");
+    }
     Ok(())
 }
 

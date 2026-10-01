@@ -67,10 +67,14 @@ $ slopdex map src docs
 $ slopdex map src -g '*.rs' -k fns -e 'refresh|search'
 $ slopdex map src --private
 $ slopdex map -g '*.md' -e '^Guide\.Setup' -i --format json
+$ slopdex map docs --detail expanded
 $ slopdex map --no-reindex
 ```
 
 The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains structurally useful information that can act as an index into the source code, which improves context usage.
+
+Markdown headings show the full section's line range. Use `--detail expanded` to
+also show the body text beneath selected headings, including long sections.
 
 See the [selector reference](docs/reference.md#shared-selectors).
 
