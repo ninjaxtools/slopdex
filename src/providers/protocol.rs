@@ -5,6 +5,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{Failure, endpoint, validate_url};
+use crate::models::Message;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Protocol {
@@ -41,22 +42,41 @@ pub(super) fn description_request(
     system: &str,
     prompt: &str,
 ) -> Result<(String, Value)> {
+    conversation_request(
+        base,
+        model,
+        protocol,
+        system,
+        &[Message::user(prompt.into())],
+    )
+}
+
+pub(super) fn conversation_request(
+    base: &str,
+    model: &str,
+    protocol: Protocol,
+    system: &str,
+    messages: &[Message],
+) -> Result<(String, Value)> {
     Ok(match protocol {
         Protocol::Responses => (
             endpoint(base, "responses")?,
             json!({"model": model, "instructions": system,
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            "input": messages.iter().map(|message| json!({"role": message.role,
+                "content": [{"type": if message.role == "assistant" { "output_text" } else { "input_text" }, "text": message.content}]})).collect::<Vec<_>>(),
             "store": false, "max_output_tokens": 4096}),
         ),
         Protocol::Chat => (
             endpoint(base, "chat/completions")?,
-            json!({"model": model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "max_tokens": 4096}),
+            json!({"model": model, "messages": std::iter::once(json!({"role": "system", "content": system}))
+                .chain(messages.iter().map(|message| json!({"role": message.role, "content": message.content}))).collect::<Vec<_>>(), "max_tokens": 4096}),
         ),
         Protocol::Messages => (
             endpoint(base, "messages")?,
             json!({"model": model, "system": system,
-            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}], "max_tokens": 4096}),
+            "messages": messages.iter().map(|message| json!({"role": message.role,
+                "content": [{"type": "text", "text": message.content}]})).collect::<Vec<_>>(),
+            "cache_control": {"type": "ephemeral"}, "max_tokens": 4096}),
         ),
         Protocol::Gemini => {
             let mut url = validate_url(base)?;
@@ -72,7 +92,8 @@ pub(super) fn description_request(
             (
                 url.into(),
                 json!({"systemInstruction": {"parts": [{"text": system}]},
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 4096}}),
+                "contents": messages.iter().map(|message| json!({"role": if message.role == "assistant" { "model" } else { "user" },
+                    "parts": [{"text": message.content}]})).collect::<Vec<_>>(), "generationConfig": {"maxOutputTokens": 4096}}),
             )
         }
     })

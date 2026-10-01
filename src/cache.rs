@@ -43,6 +43,7 @@ pub(crate) struct DescriptionGeneration {
     pub settings: Value,
     pub system: String,
     pub prompt: String,
+    pub messages: Vec<crate::models::Message>,
     pub regenerate: bool,
 }
 
@@ -58,7 +59,15 @@ pub(crate) struct DescriptionReferences {
     pub settings_hash: String,
     pub system_hash: String,
     pub prompt_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<DescriptionMessageReference>,
     pub regenerate: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DescriptionMessageReference {
+    pub role: String,
+    pub content_hash: String,
 }
 
 impl DescriptionArtifact {
@@ -85,6 +94,14 @@ impl DescriptionArtifact {
             settings_hash: intern(&serde_json::to_string(&generation.settings)?),
             system_hash: intern(&generation.system),
             prompt_hash: intern(&generation.prompt),
+            messages: generation
+                .messages
+                .iter()
+                .map(|message| DescriptionMessageReference {
+                    role: message.role.clone(),
+                    content_hash: intern(&message.content),
+                })
+                .collect(),
             regenerate: generation.regenerate,
         };
         Ok((
@@ -123,6 +140,11 @@ impl DescriptionReferences {
         ]
         .into_iter()
         .flatten()
+        .chain(
+            self.messages
+                .iter()
+                .map(|message| message.content_hash.as_str()),
+        )
         .collect()
     }
 }

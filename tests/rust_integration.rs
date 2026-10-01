@@ -183,6 +183,12 @@ impl Drop for Mock {
     }
 }
 
+fn description_prompt(body: &Value) -> &str {
+    body["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+}
+
 fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
     // Windows accepted sockets inherit the listener's nonblocking mode.
     // Request parsing needs blocking I/O, bounded by the timeouts below.
@@ -249,9 +255,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
             }
         }
         "/v1/responses" => {
-            let prompt = body["input"][0]["content"][0]["text"]
-                .as_str()
-                .context("missing prompt")?;
+            let prompt = description_prompt(&body);
             let prefix = if prompt.starts_with("Describe the purpose") {
                 "file-summary"
             } else if prompt.starts_with("Describe what") {
@@ -261,7 +265,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
             };
             (
                 200,
-                json!({"output_text": format!("{prefix}: {}", slopdex::hash(prompt))}),
+                json!({"output_text": format!("{prefix}: {}", slopdex::hash(body["input"].to_string()))}),
             )
         }
         "/v1/rerank" => {
@@ -328,9 +332,7 @@ impl ConcurrentWork {
             Self::Embeddings => request.path.ends_with("/embeddings"),
             Self::Callables => {
                 request.path.ends_with("/responses")
-                    && request.body["input"][0]["content"][0]["text"]
-                        .as_str()
-                        .is_some_and(|prompt| prompt.starts_with("Describe what"))
+                    && description_prompt(&request.body).starts_with("Describe what")
             }
         }
     }
@@ -343,12 +345,7 @@ impl ConcurrentWork {
                 .iter()
                 .map(|input| input.as_str().unwrap().to_owned())
                 .collect(),
-            Self::Callables => vec![
-                request.body["input"][0]["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            ],
+            Self::Callables => vec![description_prompt(&request.body).to_owned()],
         }
     }
 
@@ -701,11 +698,20 @@ fn concurrency_fixture(
     work: ConcurrentWork,
     limit: usize,
 ) -> Result<Value> {
-    // One file keeps all callable/batch jobs in the same engine scheduling pass.
-    let source: String = (0..10)
-        .map(|i| function(&format!("concurrent_{i}"), "VECTOR_EAST"))
-        .collect();
-    repo.write("concurrent.rs", &source)?;
+    if matches!(work, ConcurrentWork::Callables) {
+        // Callable turns are serial within each file; concurrency is across files.
+        for i in 0..10 {
+            repo.write(
+                &format!("concurrent_{i}.rs"),
+                &function(&format!("concurrent_{i}"), "VECTOR_EAST"),
+            )?;
+        }
+    } else {
+        let source: String = (0..10)
+            .map(|i| function(&format!("concurrent_{i}"), "VECTOR_EAST"))
+            .collect();
+        repo.write("concurrent.rs", &source)?;
+    }
     let mut config = mock.config();
     config["parallelism"] = json!(limit);
     config["embeddingBatchSize"] = json!(2);
@@ -792,10 +798,9 @@ fn preparation_finishes_callable_descriptions_before_global_embeddings() -> Resu
         .iter()
         .enumerate()
         .filter_map(|(index, request)| {
-            request.body["input"][0]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|prompt| prompt.starts_with("Describe what"))
-                .then_some(index)
+            (request.path.ends_with("/responses")
+                && description_prompt(&request.body).starts_with("Describe what"))
+            .then_some(index)
         })
         .collect();
     let embedding_indices: Vec<_> = requests
@@ -814,6 +819,11 @@ fn preparation_finishes_callable_descriptions_before_global_embeddings() -> Resu
 
 fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<()> {
     let repo = Repo::new()?;
+    let file_count = if matches!(work, ConcurrentWork::Callables) {
+        10
+    } else {
+        1
+    };
     let limit = 3;
     let concurrent = ConcurrentRequests::new(work, limit, repo.index.clone(), true);
     let mock = Mock::start_with(Some(concurrent.clone()))?;
@@ -825,7 +835,7 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
     assert!(format!("{error:#}").contains("HTTP 503"));
     mock.requests(""); // Surface any timeout/protocol failure in the scheduling harness.
     assert_eq!(engine.status()?["functionCount"], 10);
-    assert_eq!(engine.status()?["fileCount"], 1);
+    assert_eq!(engine.status()?["fileCount"], file_count);
     assert_eq!(map_names(&engine.map(&json!({"private":true}))?).len(), 10);
     assert_incomplete(&engine);
     let completed = {
@@ -874,7 +884,7 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
     let offset = mock.count();
     let retry = engine.refresh()?;
     assert_eq!(retry["filesUpdated"], 0, "structure was already published");
-    assert_eq!(retry["filesPrepared"], 1);
+    assert_eq!(retry["filesPrepared"], file_count);
     assert_eq!(engine.status()?["functionCount"], 10);
     let retry_inputs: Vec<_> = mock.requests("")[offset..]
         .iter()
@@ -2182,10 +2192,7 @@ fn failed_provider_publishes_structure_and_partial_artifacts_survive_restart() -
         retry_requests
             .iter()
             .filter(|r| r.path.ends_with("/responses"))
-            .all(|r| r.body["input"][0]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("Describe what")),
+            .all(|r| description_prompt(&r.body).starts_with("Describe what")),
         "completed file descriptions must not be regenerated"
     );
     assert_eq!(
@@ -2778,30 +2785,68 @@ fn regression_descriptions_with_markdown_refresh_is_noop_and_keeps_query_caches(
 }
 
 #[test]
-fn generated_descriptions_request_a_sentence_for_callables_and_paragraph_for_files() -> Result<()> {
+fn generated_descriptions_share_a_growing_file_conversation_in_source_order() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let mut config = mock.config();
     config["descriptionsEnabled"] = json!(true);
-    repo.write("api.rs", "pub fn run() -> i32 { 42 }\n")?;
+    let source = "pub fn run() -> i32 { helper() }\npub fn helper() -> i32 { 42 }\n";
+    repo.write("api.rs", source)?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
     let requests = mock.requests("/responses");
+    assert_eq!(requests.len(), 3);
+    assert!(description_prompt(&requests[0].body).starts_with("Describe the purpose"));
+    assert!(description_prompt(&requests[1].body).contains("Symbol: run\n"));
+    assert!(description_prompt(&requests[2].body).contains("Symbol: helper\n"));
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            request.body["instructions"],
+            requests[0].body["instructions"]
+        );
+        let messages = request.body["input"].as_array().unwrap();
+        assert_eq!(messages.len(), index * 2 + 1);
+        assert!(
+            messages[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(source)
+        );
+        if index > 0 {
+            let previous = requests[index - 1].body["input"].as_array().unwrap();
+            assert_eq!(
+                &messages[..previous.len()],
+                previous.as_slice(),
+                "previous turn must be an identical cacheable prefix"
+            );
+            let answer = &messages[previous.len()];
+            assert_eq!(answer["role"], "assistant");
+            assert_eq!(answer["content"][0]["type"], "output_text");
+            let expected_prefix = if index == 1 {
+                "file-summary"
+            } else {
+                "callable-summary"
+            };
+            assert_eq!(
+                answer["content"][0]["text"],
+                format!(
+                    "{expected_prefix}: {}",
+                    slopdex::hash(requests[index - 1].body["input"].to_string())
+                )
+            );
+            assert!(
+                !description_prompt(&request.body).contains(source),
+                "callable source is already in the shared context"
+            );
+        }
+    }
     let file = requests
         .iter()
-        .find(|request| {
-            request.body["input"][0]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.starts_with("Describe the purpose"))
-        })
+        .find(|request| description_prompt(&request.body).starts_with("Describe the purpose"))
         .unwrap();
     let callable = requests
         .iter()
-        .find(|request| {
-            request.body["input"][0]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.starts_with("Describe what"))
-        })
+        .find(|request| description_prompt(&request.body).starts_with("Describe what"))
         .unwrap();
     assert!(
         file.body["instructions"]
@@ -2882,12 +2927,20 @@ fn regression_description_model_change_retains_unchanged_and_regenerates_only_ed
         "only the edited callable needs a new description"
     );
     assert_eq!(requests[3].body["model"], config["descriptionModel"]);
-    let prompt = requests[3].body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
+    let prompt = description_prompt(&requests[3].body);
     assert!(prompt.starts_with("Describe what"));
     assert!(prompt.contains("Symbol: edited\n"));
     assert!(!prompt.contains("Symbol: untouched"));
+    assert_eq!(
+        requests[3].body["input"][1]["content"][0]["text"],
+        saved_file["description"]
+    );
+    assert!(
+        requests[3].body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("VECTOR_NORTH")
+    );
     let file = file_record(&repo, "code.rs")?;
     assert_eq!(file["description"], saved_file["description"]);
     assert_eq!(file["description_hash"], saved_file["description_hash"]);
@@ -5006,8 +5059,15 @@ fn description_keys_reuse_renames_and_models_while_retaining_generation_context(
         let profile: Value = serde_json::from_str(&content("profile_hash")?)?;
         assert_eq!(profile["model"], "integration-description");
         let prompt = content("prompt_hash")?;
-        assert!(prompt.contains("File: src/old.rs"));
-        assert!(prompt.contains("VECTOR_EAST"));
+        let first_message = &generation["messages"][0];
+        let context: String = db.query_row(
+            "SELECT content FROM description_content WHERE hash=?",
+            [first_message["content_hash"].as_str().unwrap()],
+            |row| row.get(0),
+        )?;
+        assert!(context.contains("File: src/old.rs"));
+        assert!(context.contains("VECTOR_EAST"));
+        assert!(prompt.starts_with("Describe"));
         assert!(artifact["generation"].get("prompt").is_none());
         assert!(artifact["generation"].get("system").is_none());
         assert!(
@@ -5081,7 +5141,7 @@ fn description_context_is_stored_once_by_hash_across_callable_artifacts() -> Res
             .filter_map(|row| row[field].as_str().map(str::to_owned))
             .collect()
     };
-    assert_eq!(unique("system_hash").len(), 2);
+    assert_eq!(unique("system_hash").len(), 1);
     assert_eq!(unique("prompt_hash").len(), 9);
     assert_eq!(unique("profile_hash").len(), 1);
     assert_eq!(unique("settings_hash").len(), 1);
@@ -5095,7 +5155,23 @@ fn description_context_is_stored_once_by_hash_across_callable_artifacts() -> Res
     ]
     .into_iter()
     .flat_map(unique)
+    .chain(refs.iter().flat_map(|row| {
+        row["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["content_hash"].as_str().unwrap().to_owned())
+    }))
     .collect();
+    let source_messages: BTreeSet<_> = refs
+        .iter()
+        .map(|row| row["messages"][0]["content_hash"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        source_messages.len(),
+        1,
+        "full-file context is stored once across every turn"
+    );
     let count: i64 = db.query_row("SELECT count(*) FROM description_content", [], |row| {
         row.get(0)
     })?;

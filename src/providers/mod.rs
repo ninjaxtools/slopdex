@@ -408,7 +408,7 @@ fn parse_ranking(value: &Value, count: usize, openai: bool) -> Result<Vec<(usize
     Ok(result)
 }
 
-fn session_id() -> String {
+pub(crate) fn session_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seed = format!(
         "{}-{}-{}",

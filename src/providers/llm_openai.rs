@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::llm::{Adapter, Configured};
 use super::{Context, OPENAI, Protocol};
-use crate::models::Llm;
+use crate::models::{Llm, Message};
 
 pub(super) const DEFAULT_BASE: &str = OPENAI;
 pub(super) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
@@ -36,7 +36,12 @@ impl Llm for OpenAi {
         self.configured.profile::<Self>()
     }
 
-    fn describe(&self, system: &str, prompt: &str) -> Result<String> {
-        self.configured.describe::<Self>(system, prompt)
+    fn describe_conversation(
+        &self,
+        system: &str,
+        messages: &[Message],
+        session: &str,
+    ) -> Result<String> {
+        self.configured.describe::<Self>(system, messages, session)
     }
 }

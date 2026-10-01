@@ -1,4 +1,5 @@
 use super::*;
+use crate::models::Message;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{
@@ -410,14 +411,25 @@ fn descriptions_use_all_four_wire_protocols_and_headers() {
             "x-goog-api-key: mock-secret",
         ),
     ] {
-        let mock = Mock::new(vec![(200, output)]);
+        let mock = Mock::new(vec![(200, output.clone()), (200, output)]);
         let mut config = mock.config();
         config["descriptionProvider"] = json!(provider);
         config["descriptionModel"] = json!(model);
+        let providers = Providers::new(&config).unwrap();
+        let mut messages = vec![Message::user("question".into())];
         assert_eq!(
-            Providers::new(&config)
-                .unwrap()
-                .describe("instructions", "question")
+            providers
+                .llm()
+                .describe_conversation("instructions", &messages, "file-session")
+                .unwrap(),
+            "hello"
+        );
+        messages.push(Message::assistant("hello".into()));
+        messages.push(Message::user("callable question".into()));
+        assert_eq!(
+            providers
+                .llm()
+                .describe_conversation("instructions", &messages, "file-session")
                 .unwrap(),
             "hello"
         );
@@ -430,18 +442,45 @@ fn descriptions_use_all_four_wire_protocols_and_headers() {
             provider != "openai"
         );
         let body = &requests[0].body;
+        let next = &requests[1].body;
+        if provider != "openai" {
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.headers.contains("x-opencode-session: file-session"))
+            );
+        }
         match adapter_protocol(provider, model) {
             Protocol::Responses => {
                 assert_eq!(body["store"], false);
                 assert_eq!(body["instructions"], "instructions");
                 assert_eq!(body["input"][0]["content"][0]["text"], "question");
+                assert_eq!(next["input"][0], body["input"][0]);
+                assert_eq!(next["input"][1]["role"], "assistant");
+                assert_eq!(next["input"][1]["content"][0]["type"], "output_text");
+                assert_eq!(next["input"][1]["content"][0]["text"], "hello");
+                assert_eq!(next["input"][2]["content"][0]["text"], "callable question");
             }
             Protocol::Chat => {
                 assert_eq!(body["messages"][0]["content"], "instructions");
                 assert_eq!(body["messages"][1]["content"], "question");
+                assert_eq!(next["messages"][1], body["messages"][1]);
+                assert_eq!(
+                    next["messages"][2],
+                    json!({"role": "assistant", "content": "hello"})
+                );
+                assert_eq!(next["messages"][3]["content"], "callable question");
             }
             Protocol::Messages => {
                 assert_eq!(body["system"], "instructions");
+                assert_eq!(next["messages"][0], body["messages"][0]);
+                assert_eq!(next["messages"][1]["role"], "assistant");
+                assert_eq!(next["messages"][1]["content"][0]["text"], "hello");
+                assert_eq!(
+                    next["messages"][2]["content"][0]["text"],
+                    "callable question"
+                );
+                assert_eq!(next["cache_control"]["type"], "ephemeral");
                 assert!(
                     requests[0]
                         .headers
@@ -454,6 +493,10 @@ fn descriptions_use_all_four_wire_protocols_and_headers() {
                     "instructions"
                 );
                 assert_eq!(body["contents"][0]["parts"][0]["text"], "question");
+                assert_eq!(next["contents"][0], body["contents"][0]);
+                assert_eq!(next["contents"][1]["role"], "model");
+                assert_eq!(next["contents"][1]["parts"][0]["text"], "hello");
+                assert_eq!(next["contents"][2]["parts"][0]["text"], "callable question");
             }
         }
     }

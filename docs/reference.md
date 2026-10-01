@@ -556,12 +556,15 @@ callable descriptions in those files. Matching cached artifacts are reused,
 including when the configured model has changed. Merely changing that model does not
 regenerate all existing descriptions.
 
-File descriptions use the complete file source. Each callable request is a
-separate request containing its source, symbol, path, and file-description
-context. File generation asks for one paragraph; callable generation asks for
-one sentence. Previously saved descriptions are reused until regenerated and
-multi-line callable descriptions are flattened for inline display. There is no
-continuing per-file chat conversation. `status` reports
+Description generation uses one conversation per file, starting with the complete
+file source and a request for a one-paragraph file description. Its callables are
+then described sequentially in source order, each requesting one sentence by
+symbol and line range. The system instructions and conversation history remain
+an identical prefix across turns so providers can reuse cached input tokens;
+different files can run in parallel up to `parallelism`. Cached or saved file
+descriptions seed the conversation without another generation request. Previously
+saved callable descriptions are reused until regenerated, and multi-line callable
+descriptions are flattened for inline display. `status` reports
 enabled state, profiles, description counts, and stale-file-description count.
 
 ### Native offline reuse and recovery

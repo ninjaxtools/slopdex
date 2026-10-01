@@ -6,12 +6,13 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::protocol::conversation_request;
 use super::{
-    Context, DESCRIPTION_ATTEMPTS, Protocol, api_key, auth_headers, description_request,
-    description_text, llm_openai::OpenAi, llm_opencode::OpenCode, llm_opencode_go::OpenCodeGo,
-    session_id, string, unqualify, validate_url,
+    Context, DESCRIPTION_ATTEMPTS, Protocol, api_key, auth_headers, description_text,
+    llm_openai::OpenAi, llm_opencode::OpenCode, llm_opencode_go::OpenCodeGo, session_id, string,
+    unqualify, validate_url,
 };
-use crate::models::Llm;
+use crate::models::{Llm, Message};
 
 pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Llm>> {
     let configured_provider = string(&context.config, &["descriptionProvider"])?;
@@ -79,7 +80,7 @@ impl Configured {
     /// The profile identifies the configured primary, even while fallback is active.
     pub(super) fn profile<A: Adapter>(&self) -> Value {
         let mut profile = json!({"provider": A::PROVIDER, "model": self.models[0],
-            "strategyVersion": "callable-purpose-v2"});
+            "strategyVersion": "file-conversation-v3"});
         if self.context.config["descriptionBaseUrl"].is_string() {
             profile["endpoint"] = json!(self.base);
         }
@@ -91,16 +92,25 @@ impl Configured {
 
     /// Successful fallback remains active across calls; a failure switches back.
     /// Six total attempts bound failover/empty-output retries without nesting HTTP retries.
-    pub(super) fn describe<A: Adapter>(&self, system: &str, prompt: &str) -> Result<String> {
+    pub(super) fn describe<A: Adapter>(
+        &self,
+        system: &str,
+        messages: &[Message],
+        session: &str,
+    ) -> Result<String> {
         let key = api_key(&self.context.config, "descriptionApiKey", A::PROVIDER)?;
         let failover = self.models.len() > 1;
         let mut permanent_failures = vec![false; self.models.len()];
         let mut active = self.active.load(Ordering::Relaxed);
-        let session = session_id();
+        let session = if session.is_empty() {
+            session_id()
+        } else {
+            session.to_owned()
+        };
         for attempt in 0..DESCRIPTION_ATTEMPTS {
             let model = &self.models[active];
             let protocol = A::protocol(model);
-            let (url, body) = description_request(&self.base, model, protocol, system, prompt)?;
+            let (url, body) = conversation_request(&self.base, model, protocol, system, messages)?;
             let headers = A::headers(&key, protocol, &session)?;
             self.context.report_call("descriptions", A::PROVIDER, model);
             let outcome = self

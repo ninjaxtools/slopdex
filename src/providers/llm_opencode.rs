@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::llm::{Adapter, Configured};
 use super::{Context, Protocol, ZEN, auth_headers};
-use crate::models::Llm;
+use crate::models::{Llm, Message};
 
 pub(super) const DEFAULT_BASE: &str = ZEN;
 pub(super) const DEFAULT_MODEL: &str = "muse-spark-1.3-contributor";
@@ -41,8 +41,13 @@ impl Llm for OpenCode {
         self.configured.profile::<Self>()
     }
 
-    fn describe(&self, system: &str, prompt: &str) -> Result<String> {
-        self.configured.describe::<Self>(system, prompt)
+    fn describe_conversation(
+        &self,
+        system: &str,
+        messages: &[Message],
+        session: &str,
+    ) -> Result<String> {
+        self.configured.describe::<Self>(system, messages, session)
     }
 }
 

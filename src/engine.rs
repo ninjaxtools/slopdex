@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use crate::{
     cache::{Artifacts, DescriptionArtifact, DescriptionGeneration},
     filter::Selection,
-    git, hash, parse,
+    git, hash,
+    models::Message,
+    parse,
     providers::Providers,
     storage::{Database, File, Item, STRUCTURE_PARSER_VERSION},
     ui,
@@ -38,8 +40,7 @@ const EXCLUDED: &[&str] = &[
     "target",
 ];
 
-const FILE_DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. Return exactly one concise paragraph about the file's purpose, responsibilities, and important relationships; use plain text without a heading, bullets, or a preamble.";
-const CALLABLE_DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. Return exactly one sentence describing what the callable does, including relevant inputs, outputs, or side effects; use plain text without a heading, bullets, or a preamble.";
+const DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. When asked about a file, return exactly one concise paragraph about its purpose, responsibilities, and important relationships. When asked about a callable, return exactly one sentence describing what it does, including relevant inputs, outputs, or side effects. Use plain text without a heading, bullets, or a preamble. Do not propose changes.";
 // A byte cap is deliberately conservative even for providers with different tokenizers.
 // Leave room for the task, expanded search context, and the model's response.
 const DESCRIBE_PROMPT_BYTES: usize = 128 * 1024;
@@ -115,6 +116,22 @@ struct PreparedCallable {
     identity: String,
     data: Value,
     description_embedding: Option<String>,
+    generate_description: bool,
+}
+
+struct FileConversation {
+    messages: Vec<Message>,
+    session: String,
+    file_ready: bool,
+    next_callable: usize,
+}
+
+struct DescriptionJob {
+    file_index: usize,
+    callable_index: Option<usize>,
+    key: String,
+    generation: DescriptionGeneration,
+    session: String,
 }
 
 struct PreparedFile {
@@ -663,67 +680,7 @@ impl Engine {
             });
         }
 
-        let mut file_jobs = BTreeMap::new();
-        let mut file_assignments = Vec::new();
-        for (index, prepared) in prepared.iter().enumerate() {
-            if self.enabled
-                && (prepared.file.description.is_none() || prepared.regenerate_file)
-                && prepared.file.language != "markdown"
-            {
-                let key = hash(json!([prepared.file.hash, FILE_DESCRIPTION_SYSTEM]).to_string());
-                let prompt = format!(
-                    "Describe the purpose, responsibilities, and important relationships of this existing source file in one paragraph. Do not propose changes.\nFile: {}\n\n{}",
-                    prepared.file.path, prepared.file.source
-                );
-                file_jobs
-                    .entry(key.clone())
-                    .or_insert_with(|| DescriptionGeneration {
-                        scope: "file".into(),
-                        path: prepared.file.path.clone(),
-                        symbol: None,
-                        source_hash: prepared.file.hash.clone(),
-                        file_hash: prepared.file.hash.clone(),
-                        file_description: None,
-                        profile: self.providers.llm().profile(),
-                        settings: description_settings(&self.config),
-                        system: FILE_DESCRIPTION_SYSTEM.into(),
-                        prompt,
-                        regenerate: prepared.regenerate_file,
-                    });
-                file_assignments.push((index, key));
-            }
-        }
-        self.artifacts
-            .hydrate_descriptions(&self.db, &file_jobs.keys().cloned().collect::<Vec<_>>())?;
-        let jobs = missing_jobs(&self.db, "description", file_jobs)?;
-        let llm = self.providers.llm();
-        run_jobs(
-            "Generating file descriptions",
-            &jobs,
-            self.parallelism()?,
-            |_| 1,
-            |(_, generation)| llm.describe(&generation.system, &generation.prompt),
-            |(key, generation), description| {
-                let (artifact, contents) = DescriptionArtifact::new(description, generation)?;
-                let encoded = serde_json::to_string(&artifact)?;
-                self.db.put_description_artifact(key, &encoded, &contents)?;
-                self.artifacts
-                    .put_description(&self.db, key, &encoded, &contents);
-                Ok(())
-            },
-        )?;
-        for (index, key) in file_assignments {
-            let artifact = self
-                .db
-                .cache("description", &key)?
-                .context("Missing generated file description")?;
-            prepared[index].file.description = Some(DescriptionArtifact::decode(&artifact)?.text);
-            prepared[index].file.description_hash = Some(prepared[index].file.hash.clone());
-        }
-
-        let mut description_jobs = BTreeMap::new();
-        let mut description_assignments = Vec::new();
-        for (file_index, prepared) in prepared.iter_mut().enumerate() {
+        for prepared in &mut prepared {
             let mut occurrences = HashMap::<String, usize>::new();
             for callable in &prepared.parsed.callables {
                 let occurrence = occurrences
@@ -756,43 +713,10 @@ impl Engine {
                     description_embedding = None;
                     data["description"] = Value::Null;
                 }
-                if self.enabled
+                let generate_description = self.enabled
                     && (prepared.regenerate_callables
-                        || (!unchanged && description_embedding.is_none()))
-                {
-                    let key = hash(
-                        json!([
-                            callable.qualified_name,
-                            callable.source_hash,
-                            prepared.file.description.as_deref().unwrap_or(""),
-                            CALLABLE_DESCRIPTION_SYSTEM,
-                        ])
-                        .to_string(),
-                    );
-                    let prompt = format!(
-                        "Describe what this existing callable does in one sentence, covering relevant inputs, outputs and side effects. Do not propose changes.\nFile: {}\nFile context: {}\nSymbol: {}\n\n{}",
-                        prepared.file.path,
-                        prepared.file.description.as_deref().unwrap_or(""),
-                        callable.qualified_name,
-                        callable.source
-                    );
-                    description_jobs
-                        .entry(key.clone())
-                        .or_insert_with(|| DescriptionGeneration {
-                            scope: "callable".into(),
-                            path: prepared.file.path.clone(),
-                            symbol: Some(callable.qualified_name.clone()),
-                            source_hash: callable.source_hash.clone(),
-                            file_hash: prepared.file.hash.clone(),
-                            file_description: prepared.file.description.clone(),
-                            profile: self.providers.llm().profile(),
-                            settings: description_settings(&self.config),
-                            system: CALLABLE_DESCRIPTION_SYSTEM.into(),
-                            prompt,
-                            regenerate: prepared.regenerate_callables,
-                        });
-                    description_assignments.push((file_index, prepared.callables.len(), key));
-                } else if !self.enabled
+                        || (!unchanged && description_embedding.is_none()));
+                if !self.enabled
                     && old.is_some_and(|item| item.data["sourceHash"] != data["sourceHash"])
                 {
                     description_embedding = None;
@@ -802,36 +726,12 @@ impl Engine {
                     identity,
                     data,
                     description_embedding,
+                    generate_description,
                 });
             }
         }
-        self.artifacts.hydrate_descriptions(
-            &self.db,
-            &description_jobs.keys().cloned().collect::<Vec<_>>(),
-        )?;
-        let jobs = missing_jobs(&self.db, "description", description_jobs)?;
-        run_jobs(
-            "Generating callable descriptions",
-            &jobs,
-            self.parallelism()?,
-            |_| 1,
-            |(_, generation)| llm.describe(&generation.system, &generation.prompt),
-            |(key, generation), description| {
-                let (artifact, contents) = DescriptionArtifact::new(description, generation)?;
-                let encoded = serde_json::to_string(&artifact)?;
-                self.db.put_description_artifact(key, &encoded, &contents)?;
-                self.artifacts
-                    .put_description(&self.db, key, &encoded, &contents);
-                Ok(())
-            },
-        )?;
-        for (file_index, callable_index, key) in description_assignments {
-            let artifact = self
-                .db
-                .cache("description", &key)?
-                .context("Missing generated callable description")?;
-            prepared[file_index].callables[callable_index].data["description"] =
-                json!(DescriptionArtifact::decode(&artifact)?.text);
+        if self.enabled {
+            self.prepare_descriptions(&mut prepared)?;
         }
 
         let mut embedding_groups = Vec::with_capacity(prepared.len());
@@ -922,6 +822,169 @@ impl Engine {
             result.push((prepared.file, items));
         }
         Ok(result)
+    }
+
+    fn prepare_descriptions(&self, prepared: &mut [PreparedFile]) -> Result<()> {
+        let parallelism = self.parallelism()?;
+        for files in prepared.chunks_mut(parallelism) {
+            self.prepare_description_window(files, parallelism)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_description_window(
+        &self,
+        prepared: &mut [PreparedFile],
+        parallelism: usize,
+    ) -> Result<()> {
+        let mut conversations: Vec<_> = prepared.iter().map(|prepared| {
+            let prompt = format!(
+                "Describe the purpose, responsibilities, and important relationships of this existing source file in one paragraph. Do not propose changes.\nFile: {}\n\n{}",
+                prepared.file.path, prepared.file.source
+            );
+            let file_ready = prepared.file.description.is_some() && !prepared.regenerate_file;
+            let mut messages = vec![Message::user(prompt)];
+            if file_ready {
+                messages.push(Message::assistant(prepared.file.description.clone().unwrap()));
+            }
+            FileConversation {
+                messages,
+                session: crate::providers::session_id(),
+                file_ready,
+                next_callable: 0,
+            }
+        }).collect();
+        let llm = self.providers.llm();
+        loop {
+            // Only the next turn of each file can run. Completing a turn makes
+            // its exact request and response the prefix of the following turn.
+            let mut jobs = BTreeMap::<String, Vec<DescriptionJob>>::new();
+            for (file_index, (prepared, conversation)) in
+                prepared.iter().zip(&mut conversations).enumerate()
+            {
+                if prepared.file.language == "markdown" {
+                    continue;
+                }
+                let (callable_index, key, symbol, source_hash, regenerate, messages) =
+                    if !conversation.file_ready {
+                        (
+                            None,
+                            hash(json!([prepared.file.hash, DESCRIPTION_SYSTEM]).to_string()),
+                            None,
+                            prepared.file.hash.clone(),
+                            prepared.regenerate_file,
+                            conversation.messages.clone(),
+                        )
+                    } else {
+                        while conversation.next_callable < prepared.callables.len()
+                            && !prepared.callables[conversation.next_callable].generate_description
+                        {
+                            conversation.next_callable += 1;
+                        }
+                        let index = conversation.next_callable;
+                        let Some(callable) = prepared.parsed.callables.get(index) else {
+                            continue;
+                        };
+                        let key = hash(
+                            json!([
+                                callable.qualified_name,
+                                callable.source_hash,
+                                prepared.file.description.as_deref().unwrap_or(""),
+                                DESCRIPTION_SYSTEM
+                            ])
+                            .to_string(),
+                        );
+                        let prompt = format!(
+                            "Describe what this existing callable does in one sentence, covering relevant inputs, outputs and side effects. Use the source file already provided.\nSymbol: {}\nLines: {}-{}",
+                            callable.qualified_name, callable.start_line, callable.end_line
+                        );
+                        let mut messages = conversation.messages.clone();
+                        messages.push(Message::user(prompt));
+                        (
+                            Some(index),
+                            key,
+                            Some(callable.qualified_name.clone()),
+                            callable.source_hash.clone(),
+                            prepared.regenerate_callables,
+                            messages,
+                        )
+                    };
+                let generation = DescriptionGeneration {
+                    scope: if callable_index.is_some() {
+                        "callable"
+                    } else {
+                        "file"
+                    }
+                    .into(),
+                    path: prepared.file.path.clone(),
+                    symbol,
+                    source_hash,
+                    file_hash: prepared.file.hash.clone(),
+                    file_description: if callable_index.is_some() {
+                        prepared.file.description.clone()
+                    } else {
+                        None
+                    },
+                    profile: llm.profile(),
+                    settings: description_settings(&self.config),
+                    system: DESCRIPTION_SYSTEM.into(),
+                    prompt: messages.last().unwrap().content.clone(),
+                    messages,
+                    regenerate,
+                };
+                jobs.entry(key.clone()).or_default().push(DescriptionJob {
+                    file_index,
+                    callable_index,
+                    key,
+                    generation,
+                    session: conversation.session.clone(),
+                });
+            }
+            if jobs.is_empty() {
+                return Ok(());
+            }
+            self.artifacts
+                .hydrate_descriptions(&self.db, &jobs.keys().cloned().collect::<Vec<_>>())?;
+            let mut pending = Vec::new();
+            for (_, jobs) in jobs {
+                if let Some(cached) = self.db.cache("description", &jobs[0].key)? {
+                    let text = DescriptionArtifact::decode(&cached)?.text;
+                    for job in jobs {
+                        apply_description(prepared, &mut conversations, &job, text.clone());
+                    }
+                } else {
+                    pending.push(jobs);
+                }
+            }
+            run_jobs(
+                "Generating descriptions",
+                &pending,
+                parallelism,
+                |_| 1,
+                |jobs| {
+                    let job = &jobs[0];
+                    llm.describe_conversation(
+                        DESCRIPTION_SYSTEM,
+                        &job.generation.messages,
+                        &job.session,
+                    )
+                },
+                |jobs, text| {
+                    let job = &jobs[0];
+                    let (artifact, contents) =
+                        DescriptionArtifact::new(text.clone(), &job.generation)?;
+                    let encoded = serde_json::to_string(&artifact)?;
+                    self.db
+                        .put_description_artifact(&job.key, &encoded, &contents)?;
+                    self.artifacts
+                        .put_description(&self.db, &job.key, &encoded, &contents);
+                    for job in jobs {
+                        apply_description(prepared, &mut conversations, job, text.clone());
+                    }
+                    Ok(())
+                },
+            )?;
+        }
     }
 
     fn ensure_embeddings(&self, inputs: &[String], query: bool) -> Result<()> {
@@ -1775,6 +1838,26 @@ fn flag(value: &Value, key: &str) -> bool {
     value[key].as_bool().unwrap_or(false)
 }
 
+fn apply_description(
+    prepared: &mut [PreparedFile],
+    conversations: &mut [FileConversation],
+    job: &DescriptionJob,
+    text: String,
+) {
+    let prepared = &mut prepared[job.file_index];
+    let conversation = &mut conversations[job.file_index];
+    if let Some(index) = job.callable_index {
+        prepared.callables[index].data["description"] = json!(text);
+        conversation.next_callable = index + 1;
+    } else {
+        prepared.file.description = Some(text.clone());
+        prepared.file.description_hash = Some(prepared.file.hash.clone());
+        conversation.file_ready = true;
+    }
+    conversation.messages = job.generation.messages.clone();
+    conversation.messages.push(Message::assistant(text));
+}
+
 fn description_settings(config: &Value) -> Value {
     json!({
         "descriptionProvider": config["descriptionProvider"],
@@ -1832,18 +1915,6 @@ fn globs(value: &Value) -> Result<GlobSet> {
     Ok(builder.build()?)
 }
 
-fn missing_jobs<T>(
-    db: &Database,
-    kind: &str,
-    jobs: BTreeMap<String, T>,
-) -> Result<Vec<(String, T)>> {
-    jobs.into_iter()
-        .filter_map(|(key, job)| match db.cache(kind, &key) {
-            Ok(Some(_)) => None,
-            other => Some(other.map(|_| (key, job))),
-        })
-        .collect()
-}
 fn concatenate(parts: &[&[f32]]) -> Result<Vec<f32>> {
     let mut values = Vec::new();
     for part in parts {
