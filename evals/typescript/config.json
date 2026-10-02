@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "models": [
+    {"model": "opencode-go/deepseek-v4.1-flash", "variant": "medium", "options": {"reasoningEffort": "medium"}},
+    {"model": "opencode-go/muse-spark-1.3-contributor", "variant": "medium", "options": {"reasoningEffort": "medium"}}
+  ],
+  "timeout_seconds": 600,
+  "max_steps": 40,
+  "index_timeout_seconds": 3600,
+  "slopdex": {
+    "provider": "openai",
+    "model": "text-embedding-3-large",
+    "dimensions": 3072,
+    "descriptionsEnabled": false,
+    "rerankingEnabled": false,
+    "include": ["tsc/internal/**/*.go"],
+    "maxFileSize": 16777216
+  }
+}

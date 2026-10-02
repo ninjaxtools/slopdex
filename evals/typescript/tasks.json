@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "repository_commit": "edf7da4e93ab65e1f7766deae156c35132c0cde3",
+  "tasks": [
+    {
+      "id": "overloaded-generic-calls",
+      "title": "Selecting an overload with context-sensitive arguments",
+      "prompt": "Investigate how the checker handles an ordinary call to an overloaded generic function when an argument is a callback whose type depends on the selected overload. Identify three implementation functions: the one that obtains callable signatures from the callee's type and delegates typed calls; the one that coordinates candidate ordering, the successive type-relation passes, and failure reporting; and the one that evaluates individual candidates through arity checks, type-argument inference or validation, and contextual argument checking. Explain the flow between them, why a candidate may be checked again after initially excluding context-sensitive arguments, and what happens when no candidate succeeds. Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/checker/checker.go",
+          "symbol": "resolveCallExpression"
+        },
+        {
+          "path": "tsc/internal/checker/checker.go",
+          "symbol": "resolveCall"
+        },
+        {
+          "path": "tsc/internal/checker/checker.go",
+          "symbol": "chooseOverload"
+        }
+      ]
+    },
+    {
+      "id": "discriminant-branch-types",
+      "title": "Recovering a union member from a branch condition",
+      "prompt": "Trace how comparing a union-valued object's discriminant property with a literal changes the object's type inside the true and false branches. Identify three implementation functions: the one that computes a conditional flow node's type from its antecedent and the branch polarity; the one that handles discriminant-property comparisons, including any special handling of strict equality and inequality; and the fallback that narrows the accessed property and filters the original union's constituents. Explain their relationship, how the two branch polarities affect selection or exclusion of a member, and how optional property access and nullable types influence the fallback. Do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/checker/flow.go",
+          "symbol": "getTypeAtFlowCondition"
+        },
+        {
+          "path": "tsc/internal/checker/flow.go",
+          "symbol": "narrowTypeByDiscriminantProperty"
+        },
+        {
+          "path": "tsc/internal/checker/flow.go",
+          "symbol": "narrowTypeByDiscriminant"
+        }
+      ]
+    },
+    {
+      "id": "conditional-package-subpaths",
+      "title": "Resolving a package subpath through an export map",
+      "prompt": "Investigate Node-style resolution of a package whose export map includes a root entry, overlapping exact and wildcard subpaths, conditional targets, arrays of alternatives, and an explicitly blocked subpath. Identify three implementation functions: the one that interprets the package's export map for the requested root or subpath; the one that selects an exact or expanding subpath key and extracts the matched portion; and the recursive one that interprets the selected target and attempts resolution. Explain the flow between them, how wildcard precedence is determined, how conditions and arrays are traversed, and how an explicit null target differs from an unsuccessful alternative. Include where target paths are validated and where a matched target becomes a file lookup. Do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/module/resolver.go",
+          "symbol": "loadModuleFromExports"
+        },
+        {
+          "path": "tsc/internal/module/resolver.go",
+          "symbol": "loadModuleFromExportsOrImports"
+        },
+        {
+          "path": "tsc/internal/module/resolver.go",
+          "symbol": "loadModuleFromTargetExportOrImport"
+        }
+      ]
+    },
+    {
+      "id": "inherited-config-file-selection",
+      "title": "From layered configuration to the selected source files",
+      "prompt": "A project inherits several configurations from other directories, overrides some compiler options and file-selection settings, and encounters both source files and generated files with the same basename. Identify three implementation functions: the one that recursively combines the project's own configuration with its bases and adjusts inherited relative file specifications; the one that obtains an inherited configuration through the optional cache while accounting for the active resolution stack; and the one that expands validated file specifications into the final file list. Explain the flow across these stages, precedence among multiple bases and local settings, preservation of the origin of relative path mappings, circular-inheritance handling, and the different treatment of explicit files, wildcard matches, competing extensions, and JSON files. Do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/tsoptions/tsconfigparsing.go",
+          "symbol": "parseConfig"
+        },
+        {
+          "path": "tsc/internal/tsoptions/tsconfigparsing.go",
+          "symbol": "getExtendedConfig"
+        },
+        {
+          "path": "tsc/internal/tsoptions/tsconfigparsing.go",
+          "symbol": "getFileNamesFromConfigSpecs"
+        }
+      ]
+    },
+    {
+      "id": "unbuilt-referenced-project",
+      "title": "Using a referenced project's sources before declaration output exists",
+      "prompt": "Trace how a program configured to use project-reference sources can follow a dependency whose expected declaration output has not been written to disk. Identify three implementation functions: the one that builds the referenced configuration's input-to-declaration-output and reverse associations; the filesystem helper that decides whether an expected declaration file can count as present based on its corresponding source; and the file-loading routine that checks project-reference redirection before reading and parsing the requested file. Explain how the associations support resolution and loading, where the source-versus-output policy enters the loading flow, how a redirected task is scheduled, and how an unmapped declaration path is distinguished from a mapped path whose source is missing. Do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/tsoptions/parsedcommandline.go",
+          "symbol": "ParseInputOutputNames"
+        },
+        {
+          "path": "tsc/internal/compiler/projectreferencedtsfakinghost.go",
+          "symbol": "fileExistsIfProjectReferenceDts"
+        },
+        {
+          "path": "tsc/internal/compiler/filesparser.go",
+          "symbol": "load"
+        }
+      ]
+    },
+    {
+      "id": "single-file-program-reuse",
+      "title": "Deciding whether an editor edit permits program reuse",
+      "prompt": "Investigate the incremental program-update path when an editor project knows that exactly one source file changed and the configuration object is unchanged. Identify three implementation functions: the project-level routine that attempts this optimization and manages ownership of parsed files; the compiler routine that tries replacing the changed file while retaining existing program data; and the predicate that compares the old and new file's structure-affecting metadata. Explain their flow, which import or reference changes invalidate the optimization, why some package redirects or synthetic imports require rebuilding even when the metadata predicate passes, and what happens to the speculatively acquired changed file and the references to unchanged parsed files on success versus fallback. Do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/project/project.go",
+          "symbol": "CreateProgram"
+        },
+        {
+          "path": "tsc/internal/compiler/program.go",
+          "symbol": "ReuseProgram"
+        },
+        {
+          "path": "tsc/internal/compiler/program.go",
+          "symbol": "canReplaceFileInProgram"
+        }
+      ]
+    },
+    {
+      "id": "lazy-auto-import-completion",
+      "title": "From exported candidates to a resolved auto-import completion",
+      "prompt": "Trace an auto-import completion for an identifier in an ordinary, non-content-mapped source file, from candidate selection to the client's later request for its details. Identify three implementation functions: the auto-import view routine that groups matching exports and chooses and orders their import fixes; the language-service resolve entry point that recovers the correct source file and checker from the completion item's stored data; and the details routine that handles the stored auto-import fix and attaches the resulting import edits. Explain how duplicate exports, alternative module spellings, JSX or type-only context, and fix ranking affect candidate selection, and how the lazy resolve path uses stored data rather than collecting auto-import candidates again. Include the special treatment of completions inside an import statement. Do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/ls/autoimport/view.go",
+          "symbol": "GetCompletions"
+        },
+        {
+          "path": "tsc/internal/ls/completions.go",
+          "symbol": "ResolveCompletionItem"
+        },
+        {
+          "path": "tsc/internal/ls/completions.go",
+          "symbol": "getCompletionItemDetails"
+        }
+      ]
+    },
+    {
+      "id": "rename-occurrence-consistency",
+      "title": "Turning rename references into consistent workspace edits",
+      "prompt": "Investigate how the language service converts already-found symbol references into rename edits when a name participates in shorthand object properties, destructuring, or import and export aliases, and more than one reference may describe the same text range. Identify three implementation functions: the routine that validates the original node and builds workspace edits from the symbol-and-reference results; the helper that chooses replacement text according to the relationship between the renamed symbol and each occurrence; and the helper that consolidates edits by document and range. Explain their flow, why a shorthand or alias occurrence may require more than replacing the identifier, how edit construction handles occurrences that cannot be mapped back exactly to original text, and how identical duplicate edits differ from conflicting replacements at the same range. This is an implementation-understanding task; do not perform a rename or modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/ls/rename.go",
+          "symbol": "symbolAndEntriesToRename"
+        },
+        {
+          "path": "tsc/internal/ls/rename.go",
+          "symbol": "getTextForRename"
+        },
+        {
+          "path": "tsc/internal/ls/rename.go",
+          "symbol": "deduplicateRenameEdits"
+        }
+      ]
+    },
+    {
+      "id": "async-lexical-runtime-semantics",
+      "title": "Preserving runtime semantics while lowering async functions",
+      "prompt": "Trace the compiler transformation of a non-generator async function or async arrow when its parameter list contains defaults or rest parameters and its body depends on lexical bindings. Identify three implementation functions: the one that rewrites the outer parameter list; the one that constructs the lowered function body and manages forwarded arguments and captured bindings; and the visitor that rewrites individual await expressions. Explain how these stages fit together, how ordinary functions and arrows differ in parameter forwarding and function-length preservation, how lexical this and arguments are carried through the transformation, and why top-level await receives different treatment from await inside the function. Do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/transformers/estransforms/async.go",
+          "symbol": "transformAsyncFunctionParameterList"
+        },
+        {
+          "path": "tsc/internal/transformers/estransforms/async.go",
+          "symbol": "transformAsyncFunctionBody"
+        },
+        {
+          "path": "tsc/internal/transformers/estransforms/async.go",
+          "symbol": "visitAwaitExpression"
+        }
+      ]
+    },
+    {
+      "id": "ambiguous-expression-type-arguments",
+      "title": "Accepting or rolling back an ambiguous generic expression",
+      "prompt": "Investigate how the parser decides whether angle-bracket tokens after an expression represent type arguments or should remain available for relational or shift-expression parsing. Identify three implementation functions: the one that attempts the type-argument parse and either commits or abandons it; the predicate that judges the tokens following the closing bracket; and the rollback routine that restores parser and scanner state after the abandoned attempt. Explain the flow among them, the role of rescanning compound angle-bracket tokens, why JavaScript files bypass the attempt, how a following call, template, operator, or line break affects the decision, and which diagnostic and contextual state must be restored so the speculative attempt does not corrupt subsequent parsing. Do not modify code.",
+      "targets": [
+        {
+          "path": "tsc/internal/parser/parser.go",
+          "symbol": "tryParseTypeArgumentsInExpression"
+        },
+        {
+          "path": "tsc/internal/parser/parser.go",
+          "symbol": "canFollowTypeArgumentsInExpression"
+        },
+        {
+          "path": "tsc/internal/parser/parser.go",
+          "symbol": "rewind"
+        }
+      ]
+    }
+  ]
+}

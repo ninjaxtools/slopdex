@@ -1,0 +1,5 @@
+[submodule "evals/typescript/repo"]
+	path = evals/typescript/repo
+	url = https://github.com/microsoft/TypeScript.git
+	branch = main
+	shallow = true
