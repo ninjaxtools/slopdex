@@ -18,6 +18,7 @@ root. Source builds require Rust/Cargo, a C/C++ compiler, and platform build too
 the native application runs without Node. For development, run:
 
 ```bash
+cargo run --locked -- update
 cargo run --locked -- search "keep the repository index synchronized"
 cargo verify
 ```
@@ -40,10 +41,10 @@ can also follow the command. Quote multiword queries.
 | `search-md <query>` | Search heading-aware `.md`/`.markdown` chunks. | Ranked heading paths |
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
-| `map [PATH]...` | Refresh local structure and show code declarations/Markdown headings without providers or vector sidecars. | Summary |
+| `map [PATH]...` | Show code declarations/Markdown headings; refresh existing index structure or parse directly if no index exists. | Summary |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
-| `update` | Explicitly refresh the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
+| `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
 | `index reindex-files [--callables]` | Regenerate stale file descriptions from indexed source; optionally regenerate their callable descriptions too. Requires enabled descriptions. | JSON statistics |
 | `help models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
 | `config [prefix]` | Configure matching settings interactively without opening an index. | Updated-setting summary |
@@ -77,9 +78,11 @@ can write the resulting configuration to redirected stdout.
 Advanced endpoint/HTTP settings can be set with `config set`.
 
 Help, version, configuration, and model-catalog commands do not refresh the index.
-Other commands open it and normally refresh before doing their work.
-`map` refreshes only local structure; semantic commands also prepare missing
-embeddings and enabled descriptions.
+Search commands and cross-search require an existing resolved index; run
+`slopdex update` first. Existing indexes normally refresh before commands run.
+`map` refreshes only local structure when indexed, or parses directly when the
+index is missing. Semantic refresh also prepares missing embeddings and enabled
+descriptions.
 
 On terminal stderr, cliclack displays progress for catalog loading, opening and
 refreshing indexes, searches, explanations, and description regeneration.
@@ -106,17 +109,23 @@ use plain diagnostics without animations; result data on stdout retains its
 slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--format text|json]
 ```
 
-With no paths, map selects the indexed repository. Paths select files or recursive
+With no paths, map selects the repository. Paths select files or recursive
 directories and are relative to `--root`, including when invoked from another
 working directory. Absolute paths within the root are accepted; paths outside it
 are rejected. Missing paths produce warnings on stderr and are ignored. Multiple
 paths form a union, intersected with the shared selectors.
 
-Map normally refreshes local file snapshots, declarations, headings, search units,
-and diagnostics in SQLite. It makes no provider requests, generates no descriptions
-or embeddings, and does not open/rebuild USearch sidecars. `map --no-reindex` reads stored
+When the resolved index is missing, map parses eligible files directly and renders
+the same structure, selectors, call-graph expansion, and expanded source/Markdown
+output. It creates no database, lock files, cache directories, or sidecars, even
+with `--no-reindex`, and works without Git. Ignore/include/exclude rules and
+`maxFileSize` still apply.
+
+With an existing index, map normally refreshes local file snapshots, declarations,
+headings, search units, and diagnostics in SQLite. `map --no-reindex` reads stored
 SQLite structure without reading current source files. Selection narrows output,
-not repository indexing; the normal indexing ignore/include/exclude rules apply.
+not repository discovery. Both paths make no provider requests or generate
+descriptions, embeddings, or USearch sidecars.
 
 Private and unexported symbols are omitted by default according to each language's
 visibility conventions. Pass `--private` to include them. Ancestors needed to
@@ -184,8 +193,10 @@ indented. Code ranges cover original declarations; Markdown map ranges cover ful
 sections, including subsections. With `--detail expanded`, Markdown maps also print
 the full body beneath each selected heading, without repeating nested sections.
 Headings included only as ancestor context remain heading-only, and filters omit
-unmatched section bodies. The renderer uses indexed source and declaration metadata
-(and remains offline with `--no-reindex`). Long signatures are truncated at the default detail level.
+unmatched section bodies. The renderer uses source and declaration metadata from
+the saved index or direct parsing. Indexed maps remain offline with `--no-reindex`;
+unindexed maps read current files even with that flag. Long signatures are
+truncated at the default detail level.
 JSON is an array of
 file objects with `path` and `nodes`, retaining full selected metadata: file-local
 `id`/`parentId`, kind, names, `qualifiedName`, signature, attributes, import
@@ -254,12 +265,13 @@ Cross-search options:
 | `--cross-file-only` | Exclude candidates with the same root-qualified file path as the source. |
 | `--include-symmetric-duplicates` | Keep both directions of same-index pairs. By default each unordered observed pair is emitted once. |
 | `--cohesion` | Sort each source's selected matches by descending filesystem distance, then similarity. Defaults to summary; incompatible with clusters. |
-| `--target-root <path> --target-index <path>` | Compare to another index; both are required together. Embedding profiles must match. |
+| `--target-root <path> --target-index <path>` | Compare to another existing index; both are required together. The target is checked before the source engine opens or refreshes. Embedding profiles must match. |
 | `--target-config <path>` | Config for the second root; defaults to `<target-root>/.slopdex/config.json`. Requires both target options. |
 
 Examples:
 
 ```bash
+slopdex update
 slopdex search "keep the repository index synchronized"
 slopdex search-code "configure the embedding provider"
 slopdex search-md "configure the embedding provider"
@@ -273,6 +285,7 @@ slopdex cross-search --uncommitted --cross-file-only --threshold 0.9
 slopdex cross-search --changed-since origin/main --threshold 0.9
 slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 0.9
 slopdex cross-search --cross-file-only --cohesion --threshold 0.8
+slopdex --root /path/to/other/repo --index /path/to/other/index.sqlite update
 slopdex cross-search --target-root /path/to/other/repo \
   --target-index /path/to/other/index.sqlite --threshold 0.9
 ```
@@ -449,6 +462,22 @@ format and wording are not deterministic.
 
 ## Index lifecycle and persistence
 
+### Create and refresh
+
+Run `slopdex update` once for the selected root/index path before searching.
+`search`, `search-code`, `search-md`, `search-descriptions`, and `cross-search`
+fail promptly if the resolved source index does not exist, with an instruction to
+run `slopdex update`, including with `--no-reindex`. Cross-search also requires
+the target index to exist and validates it before opening or refreshing the
+source engine. Missing-index failures create no index/cache artifacts and make
+no provider calls.
+
+Existing indexes continue to refresh automatically unless `--no-reindex` is
+given. A compatible legacy default index can still migrate to the XDG location
+before use. Git is optional: indexing reads the working tree and records HEAD
+when available. An unindexed `map` is direct, local inspection; it does not
+initialize an index for a subsequent search.
+
 ### SQLite authority and USearch sidecars
 
 The default database is `$XDG_CACHE_HOME/slopdex/workspaces/<root-hash>/index.sqlite`
@@ -583,9 +612,11 @@ offline when the matching artifacts/results exist. Catalog commands still fetch
 their catalogs. Use the CLI flag: the CLI overwrites a JSON `noReindex` value with
 the flag's value on every invocation.
 
-`map --no-reindex` needs neither providers nor sidecar repair. A structure-only
-index can have search units without vectors; `--no-reindex` does not prepare those
-missing vectors. Run a semantic command with normal refresh to prepare them.
+`map --no-reindex` needs neither providers nor sidecar repair. With no index it
+parses current files directly; with an existing index it uses saved structure.
+A structure-only index can have search units without vectors; `--no-reindex`
+does not prepare those missing vectors. Run a semantic command with normal
+refresh to prepare them.
 
 Native index identity includes canonical root and schema. Embedding profiles
 (provider/model/dimensions/strategy) are separate projections: changing a model
@@ -603,15 +634,16 @@ the flag adds no engine behavior.
 Native schema **3** is a hard cutoff: **all schema-2 indexes**, old
 `rust_`-prefixed native tables, and TypeScript layouts (including schema 11) are
 rejected with instructions to remove the existing SQLite index and rebuild, or
-choose a new index path. There is no legacy import or migration, and neither
-`--force-reindex` nor `--no-reindex` bypasses old-layout rejection.
+choose a new index path. These incompatible layouts are not imported or migrated;
+neither `--force-reindex` nor `--no-reindex` bypasses old-layout rejection.
 
 For an old explicit database, stop any Slopdex process using it, then remove
 that database and its `-wal`/`-shm` companions. A schema-3 index at the former
 default `.slopdex/index.sqlite` is copied automatically to the new XDG default
-location on first use; older incompatible layouts are skipped and rebuilt at
-the new location. To rebuild at a fresh default location, remove the current
-index path reported by `slopdex status --format json` and its WAL/SHM companions.
+location on first use; older incompatible layouts are skipped. Run
+`slopdex update` to create the new index. To rebuild at a fresh default location,
+remove the current index path reported by `slopdex status --format json` and its
+WAL/SHM companions.
 Alternatively, select a new path:
 
 ```bash
@@ -632,8 +664,8 @@ descriptions using the configured providers; old database artifacts and saved
 description settings are not imported. Derived USearch sidecars are reconciled
 or rebuilt from the new SQLite snapshot.
 
-Use `slopdex map` instead of `update` to build only local structure without
-provider calls; semantic refresh can prepare embeddings later.
+Use `slopdex map` to inspect local structure before creating an index. Run
+`slopdex update` when ready to prepare an index for search.
 
 ### Coverage and failures
 

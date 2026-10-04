@@ -6,11 +6,11 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use slopdex::engine::Engine;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         Arc, Condvar, Mutex,
@@ -690,6 +690,82 @@ fn artifact_counts(repo: &Repo) -> Result<(i64, i64, i64)> {
             |r| r.get(0),
         )?,
     ))
+}
+
+/// Include directories as well as file bytes, so even an empty cache/lock
+/// directory or a write to an existing index is observable.
+fn filesystem_snapshot(root: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        entries: &mut BTreeMap<PathBuf, Option<Vec<u8>>>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root)?.to_owned();
+            if entry.file_type()?.is_dir() {
+                entries.insert(relative, None);
+                visit(root, &path, entries)?;
+            } else {
+                // Empty lifetime-lock files can be held by another process;
+                // avoid reading their locked byte range on Windows.
+                let bytes = if entry.metadata()?.len() == 0 {
+                    Vec::new()
+                } else {
+                    fs::read(path)?
+                };
+                entries.insert(relative, Some(bytes));
+            }
+        }
+        Ok(())
+    }
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries)?;
+    Ok(entries)
+}
+
+fn isolated_cli(repo: &Repo, index: Option<&Path>) -> Command {
+    let mut command = repo.child(env!("CARGO_BIN_EXE_slopdex"));
+    command
+        .arg("--root")
+        .arg(&repo.root)
+        .env("XDG_CACHE_HOME", repo.home.join("cache"));
+    if let Some(index) = index {
+        command.arg("--index").arg(index);
+    }
+    command
+}
+
+/// Bound failures that must precede engine locking or provider work. Killing a
+/// regressed child keeps the locked-source case from hanging the test suite.
+fn quick_output(command: &mut Command) -> Result<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            child.kill()?;
+            let output = child.wait_with_output()?;
+            anyhow::bail!(
+                "CLI did not fail promptly: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(child.wait_with_output()?)
+}
+
+fn assert_missing_index(output: &Output) {
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.to_lowercase().contains("index"), "{stderr}");
+    assert!(stderr.contains("slopdex update"), "{stderr}");
+    assert!(!stderr.contains(TEST_KEY), "CLI leaked a credential");
 }
 
 fn concurrency_fixture(
@@ -2408,6 +2484,136 @@ fn git_changed_since_filters_symbols_while_uncommitted_includes_staged_and_untra
 }
 
 #[test]
+fn cli_missing_resolved_source_indexes_fail_without_artifacts_or_provider_calls() -> Result<()> {
+    for selection in ["default", "explicit", "config"] {
+        let mock = Mock::start()?;
+        let repo = Repo::new()?;
+        let mut config = mock.config();
+        config["descriptionsEnabled"] = json!(true);
+        config["rerankingEnabled"] = json!(true);
+        if selection == "config" {
+            config["indexPath"] = json!("uncreated/configured.sqlite");
+        }
+        repo.write(".slopdex/config.json", &config.to_string())?;
+        repo.write("api.rs", &function("alpha", "VECTOR_EAST"))?;
+        repo.write("guide.md", "# Guide\n\nVECTOR_EAST documentation.\n")?;
+        // A lower-priority existing index must not mask the missing selected
+        // path: --index beats config, and config beats the XDG default.
+        if selection != "default" {
+            let decoy = if selection == "explicit" {
+                repo.index.clone()
+            } else {
+                repo.home
+                    .join("cache/slopdex/workspaces")
+                    .join(slopdex::hash(
+                        repo.root.canonicalize()?.as_os_str().as_encoded_bytes(),
+                    ))
+                    .join("index.sqlite")
+            };
+            Engine::open_map(&repo.root, &decoy, config.clone())?.refresh_structure()?;
+            if selection == "explicit" {
+                config["indexPath"] = json!(decoy);
+                repo.write(".slopdex/config.json", &config.to_string())?;
+            }
+        }
+        let explicit = Path::new("uncreated/explicit.sqlite");
+        let index = (selection == "explicit").then_some(explicit);
+        let before = filesystem_snapshot(repo._temp.path())?;
+        let cache_before = filesystem_snapshot(mock.cache.path())?;
+        for no_reindex in [false, true] {
+            for kind in [
+                "search",
+                "search-code",
+                "search-md",
+                "search-descriptions",
+                "cross-search",
+            ] {
+                let mut command = isolated_cli(&repo, index);
+                command.args(["--format", "json"]);
+                if no_reindex {
+                    command.arg("--no-reindex");
+                }
+                command.arg(kind);
+                if kind != "cross-search" {
+                    command.arg("east");
+                }
+                let output = quick_output(&mut command)?;
+                assert_missing_index(&output);
+                assert_eq!(mock.count(), 0, "{selection}, {kind}, {no_reindex}");
+                assert_eq!(
+                    filesystem_snapshot(repo._temp.path())?,
+                    before,
+                    "{selection}, {kind}, {no_reindex} created workspace artifacts"
+                );
+                assert_eq!(filesystem_snapshot(mock.cache.path())?, cache_before);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_missing_cross_target_fails_before_source_open_or_refresh() -> Result<()> {
+    let mock = Mock::start()?;
+    let source = Repo::new()?;
+    let mut target = Repo::new()?;
+    target.index = target._temp.path().join("uncreated/target.sqlite");
+    let config = mock.config();
+    source.write(".slopdex/config.json", &config.to_string())?;
+    target.write(".slopdex/config.json", &config.to_string())?;
+    source.write("source.rs", &function("saved", "VECTOR_EAST"))?;
+    target.write("target.rs", &function("target", "VECTOR_EAST"))?;
+    source.cli_json(&["update"])?;
+    source.write(
+        "source.rs",
+        &function("edited", "BROKEN_EMBED VECTOR_NORTH"),
+    )?;
+    mock.fail_on(Some("BROKEN_EMBED"));
+    let calls = mock.count();
+
+    // Holding the source's exclusive lock makes opening it before target
+    // validation observable, even if opening would otherwise be read-only.
+    let guard = source.open(&config)?;
+    let status = guard.status()?;
+    let check = || -> Result<()> {
+        let before = filesystem_snapshot(source._temp.path())?;
+        let target_before = filesystem_snapshot(target._temp.path())?;
+        let cache_before = filesystem_snapshot(mock.cache.path())?;
+        for no_reindex in [false, true] {
+            let mut command = isolated_cli(&source, Some(&source.index));
+            if no_reindex {
+                command.arg("--no-reindex");
+            }
+            let output = quick_output(command.args([
+                "cross-search",
+                "--target-root",
+                target.root.to_str().unwrap(),
+                "--target-index",
+                target.index.to_str().unwrap(),
+            ]))?;
+            assert_missing_index(&output);
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(target.index.to_str().unwrap())
+            );
+            assert_eq!(filesystem_snapshot(source._temp.path())?, before);
+            assert_eq!(filesystem_snapshot(target._temp.path())?, target_before);
+            assert_eq!(filesystem_snapshot(mock.cache.path())?, cache_before);
+            assert_eq!(mock.count(), calls);
+        }
+        Ok(())
+    };
+    check()?;
+    assert_eq!(guard.status()?, status);
+    drop(guard);
+    check()?;
+    assert_eq!(
+        file_record(&source, "source.rs")?["source"],
+        function("saved", "VECTOR_EAST")
+    );
+    Ok(())
+}
+
+#[test]
 fn cli_refresh_search_no_reindex_jsonl_and_provider_failure_are_end_to_end() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
@@ -3187,6 +3393,351 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
 }
 
 #[test]
+fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_artifacts()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    assert!(!repo.root.join(".git").exists());
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    config["rerankingEnabled"] = json!(true);
+    config["include"] = json!(["**/*.py", "**/*.ts", "**/*.md"]);
+    config["exclude"] = json!(["excluded/**"]);
+    config["maxFileSize"] = json!(2048);
+    repo.write(".gitignore", "ignored.py\n")?;
+    repo.write(".ignore", "rule-ignored.py\n")?;
+    repo.write("src/.gitignore", "nested-ignored.py\n")?;
+    repo.write("a.py", "from b import middle\n\ndef outer():\n    return middle()\n\ndef outermost():\n    return outer()\n")?;
+    repo.write(
+        "b.py",
+        "from c import leaf\n\ndef middle():\n    return leaf()\n",
+    )?;
+    repo.write(
+        "c.py",
+        "from d import deepest\n\ndef leaf():\n    return deepest()\n",
+    )?;
+    repo.write("d.py", "def deepest():\n    return 42\n")?;
+    repo.write("src/api.ts", "export class Api {\n  public run() { return 1; }\n  private stop() {}\n}\nfunction hidden() {}\n")?;
+    repo.write("src/skip.ts", "export class Skip {}\n")?;
+    for path in [
+        "ignored.py",
+        "rule-ignored.py",
+        "src/nested-ignored.py",
+        "excluded/ignored.py",
+        "generated/ignored.py",
+    ] {
+        repo.write(path, "def ignored():\n    return 0\n")?;
+    }
+    repo.write("not-included.rs", "pub fn not_included() {}\n")?;
+    for (name, size) in [("at_limit", 2048), ("over_limit", 2049)] {
+        let mut source = format!("def {name}():\n    return 1\n");
+        source.push_str(&" ".repeat(size - source.len()));
+        repo.write(&format!("{name}.py"), &source)?;
+    }
+    let body = format!("{}End of selected body.", "Café 🚀 ".repeat(50));
+    let markdown = format!(
+        "Guide\n=====\nGuide intro.\n\n## Setup\n{body}\n\n### Details\n```md\n# Literal heading\n```\nDetails body.\n\n## Other\nOther body.\n"
+    );
+    repo.write("docs/guide.md", &markdown.replace('\n', "\r\n"))?;
+
+    let call_args = [
+        "map",
+        "b.py",
+        "-g",
+        "b.py",
+        "-e",
+        "^MIDDLE$",
+        "-i",
+        "-k",
+        "fns",
+        "--callers",
+        "2",
+        "--callees",
+        "2",
+        "--expand-callers",
+        "1",
+        "--expand-callees",
+        "1",
+    ];
+    let cases: [(&str, &[&str]); 8] = [
+        ("json", &["map", "--private", "-k", "fns,types,headings"]),
+        (
+            "json",
+            &[
+                "map",
+                "src",
+                "-g",
+                "**/*.ts",
+                "-g",
+                "!**/skip.ts",
+                "-e",
+                "^API\\.RUN$",
+                "-e",
+                "^absent$",
+                "-i",
+                "-k",
+                "methods",
+                "-k",
+                "headings",
+            ],
+        ),
+        ("json", &call_args),
+        ("text", &call_args),
+        (
+            "text",
+            &[
+                "map",
+                "docs",
+                "-g",
+                "**/*.md",
+                "-e",
+                "^GUIDE\\.SETUP$",
+                "-i",
+                "-k",
+                "headings",
+                "--detail",
+                "expanded",
+            ],
+        ),
+        ("text", &["map", "docs", "--detail", "expanded"]),
+        ("json", &["map", "src/api.ts"]),
+        (
+            "json",
+            &[
+                "map", "b.py", "-e", "^middle$", "-k", "fns", "--detail", "expanded",
+            ],
+        ),
+    ];
+    let mut expected = Vec::new();
+    for selection in ["default", "explicit", "config"] {
+        if selection == "config" {
+            config["indexPath"] = json!("uncreated/configured.sqlite");
+        }
+        repo.write(".slopdex/config.json", &config.to_string())?;
+        let explicit = Path::new("uncreated/explicit.sqlite");
+        let index = (selection == "explicit").then_some(explicit);
+        let before = filesystem_snapshot(repo._temp.path())?;
+        let cache_before = filesystem_snapshot(mock.cache.path())?;
+        for no_reindex in [false, true] {
+            for (i, (format, args)) in cases.iter().enumerate() {
+                let mut command = isolated_cli(&repo, index);
+                command.args(["--format", *format]);
+                if no_reindex {
+                    command.arg("--no-reindex");
+                }
+                let output = command.args(*args).output()?;
+                ensure!(
+                    output.status.success(),
+                    "{selection}, {args:?}, {no_reindex}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if selection == "default" && !no_reindex {
+                    expected.push(output.stdout);
+                } else {
+                    assert_eq!(
+                        output.stdout, expected[i],
+                        "{selection}, {args:?}, {no_reindex}"
+                    );
+                }
+                assert_eq!(filesystem_snapshot(repo._temp.path())?, before);
+                assert_eq!(filesystem_snapshot(mock.cache.path())?, cache_before);
+                assert_eq!(mock.count(), 0);
+            }
+        }
+    }
+
+    let all_rows: Value = serde_json::from_slice(&expected[0])?;
+    let paths: BTreeSet<_> = all_rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        BTreeSet::from([
+            "a.py",
+            "at_limit.py",
+            "b.py",
+            "c.py",
+            "d.py",
+            "docs/guide.md",
+            "src/api.ts",
+            "src/skip.ts"
+        ])
+    );
+    let all_names = map_names(all_rows.as_array().unwrap());
+    for name in ["at_limit", "hidden", "stop"] {
+        assert!(all_names.contains(name), "missing {name}");
+    }
+    let selected: Value = serde_json::from_slice(&expected[1])?;
+    assert_eq!(
+        map_names(selected.as_array().unwrap()),
+        strings(&["Api", "run"])
+    );
+    let expanded: Value = serde_json::from_slice(&expected[2])?;
+    assert_eq!(
+        map_names(expanded.as_array().unwrap()),
+        strings(&["outermost", "outer", "middle", "leaf", "deepest"])
+    );
+    let expanded_text = String::from_utf8(expected[3].clone())?;
+    for name in ["outer", "leaf"] {
+        assert!(
+            expanded_text.contains(&format!("@ code:\ndef {name}():")),
+            "{expanded_text}"
+        );
+    }
+    assert!(expanded_text.contains("# calls c.py :: leaf"));
+    for name in ["outermost", "middle", "deepest"] {
+        assert!(
+            !expanded_text.contains(&format!("@ code:\ndef {name}():")),
+            "{expanded_text}"
+        );
+    }
+    let filtered_md = String::from_utf8(expected[4].clone())?;
+    assert!(filtered_md.contains("Guide\n=====") && filtered_md.contains(&body));
+    for omitted in [
+        "Guide intro.",
+        "### Details",
+        "Details body.",
+        "Other body.",
+    ] {
+        assert!(!filtered_md.contains(omitted), "{omitted}");
+    }
+    let full_md = String::from_utf8(expected[5].clone())?;
+    for text in [
+        body.as_str(),
+        "Guide intro.",
+        "```md\n# Literal heading\n```\nDetails body.",
+        "Other body.",
+    ] {
+        assert_eq!(full_md.matches(text).count(), 1, "{text}");
+    }
+    let public: Value = serde_json::from_slice(&expected[6])?;
+    assert_eq!(
+        map_names(public.as_array().unwrap()),
+        strings(&["Api", "run"])
+    );
+    let default_expansion: Value = serde_json::from_slice(&expected[7])?;
+    assert_eq!(
+        map_names(default_expansion.as_array().unwrap()),
+        strings(&["outer", "middle", "leaf"])
+    );
+
+    // Engine::open_map still creates structure-only fixtures. Compare CLI output
+    // byte for byte with that indexed path, including persisted offline reads.
+    repo.open_map(&config)?.refresh_structure()?;
+    for no_reindex in [false, true] {
+        for (i, (format, args)) in cases.iter().enumerate() {
+            let mut command = isolated_cli(&repo, Some(&repo.index));
+            command.args(["--format", *format]);
+            if no_reindex {
+                command.arg("--no-reindex");
+            }
+            let output = command.args(*args).output()?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, expected[i], "indexed {args:?}, {no_reindex}");
+        }
+    }
+    assert_eq!(mock.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn cli_unindexed_map_requires_update_before_search_and_existing_indexes_refresh() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("api.rs", "pub fn alpha() -> i32 { 42 }\n")?;
+    let before = filesystem_snapshot(repo._temp.path())?;
+    for no_reindex in [false, true] {
+        let mut command = isolated_cli(&repo, None);
+        command.args(["--format", "json"]);
+        if no_reindex {
+            command.arg("--no-reindex");
+        }
+        let output = command.arg("map").output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(map_names(rows.as_array().unwrap()), strings(&["alpha"]));
+        let output = quick_output(isolated_cli(&repo, None).args(["search", "east"]))?;
+        assert_missing_index(&output);
+        assert_eq!(filesystem_snapshot(repo._temp.path())?, before);
+        assert_eq!(mock.count(), 0);
+    }
+    assert!(!repo.root.join(".slopdex").exists());
+
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    let update = isolated_cli(&repo, None).args(["update"]).output()?;
+    ensure!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&update.stdout)?["filesUpdated"],
+        1
+    );
+    assert!(
+        !repo.root.join(".git").exists(),
+        "update also works without Git"
+    );
+    let search = || -> Result<Value> {
+        let output = isolated_cli(&repo, None)
+            .args([
+                "--format",
+                "json",
+                "search-code",
+                "east",
+                "--threshold",
+                "-1",
+            ])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    assert_eq!(names(search()?.as_array().unwrap()), strings(&["alpha"]));
+    let calls = mock.count();
+    repo.write("new.rs", "pub fn beta() -> i32 { 7 }\n")?;
+    let output = isolated_cli(&repo, None)
+        .args(["--no-reindex", "--format", "json", "map"])
+        .output()?;
+    ensure!(output.status.success());
+    let rows: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(map_names(rows.as_array().unwrap()), strings(&["alpha"]));
+    let output = isolated_cli(&repo, None)
+        .args(["--format", "json", "map"])
+        .output()?;
+    ensure!(output.status.success());
+    let rows: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        map_names(rows.as_array().unwrap()),
+        strings(&["alpha", "beta"])
+    );
+    assert_eq!(mock.count(), calls, "indexed map refresh stays local");
+    assert_eq!(
+        names(search()?.as_array().unwrap()),
+        strings(&["alpha", "beta"])
+    );
+    assert!(
+        mock.count() > calls,
+        "existing search automatically prepares new code"
+    );
+    Ok(())
+}
+
+#[test]
 fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens_offline()
 -> Result<()> {
     let mock = Mock::start()?;
@@ -3596,6 +4147,7 @@ fn describe_prompt_defaults_to_two_expanded_call_levels_with_explicit_overrides(
         "from d import deepest\n\ndef leaf():\n    return deepest()\n",
     )?;
     repo.write("d.py", "def deepest():\n    return 1\n")?;
+    repo.cli_json(&["update"])?;
     let base = [
         "describe",
         "middle",
@@ -3755,6 +4307,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
         "from b import middle\n\ndef outer():\n    return middle()\n",
     )?;
     repo.write("b.py", "def middle():\n    return 1\n")?;
+    repo.cli_json(&["update"])?;
     let rows = repo.cli_json(&[
         "search-code",
         "middle",
@@ -3951,6 +4504,7 @@ fn expanded_detail_defaults_to_one_edge_and_includes_high_similarity_code() -> R
         "--threshold",
         "-1",
     ];
+    repo.cli_json(&["update"])?;
     let compact = repo.cli_json(&query)?;
     assert!(compact[0].get("relatedCallables").is_none());
     let expanded_json = repo.cli_json(&[
@@ -4267,7 +4821,7 @@ fn map_cli_folds_markdown_heading_paths_from_indexed_source() -> Result<()> {
         "guide.md",
         "Guide\n=====\n\n## Setup\nBody.\n\n### Advanced\nMore prose.\n",
     )?;
-    repo.cli_json(&["map"])?;
+    repo.open_map(&json!({}))?.refresh_structure()?;
     // An offline map should still use the saved source when deciding whether
     // gaps between headings contain only whitespace.
     repo.write("guide.md", "# Changed\n")?;
@@ -4303,7 +4857,7 @@ fn map_cli_expanded_markdown_prints_indexed_bodies_once_and_respects_filters() -
         "Guide\n=====\nGuide intro.\n\n## Setup\n{long_body}\n\n### Details\n```md\n# Literal heading\n```\nDetails body.\n\n## Other\nOther body."
     );
     repo.write("guide.md", &source.replace('\n', "\r\n"))?;
-    repo.cli_json(&["map"])?;
+    repo.open_map(&json!({}))?.refresh_structure()?;
     repo.write("guide.md", "# Changed\nChanged body.\n")?;
 
     let render = |args: &[&str]| -> Result<String> {
@@ -5046,10 +5600,35 @@ fn default_xdg_index_migrates_legacy_sqlite_without_discarding_wal_data() -> Res
     let legacy = repo.root.join(".slopdex/index.sqlite");
     let mut engine = Engine::open(&repo.root, &legacy, config)?;
     engine.refresh()?;
+    let expected_rows = engine.search("east", "search-code", &all())?;
     let generation = engine.status()?["generation"].clone();
     drop(engine);
     let calls = mock.count();
     let xdg = repo.home.join("xdg-cache");
+    let searched = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .args([
+            "--no-reindex",
+            "--format",
+            "json",
+            "search-code",
+            "east",
+            "--threshold",
+            "-1",
+        ])
+        .env("XDG_CACHE_HOME", &xdg)
+        .output()?;
+    ensure!(
+        searched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&searched.stdout)?,
+        json!(expected_rows)
+    );
     let output = repo
         .child(env!("CARGO_BIN_EXE_slopdex"))
         .arg("--root")

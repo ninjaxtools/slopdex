@@ -56,20 +56,28 @@ config/index paths, including JSON `indexPath`, resolve against the working
 directory. CLI overrides are applied after canonicalizing supported config aliases.
 Config saves use a same-directory temporary file, `sync_all`, and rename.
 
-An index command opens an engine, normally refreshes it, then runs the requested
-operation. A second cross-search root loads its own config plus the same global
-overrides. The CLI recognizes identical source/target database paths (including
+Search variants and cross-search validate that the resolved source index exists
+before opening an engine; a missing index fails promptly with `slopdex update`
+guidance and no provider calls or index/cache artifacts. Cross-search validates
+its target index before opening or refreshing the source engine. Existing
+indexes still normally refresh before the requested operation. A second
+cross-search root loads its own config plus the same global overrides. The CLI
+recognizes identical source/target database paths (including
 symlinks and Unix hard links) and reuses the source engine rather than taking a
 second lock. Provider construction validates configuration without making network
 requests; credentials are resolved only on a request. Saved description state
 and, when neither provider nor model is explicit, the saved description profile
 can supply engine defaults.
 
-`map` uses the structure-only open/refresh path: SQLite and local parsing, without
-provider requests or USearch sidecars. `--no-reindex` reads stored structure.
+If the resolved index is missing, `map` directly parses eligible files and renders
+structure without creating SQLite, locks, cache directories, or sidecars. This
+fallback applies with `--no-reindex` and without Git; it preserves selectors,
+call expansion, expanded source/Markdown rendering, and discovery/size rules.
+With an existing index, `map` uses the structure-only open/refresh path, without
+provider requests or USearch sidecars; `--no-reindex` reads stored structure.
 Map paths are root-relative (or absolute within the root) and select output from
-the indexed universe, not the discovery scope. Semantic refresh subsequently
-prepares any missing embeddings, including for files unchanged since map refresh.
+the discovered universe. Semantic refresh subsequently prepares any missing
+embeddings, including for files unchanged since an indexed map refresh.
 
 Shared selectors compile ordered `ignore::overrides` path rules and an ORed Rust
 `RegexSet`; `-i` affects regexes only. Positive globs require a match, `!` excludes,
@@ -154,9 +162,9 @@ and options. A moving Git branch is resolved before cache lookup and its ancestr
 is checked again. Dirty live publication clears the local search-result cache.
 
 This is a hard schema cutoff: all schema-2 databases, old `rust_`-prefixed tables,
-and TypeScript layouts are rejected. There is no legacy import or migration, and
-`--force-reindex` cannot bypass old-layout rejection. Remove the existing SQLite
-index and rebuild with `slopdex update`, or select a new database with
+and TypeScript layouts are rejected. These incompatible layouts are not imported
+or migrated, and `--force-reindex` cannot bypass old-layout rejection. Remove the
+existing SQLite index and rebuild with `slopdex update`, or select a new database with
 `slopdex --index /path/to/new-index.sqlite update`. See the
 [rebuild instructions](reference.md#rebuilding-an-old-index) for the default path.
 
@@ -205,7 +213,9 @@ inside dirty files. Without HEAD, files are working-tree records.
 
 Native `noReindex` skips refresh entirely, even for an empty database. Opening can
 still write metadata or, for semantic operations, repair sidecars; it is not
-read-only. Map reads saved structure without provider or sidecar work.
+read-only. Indexed map reads saved structure without provider or sidecar work;
+unindexed map still parses current files. Search/cross-search require an existing
+database even with `--no-reindex`.
 Offline status/cross-search use the saved native snapshot, while uncached query
 embedding/reranking and task descriptions still call providers. The CLI sets
 `noReindex` from `--no-reindex`, overriding a JSON value. `index reindex-files` is an
@@ -331,6 +341,7 @@ From the repository root:
 
 ```bash
 cargo verify
+cargo run --locked -- update
 cargo run --locked -- search "keep the repository index synchronized"
 cargo install --path . --locked
 slopdex --version

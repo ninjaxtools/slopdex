@@ -1,9 +1,234 @@
 //! Source-ordered declaration excerpts shared by map and semantic results.
 //! Ranges refer to the original file; signatures deliberately omit bodies.
 
-use crate::parse::{FileStructure, StructureNode};
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use crate::{
+    callgraph::{CallGraph, Key},
+    engine,
+    filter::Selection,
+    parse::{self, FileStructure, ParsedFile, StructureNode},
+    ui,
+};
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
+};
+
+/// The same selection and rendering paths serve indexed and directly parsed files.
+pub(crate) trait StructureSource {
+    fn paths(&self) -> Result<Vec<String>>;
+    fn structure(&self, path: &str) -> Result<Option<FileStructure>>;
+    fn source(&self, path: &str) -> Option<&str>;
+    fn call_graph(&self) -> Result<CallGraph>;
+
+    fn file_description(&self, _path: &str) -> Option<&str> {
+        None
+    }
+
+    fn symbol_descriptions(&self, _path: &str) -> Result<HashMap<usize, String>> {
+        Ok(HashMap::new())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Unindexed {
+    files: BTreeMap<String, (String, ParsedFile)>,
+}
+
+impl Unindexed {
+    pub(crate) fn parse(
+        root: &Path,
+        index: &Path,
+        config: &Value,
+        options: &Value,
+    ) -> Result<Self> {
+        let selection = Selection::compile(options)?;
+        let paths = selected_paths(root, options)?;
+        let (callers, callees) = call_depths(options);
+        let max_size = config["maxFileSize"].as_u64().unwrap_or(1_048_576);
+        let mut result = Self::default();
+        for path in engine::source_paths(root, index, config)? {
+            // Call resolution needs the whole workspace; otherwise parse only
+            // files that can contribute to the requested map.
+            if callers == 0 && callees == 0 && !path_matches(&selection, &paths, &path) {
+                continue;
+            }
+            let source = match engine::read_source(root, &path, max_size) {
+                Ok(source) => source,
+                Err(error) => {
+                    if config["ignoreErrors"] != true {
+                        ui::warning(format!("slopdex: {path}: {error:#}"));
+                    }
+                    continue;
+                }
+            };
+            let parsed = parse::parse(&path, &source)?;
+            if config["ignoreErrors"] != true {
+                for error in &parsed.errors {
+                    ui::warning(format!(
+                        "slopdex: {path}:{}: {}",
+                        error.start_line, error.message
+                    ));
+                }
+            }
+            result.files.insert(path, (source, parsed));
+        }
+        Ok(result)
+    }
+}
+
+impl StructureSource for Unindexed {
+    fn paths(&self) -> Result<Vec<String>> {
+        Ok(self.files.keys().cloned().collect())
+    }
+
+    fn structure(&self, path: &str) -> Result<Option<FileStructure>> {
+        Ok(self
+            .files
+            .get(path)
+            .map(|(_, parsed)| parsed.structure.clone()))
+    }
+
+    fn source(&self, path: &str) -> Option<&str> {
+        self.files.get(path).map(|(source, _)| source.as_str())
+    }
+
+    fn call_graph(&self) -> Result<CallGraph> {
+        CallGraph::from_parsed(
+            self.files
+                .iter()
+                .map(|(path, (_, parsed))| (path.as_str(), parsed)),
+        )
+    }
+}
+
+fn selected_paths(root: &Path, options: &Value) -> Result<Vec<String>> {
+    options["paths"]
+        .as_array()
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|path| {
+                    engine::normalize_path(
+                        root,
+                        path.as_str().context("Map paths must be strings")?,
+                    )
+                })
+                .collect()
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn path_matches(selection: &Selection, paths: &[String], path: &str) -> bool {
+    selection.path_matches(path)
+        && (paths.is_empty() || paths.iter().any(|p| engine::under(path, p)))
+}
+
+fn call_depths(options: &Value) -> (usize, usize) {
+    let depth = |key, expanded| {
+        options[key]
+            .as_u64()
+            .unwrap_or(0)
+            .max(options[expanded].as_u64().unwrap_or(0)) as usize
+    };
+    (
+        depth("callers", "expandCallers"),
+        depth("callees", "expandCallees"),
+    )
+}
+
+pub(crate) fn query(
+    source: &dyn StructureSource,
+    root: &Path,
+    options: &Value,
+) -> Result<Vec<Value>> {
+    let selection = Selection::compile(options)?;
+    let paths = selected_paths(root, options)?;
+    let (callers, callees) = call_depths(options);
+    let mut selected = BTreeMap::<String, Vec<StructureNode>>::new();
+    for path in source.paths()? {
+        if !path_matches(&selection, &paths, &path) {
+            continue;
+        }
+        if let Some(structure) = source.structure(&path)? {
+            let nodes = selection.select_structure(&structure);
+            if !nodes.is_empty() {
+                selected.insert(path, nodes);
+            }
+        }
+    }
+    let expansion = if callers > 0 || callees > 0 {
+        let graph = source.call_graph()?;
+        let expand_callers = options["expandCallers"].as_u64().unwrap_or(0) as usize;
+        let expand_callees = options["expandCallees"].as_u64().unwrap_or(0) as usize;
+        let seeds = selected.iter().flat_map(|(path, nodes)| {
+            nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind.as_str(),
+                        "function" | "method" | "constructor" | "generator"
+                    )
+                })
+                .map(|node| Key {
+                    path: path.clone(),
+                    id: node.id,
+                })
+        });
+        let expanded = graph.expand(seeds, callers, callees);
+        let code_keys = graph.code_keys(&expanded, expand_callers, expand_callees);
+        for key in expanded.depths.keys() {
+            if let Some(structure) = graph.files.get(&key.path)
+                && let Some(node) = graph.node(key)
+            {
+                let nodes = selected.entry(key.path.clone()).or_default();
+                for ancestor in ancestors(structure, node) {
+                    if !nodes.iter().any(|existing| existing.id == ancestor.id) {
+                        nodes.push(ancestor);
+                    }
+                }
+            }
+        }
+        Some((expanded, code_keys))
+    } else {
+        None
+    };
+    let mut result = Vec::new();
+    for (path, mut nodes) in selected {
+        nodes.sort_by_key(|node| (node.start_byte, node.id));
+        let mut values = Vec::new();
+        for node in nodes {
+            let key = Key {
+                path: path.clone(),
+                id: node.id,
+            };
+            let mut value = serde_json::to_value(&node)?;
+            value.as_object_mut().unwrap().remove("calls");
+            if let Some((expansion, code_keys)) = &expansion {
+                if let Some(depth) = expansion.depths.get(&key) {
+                    value["callDepth"] = json!(depth);
+                }
+                if let Some(calls) = expansion.comments.get(&key) {
+                    value["callees"] = json!(calls);
+                }
+                if code_keys.contains(&key) {
+                    value["expandedCode"] = json!(true);
+                    if let Some(code) = source
+                        .source(&path)
+                        .and_then(|source| source.get(node.start_byte..node.end_byte))
+                    {
+                        value["source"] = json!(code);
+                    }
+                }
+            }
+            values.push(value);
+        }
+        result.push(json!({"path":path,"nodes":values}));
+    }
+    Ok(result)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Detail {

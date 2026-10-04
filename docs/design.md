@@ -54,14 +54,19 @@ provider caches accelerate work but do not define the live repository snapshot.
 ## How the pieces fit
 
 1. `cli.rs` resolves root/config/index paths and dispatches commands to `Engine`;
-   `ui.rs` reports progress separately from result output. Index-using commands
-   normally refresh before running. Read-oriented commands try a shared lock and
-   reopen with an exclusive lock if refresh or a query needs a write.
+   `ui.rs` reports progress separately from result output. Search variants and
+   cross-search require an existing source index (`slopdex update` creates it).
+   Cross-search checks target existence before opening or refreshing the source.
+   Existing indexes normally refresh before running. Read-oriented commands try
+   a shared lock and reopen with an exclusive lock if refresh or a query needs a write.
 2. Refresh walks eligible working-tree files; `git.rs` supplies HEAD and dirty-file
    provenance, not the source text. `parse/` extracts canonical declarations,
    callable and document/Markdown search units, and diagnostics. `storage.rs`
    transactionally reconciles those records with stable unit IDs. `map` reads this
-   structure without requiring network providers or vector sidecars.
+   structure without requiring network providers or vector sidecars. When no
+   index exists, map parses directly with the same discovery rules, selectors,
+   call expansion, and rendering, creating no index/cache artifacts even with
+   `--no-reindex`.
 3. Semantic refresh uses `models.rs` traits and `providers/` adapters to generate
    missing embeddings and optional file/callable descriptions. Completed work is
    cached before live publication: workspace SQLite first, then a reusable

@@ -52,11 +52,12 @@ Vector search requires an embedding-provider API key from OpenAI or Jina.
 
 ```console
 $ export OPENAI_API_KEY="your-api-key"
+$ slopdex update
 $ slopdex search "validate an authenticated session"
 ...
 ```
 
-The index tracks the current Git commit and is created or updated on every command that uses it. Index data is stored in the current user's cache folder and project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
+The index is created with the `update` command and tracks the current Git commit and is refreshed with the latest changes before it is used. Index data is stored in the current user's global cache folder and project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
 
 ### Code map/skeleton
 

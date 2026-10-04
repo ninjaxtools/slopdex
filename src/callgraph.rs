@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    parse::{FileStructure, StructureNode},
+    parse::{FileStructure, ParsedFile, StructureNode},
     storage::{Database, STRUCTURE_PARSER_VERSION},
 };
 
@@ -75,6 +75,31 @@ impl CallGraph {
             );
             files.insert(path.clone(), db.structure(&path)?);
         }
+        Ok(Self::from_parts(files, indexed))
+    }
+
+    pub(crate) fn from_parsed<'a>(
+        files: impl IntoIterator<Item = (&'a str, &'a ParsedFile)>,
+    ) -> Result<Self> {
+        let mut structures = BTreeMap::new();
+        let mut indexed = BTreeSet::new();
+        for (path, parsed) in files {
+            for callable in &parsed.callables {
+                if let Some(node) =
+                    crate::map::matching_node(&parsed.structure, &serde_json::to_value(callable)?)
+                {
+                    indexed.insert(Key {
+                        path: path.to_owned(),
+                        id: node.id,
+                    });
+                }
+            }
+            structures.insert(path.to_owned(), parsed.structure.clone());
+        }
+        Ok(Self::from_parts(structures, indexed))
+    }
+
+    fn from_parts(files: BTreeMap<String, FileStructure>, indexed: BTreeSet<Key>) -> Self {
         let mut graph = Self {
             files,
             edges: BTreeMap::new(),
@@ -108,7 +133,7 @@ impl CallGraph {
                 }
             }
         }
-        Ok(graph)
+        graph
     }
 
     pub fn node(&self, key: &Key) -> Option<&StructureNode> {

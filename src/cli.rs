@@ -27,7 +27,7 @@ use std::{
     version,
     disable_help_subcommand = true,
     about = "Semantic code, documentation, and configuration search",
-    after_help = "Examples:\n  slopdex search \"validate an authenticated session\"\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nIndex commands refresh automatically. --no-reindex reuses the index offline."
+    after_help = "Examples:\n  slopdex update\n  slopdex search \"validate an authenticated session\"\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nSearch and cross-search require an existing index; run update first. Existing indexes refresh automatically. --no-reindex reuses the index offline. Map parses directly when no index exists."
 )]
 struct Cli {
     #[command(flatten)]
@@ -712,8 +712,47 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
 
     let config = effective_config(&cli.global, &config_file)?;
     let index = index_path(&root, cli.global.index.as_deref(), &config)?;
+    if let Command::CrossSearch(args) = &cli.command
+        && let Some(target_index) = &args.target_index
+    {
+        require_index(&absolute(target_index)?)?;
+    }
     if cli.global.index.is_none() && config["indexPath"].is_null() {
         migrate_legacy_index(&root, &index)?;
+    }
+    if matches!(
+        &cli.command,
+        Command::Search(_)
+            | Command::SearchCode(_)
+            | Command::SearchDescriptions(_)
+            | Command::SearchMd(_)
+            | Command::CrossSearch(_)
+    ) {
+        require_index(&index)?;
+    }
+    if let Command::Map(args) = &cli.command
+        && !index.exists()
+    {
+        let root = root
+            .canonicalize()
+            .context("Repository root does not exist")?;
+        ensure!(root.is_dir(), "Repository root is not a directory");
+        let format = cli.global.format.unwrap_or(Format::Summary);
+        let Some(options) = args.existing_options(&root, cli.global.detail)? else {
+            return print_map(&mut out, &[], format, cli.global.detail, None, None);
+        };
+        let source = ui::spin("Parsing structure", || {
+            map::Unindexed::parse(&root, &index, &config, &options)
+        })?;
+        let rows = map::query(&source, &root, &options)?;
+        return print_map(
+            &mut out,
+            &rows,
+            format,
+            cli.global.detail,
+            Some(&source),
+            Some(&filter::Selection::compile(&options)?),
+        );
     }
     let is_map = matches!(&cli.command, Command::Map(_));
     let read_only_command = matches!(
@@ -1036,6 +1075,15 @@ fn index_path(root: &Path, explicit: Option<&Path>, config: &Value) -> Result<Pa
         .join("workspaces")
         .join(crate::hash(root.as_os_str().as_encoded_bytes()))
         .join("index.sqlite"))
+}
+
+fn require_index(index: &Path) -> Result<()> {
+    ensure!(
+        index.is_file(),
+        "No index found at {}; run `slopdex update` first",
+        index.display()
+    );
+    Ok(())
 }
 
 /// Migrate a compatible snapshot with SQLite backup so committed WAL data is included.
@@ -1913,7 +1961,7 @@ fn print_map(
     rows: &[Value],
     format: Format,
     detail: Detail,
-    engine: Option<&Engine>,
+    source: Option<&dyn map::StructureSource>,
     selection: Option<&filter::Selection>,
 ) -> Result<()> {
     if format == Format::Json {
@@ -1938,7 +1986,7 @@ fn print_map(
                 ))
             })
             .collect();
-        if let Some(source) = engine.and_then(|engine| engine.presentation_source(path)) {
+        if let Some(source) = source.and_then(|source| source.source(path)) {
             for (node, value) in nodes.iter().zip(array(&row["nodes"])) {
                 if value["expandedCode"] == true
                     && let Some(code) = source_code(source, node)
@@ -1947,12 +1995,12 @@ fn print_map(
                 }
             }
         }
-        let full = engine
-            .map(|engine| engine.presentation_structure(path))
+        let full = source
+            .map(|source| source.structure(path))
             .transpose()?
             .flatten();
         if detail == Detail::Expanded
-            && let Some(source) = engine.and_then(|engine| engine.presentation_source(path))
+            && let Some(source) = source.and_then(|source| source.source(path))
             && let Some(structure) = &full
         {
             let bodies = markdown_map_bodies(source, structure);
@@ -1968,8 +2016,8 @@ fn print_map(
             }
         }
         let symbols = if detail == Detail::Expanded {
-            engine
-                .map(|engine| engine.presentation_symbol_descriptions(path))
+            source
+                .map(|source| source.symbol_descriptions(path))
                 .transpose()?
         } else {
             None
@@ -1984,11 +2032,11 @@ fn print_map(
                 &nodes,
                 Some(path),
                 detail.into(),
-                engine.and_then(|engine| engine.presentation_source(path)),
+                source.and_then(|source| source.source(path)),
                 full.as_ref(),
                 map::Descriptions {
                     file: if detail == Detail::Expanded {
-                        engine.and_then(|engine| engine.presentation_file_description(path))
+                        source.and_then(|source| source.file_description(path))
                     } else {
                         None
                     },

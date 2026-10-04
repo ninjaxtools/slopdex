@@ -343,40 +343,8 @@ impl Engine {
         ui::progress("Scanning repository files");
         let checkpoint = git::head(&self.root);
         let dirty = git::dirty_paths(&self.root)?;
-        let include = globs(&self.config["include"])?;
-        let exclude = globs(&self.config["exclude"])?;
         let max_size = self.config["maxFileSize"].as_u64().unwrap_or(1_048_576);
-        ensure!(max_size > 0, "maxFileSize must be positive");
-        let mut walker = ignore::WalkBuilder::new(&self.root);
-        walker
-            .hidden(false)
-            .require_git(false)
-            .git_ignore(true)
-            .git_exclude(true)
-            .git_global(true)
-            .filter_entry(|entry| {
-                !entry.file_type().is_some_and(|t| t.is_dir())
-                    || !EXCLUDED.contains(&entry.file_name().to_string_lossy().as_ref())
-            });
-        let mut paths = Vec::new();
-        for entry in walker.build() {
-            let entry = entry.context("Cannot walk repository")?;
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            if index_artifact(entry.path(), &self.db.path) {
-                continue;
-            }
-            let relative = relative(&self.root, entry.path())?;
-            if parse::language_for_path(&relative).is_none()
-                || exclude.is_match(&relative)
-                || (!include.is_empty() && !include.is_match(&relative))
-            {
-                continue;
-            }
-            paths.push(relative);
-        }
-        paths.sort();
+        let paths = source_paths(&self.root, &self.db.path, &self.config)?;
         let paths_set: HashSet<_> = paths.iter().cloned().collect();
         let removed: Vec<_> = self
             .files
@@ -396,17 +364,12 @@ impl Engine {
             } else {
                 "git"
             };
-            let source_path = self.root.join(&path);
-            let read = (|| -> Result<String> {
-                ensure!(
-                    fs::metadata(&source_path)?.len() <= max_size,
-                    "File exceeds maxFileSize ({max_size} bytes)"
-                );
-                fs::read_to_string(&source_path).context("Cannot read UTF-8 source")
-            })();
-            let source = match read {
+            let source = match read_source(&self.root, &path, max_size) {
                 Ok(source) => source,
                 Err(error) => {
+                    if self.readonly {
+                        return Err(NeedsWrite.into());
+                    }
                     let file = File {
                         path: path.clone(),
                         hash: String::new(),
@@ -491,114 +454,7 @@ impl Engine {
     }
 
     pub fn map(&self, options: &Value) -> Result<Vec<Value>> {
-        let selection = Selection::compile(options)?;
-        let paths = options["paths"]
-            .as_array()
-            .map(|paths| {
-                paths
-                    .iter()
-                    .map(|path| {
-                        self.normalize_path(path.as_str().context("Map paths must be strings")?)
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let callers = options["callers"]
-            .as_u64()
-            .unwrap_or(0)
-            .max(options["expandCallers"].as_u64().unwrap_or(0)) as usize;
-        let callees = options["callees"]
-            .as_u64()
-            .unwrap_or(0)
-            .max(options["expandCallees"].as_u64().unwrap_or(0)) as usize;
-        let mut selected = BTreeMap::<String, Vec<parse::StructureNode>>::new();
-        for path in self.db.paths()? {
-            if !selection.path_matches(&path)
-                || (!paths.is_empty() && !paths.iter().any(|p| under(&path, p)))
-            {
-                continue;
-            }
-            let file = &self.files[&path];
-            ensure!(
-                self.db
-                    .structure_current(&path, &file.hash, STRUCTURE_PARSER_VERSION)?,
-                "Structure for {path} requires refresh; run map without --no-reindex"
-            );
-            let nodes = selection.select_structure(&self.db.structure(&path)?);
-            if !nodes.is_empty() {
-                selected.insert(path, nodes);
-            }
-        }
-        let expansion = if callers > 0 || callees > 0 {
-            let graph = self.call_graph()?;
-            let expand_callers = options["expandCallers"].as_u64().unwrap_or(0) as usize;
-            let expand_callees = options["expandCallees"].as_u64().unwrap_or(0) as usize;
-            let seeds = selected.iter().flat_map(|(path, nodes)| {
-                nodes
-                    .iter()
-                    .filter(|node| {
-                        matches!(
-                            node.kind.as_str(),
-                            "function" | "method" | "constructor" | "generator"
-                        )
-                    })
-                    .map(|node| crate::callgraph::Key {
-                        path: path.clone(),
-                        id: node.id,
-                    })
-            });
-            let expanded = graph.expand(seeds, callers, callees);
-            let code_keys = graph.code_keys(&expanded, expand_callers, expand_callees);
-            for key in expanded.depths.keys() {
-                if let Some(structure) = graph.files.get(&key.path)
-                    && let Some(node) = graph.node(key)
-                {
-                    let nodes = selected.entry(key.path.clone()).or_default();
-                    for ancestor in crate::map::ancestors(structure, node) {
-                        if !nodes.iter().any(|existing| existing.id == ancestor.id) {
-                            nodes.push(ancestor);
-                        }
-                    }
-                }
-            }
-            Some((expanded, code_keys))
-        } else {
-            None
-        };
-        let mut result = Vec::new();
-        for (path, mut nodes) in selected {
-            nodes.sort_by_key(|node| (node.start_byte, node.id));
-            let mut values = Vec::new();
-            for node in nodes {
-                let key = crate::callgraph::Key {
-                    path: path.clone(),
-                    id: node.id,
-                };
-                let mut value = serde_json::to_value(&node)?;
-                value.as_object_mut().unwrap().remove("calls");
-                if let Some((expansion, code_keys)) = &expansion {
-                    if let Some(depth) = expansion.depths.get(&key) {
-                        value["callDepth"] = json!(depth);
-                    }
-                    if let Some(calls) = expansion.comments.get(&key) {
-                        value["callees"] = json!(calls);
-                    }
-                    if code_keys.contains(&key) {
-                        value["expandedCode"] = json!(true);
-                        if let Some(code) = self
-                            .presentation_source(&path)
-                            .and_then(|source| source.get(node.start_byte..node.end_byte))
-                        {
-                            value["source"] = json!(code);
-                        }
-                    }
-                }
-                values.push(value);
-            }
-            result.push(json!({"path":path,"nodes":values}));
-        }
-        Ok(result)
+        crate::map::query(self, &self.root, options)
     }
 
     /// Search presentation uses the same indexed declarations as map. Older
@@ -1788,26 +1644,106 @@ impl Engine {
     }
 
     fn normalize_path(&self, path: &str) -> Result<String> {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            // Engine::open canonicalizes the root; resolve aliases here too
-            // before checking that an absolute source path is inside it.
-            let path = path.canonicalize().context("Cannot resolve source path")?;
-            return relative(&self.root, &path);
-        }
-        ensure!(
-            !path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir)),
-            "Source path must remain inside the repository"
-        );
-        Ok(path
-            .components()
-            .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .collect::<PathBuf>()
-            .to_string_lossy()
-            .replace('\\', "/"))
+        normalize_path(&self.root, path)
     }
+}
+
+impl crate::map::StructureSource for Engine {
+    fn paths(&self) -> Result<Vec<String>> {
+        self.db.paths()
+    }
+
+    fn structure(&self, path: &str) -> Result<Option<parse::FileStructure>> {
+        let structure = self.presentation_structure(path)?;
+        ensure!(
+            structure.is_some(),
+            "Structure for {path} requires refresh; run map without --no-reindex"
+        );
+        Ok(structure)
+    }
+
+    fn source(&self, path: &str) -> Option<&str> {
+        self.presentation_source(path)
+    }
+
+    fn call_graph(&self) -> Result<crate::callgraph::CallGraph> {
+        self.call_graph()
+    }
+
+    fn file_description(&self, path: &str) -> Option<&str> {
+        self.presentation_file_description(path)
+    }
+
+    fn symbol_descriptions(&self, path: &str) -> Result<HashMap<usize, String>> {
+        self.presentation_symbol_descriptions(path)
+    }
+}
+
+pub(crate) fn source_paths(root: &Path, index: &Path, config: &Value) -> Result<Vec<String>> {
+    let include = globs(&config["include"])?;
+    let exclude = globs(&config["exclude"])?;
+    ensure!(
+        config["maxFileSize"].as_u64().unwrap_or(1_048_576) > 0,
+        "maxFileSize must be positive"
+    );
+    let mut walker = ignore::WalkBuilder::new(root);
+    walker
+        .hidden(false)
+        .require_git(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .filter_entry(|entry| {
+            !entry.file_type().is_some_and(|t| t.is_dir())
+                || !EXCLUDED.contains(&entry.file_name().to_string_lossy().as_ref())
+        });
+    let mut paths = Vec::new();
+    for entry in walker.build() {
+        let entry = entry.context("Cannot walk repository")?;
+        if !entry.file_type().is_some_and(|t| t.is_file()) || index_artifact(entry.path(), index) {
+            continue;
+        }
+        let path = relative(root, entry.path())?;
+        if parse::language_for_path(&path).is_some()
+            && !exclude.is_match(&path)
+            && (include.is_empty() || include.is_match(&path))
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+pub(crate) fn read_source(root: &Path, path: &str, max_size: u64) -> Result<String> {
+    let path = root.join(path);
+    ensure!(
+        fs::metadata(&path)?.len() <= max_size,
+        "File exceeds maxFileSize ({max_size} bytes)"
+    );
+    fs::read_to_string(&path).context("Cannot read UTF-8 source")
+}
+
+pub(crate) fn normalize_path(root: &Path, path: &str) -> Result<String> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        // Both indexed and direct maps use a canonical root; resolve aliases
+        // before checking that an absolute source path is inside it.
+        let path = path.canonicalize().context("Cannot resolve source path")?;
+        return relative(root, &path);
+    }
+    ensure!(
+        !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "Source path must remain inside the repository"
+    );
+    Ok(path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .replace('\\', "/"))
 }
 
 /// The index may live inside the scanned root; its vector manifests are JSON.
@@ -1888,7 +1824,7 @@ fn score(value: &Value, key: &str) -> f64 {
 fn sort_scores(values: &mut [Value], key: &str) {
     values.sort_by(|a, b| score(b, key).total_cmp(&score(a, key)));
 }
-fn under(path: &str, parent: &str) -> bool {
+pub(crate) fn under(path: &str, parent: &str) -> bool {
     parent.is_empty()
         || path == parent
         || path
