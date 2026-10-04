@@ -615,12 +615,75 @@ pub fn report_error(error: &anyhow::Error) {
     ui::error(format!("slopdex: {error:#}"));
 }
 
+#[derive(Debug)]
+struct ClosedStdout;
+
+impl std::fmt::Display for ClosedStdout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout pipe closed")
+    }
+}
+
+impl std::error::Error for ClosedStdout {}
+
+#[derive(Debug)]
+struct StdoutBrokenPipe(io::Error);
+
+impl std::fmt::Display for StdoutBrokenPipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for StdoutBrokenPipe {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Both io::Error and serde_json::Error forward the inner error's source.
+        // Keep a stdout-specific marker visible through either wrapper.
+        Some(&ClosedStdout)
+    }
+}
+
+struct StdoutWriter<W>(W);
+
+fn stdout_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        io::Error::new(io::ErrorKind::BrokenPipe, StdoutBrokenPipe(error))
+    } else {
+        error
+    }
+}
+
+impl<W: Write> Write for StdoutWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes).map_err(stdout_error)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush().map_err(stdout_error)
+    }
+}
+
+fn with_stdout<W: Write>(
+    writer: W,
+    run: impl FnOnce(&mut StdoutWriter<W>) -> Result<()>,
+) -> Result<()> {
+    let mut out = StdoutWriter(writer);
+    let result = run(&mut out).and_then(|()| out.flush().map_err(Into::into));
+    match result {
+        Err(error) if error.chain().any(|cause| cause.is::<ClosedStdout>()) => Ok(()),
+        result => result,
+    }
+}
+
 /// Execute the CLI; main owns reporting runtime errors and selecting the failure exit code.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     cli.validate()?;
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    with_stdout(stdout.lock(), |out| run_cli(&cli, out))
+}
+
+fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
     if let Command::Help {
         topic: Some(HelpTopic::Models { provider }),
     } = &cli.command
@@ -638,7 +701,7 @@ pub fn run() -> Result<()> {
     }
     if let Command::Help { topic: None } = &cli.command {
         use clap::CommandFactory;
-        Cli::command().print_long_help()?;
+        Cli::command().write_long_help(&mut out)?;
         return Ok(());
     }
     let root = absolute(cli.global.root.as_deref().unwrap_or(Path::new(".")))?;
@@ -5153,6 +5216,74 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn stdout_boundary_only_ignores_its_own_broken_pipes() {
+        struct FailingWriter {
+            write_error: Option<io::ErrorKind>,
+            flush_error: Option<io::ErrorKind>,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                match self.write_error {
+                    Some(kind) => Err(kind.into()),
+                    None => Ok(bytes.len()),
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                match self.flush_error {
+                    Some(kind) => Err(kind.into()),
+                    None => Ok(()),
+                }
+            }
+        }
+
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::PermissionDenied] {
+            for json in [false, true] {
+                for on_flush in [false, true] {
+                    let writer = FailingWriter {
+                        write_error: (!on_flush).then_some(kind),
+                        flush_error: on_flush.then_some(kind),
+                    };
+                    let result = with_stdout(writer, |out| {
+                        if json {
+                            print_json(out, &json!({"output": "value"}))
+                        } else {
+                            writeln!(out, "output").map_err(Into::into)
+                        }
+                    });
+                    assert_eq!(
+                        result.is_ok(),
+                        kind == io::ErrorKind::BrokenPipe,
+                        "kind={kind:?}, json={json}, on_flush={on_flush}: {result:?}"
+                    );
+                }
+            }
+        }
+
+        // Provider/network failures have no stdout marker, even when they have
+        // the same I/O kind or are wrapped by JSON serialization and context.
+        for error in [
+            anyhow::Error::from(io::Error::from(io::ErrorKind::BrokenPipe)),
+            anyhow::Error::from(serde_json::Error::io(io::ErrorKind::BrokenPipe.into())),
+        ] {
+            let result = with_stdout(Vec::new(), |_| Err(error.context("provider failed")));
+            assert!(result.is_err());
+        }
+
+        let result = with_stdout(
+            FailingWriter {
+                write_error: Some(io::ErrorKind::BrokenPipe),
+                flush_error: None,
+            },
+            |out| {
+                let _ = writeln!(out, "output");
+                Err(io::Error::from(io::ErrorKind::BrokenPipe).into())
+            },
+        );
+        assert!(result.is_err(), "an unrelated error must still propagate");
     }
 
     #[test]

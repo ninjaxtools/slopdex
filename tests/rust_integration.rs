@@ -11,7 +11,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -4125,6 +4125,75 @@ fn map_excludes_private_symbols_unless_requested() -> Result<()> {
         map_names(rows.as_array().unwrap()),
         strings(&["Api", "run", "stop", "visible", "hidden"])
     );
+    Ok(())
+}
+
+#[test]
+fn map_cli_closed_stdout_succeeds_for_text_and_json() -> Result<()> {
+    let repo = Repo::new()?;
+    // Long public signatures produce substantial output in both formats without
+    // requiring a semantic index or any provider traffic.
+    let source: String = (0..2048)
+        .map(|i| format!("pub fn symbol_{i}_{}() {{}}\n", "x".repeat(128)))
+        .collect();
+    repo.write("large.rs", &source)?;
+    let rows = repo.cli_json(&["map"])?;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+
+    for format in ["summary", "json"] {
+        let mut command = repo.child(env!("CARGO_BIN_EXE_slopdex"));
+        command
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .args(["--no-reindex", "--format", format, "map"]);
+        let complete = command.output()?;
+        ensure!(complete.status.success());
+        assert!(complete.stdout.len() > 256 * 1024);
+        assert!(complete.stderr.is_empty());
+
+        // Close the only read end before spawning. This deterministically fails
+        // the child's first write without sleeps or pipe-buffer-size assumptions.
+        let (reader, writer) = std::io::pipe()?;
+        drop(reader);
+        let output = command.stdout(writer).stderr(Stdio::piped()).output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "{format}: {:?}", output.stderr);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn map_cli_stdout_full_still_fails_for_text_and_json() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("api.rs", "pub fn api() {}\n")?;
+    repo.cli_json(&["map"])?;
+
+    for format in ["summary", "json"] {
+        let output = repo
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .args(["--no-reindex", "--format", format, "map"])
+            .stdout(fs::OpenOptions::new().write(true).open("/dev/full")?)
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{format}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("slopdex:"), "{format}: {stderr}");
+        assert!(
+            stderr.contains("No space left on device"),
+            "{format}: {stderr}"
+        );
+    }
     Ok(())
 }
 
