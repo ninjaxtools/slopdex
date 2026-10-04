@@ -82,10 +82,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > Add this to your `AGENTS.md` to let the agent use the map command to explore the codebase:
 >
 > ```text
-> - Start unknown implementation discovery with a compact function map: `slopdex map --private -k fns -g "<source-glob>" -i -e "<name-term|other-name-term>" <files or directories...>`. Derive distinctive name fragments from the task, scope likely subsystems, and batch terms and paths in one call. Exclude test files when locating implementation code.
-> - `-e` matches names and qualified names, not bodies. If empty, broaden terms or scope once; if noisy, narrow paths and terms. Use `-k types`, `classes`, `consts`, or `imports` when those declarations are needed.
-> - Once a plausible entry point is mapped, stop inventory browsing and read its implementation using the returned ranges. Follow concrete names found in source; map again only for needed declarations whose locations are unknown. Use grep for body text and unresolved usages.
-> - Batch independent lookups and reads. Avoid repeating declaration checks, reading whole files just to discover structure, or splitting broad inventories with head/tail. In a prepared checkout, use the known CLI directly instead of Git/layout/help inventories. Verify behavior and citations in source before answering.
+- use `slopdex map --private -g "<glob>" -i -e "<regex>" <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads using the line numbers for implementation details. Once a plausible entry point is mapped, **stop inventory browsing and read its implementation using the returned ranges**. Do not repeat declaration searches for names and locations already found.
 > ```
 
 ### Search
@@ -147,8 +144,7 @@ File and function descriptions are cached by source and description context, so 
 > Add this to your `AGENTS.md` to use semantic code search with your agent:
 >
 > ```text
-> - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.3 --limit 50`; vary the search query if you get no results
-> - Limit candidates before rendering with `--limit`. Results are grouped by source file and line order, so avoid `head` as a result selector; inspect the returned ranges with targeted source reads.
+> - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.3 --limit 20`; vary the search query if you get no results
 > ```
 
 ### Interactive Config
