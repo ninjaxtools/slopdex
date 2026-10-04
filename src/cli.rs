@@ -27,7 +27,7 @@ use std::{
     version,
     disable_help_subcommand = true,
     about = "Semantic code, documentation, and configuration search",
-    after_help = "Examples:\n  slopdex update\n  slopdex search \"validate an authenticated session\"\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nSearch and cross-search require an existing index; run update first. Existing indexes refresh automatically. --no-reindex reuses the index offline. Map parses directly when no index exists."
+    after_help = "Examples:\n  slopdex update\n  slopdex search \"validate an authenticated session\"\n  slopdex search-symbols \"validate session\"\n  slopdex search \"validate session\" --code --symbols\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nSearch and cross-search require an existing index; run update first. Symbols are opt-in: plain search uses content streams. Pure symbol searches refresh only structure. --no-reindex reuses saved snapshots; uncached queries may call providers. Map without -q parses directly when no index exists."
 )]
 struct Cli {
     #[command(flatten)]
@@ -76,7 +76,7 @@ struct Global {
     /// Show full callable code in expanded text output when similarity is strictly above this value
     #[arg(long, global = true, default_value = "0.9", allow_hyphen_values = true, value_parser = similarity)]
     expand_code_threshold: f64,
-    /// Reuse the existing index offline, without automatic refresh
+    /// Reuse the saved index without refresh; uncached semantic queries may call providers
     #[arg(long, global = true, conflicts_with = "force_reindex")]
     no_reindex: bool,
     /// Reset live index state while preserving reusable caches
@@ -123,7 +123,7 @@ impl From<Detail> for map::Detail {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Search code, enabled descriptions, and Markdown together
+    /// Search code, enabled descriptions, and Markdown together (symbols opt-in)
     Search(SearchArgs),
     /// Search callable code only
     SearchCode(QueryArgs),
@@ -131,11 +131,13 @@ enum Command {
     SearchDescriptions(QueryArgs),
     /// Search heading-aware Markdown chunks
     SearchMd(QueryArgs),
+    /// Search bare symbol names, aliases, and heading titles only
+    SearchSymbols(QueryArgs),
     /// Explain existing code relevant to a task using the description model
     Describe(DescribeArgs),
     /// Compare functions; clusters are connected components of observed matches
     CrossSearch(CrossArgs),
-    /// Show code declarations and Markdown headings without calling providers
+    /// Show code declarations and Markdown headings; -q selects semantic names
     Map(MapArgs),
     /// Refresh and show index metadata, counts, and profiles as JSON
     Status,
@@ -209,6 +211,12 @@ struct SelectionArgs {
     /// Qualified-name or heading-path regex; repeat for OR; cross-search selects sources
     #[arg(short = 'e', long, alias = "regex", value_parser = valid_regex)]
     regexp: Vec<String>,
+    /// Semantic bare-name/heading-title query; repeat for OR; cross-search selects sources
+    #[arg(short = 'q', long, value_parser = valid_symbol_query)]
+    symbol_query: Vec<String>,
+    /// Minimum symbol-name similarity in [-1,1], independent of --threshold (default: 0.5)
+    #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
+    symbol_threshold: Option<f64>,
     /// Match regexes case-insensitively
     #[arg(short = 'i', long)]
     ignore_case: bool,
@@ -225,6 +233,12 @@ impl SelectionArgs {
         }
         if self.ignore_case {
             value["ignoreCase"] = json!(true);
+        }
+        if !self.symbol_query.is_empty() {
+            value["symbolQuery"] = json!(self.symbol_query);
+        }
+        if let Some(threshold) = self.symbol_threshold {
+            value["symbolThreshold"] = json!(threshold);
         }
         value
     }
@@ -391,6 +405,85 @@ struct SearchArgs {
     /// Select Markdown
     #[arg(long)]
     md: bool,
+    /// Select bare symbol names and heading titles (opt-in)
+    #[arg(long)]
+    symbols: bool,
+}
+
+impl SearchArgs {
+    fn options(&self) -> Value {
+        let mut options = self.query.filters.options();
+        if self.code || self.descriptions || self.md || self.symbols {
+            options["code"] = json!(self.code);
+            options["descriptions"] = json!(self.descriptions);
+            options["md"] = json!(self.md);
+            options["symbols"] = json!(self.symbols);
+        }
+        options
+    }
+
+    fn symbols_only(&self) -> bool {
+        self.symbols && !self.code && !self.descriptions && !self.md
+    }
+}
+
+impl Command {
+    fn search_request(&self) -> Option<(&QueryArgs, &str, Value, bool)> {
+        let (args, kind) = match self {
+            Self::Search(args) => {
+                return Some((&args.query, "search", args.options(), args.descriptions));
+            }
+            Self::SearchCode(args) => (args, "search-code"),
+            Self::SearchDescriptions(args) => (args, "search-descriptions"),
+            Self::SearchMd(args) => (args, "search-md"),
+            Self::SearchSymbols(args) => (args, "search-symbols"),
+            _ => return None,
+        };
+        Some((
+            args,
+            kind,
+            args.filters.options(),
+            kind == "search-descriptions",
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandMode {
+    Content,
+    Structure,
+    Symbols,
+}
+
+impl CommandMode {
+    fn for_command(command: &Command) -> Self {
+        match command {
+            Command::Map(args) if args.selection.symbol_query.is_empty() => Self::Structure,
+            Command::Map(_) | Command::SearchSymbols(_) => Self::Symbols,
+            Command::Search(args) if args.symbols_only() => Self::Symbols,
+            _ => Self::Content,
+        }
+    }
+
+    fn open(self, root: &Path, index: &Path, config: &Value, readonly: bool) -> Result<Engine> {
+        match (self, readonly) {
+            (Self::Symbols, _) => Engine::open_symbol_map(root, index, config.clone(), readonly),
+            (Self::Structure, true) => Engine::open_map_readonly(root, index, config.clone()),
+            (Self::Structure, false) => Engine::open_map(root, index, config.clone()),
+            (Self::Content, true) => Engine::open_readonly(root, index, config.clone()),
+            (Self::Content, false) => Engine::open(root, index, config.clone()),
+        }
+    }
+
+    fn refresh(self, engine: &mut Engine) -> Result<Option<Value>> {
+        match self {
+            Self::Content => ui::spin("Refreshing index", || engine.refresh()).map(Some),
+            Self::Structure | Self::Symbols => {
+                ui::spin("Refreshing structure", || engine.refresh_structure())?;
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -490,6 +583,14 @@ struct LineRange {
 fn nonempty(input: &str) -> std::result::Result<String, String> {
     if input.trim().is_empty() {
         Err("must not be empty".into())
+    } else {
+        Ok(input.to_owned())
+    }
+}
+
+fn valid_symbol_query(input: &str) -> std::result::Result<String, String> {
+    if crate::symbols::normalize(input).is_empty() {
+        Err("symbol query must contain letters or numbers".into())
     } else {
         Ok(input.to_owned())
     }
@@ -726,6 +827,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             | Command::SearchCode(_)
             | Command::SearchDescriptions(_)
             | Command::SearchMd(_)
+            | Command::SearchSymbols(_)
             | Command::CrossSearch(_)
     ) {
         require_index(&index)?;
@@ -738,9 +840,14 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             .context("Repository root does not exist")?;
         ensure!(root.is_dir(), "Repository root is not a directory");
         let format = cli.global.format.unwrap_or(Format::Summary);
-        let Some(options) = args.existing_options(&root, cli.global.detail)? else {
+        if !args.selection.symbol_query.is_empty() {
+            writeln!(out, "slopdex: warning: no active index; -q is ignored.")?;
+        }
+        let Some(mut options) = args.existing_options(&root, cli.global.detail)? else {
             return print_map(&mut out, &[], format, cli.global.detail, None, None);
         };
+        options.as_object_mut().unwrap().remove("symbolQuery");
+        options.as_object_mut().unwrap().remove("symbolThreshold");
         let source = ui::spin("Parsing structure", || {
             map::Unindexed::parse(&root, &index, &config, &options)
         })?;
@@ -754,7 +861,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             Some(&filter::Selection::compile(&options)?),
         );
     }
-    let is_map = matches!(&cli.command, Command::Map(_));
+    let mode = CommandMode::for_command(&cli.command);
     let read_only_command = matches!(
         &cli.command,
         Command::Map(_)
@@ -766,19 +873,12 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             | Command::SearchCode(_)
             | Command::SearchDescriptions(_)
             | Command::SearchMd(_)
+            | Command::SearchSymbols(_)
     );
     let reader =
         read_only_command && index.exists() && config["forceReindex"].as_bool() != Some(true);
     let mut engine = ui::spin("Opening index", || {
-        if reader && is_map {
-            Engine::open_map_readonly(&root, &index, config.clone())
-        } else if reader {
-            Engine::open_readonly(&root, &index, config.clone())
-        } else if is_map {
-            Engine::open_map(&root, &index, config.clone())
-        } else {
-            Engine::open(&root, &index, config.clone())
-        }
+        mode.open(&root, &index, &config, reader)
     })?;
     let map_options = if let Command::Map(args) = &cli.command {
         args.existing_options(&root, cli.global.detail)?
@@ -787,31 +887,17 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
     };
     let refreshed = if cli.global.no_reindex {
         None
-    } else if is_map {
-        match ui::spin("Refreshing structure", || engine.refresh_structure()) {
-            Err(error) if error.is::<crate::engine::NeedsWrite>() => {
-                drop(engine);
-                engine = ui::spin("Opening index for update", || {
-                    Engine::open_map(&root, &index, config.clone())
-                })?;
-                ui::spin("Refreshing structure", || engine.refresh_structure())?;
-            }
-            result => {
-                result?;
-            }
-        }
-        None
     } else {
-        Some(match ui::spin("Refreshing index", || engine.refresh()) {
+        match mode.refresh(&mut engine) {
             Err(error) if error.is::<crate::engine::NeedsWrite>() => {
                 drop(engine);
                 engine = ui::spin("Opening index for update", || {
-                    Engine::open(&root, &index, config.clone())
+                    mode.open(&root, &index, &config, false)
                 })?;
-                ui::spin("Refreshing index", || engine.refresh())?
+                mode.refresh(&mut engine)?
             }
             result => result?,
-        })
+        }
     };
     warn_errors(
         &engine,
@@ -821,15 +907,29 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
     let format = cli.global.format.unwrap_or(Format::Summary);
     match &cli.command {
         Command::Map(_) => {
-            let rows = if let Some(options) = map_options.as_ref() {
-                ui::spin("Mapping repository structure", || engine.map(options))?
+            let (rows, selection) = if let Some(options) = map_options.as_ref() {
+                let mapped = ui::spin("Mapping repository structure", || {
+                    Ok((engine.map(options)?, engine.selection(options)?))
+                });
+                let (rows, selection) = match mapped {
+                    Err(error) if error.is::<crate::engine::NeedsWrite>() => {
+                        drop(engine);
+                        engine = ui::spin("Opening index for update", || {
+                            mode.open(&root, &index, &config, false)
+                        })?;
+                        if !cli.global.no_reindex {
+                            mode.refresh(&mut engine)?;
+                        }
+                        ui::spin("Mapping repository structure", || {
+                            Ok((engine.map(options)?, engine.selection(options)?))
+                        })?
+                    }
+                    result => result?,
+                };
+                (rows, Some(selection))
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
-            let selection = map_options
-                .as_ref()
-                .map(filter::Selection::compile)
-                .transpose()?;
             print_map(
                 &mut out,
                 &rows,
@@ -839,60 +939,22 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
                 selection.as_ref(),
             )?;
         }
-        Command::Search(args) => {
-            let mut options = args.query.filters.options();
-            if args.code || args.descriptions || args.md {
-                options["code"] = json!(args.code);
-                options["descriptions"] = json!(args.descriptions);
-                options["md"] = json!(args.md);
-            }
-            let rows = match ui::spin("Searching index", || {
-                engine.search(&args.query.query, "search", &options)
-            }) {
-                Err(error) if error.is::<crate::engine::NeedsWrite>() => {
-                    drop(engine);
-                    engine = ui::spin("Opening index for update", || {
-                        Engine::open(&root, &index, config.clone())
-                    })?;
-                    if !cli.global.no_reindex {
-                        ui::spin("Refreshing index", || engine.refresh())?;
-                    }
-                    ui::spin("Searching index", || {
-                        engine.search(&args.query.query, "search", &options)
-                    })?
-                }
-                result => result?,
-            };
-            print_search(
-                &mut out,
-                &rows,
-                format,
-                cli.global.detail,
-                args.descriptions,
-                &mut Presentation::with_calls(
-                    &engine,
-                    args.query.calls.resolve(cli.global.detail),
-                    cli.global.expand_code_threshold,
-                )?,
-            )?;
-        }
-        Command::SearchCode(args) | Command::SearchDescriptions(args) | Command::SearchMd(args) => {
-            let kind = match &cli.command {
-                Command::SearchCode(_) => "search-code",
-                Command::SearchDescriptions(_) => "search-descriptions",
-                _ => "search-md",
-            };
-            let options = args.filters.options();
+        Command::Search(_)
+        | Command::SearchCode(_)
+        | Command::SearchDescriptions(_)
+        | Command::SearchMd(_)
+        | Command::SearchSymbols(_) => {
+            let (args, kind, options, descriptions) = cli.command.search_request().unwrap();
             let rows = match ui::spin("Searching index", || {
                 engine.search(&args.query, kind, &options)
             }) {
                 Err(error) if error.is::<crate::engine::NeedsWrite>() => {
                     drop(engine);
                     engine = ui::spin("Opening index for update", || {
-                        Engine::open(&root, &index, config.clone())
+                        mode.open(&root, &index, &config, false)
                     })?;
                     if !cli.global.no_reindex {
-                        ui::spin("Refreshing index", || engine.refresh())?;
+                        mode.refresh(&mut engine)?;
                     }
                     ui::spin("Searching index", || {
                         engine.search(&args.query, kind, &options)
@@ -905,7 +967,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
                 &rows,
                 format,
                 cli.global.detail,
-                kind == "search-descriptions",
+                descriptions,
                 &mut Presentation::with_calls(
                     &engine,
                     args.calls.resolve(cli.global.detail),
@@ -2086,6 +2148,9 @@ fn rank(row: &Value) -> String {
 }
 
 fn score_details(row: &Value) -> String {
+    if let Some(symbol) = row["symbolSimilarity"].as_f64() {
+        return format!("  [symbol {symbol:.2}]");
+    }
     match (
         row["descriptionSimilarity"].as_f64(),
         row["fileDescriptionSimilarity"].as_f64(),
@@ -2144,6 +2209,12 @@ impl<'a> Presentation<'a> {
         let path = function["path"].as_str()?;
         let structure = self.graph.as_ref()?.files.get(path)?;
         let node = map::matching_node(structure, function)?;
+        if !matches!(
+            node.kind.as_str(),
+            "function" | "method" | "constructor" | "generator"
+        ) {
+            return None;
+        }
         Some(Key {
             path: path.to_owned(),
             id: node.id,
@@ -2186,6 +2257,9 @@ impl<'a> Presentation<'a> {
         similarity: Option<f64>,
         detail: Detail,
     ) -> Option<String> {
+        if node.kind == "heading" {
+            return None;
+        }
         let forced = self.force_code.contains(&Key {
             path: path.to_owned(),
             id: node.id,
@@ -2600,6 +2674,23 @@ fn print_ranked_file(
     let mut extras = HashMap::new();
     let mut descriptions = HashMap::new();
     let mut unmatched = Vec::new();
+    let heading_bodies = if detail == Detail::Expanded
+        && hits
+            .iter()
+            .any(|hit| hit.row["type"] == "symbol" && hit.item["kind"] == "heading")
+    {
+        structure
+            .as_ref()
+            .and_then(|structure| {
+                presentation
+                    .engine?
+                    .presentation_source(path)
+                    .map(|source| markdown_map_bodies(source, structure))
+            })
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     for hit in hits {
         let chain = structure
             .as_ref()
@@ -2612,34 +2703,36 @@ fn print_ranked_file(
                         .unwrap_or_default()
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if hit.row["type"] == "symbol" {
+                    serde_json::from_value::<StructureNode>(hit.item.clone())
+                        .map(|node| vec![node])
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            });
         if let Some(matched) = chain.last() {
             if let Some(previous) = annotations.get_mut(&matched.id) {
                 if previous != &hit.annotation {
                     previous.push_str(" | ");
                     previous.push_str(&hit.annotation);
                 }
-                if hit.markdown {
-                    extras
-                        .entry(matched.id)
-                        .or_insert_with(String::new)
-                        .push_str(&markdown_extra(hit.item, Some(&matched.signature), detail));
-                } else if let Some(code) =
-                    presentation.code(path, matched, hit.row["similarity"].as_f64(), detail)
-                {
+            } else {
+                annotations.insert(matched.id, hit.annotation.clone());
+            }
+            if hit.markdown {
+                extras
+                    .entry(matched.id)
+                    .or_insert_with(String::new)
+                    .push_str(&markdown_extra(hit.item, Some(&matched.signature), detail));
+            } else if hit.row["type"] == "symbol" && matched.kind == "heading" {
+                if let Some(body) = heading_bodies.get(&matched.id) {
                     let extra = extras.entry(matched.id).or_insert_with(String::new);
-                    if !extra.contains("@ code:\n") {
-                        extra.push_str(&code);
+                    if !extra.contains(body) {
+                        extra.push_str(body);
                     }
                 }
-                continue;
-            }
-            annotations.insert(matched.id, hit.annotation.clone());
-            if hit.markdown {
-                extras.insert(
-                    matched.id,
-                    markdown_extra(hit.item, Some(&matched.signature), detail),
-                );
             } else if (detail == Detail::Expanded || hit.description)
                 && let Some(description) = hit.item["description"]
                     .as_str()
@@ -2651,10 +2744,10 @@ fn print_ranked_file(
                 && let Some(code) =
                     presentation.code(path, matched, hit.row["similarity"].as_f64(), detail)
             {
-                extras
-                    .entry(matched.id)
-                    .or_insert_with(String::new)
-                    .push_str(&code);
+                let extra = extras.entry(matched.id).or_insert_with(String::new);
+                if !extra.contains("@ code:\n") {
+                    extra.push_str(&code);
+                }
             }
             for node in chain {
                 selected.insert(node.id, node);
@@ -2770,9 +2863,18 @@ fn print_search(
         }
         let mut rows = rows.to_vec();
         for row in &mut rows {
-            if row["type"] == "function" {
-                row["relatedCallables"] = json!(presentation.related_json(&row["function"]));
-                row["callees"] = json!(presentation.outgoing_json(&row["function"]));
+            let item = if row["type"] == "function" {
+                Some(&row["function"])
+            } else if row["type"] == "symbol" && presentation.key(&row["symbol"]).is_some() {
+                Some(&row["symbol"])
+            } else {
+                None
+            };
+            if let Some(item) = item {
+                let related = presentation.related_json(item);
+                let outgoing = presentation.outgoing_json(item);
+                row["relatedCallables"] = json!(related);
+                row["callees"] = json!(outgoing);
             }
         }
         return print_json(out, &rows);
@@ -2788,12 +2890,19 @@ fn print_search(
                 RankedHit {
                     item: if markdown {
                         &row["chunk"]
+                    } else if row["type"] == "symbol" {
+                        &row["symbol"]
                     } else {
                         &row["function"]
                     },
                     row,
                     annotation: format!(
-                        "{}{}",
+                        "{}{}{}",
+                        if row["type"] == "symbol" {
+                            "symbol "
+                        } else {
+                            ""
+                        },
                         rank(row),
                         if detail == Detail::Expanded {
                             score_details(row)
@@ -3257,6 +3366,7 @@ mod tests {
             "search-code",
             "search-descriptions",
             "search-md",
+            "search-symbols",
             "describe",
             "cross-search",
         ] {
@@ -3278,13 +3388,20 @@ mod tests {
                 "--regexp",
                 "Guide",
                 "-i",
+                "-q",
+                "validateSession",
+                "--symbol-query",
+                "load settings",
+                "--symbol-threshold",
+                "0.65",
             ]);
             let cli = parse(&argv);
             let options = match cli.command {
                 Command::Search(args) => args.query.filters.options(),
                 Command::SearchCode(args)
                 | Command::SearchDescriptions(args)
-                | Command::SearchMd(args) => args.filters.options(),
+                | Command::SearchMd(args)
+                | Command::SearchSymbols(args) => args.filters.options(),
                 Command::Describe(args) => args.query.filters.options(),
                 Command::CrossSearch(args) => args.options(),
                 _ => unreachable!(),
@@ -3300,7 +3417,229 @@ mod tests {
                 "{command}"
             );
             assert_eq!(options["ignoreCase"], true, "{command}");
+            assert_eq!(
+                options["symbolQuery"],
+                json!(["validateSession", "load settings"]),
+                "{command}"
+            );
+            assert_eq!(options["symbolThreshold"], 0.65, "{command}");
         }
+    }
+
+    #[test]
+    fn symbol_search_commands_select_explicit_streams_and_structural_mode() {
+        let plain = parse(&["search", "query"]);
+        let (_, kind, options, descriptions) = plain.command.search_request().unwrap();
+        assert_eq!(kind, "search");
+        assert!(!descriptions);
+        for selector in ["code", "descriptions", "md", "symbols"] {
+            assert!(options.get(selector).is_none());
+        }
+        assert_eq!(
+            CommandMode::for_command(&plain.command),
+            CommandMode::Content
+        );
+        for argv in [
+            vec!["search-symbols", "validate session"],
+            vec!["search", "validate session", "--symbols"],
+        ] {
+            let cli = parse(&argv);
+            let (args, kind, options, _) = cli.command.search_request().unwrap();
+            assert_eq!(args.query, "validate session");
+            assert_eq!(CommandMode::for_command(&cli.command), CommandMode::Symbols);
+            if kind == "search" {
+                assert_eq!(options["symbols"], true);
+                for selector in ["code", "descriptions", "md"] {
+                    assert_eq!(options[selector], false);
+                }
+            } else {
+                assert_eq!(kind, "search-symbols");
+            }
+        }
+        for selector in ["--code", "--md", "--descriptions"] {
+            let cli = parse(&["search", "query", "--symbols", selector]);
+            let (_, _, options, _) = cli.command.search_request().unwrap();
+            assert_eq!(options["symbols"], true);
+            assert_eq!(options[selector.trim_start_matches('-')], true);
+            assert_eq!(CommandMode::for_command(&cli.command), CommandMode::Content);
+        }
+        let cli = parse(&[
+            "search-symbols",
+            "rank names",
+            "-q",
+            "filter names",
+            "--threshold",
+            "0.3-0.8",
+            "--symbol-threshold",
+            "0.7",
+            "--limit",
+            "4",
+        ]);
+        let (_, _, options, _) = cli.command.search_request().unwrap();
+        assert_eq!(options["minSimilarity"], 0.3);
+        assert_eq!(options["maxSimilarity"], 0.8);
+        assert_eq!(options["symbolQuery"], json!(["filter names"]));
+        assert_eq!(options["symbolThreshold"], 0.7);
+        assert_eq!(options["limit"], 4);
+        assert!(Cli::try_parse_from(["slopdex", "search-symbols"]).is_err());
+        assert!(Cli::try_parse_from(["slopdex", "search-symbols", "query", "--code"]).is_err());
+    }
+
+    #[test]
+    fn symbol_search_requires_existing_index_even_without_refresh() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = dir.path().join("missing.sqlite");
+        for command in [
+            vec!["search-symbols", "query"],
+            vec!["search", "query", "--symbols"],
+        ] {
+            for no_reindex in [false, true] {
+                let mut argv = command.clone();
+                argv.extend([
+                    "--root",
+                    dir.path().to_str().unwrap(),
+                    "--index",
+                    index.to_str().unwrap(),
+                ]);
+                if no_reindex {
+                    argv.push("--no-reindex");
+                }
+                let mut out = Vec::new();
+                let error = run_cli(&parse(&argv), &mut out).unwrap_err();
+                assert!(
+                    error.to_string().contains("run `slopdex update` first"),
+                    "{error}"
+                );
+                assert!(out.is_empty());
+                assert!(!index.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_selection_defaults_and_scalar_threshold_validation() {
+        for command in [
+            "map",
+            "search",
+            "search-code",
+            "search-descriptions",
+            "search-md",
+            "search-symbols",
+            "describe",
+            "cross-search",
+        ] {
+            let mut argv = vec![command];
+            if !matches!(command, "map" | "cross-search") {
+                argv.push("content query");
+            }
+            let options = |cli: Cli| match cli.command {
+                Command::Map(args) => args.options(),
+                Command::Search(args) => args.query.filters.options(),
+                Command::SearchCode(args)
+                | Command::SearchDescriptions(args)
+                | Command::SearchMd(args)
+                | Command::SearchSymbols(args) => args.filters.options(),
+                Command::Describe(args) => args.query.filters.options(),
+                Command::CrossSearch(args) => args.options(),
+                _ => unreachable!(),
+            };
+            let defaults = options(parse(&argv));
+            assert!(defaults.get("symbolQuery").is_none(), "{command}");
+            assert!(defaults.get("symbolThreshold").is_none(), "{command}");
+            let mut selected = argv.clone();
+            selected.extend(["-q", "readFile", "--symbol-query", "write file"]);
+            let selected = options(parse(&selected));
+            assert_eq!(selected["symbolQuery"], json!(["readFile", "write file"]));
+            assert!(selected.get("symbolThreshold").is_none());
+            for value in ["", "   ", "_::.!🙂"] {
+                let mut invalid = argv.clone();
+                invalid.extend(["-q", value]);
+                assert!(
+                    Cli::try_parse_from(std::iter::once("slopdex").chain(invalid)).is_err(),
+                    "{command}: {value}"
+                );
+            }
+            for value in ["NaN", "inf", "-inf", "-1.01", "1.01", "0.4-0.9", "no"] {
+                let mut invalid = argv.clone();
+                invalid.extend(["--symbol-threshold", value]);
+                assert!(
+                    Cli::try_parse_from(std::iter::once("slopdex").chain(invalid)).is_err(),
+                    "{command}: {value}"
+                );
+            }
+            for value in ["-1", "0", "1"] {
+                let mut valid = argv.clone();
+                valid.extend(["--symbol-threshold", value]);
+                assert_eq!(
+                    options(parse(&valid))["symbolThreshold"],
+                    json!(value.parse::<f64>().unwrap())
+                );
+            }
+        }
+        let Command::Search(args) = parse(&[
+            "search",
+            "content query",
+            "-q",
+            "names",
+            "--threshold",
+            "0.2",
+            "--symbol-threshold",
+            "0.7",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(args.query.query, "content query");
+        assert_eq!(args.query.filters.options()["minSimilarity"], 0.2);
+        assert_eq!(args.query.filters.options()["symbolThreshold"], 0.7);
+    }
+
+    #[test]
+    fn semantic_heading_selection_expands_only_direct_match_bodies() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("guide.md"),
+            "# Guide\nParent body.\n## Setup\nSelected body.\n### Linux\nChild body.\n## Other\nOther body.\n",
+        )?;
+        let options = json!({"symbolQuery": ["setup"], "regexp": "^Guide\\.Setup$"});
+        let source = map::Unindexed::parse(
+            dir.path(),
+            &dir.path().join("index.sqlite"),
+            &json!({}),
+            &options,
+        )?;
+        let selection = filter::Selection::compile(&options)?
+            .with_symbol_names(HashSet::from(["setup".into()]));
+        let structure = map::StructureSource::structure(&source, "guide.md")?.unwrap();
+        let rows =
+            vec![json!({"path": "guide.md", "nodes": selection.select_structure(&structure)})];
+        let mut output = Vec::new();
+        print_map(
+            &mut output,
+            &rows,
+            Format::Summary,
+            Detail::Expanded,
+            Some(&source),
+            Some(&selection),
+        )?;
+        let output = String::from_utf8(output)?;
+        assert!(
+            output.contains("# Guide") && output.contains("## Setup"),
+            "{output}"
+        );
+        assert!(output.contains("Selected body."), "{output}");
+        for omitted in [
+            "Parent body.",
+            "Child body.",
+            "Other body.",
+            "### Linux",
+            "## Other",
+        ] {
+            assert!(!output.contains(omitted), "{output}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -3587,6 +3926,7 @@ mod tests {
             "search-code",
             "search-descriptions",
             "search-md",
+            "search-symbols",
             "describe",
         ] {
             let cli = parse(&[command, "query"]);
@@ -3594,7 +3934,8 @@ mod tests {
                 Command::Search(args) => args.query.filters,
                 Command::SearchCode(args)
                 | Command::SearchDescriptions(args)
-                | Command::SearchMd(args) => args.filters,
+                | Command::SearchMd(args)
+                | Command::SearchSymbols(args) => args.filters,
                 Command::Describe(args) => args.query.filters,
                 _ => unreachable!(),
             };
@@ -4620,6 +4961,153 @@ mod tests {
         assert!(expanded.contains(" | Purpose second line\n"), "{expanded}");
         assert!(expanded.contains("Use `KEY`.\nNext step."));
         assert!(summary.len() < expanded.len());
+    }
+
+    #[test]
+    fn symbol_search_renders_saved_nodes_heading_bodies_and_independent_scores() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("api.rs"),
+            "pub const TIMEOUT: u64 = 30;\npub type Session = String;\npub fn validate_session() { check(); }\nfn check() {}\n",
+        )?;
+        fs::write(
+            dir.path().join("guide.md"),
+            "# Guide\nParent body.\n## Setup\nSaved setup body.\n### Empty\n## Other\nOther body.\n",
+        )?;
+        let index = dir.path().join("index.sqlite");
+        let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+        engine.refresh_structure()?;
+        let symbol = |path: &str, name: &str| -> Result<Value> {
+            let structure = engine.presentation_structure(path)?.unwrap();
+            let node = structure
+                .nodes
+                .iter()
+                .find(|node| node.name == name)
+                .unwrap();
+            let mut value = serde_json::to_value(node)?;
+            value["path"] = json!(path);
+            value["sourceMode"] = json!("working-tree");
+            Ok(value)
+        };
+        let callable = symbol("api.rs", "validate_session")?;
+        let rows = vec![
+            json!({"type":"symbol", "symbol":symbol("guide.md", "Setup")?, "similarity":0.95, "symbolSimilarity":0.95}),
+            json!({"type":"symbol", "symbol":symbol("guide.md", "Empty")?, "similarity":0.8, "symbolSimilarity":0.8}),
+            json!({"type":"symbol", "symbol":symbol("api.rs", "TIMEOUT")?, "similarity":0.7, "symbolSimilarity":0.7}),
+            json!({"type":"symbol", "symbol":symbol("api.rs", "Session")?, "similarity":0.6, "symbolSimilarity":0.6}),
+            json!({"type":"symbol", "symbol":callable, "similarity":0.85, "symbolSimilarity":0.85}),
+            json!({"type":"function", "function":callable, "similarity":0.65}),
+        ];
+        // Presentation must use the saved snapshot, even if the working tree changes.
+        fs::write(dir.path().join("guide.md"), "# Replaced\nNew body.\n")?;
+        let mut json_out = Vec::new();
+        print_search(
+            &mut json_out,
+            &rows,
+            Format::Json,
+            Detail::Expanded,
+            false,
+            &mut Presentation::new(&engine),
+        )?;
+        assert_eq!(serde_json::from_slice::<Value>(&json_out)?, json!(rows));
+        for detail in [Detail::Compact, Detail::Expanded] {
+            let mut output = Vec::new();
+            print_search(
+                &mut output,
+                &rows,
+                Format::Summary,
+                detail,
+                false,
+                &mut Presentation::new(&engine),
+            )?;
+            let output = String::from_utf8(output)?;
+            assert!(
+                output.find("*** guide.md").unwrap() < output.find("*** api.rs").unwrap(),
+                "{output}"
+            );
+            assert_eq!(output.matches("# Guide").count(), 1, "{output}");
+            assert!(
+                output.contains("## Setup  <!-- symbol score=0.95"),
+                "{output}"
+            );
+            assert!(
+                output.contains("### Empty  <!-- symbol score=0.80"),
+                "{output}"
+            );
+            assert!(output.contains("pub const TIMEOUT"), "{output}");
+            assert!(output.contains("pub type Session"), "{output}");
+            assert_eq!(
+                output.matches("pub fn validate_session()").count(),
+                1,
+                "{output}"
+            );
+            assert!(
+                output.contains("symbol score=0.85") && output.contains(" | score=0.65"),
+                "{output}"
+            );
+            assert_eq!(
+                output.contains("Saved setup body."),
+                detail == Detail::Expanded,
+                "{output}"
+            );
+            assert_eq!(
+                output.contains("[symbol 0.95]"),
+                detail == Detail::Expanded,
+                "{output}"
+            );
+            for omitted in [
+                "Parent body.",
+                "Other body.",
+                "## Other",
+                "New body.",
+                "@ code:",
+            ] {
+                assert!(!output.contains(omitted), "{omitted}: {output}");
+            }
+        }
+        let mut presentation = Presentation::with_calls(
+            &engine,
+            CallDepths {
+                callees: 1,
+                ..CallDepths::default()
+            },
+            0.9,
+        )?;
+        for row in &rows[..4] {
+            assert!(presentation.key(&row["symbol"]).is_none());
+        }
+        presentation.prepare(
+            &rows[..4]
+                .iter()
+                .map(|row| &row["symbol"])
+                .collect::<Vec<_>>(),
+        );
+        assert!(presentation.expanded.as_ref().unwrap().depths.is_empty());
+        let mut output = Vec::new();
+        print_search(
+            &mut output,
+            &rows,
+            Format::Json,
+            Detail::Expanded,
+            false,
+            &mut presentation,
+        )?;
+        let enriched: Value = serde_json::from_slice(&output)?;
+        for row in &array(&enriched)[..4] {
+            assert!(row.get("relatedCallables").is_none());
+        }
+        assert_eq!(enriched[4]["symbol"], rows[4]["symbol"]);
+        assert_eq!(
+            enriched[4]["relatedCallables"],
+            enriched[5]["relatedCallables"]
+        );
+        assert_eq!(enriched[4]["callees"], enriched[5]["callees"]);
+        assert!(!array(&enriched[4]["relatedCallables"]).is_empty());
+        assert_eq!(
+            score_details(&json!({"symbolSimilarity":0.4639})),
+            "  [symbol 0.46]"
+        );
+        Ok(())
     }
 
     #[test]

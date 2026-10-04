@@ -1,6 +1,9 @@
 //! Shared repository-relative path and symbol selection for search and structure maps.
 
-use crate::parse::{FileStructure, StructureNode};
+use crate::{
+    parse::{FileStructure, StructureNode},
+    symbols,
+};
 use anyhow::{Context, Result, bail, ensure};
 use ignore::overrides::{Override, OverrideBuilder};
 use regex::{RegexSet, RegexSetBuilder};
@@ -11,12 +14,13 @@ use std::collections::{HashMap, HashSet};
 pub struct Selection {
     globs: Override,
     names: Option<RegexSet>,
+    semantic_names: Option<HashSet<String>>,
     kinds: HashSet<&'static str>,
     private: bool,
 }
 
 impl Selection {
-    /// Compile `glob`, `regexp`, `ignoreCase`, and map-only `kinds`/`private` options.
+    /// Compile shared path, regex, and semantic selectors, plus map kinds/visibility.
     /// String lists accept either a string (including legacy `regexp`) or an array.
     /// Glob rules use gitignore syntax with inverted `!`: the last matching rule
     /// wins, and any positive rule requires a positive match. `ignoreCase` affects
@@ -30,6 +34,23 @@ impl Selection {
                 .with_context(|| format!("invalid glob: {pattern}"))?;
         }
         let patterns = strings(options, "regexp")?;
+        let queries = strings(options, "symbolQuery")?;
+        for query in &queries {
+            ensure!(
+                !symbols::normalize(query).is_empty(),
+                "symbolQuery must contain nonempty normalized queries"
+            );
+        }
+        if let Some(value) = options
+            .get("symbolThreshold")
+            .filter(|value| !value.is_null())
+        {
+            let threshold = value.as_f64().context("symbolThreshold must be a number")?;
+            ensure!(
+                threshold.is_finite() && (-1.0..=1.0).contains(&threshold),
+                "symbolThreshold must be finite and in [-1,1]"
+            );
+        }
         let ignore_case = match options.get("ignoreCase") {
             None | Some(Value::Null) => false,
             Some(Value::Bool(value)) => *value,
@@ -59,6 +80,7 @@ impl Selection {
         Ok(Self {
             globs: globs.build().context("compile selection globs")?,
             names,
+            semantic_names: (!queries.is_empty()).then(HashSet::new),
             kinds,
             private,
         })
@@ -76,28 +98,46 @@ impl Selection {
         self.names.as_ref().is_none_or(|names| names.is_match(name))
     }
 
+    /// Resolve the union of normalized names matching the semantic queries.
+    pub(crate) fn with_symbol_names(mut self, names: HashSet<String>) -> Self {
+        self.semantic_names = Some(names);
+        self
+    }
+
+    pub(crate) fn semantic_name_matches(&self, name: &str) -> bool {
+        self.semantic_names
+            .as_ref()
+            .is_none_or(|names| names.contains(&symbols::normalize(name)))
+    }
+
     /// Declaration names use the same qualified-name contract as search. Imports
     /// additionally expose their source paths and aliases; multi-binding names
-    /// are qualified in the declaration's enclosing scope.
+    /// are qualified in the declaration's enclosing scope. Semantic selection
+    /// independently matches bare names/aliases, then intersects the regex family.
     pub fn symbol_matches(&self, node: &StructureNode) -> bool {
-        if self.name_matches(&node.qualified_name) {
-            return true;
-        }
         let prefix = if node.kind == "import" {
             ""
         } else {
             node.qualified_name.strip_suffix(&node.name).unwrap_or("")
         };
-        node.names
-            .iter()
-            .any(|name| self.name_matches(&format!("{prefix}{name}")))
+        let regex_matches = self.name_matches(&node.qualified_name)
+            || node
+                .names
+                .iter()
+                .any(|name| self.name_matches(&format!("{prefix}{name}")));
+        let semantic_matches = self.semantic_name_matches(&node.name)
+            || node
+                .names
+                .iter()
+                .any(|name| self.semantic_name_matches(name));
+        regex_matches && semantic_matches
     }
 
     pub fn kind_matches(&self, kind: &str) -> bool {
         self.kinds.is_empty() || self.kinds.contains(kind)
     }
 
-    /// Keep direct kind+regex matches and all their ancestors as context. Never
+    /// Keep direct kind+name matches and all their ancestors as context. Never
     /// expand a matched parent to its unmatched children. IDs and source order
     /// remain unchanged, even if IDs are sparse or parents follow their children.
     pub fn select_structure(&self, structure: &FileStructure) -> Vec<StructureNode> {
@@ -271,7 +311,7 @@ fn has_word(value: &str, expected: &str) -> bool {
         .any(|word| word == expected)
 }
 
-fn strings<'a>(options: &'a Value, key: &str) -> Result<Vec<&'a str>> {
+pub(crate) fn strings<'a>(options: &'a Value, key: &str) -> Result<Vec<&'a str>> {
     match options.get(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::String(value)) => Ok(vec![value]),
@@ -436,8 +476,142 @@ mod tests {
             json!({"kinds": ["methdos"]}),
             json!({"kinds": "functions,"}),
             json!({"private": "true"}),
+            json!({"symbolQuery": true}),
+            json!({"symbolQuery": ["valid", 1]}),
+            json!({"symbolQuery": ""}),
+            json!({"symbolQuery": ["valid", " _::.!🙂 "]}),
+            json!({"symbolThreshold": "0.5"}),
+            json!({"symbolThreshold": [0.5]}),
+            json!({"symbolThreshold": -1.1}),
+            json!({"symbolThreshold": 1.1}),
         ] {
             assert!(Selection::compile(&options).is_err(), "{options}");
+        }
+    }
+
+    #[test]
+    fn semantic_queries_fail_closed_until_resolved_and_match_normalized_names() {
+        let selection =
+            Selection::compile(&json!({"symbolQuery": ["read file", "write file"]})).unwrap();
+        assert!(selection.name_matches("anything"));
+        assert!(!selection.semantic_name_matches("readFile"));
+        let selection =
+            selection.with_symbol_names(HashSet::from(["read file".into(), "write file".into()]));
+        for name in ["readFile", "Read_File", "write file", "WRITE_FILE"] {
+            assert!(selection.semantic_name_matches(name), "{name}");
+        }
+        assert!(!selection.semantic_name_matches("Service.readFile"));
+        assert!(!selection.semantic_name_matches("deleteFile"));
+        for options in [
+            json!({}),
+            json!({"symbolQuery": []}),
+            json!({"symbolThreshold": -1}),
+            json!({"symbolThreshold": 1}),
+        ] {
+            assert!(
+                Selection::compile(&options)
+                    .unwrap()
+                    .semantic_name_matches("anything")
+            );
+        }
+    }
+
+    #[test]
+    fn regex_and_semantic_families_match_independently_and_intersect() {
+        let selection = Selection::compile(&json!({
+            "symbolQuery": ["read file", "write file"],
+            "regexp": ["^Service\\.", "^fs(?:\\.|$)"],
+            "glob": "*.ts", "kinds": "functions,imports", "private": true
+        }))
+        .unwrap()
+        .with_symbol_names(HashSet::from(["read file".into(), "write file".into()]));
+        assert!(selection.path_matches("src/service.ts"));
+        assert!(!selection.path_matches("src/service.py"));
+        let parsed = crate::parse::parse("service.ts", "export class Service { readFile() {} writeFile() {} deleteFile() {} } export class Other { readFile() {} } import { readFile as load } from 'fs';").unwrap();
+        let nodes = selection.select_structure(&parsed.structure);
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.qualified_name == "Service.readFile")
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.qualified_name == "Service.writeFile")
+        );
+        assert!(
+            !nodes
+                .iter()
+                .any(|node| node.qualified_name == "Other.readFile" || node.name == "deleteFile")
+        );
+        assert!(
+            nodes.iter().any(|node| node.kind == "import"),
+            "{:?}",
+            parsed.structure.nodes
+        );
+        // The regex can match the source path while semantics match an alias.
+        let alias = StructureNode {
+            kind: "import".into(),
+            qualified_name: "fs".into(),
+            name: "fs".into(),
+            names: vec!["readFile".into()],
+            ..StructureNode::default()
+        };
+        assert!(selection.symbol_matches(&alias));
+        assert!(!selection.symbol_matches(&StructureNode {
+            names: vec!["deleteFile".into()],
+            ..alias
+        }));
+    }
+
+    #[test]
+    fn semantic_headings_use_bare_titles_without_parent_semantics() {
+        let parsed =
+            crate::parse::parse("guide.md", "# Guide\n## Setup\n### Linux\n## Other\n").unwrap();
+        let selection = Selection::compile(&json!({"symbolQuery": "setup"}))
+            .unwrap()
+            .with_symbol_names(HashSet::from(["setup".into()]));
+        let nodes = selection.select_structure(&parsed.structure);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Guide", "Setup"]
+        );
+        assert!(!selection.symbol_matches(&nodes[0]));
+        assert!(selection.symbol_matches(&nodes[1]));
+        let parent = Selection::compile(&json!({"symbolQuery": "guide"}))
+            .unwrap()
+            .with_symbol_names(HashSet::from(["guide".into()]));
+        assert_eq!(parent.select_structure(&parsed.structure).len(), 1);
+    }
+
+    #[test]
+    fn semantic_selection_intersects_kind_and_visibility() {
+        let parsed = crate::parse::parse(
+            "files.rs",
+            "pub struct ReadFile; pub fn readFile() {} fn writeFile() {}",
+        )
+        .unwrap();
+        let names = HashSet::from(["read file".into(), "write file".into()]);
+        for (private, expected) in [
+            (false, vec!["readFile"]),
+            (true, vec!["readFile", "writeFile"]),
+        ] {
+            let selection = Selection::compile(&json!({
+                "symbolQuery": ["read file", "write file"], "kinds": "functions", "private": private
+            }))
+            .unwrap()
+            .with_symbol_names(names.clone());
+            assert_eq!(
+                selection
+                    .select_structure(&parsed.structure)
+                    .iter()
+                    .map(|node| node.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
         }
     }
 

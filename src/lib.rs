@@ -9,6 +9,7 @@ pub mod models;
 pub mod parse;
 pub mod providers;
 pub mod storage;
+mod symbols;
 mod ui;
 pub mod vectors;
 

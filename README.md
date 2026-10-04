@@ -61,7 +61,7 @@ The index is created with the `update` command and tracks the current Git commit
 
 ### Code map/skeleton
 
-`slopdex map` doesn't use vector search and works locally without a provider or API key.
+`slopdex map` works locally without a provider or API key.
 
 ```console
 $ slopdex map src docs
@@ -70,12 +70,16 @@ $ slopdex map src --private
 $ slopdex map -g '*.md' -e '^Guide\.Setup' -i --format json
 $ slopdex map docs --detail expanded
 $ slopdex map --no-reindex
+$ slopdex map src -q 'validate session' -q 'authenticate user' -k fns
+$ slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
 ```
 
 The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains structurally useful information that can act as an index into the source code, which improves context usage.
 
-Markdown headings show the full section's line range. Use `--detail expanded` to
-also show the body text beneath selected headings, including long sections.
+Symbols can be filtered either by `-e <regex>` or `-q <symbol>`. The `-q` filter uses vector search
+and will be ignored if an index doesn't exist.
+
+Use `--detail expanded` to to show full code or markdown of matched symbols.
 
 See the [selector reference](docs/reference.md#shared-selectors).
 
@@ -88,7 +92,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 
 ### Search
 
-By default all available indexes are searched and ranked together.
+By default code/docs and generated descriptions, are searched and ranked together.
 
 ```console
 $ slopdex search "keep the repository index synchronized"
@@ -109,9 +113,20 @@ To search code/docs individually:
 ```console
 $ slopdex search-code "configure the embedding provider"
 $ slopdex search-md "configure the embedding provider" 
+$ slopdex search-code 'reject expired credentials' -q 'validate session' --symbol-threshold 0.6
 ```
 
-You can also enable optional description generation which will automatically generate file and function descriptions with a configured LLM provider and include them in the search.
+Symbol index is searched with either `search-symbols` or `--symbols`:
+
+```console
+$ slopdex search-symbols 'validate session' --threshold 0.6 --limit 20
+$ slopdex search 'installation' --symbols -g '*.md' --detail expanded
+$ slopdex search 'validate session' --code --symbols
+$ slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
+```
+
+You can also enable optional description generation which will automatically generate file and
+function descriptions with a configured LLM provider and include them in the search.
 
 I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low-cost models. If you
 sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive

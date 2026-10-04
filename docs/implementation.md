@@ -18,7 +18,8 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/cli.rs` | Clap commands/validation, root-selected JSON configuration, interactive prompts, summary/JSON/JSONL output, connected-component clusters. |
 | `src/ui.rs` | Shared cliclack progress and diagnostic rendering on terminal stderr, plain redirected diagnostics, synchronized provider notices. |
 | `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, search/filtering/fusion/reranking, cross-search, and task explanation context. |
-| `src/filter.rs` | Shared ordered path globs, qualified-name regexes, and map kind selection with ancestor context. |
+| `src/filter.rs` | Shared ordered path globs, qualified-name regexes, resolved normalized semantic names, and map kind selection with ancestor context. |
+| `src/symbols.rs` | Stable normalization of bare names and queries for name-only symbol embeddings. |
 | `src/map.rs` | Compact structure summaries from canonical metadata; display-only truncation. |
 | `src/parse/mod.rs` | Shared parsing result types, file-language detection, and dispatch to code or Markdown parsing. |
 | `src/parse/code.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery. |
@@ -73,11 +74,36 @@ If the resolved index is missing, `map` directly parses eligible files and rende
 structure without creating SQLite, locks, cache directories, or sidecars. This
 fallback applies with `--no-reindex` and without Git; it preserves selectors,
 call expansion, expanded source/Markdown rendering, and discovery/size rules.
-With an existing index, `map` uses the structure-only open/refresh path, without
-provider requests or USearch sidecars; `--no-reindex` reads stored structure.
+When `-q` is supplied, the CLI first writes a warning to stdout that there is no
+active index and `-q` is ignored. It removes `symbolQuery` and `symbolThreshold`
+from the local options before parsing, selection, and expanded heading rendering.
+With an existing index, ordinary `map` uses the structure-only open/refresh path,
+without provider requests or USearch sidecars; `--no-reindex` reads stored structure.
 Map paths are root-relative (or absolute within the root) and select output from
 the discovered universe. Semantic refresh subsequently prepares any missing
 embeddings, including for files unchanged since an indexed map refresh.
+
+With an existing index, `map -q` opens through `Engine::open_symbol_map`.
+It still calls only `refresh_structure`, then lazily resolves semantic name
+selection from saved structures. It may prepare name/query embeddings through
+providers or caches and build the separate `<index>.symbols.usearch` sidecar.
+If a read-only engine reports `NeedsWrite` during refresh, map, or selection,
+the CLI reopens a writable symbol-map engine and retries; `--no-reindex` keeps
+the saved snapshot while allowing symbol cache population. Ordinary map does
+not initialize a model. `StructureSource::selection` defaults to compiling local
+filters, while the engine override resolves semantic names; both map querying
+and expanded heading-body rendering use the resolved selection.
+
+The CLI's `Command::SearchSymbols(QueryArgs)` forwards `search-symbols` to the
+engine. `SearchArgs` adds `symbols` to the explicit `code`/`descriptions`/`md`
+selector family: any true stream flag serializes all four booleans. Plain search
+keeps its existing content streams, with symbols opt-in. `CommandMode` centralizes
+opening and refresh: pure `search-symbols` and `search --symbols` use
+`Engine::open_symbol_map(root, index, config, readonly)` and `refresh_structure`,
+as semantic map does; mixed content/symbol searches use normal engine refresh.
+All search commands require an existing index. Read-only `NeedsWrite` retries
+reopen the same mode writable, retaining structural-only refresh for pure symbols.
+`--no-reindex` skips refresh but allows lazy name/query cache writes.
 
 Shared selectors compile ordered `ignore::overrides` path rules and an ORed Rust
 `RegexSet`; `-i` affects regexes only. Positive globs require a match, `!` excludes,
@@ -87,6 +113,26 @@ extra declaration bindings in their enclosing scope, and exposes import paths
 and aliases. Its kind/name
 matches retain ancestors as context without expanding unmatched children.
 Cross-search applies selectors only to sources, intersecting path/Git selection.
+
+Shared `SelectionArgs` serializes `symbolQuery` only for supplied `-q` values and
+`symbolThreshold` only when supplied. Queries are ORed with default minimum
+similarity `0.5`, independently of content `--threshold`. `Selection::compile`
+validates string queries and a finite scalar threshold in `[-1,1]`; a semantic
+selector starts with an empty resolved-name set, so unresolved selection cannot
+silently select everything. The engine fills the union through `with_symbol_names`.
+Regex matching remains qualified-name/alias based, while semantic matching uses
+normalized `node.name` or `node.names`. The two families intersect independently,
+including when different aliases match. Bare heading titles carry no parent
+semantics; ancestors are context and receive body text only if directly selected.
+`name_matches` stays regex-only and `-i` affects regexes only.
+
+Normalization splits camelCase/PascalCase, acronyms, letter/digit boundaries, and
+punctuation into lowercase words, making equivalent identifier spellings share
+vectors. Embedding inputs contain names only, without bodies, signatures,
+descriptions, or parent scopes. Symbol vectors use 256 native dimensions by
+default, capped at configured embedding dimensions, with optional
+`symbolDimensions`; OpenAI ada requires its full dimensions. They are derived
+lazily from saved structures rather than from content search units.
 
 ### SQLite schema and artifacts
 
@@ -124,7 +170,7 @@ versions when another index has already uploaded the same input. All remote obje
 values are zstd-compressed in the `v3` namespace; reads bound decompressed size
 before checking the uncompressed payload checksum. Workspace and shared SQLite
 values retain their existing representation.
-No remote object contains workspace item IDs or Git snapshot state. Map does not
+No remote object contains workspace item IDs or Git snapshot state. Ordinary map does not
 fetch remote artifacts.
 
 Callable identity hashes path, qualified name, kind, and same-name occurrence;
@@ -194,7 +240,7 @@ Refresh proceeds as follows:
 4. In one SQLite transaction, reconcile files, symbols, pending search units,
    diagnostics, checkpoint, generation, and result-cache invalidation.
    Generation advances for live-record changes; checkpoint-only updates do not
-   increment it. Map reads this structure without opening sidecars.
+   increment it. Ordinary map reads this structure without opening sidecars.
 5. Semantic refresh prepares missing active-profile embeddings and enabled
    descriptions, including for files unchanged since a map refresh. Each completed
    model artifact is saved immediately. After rechecking HEAD and prepared source
@@ -213,8 +259,8 @@ inside dirty files. Without HEAD, files are working-tree records.
 
 Native `noReindex` skips refresh entirely, even for an empty database. Opening can
 still write metadata or, for semantic operations, repair sidecars; it is not
-read-only. Indexed map reads saved structure without provider or sidecar work;
-unindexed map still parses current files. Search/cross-search require an existing
+read-only. Ordinary indexed map reads saved structure without provider or sidecar
+work; unindexed map still parses current files. Search/cross-search require an existing
 database even with `--no-reindex`.
 Offline status/cross-search use the saved native snapshot, while uncached query
 embedding/reranking and task descriptions still call providers. The CLI sets
@@ -252,6 +298,26 @@ with F64 cosine arithmetic over the stored F32 vectors before threshold filterin
 avoiding CPU-specific SIMD approximation errors at score boundaries. The engine
 widens retrieval as needed for threshold ranges, then applies score bounds and
 result limits.
+Symbol hits are scored from normalized bare names/aliases, taking the maximum
+similarity per structural node. They include all structural kinds and headings
+without content units. The ordinary ranking threshold and limit apply; optional
+`symbolQuery` is an additional selector with independent `symbolThreshold`.
+Mixed searches retain separate function, Markdown/document, and symbol rows,
+then apply global ranking and limit rather than fusing symbol and content scores.
+The result contract is `{type:"symbol", symbol:{...StructureNode,path,sourceMode},
+similarity, symbolSimilarity}`. Node IDs are file-local; vocabulary/vector IDs
+must never reach presentation.
+
+CLI ranked-hit construction reads symbol rows from `symbol`, matching their saved
+node by qualified name and range rather than Markdown chunk context. Text combines
+annotations when content and symbol rows match one declaration; expanded score
+details include `symbolSimilarity`. Expanded direct heading hits obtain their
+saved body through `markdown_map_bodies`, leaving ancestors heading-only. Other
+symbol kinds use ordinary structure rendering and optional indexed source display.
+No body is used to rank pure symbols. Call-graph key lookup excludes noncallable
+nodes before expansion; callable symbol JSON rows receive related callable and
+callee metadata as function rows do.
+
 Exact fusion does not make HNSW exhaustive: neighbor membership/recall remain
 approximate, with no all-pairs/exact-scan fallback. Reranking consumes the
 retrieved query candidates; cross-search is never sent to a reranker.

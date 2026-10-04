@@ -14,11 +14,11 @@ use crate::{
     cache::{Artifacts, DescriptionArtifact, DescriptionGeneration},
     filter::Selection,
     git, hash,
-    models::Message,
+    models::{Message, Vector},
     parse,
     providers::Providers,
     storage::{Database, File, Item, STRUCTURE_PARSER_VERSION},
-    ui,
+    symbols, ui,
     vectors::VectorIndex,
 };
 
@@ -62,6 +62,11 @@ pub struct Engine {
     // Readers share a lock; writers hold it across SQLite and USearch publication.
     _lock: fs::File,
     readonly: bool,
+}
+
+struct SymbolIndex {
+    names: BTreeMap<u64, String>,
+    index: VectorIndex,
 }
 
 #[derive(Debug)]
@@ -153,6 +158,18 @@ impl Engine {
 
     pub fn open_map_readonly(root: &Path, index: &Path, config: Value) -> Result<Self> {
         Self::open_internal(root, index, config, true, true)
+    }
+
+    pub(crate) fn open_symbol_map(
+        root: &Path,
+        index: &Path,
+        config: Value,
+        readonly: bool,
+    ) -> Result<Self> {
+        let providers = Providers::new(&config)?;
+        let mut engine = Self::open_internal(root, index, config, true, readonly)?;
+        engine.providers = providers;
+        Ok(engine)
     }
 
     pub fn open_readonly(root: &Path, index: &Path, config: Value) -> Result<Self> {
@@ -455,6 +472,183 @@ impl Engine {
 
     pub fn map(&self, options: &Value) -> Result<Vec<Value>> {
         crate::map::query(self, &self.root, options)
+    }
+
+    /// Resolve name-only semantic selectors against the current structural snapshot.
+    /// SQLite's symbols and content-addressed embeddings are authoritative; the
+    /// separate USearch vocabulary index is a disposable materialized view.
+    pub(crate) fn selection(&self, options: &Value) -> Result<Selection> {
+        let selection = Selection::compile(options)?;
+        let queries = crate::filter::strings(options, "symbolQuery")?;
+        if queries.is_empty() {
+            return Ok(selection);
+        }
+        let vector = self.providers.symbol_vector()?;
+        let profile = vector.profile();
+        let queries: Vec<_> = queries
+            .iter()
+            .map(|query| symbols::normalize(query))
+            .collect();
+        let threshold = options["symbolThreshold"].as_f64().unwrap_or(0.5);
+        let key = hash(
+            json!([
+                "symbol-selection-v1",
+                self.db.generation()?,
+                profile,
+                queries,
+                threshold
+            ])
+            .to_string(),
+        );
+        if let Some(cached) = self.db.search_cache(&key)? {
+            let names = cached
+                .into_iter()
+                .map(|name| {
+                    Ok(name
+                        .as_str()
+                        .context("Invalid cached symbol name")?
+                        .to_owned())
+                })
+                .collect::<Result<_>>()?;
+            return Ok(selection.with_symbol_names(names));
+        }
+        let symbols = self.symbol_index()?;
+        self.ensure_embedding_groups_with(vector, vec![queries.clone()], true)?;
+        let mut matched = HashSet::new();
+        for query in queries {
+            let query = self
+                .db
+                .embedding(&Database::embedding_key(&profile, true, &query))?
+                .context("Missing symbol query embedding")?;
+            for (id, similarity) in
+                symbols
+                    .index
+                    .search_filtered(&query, symbols.names.len(), |_| true)?
+            {
+                if similarity >= threshold {
+                    matched.insert(symbols.names[&id].clone());
+                }
+            }
+        }
+        if !self.readonly {
+            self.db.put_search_cache(
+                &key,
+                &matched.iter().map(|name| json!(name)).collect::<Vec<_>>(),
+            )?;
+        }
+        Ok(selection.with_symbol_names(matched))
+    }
+
+    fn symbol_structures(&self) -> Result<BTreeMap<String, parse::FileStructure>> {
+        self.db
+            .paths()?
+            .into_iter()
+            .map(|path| {
+                let structure = self.presentation_structure(&path)?.with_context(|| {
+                    format!("Structure for {path} requires refresh; run without --no-reindex")
+                })?;
+                Ok((path, structure))
+            })
+            .collect()
+    }
+
+    fn symbol_index(&self) -> Result<SymbolIndex> {
+        let vector = self.providers.symbol_vector()?;
+        let profile = vector.profile();
+        let names: std::collections::BTreeSet<_> = self
+            .symbol_structures()?
+            .values()
+            .flat_map(|structure| &structure.nodes)
+            .flat_map(|node| std::iter::once(&node.name).chain(&node.names))
+            .map(|name| symbols::normalize(name))
+            .filter(|name| !name.is_empty())
+            .collect();
+        let names: Vec<_> = names.into_iter().collect();
+        self.ensure_embedding_groups_with(vector, vec![names.clone()], false)?;
+        // Name hashes keep unchanged graph entries stable when vocabulary order
+        // changes. Reject collisions rather than silently dropping a name.
+        let name_count = names.len();
+        let names: BTreeMap<_, _> = names
+            .into_iter()
+            .map(|name| Ok((u64::from_str_radix(&hash(&name)[..16], 16)?, name)))
+            .collect::<Result<_>>()?;
+        ensure!(names.len() == name_count, "Symbol name hash collision");
+        let vectors: Vec<_> = names
+            .iter()
+            .map(|(&id, name)| {
+                let key = Database::embedding_key(&profile, false, name);
+                Ok((
+                    id,
+                    self.db
+                        .embedding(&key)?
+                        .context("Missing symbol embedding")?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let mut path = self.db.path.as_os_str().to_os_string();
+        path.push(".symbols.usearch");
+        let path = PathBuf::from(path);
+        let index = if self.readonly {
+            VectorIndex::open_readonly(&path, vector.dimensions(), self.db.generation()?, &vectors)?
+        } else {
+            VectorIndex::open(&path, vector.dimensions(), self.db.generation()?, &vectors)?
+        };
+        Ok(SymbolIndex { names, index })
+    }
+
+    fn symbol_results(
+        &self,
+        query: &str,
+        selection: &Selection,
+        options: &Value,
+    ) -> Result<Vec<Value>> {
+        let query = symbols::normalize(query);
+        ensure!(
+            !query.is_empty(),
+            "Symbol query must contain letters or numbers"
+        );
+        let symbols = self.symbol_index()?;
+        let vector = self.providers.symbol_vector()?;
+        let profile = vector.profile();
+        self.ensure_embedding_groups_with(vector, vec![vec![query.clone()]], true)?;
+        let query = self
+            .db
+            .embedding(&Database::embedding_key(&profile, true, &query))?
+            .context("Missing symbol query embedding")?;
+        let scores: HashMap<_, _> = symbols
+            .index
+            .search_filtered(&query, symbols.names.len(), |_| true)?
+            .into_iter()
+            .map(|(id, score)| (symbols.names[&id].clone(), score))
+            .collect();
+        let min = options["minSimilarity"].as_f64().unwrap_or(0.3);
+        let max = options["maxSimilarity"].as_f64().unwrap_or(f64::INFINITY);
+        let mut results = Vec::new();
+        for (path, structure) in self.symbol_structures()? {
+            if !selection.path_matches(&path) {
+                continue;
+            }
+            for node in structure.nodes {
+                if !selection.kind_matches(&node.kind) || !selection.symbol_matches(&node) {
+                    continue;
+                }
+                let similarity = std::iter::once(&node.name)
+                    .chain(&node.names)
+                    .filter_map(|name| scores.get(&symbols::normalize(name)).copied())
+                    .max_by(f64::total_cmp);
+                if let Some(similarity) = similarity.filter(|score| *score >= min && *score < max) {
+                    let mut symbol = serde_json::to_value(&node)?;
+                    symbol.as_object_mut().unwrap().remove("calls");
+                    symbol["path"] = json!(path);
+                    symbol["sourceMode"] = json!(self.files[&path].source_mode);
+                    results.push(
+                        json!({"type":"symbol", "symbol":symbol, "similarity":similarity,
+                        "symbolSimilarity":similarity}),
+                    );
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Search presentation uses the same indexed declarations as map. Older
@@ -848,7 +1042,15 @@ impl Engine {
     }
 
     fn ensure_embedding_groups(&self, groups: Vec<Vec<String>>, query: bool) -> Result<()> {
-        let vector = self.providers.vector();
+        self.ensure_embedding_groups_with(self.providers.vector(), groups, query)
+    }
+
+    fn ensure_embedding_groups_with(
+        &self,
+        vector: &dyn Vector,
+        groups: Vec<Vec<String>>,
+        query: bool,
+    ) -> Result<()> {
         let profile = vector.profile();
         let dimensions = vector.dimensions();
         let batch = vector.batch_limit();
@@ -859,6 +1061,14 @@ impl Engine {
             .flatten()
             .map(|input| (Database::embedding_key(&profile, query, input), dimensions))
             .collect();
+        if self.readonly {
+            for (key, _) in &keys {
+                if self.db.embedding(key)?.is_none() {
+                    return Err(NeedsWrite.into());
+                }
+            }
+            return Ok(());
+        }
         self.artifacts.hydrate_embeddings(&self.db, &keys)?;
         for inputs in groups {
             let mut pending = BTreeMap::new();
@@ -1071,14 +1281,26 @@ impl Engine {
     }
 
     pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>> {
+        let explicit = ["code", "descriptions", "md", "symbols"]
+            .iter()
+            .any(|k| flag(options, k));
+        let code =
+            kind == "search-code" || (kind == "search" && (!explicit || flag(options, "code")));
+        let descriptions = kind == "search-descriptions"
+            || (kind == "search"
+                && ((!explicit && self.complete_descriptions) || flag(options, "descriptions")));
+        let markdown =
+            kind == "search-md" || (kind == "search" && (!explicit || flag(options, "md")));
+        let symbols = kind == "search-symbols" || (kind == "search" && flag(options, "symbols"));
+        let content = code || descriptions || markdown;
         ensure!(
-            self.complete_code && (!self.enabled || self.complete_descriptions),
+            !content || self.complete_code && (!self.enabled || self.complete_descriptions),
             "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"
         );
-        let selection = Selection::compile(options)?;
+        Selection::compile(options)?;
         let key = hash(
             json!([
-                "query",
+                "query-v2-symbols",
                 self.db.generation()?,
                 self.enabled,
                 self.config,
@@ -1094,21 +1316,15 @@ impl Engine {
         if self.readonly {
             return Err(NeedsWrite.into());
         }
-        let embedding_key = self.embed_one(query, true)?;
-        let vector = self
-            .db
-            .embedding(&embedding_key)?
-            .context("Missing query vector")?;
-        let explicit = ["code", "descriptions", "md"]
-            .iter()
-            .any(|k| flag(options, k));
-        let code =
-            kind == "search-code" || (kind == "search" && (!explicit || flag(options, "code")));
-        let descriptions = kind == "search-descriptions"
-            || (kind == "search"
-                && ((!explicit && self.complete_descriptions) || flag(options, "descriptions")));
-        let markdown =
-            kind == "search-md" || (kind == "search" && (!explicit || flag(options, "md")));
+        let selection = self.selection(options)?;
+        let vector = if content {
+            let embedding_key = self.embed_one(query, true)?;
+            self.db
+                .embedding(&embedding_key)?
+                .context("Missing query vector")?
+        } else {
+            Vec::new()
+        };
         ensure!(
             !descriptions || self.complete_descriptions,
             "Descriptions are not enabled/complete; run slopdex descriptions enable"
@@ -1132,7 +1348,7 @@ impl Engine {
         let mut results = Vec::new();
         let searching = ui::counted(
             "Searching vector indexes",
-            usize::from(code || descriptions) + usize::from(markdown),
+            usize::from(code || descriptions) + usize::from(markdown) + usize::from(symbols),
         );
         if code || descriptions {
             let index_kind = if code && descriptions {
@@ -1158,6 +1374,7 @@ impl Engine {
                     i.kind == "function"
                         && selection.path_matches(&i.path)
                         && selection.name_matches(i.data["qualifiedName"].as_str().unwrap_or(""))
+                        && selection.semantic_name_matches(i.data["name"].as_str().unwrap_or(""))
                 })
                 .map(|i| i.id)
                 .collect();
@@ -1185,6 +1402,13 @@ impl Engine {
                     (i.kind == "markdown" || kind == "search" && !explicit && i.kind == "document")
                         && selection.path_matches(&i.path)
                         && selection.name_matches(&heading_name(&i.data))
+                        && selection.semantic_name_matches(
+                            i.data["headingPath"]
+                                .as_array()
+                                .and_then(|path| path.last())
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                        )
                 })
                 .map(|i| i.id)
                 .collect();
@@ -1196,13 +1420,28 @@ impl Engine {
             }
             searching.inc(1);
         }
+        if symbols {
+            ui::progress("Searching symbol index");
+            results.extend(self.symbol_results(query, &selection, options)?);
+            searching.inc(1);
+        }
         searching.finish();
         sort_scores(&mut results, "similarity");
         if let Some(limit) = candidate_limit {
             results.truncate(limit);
         }
         if rerank && !results.is_empty() {
-            let documents: Vec<_> = results.iter().map(Value::to_string).collect();
+            let documents: Vec<_> = results
+                .iter()
+                .map(|row| {
+                    if row["type"] == "symbol" {
+                        json!({"name": row["symbol"]["name"], "names": row["symbol"]["names"]})
+                            .to_string()
+                    } else {
+                        row.to_string()
+                    }
+                })
+                .collect();
             let reranking = ui::counted("Reranking candidates", documents.len());
             let ranking_key = hash(
                 json!([
@@ -1401,7 +1640,7 @@ impl Engine {
             let lines = item.data["lineCount"].as_u64().unwrap_or(0);
             lines >= min_lines && max_lines.is_none_or(|max| lines < max)
         };
-        let selection = Selection::compile(options)?;
+        let selection = self.selection(options)?;
         let source_path = options["sourcePath"]
             .as_str()
             .map(|path| self.normalize_path(path))
@@ -1426,6 +1665,7 @@ impl Engine {
                     && lines_match(source)
                     && selection.path_matches(&source.path)
                     && selection.name_matches(source.data["qualifiedName"].as_str().unwrap_or(""))
+                    && selection.semantic_name_matches(source.data["name"].as_str().unwrap_or(""))
                     && source_path.as_ref().is_none_or(|p| under(&source.path, p))
                     && (!flag(options, "uncommitted")
                         || source.data["sourceMode"] == "working-tree")
@@ -1649,6 +1889,10 @@ impl Engine {
 }
 
 impl crate::map::StructureSource for Engine {
+    fn selection(&self, options: &Value) -> Result<Selection> {
+        self.selection(options)
+    }
+
     fn paths(&self) -> Result<Vec<String>> {
         self.db.paths()
     }

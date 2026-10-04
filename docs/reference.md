@@ -39,6 +39,7 @@ can also follow the command. Quote multiword queries.
 | `search-code <query>` | Search callable code. | Summary |
 | `search-descriptions <query>` | Search callable/file description fusion; descriptions must be enabled and complete. | Ranked declaration excerpts |
 | `search-md <query>` | Search heading-aware `.md`/`.markdown` chunks. | Ranked heading paths |
+| `search-symbols <query>` | Search bare names/aliases of all structural symbols and Markdown heading titles. | Ranked declaration/heading excerpts |
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Show code declarations/Markdown headings; refresh existing index structure or parse directly if no index exists. | Summary |
@@ -81,8 +82,13 @@ Help, version, configuration, and model-catalog commands do not refresh the inde
 Search commands and cross-search require an existing resolved index; run
 `slopdex update` first. Existing indexes normally refresh before commands run.
 `map` refreshes only local structure when indexed, or parses directly when the
-index is missing. Semantic refresh also prepares missing embeddings and enabled
-descriptions.
+index is missing. With an existing index, `map -q` lazily prepares symbol-name
+vectors and query vectors using the embedding provider or cache. Without an
+index, map warns on stdout that `-q` is ignored and proceeds with local mapping.
+Semantic refresh also prepares missing embeddings and enabled descriptions.
+`search-symbols` and `search --symbols` with no other content flags use the same
+structure-only refresh as `map -q`; mixed content/symbol searches use normal
+semantic refresh.
 
 On terminal stderr, cliclack displays progress for catalog loading, opening and
 refreshing indexes, searches, explanations, and description regeneration.
@@ -106,7 +112,7 @@ use plain diagnostics without animations; result data on stdout retains its
 ## Structure map
 
 ```text
-slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--format text|json]
+slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--symbol-threshold NUMBER] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--format text|json]
 ```
 
 With no paths, map selects the repository. Paths select files or recursive
@@ -115,17 +121,28 @@ working directory. Absolute paths within the root are accepted; paths outside it
 are rejected. Missing paths produce warnings on stderr and are ignored. Multiple
 paths form a union, intersected with the shared selectors.
 
-When the resolved index is missing, map parses eligible files directly and renders
-the same structure, selectors, call-graph expansion, and expanded source/Markdown
+When the resolved index is missing, map parses eligible files directly
+and renders the same structure, selectors, call-graph expansion, and expanded source/Markdown
 output. It creates no database, lock files, cache directories, or sidecars, even
 with `--no-reindex`, and works without Git. Ignore/include/exclude rules and
 `maxFileSize` still apply.
+If `-q` is supplied, map prints `slopdex: warning: no active index; -q is ignored.`
+to stdout before the map output, including with `--format json`. All symbol
+queries are ignored; other selectors, paths, and detail settings still apply.
 
 With an existing index, map normally refreshes local file snapshots, declarations,
 headings, search units, and diagnostics in SQLite. `map --no-reindex` reads stored
 SQLite structure without reading current source files. Selection narrows output,
-not repository discovery. Both paths make no provider requests or generate
-descriptions, embeddings, or USearch sidecars.
+not repository discovery. Without `-q`, both paths make no provider requests or
+generate descriptions, embeddings, or USearch sidecars.
+
+`map -q 'validate session'` uses name-only semantic selection from saved structures.
+Run `slopdex update` first to enable semantic selection; without an index, map
+warns on stdout and ignores `-q` while performing normal local mapping.
+Its refresh remains structure-only; symbol vectors and query vectors are prepared
+lazily, and may use the configured provider or shared caches. It does not prepare
+content embeddings or descriptions. With `--no-reindex`, it uses saved structures
+but may still embed names/queries and populate the symbol cache and sidecar.
 
 Private and unexported symbols are omitted by default according to each language's
 visibility conventions. Pass `--private` to include them. Ancestors needed to
@@ -136,8 +153,9 @@ identify a selected public symbol remain as structural context.
 `methods` selects methods alone. `types` groups aliases, classes, structs, unions,
 interfaces, traits, and enums. Other selectors include `imports`, `modules`,
 `consts`, `variables`, `fields`, `variants`, `impls`, `macros`, and `headings`.
-Kinds are ORed and intersect name regexes. Matching nodes retain their ancestors
-as context; a matching parent does not automatically include unmatched children.
+Kinds are ORed and intersect regex and semantic name selectors. Matching nodes
+retain their ancestors as context; a matching parent does not automatically include
+unmatched children.
 
 `--callers N` and `--callees N` each default to `0` in compact and standard
 detail, or `1` with `--detail expanded`. An explicit `0` disables that direction
@@ -194,8 +212,8 @@ sections, including subsections. With `--detail expanded`, Markdown maps also pr
 the full body beneath each selected heading, without repeating nested sections.
 Headings included only as ancestor context remain heading-only, and filters omit
 unmatched section bodies. The renderer uses source and declaration metadata from
-the saved index or direct parsing. Indexed maps remain offline with `--no-reindex`;
-unindexed maps read current files even with that flag. Long signatures are
+the saved index or direct parsing. Indexed maps without `-q` remain offline with
+`--no-reindex`; unindexed maps read current files even with that flag. Long signatures are
 truncated at the default detail level.
 JSON is an array of
 file objects with `path` and `nodes`, retaining full selected metadata: file-local
@@ -209,6 +227,8 @@ slopdex map src -k fns,types -e '^Engine\.'
 slopdex map src --private
 slopdex map -k imports -e 'HashMap|MapAlias' --format json
 slopdex map docs -k headings -e '^Guide\.Setup' -i --no-reindex
+slopdex map src -q 'validate session' -q 'authenticate user' -g '*.rs' -k fns
+slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
 ```
 
 ## Shared selectors
@@ -229,7 +249,31 @@ Map, query searches, `describe`, and cross-search accept:
   names are heading paths joined with `.`, for example `Guide.Setup`.
   Look-around and backreferences are unsupported.
 - `-i`, `--ignore-case`: case-insensitive regex matching; does not change glob
-  matching.
+  or semantic matching.
+- `-q`, `--symbol-query <QUERY>`: repeatable semantic selector over **bare symbol
+  names**, aliases, and Markdown heading titles. Repeated queries are ORed; the
+  resulting names intersect regexes, globs, and map kind/private filters. Regex
+  and semantic families can match different aliases on the same declaration.
+  Parent names do not contribute to semantics: selecting a parent does not select
+  its children. Ancestors retained as context have no expanded heading body unless
+  they directly match. The positional search/describe query ranks the chosen
+  streams; with `search-symbols` or `search --symbols` alone it ranks names.
+- `--symbol-threshold <NUMBER>`: optional finite scalar in `[-1,1]`, default
+  `0.5`; inclusive minimum symbol-name similarity, independent of `--threshold`.
+  Ranges are not accepted.
+
+Names and symbol queries normalize camelCase/PascalCase, snake_case, acronym and
+letter/digit boundaries, and punctuation into lowercase space-separated words.
+For example, `getHTTPResponse`, `get_http_response`, and `get HTTP response`
+normalize to `get http response`. A query must contain at least one letter or
+number after normalization. This selector uses name-only embeddings, not source,
+signatures, descriptions, parent scopes, or Markdown bodies.
+
+Symbol embeddings default to 256 native dimensions, capped at the configured
+content embedding dimensions. Optional JSON `symbolDimensions` sets a separate
+symbol embedding dimension; OpenAI `text-embedding-ada-002` uses its full
+dimensions. A separate `<index>.symbols.usearch` index is created lazily from
+normalized names in saved structures. Ordinary map initializes no model.
 
 Path and name selection intersect and apply before query result limits, including
 to Markdown results. Cross-search applies these selectors **only to sources**,
@@ -247,11 +291,38 @@ Common query/cross-search filters:
   Markdown), or the context matches for `describe`. For cross-search it caps
   emitted clusters or matched-source rows **after all selected sources are
   searched**.
-- `-g`, `-e`, and `-i`: the [shared selectors](#shared-selectors).
+- `-g`, `-e`, `-i`, `-q`, and `--symbol-threshold`: the [shared selectors](#shared-selectors).
 
-`search` accepts `--code`, `--descriptions`, and `--md`. With no selector, it
-searches all available kinds; any selector makes selection explicit. Explicit
-description search requires complete enabled descriptions.
+`search` accepts the explicit stream selectors `--code`, `--descriptions`, `--md`,
+and `--symbols`. With no stream selector, it searches callable code, complete
+enabled descriptions, and Markdown/document content. **Symbols are opt-in**:
+plain `search` does not add symbol-name results. Any stream selector makes
+selection explicit, omitting unselected streams. Explicit description search
+requires complete enabled descriptions. `-q` is an additional shared filter,
+not a stream selector.
+
+`search-symbols <query>` is the canonical name-only command; `search <query>
+--symbols` without any other content flags is equivalent. Both require an
+existing resolved index (`slopdex update` first), including with `--no-reindex`.
+They refresh local structure only, without preparing content embeddings or
+generating descriptions, then lazily prepare name/query vectors using the
+configured embedding provider or cache. `--no-reindex` keeps the saved snapshot
+but permits symbol-cache population and symbol-sidecar repair. Names can be
+embedded even when the structure-only snapshot lacks content vectors.
+
+All structural kinds are eligible: functions, methods, constants, variables,
+types, imports and aliases, headings (including headings without body text),
+and other declarations. Scores use the maximum bare-name/alias similarity;
+parent names, signatures, code, descriptions, and heading bodies do not contribute.
+`--threshold` applies its inclusive minimum/exclusive maximum and `--limit`
+caps the ranked hits. Optional `-q` intersects an additional semantic name
+selection, using `--symbol-threshold` independently of the ranking threshold.
+
+Combining `--symbols` with `--code`, `--md`, or `--descriptions` uses normal
+semantic refresh. Function/content, Markdown/document, and symbol hits remain
+separate scored streams with global ranking and one global output limit. A
+declaration can appear in both function and symbol rows; text combines their
+annotations on the same declaration.
 
 Cross-search options:
 
@@ -274,7 +345,12 @@ Examples:
 slopdex update
 slopdex search "keep the repository index synchronized"
 slopdex search-code "configure the embedding provider"
+slopdex search-code 'reject expired credentials' -q 'validate session' --symbol-threshold 0.6
 slopdex search-md "configure the embedding provider"
+slopdex search-symbols 'validate session' --threshold 0.6 --limit 20
+slopdex search 'installation' --symbols -g '*.md' --detail expanded
+slopdex search 'validate session' --code --symbols
+slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
 slopdex config set descriptionProvider opencode-go
 slopdex config set descriptionsEnabled true
 slopdex search-descriptions "keep the repository index synchronized"
@@ -284,6 +360,7 @@ slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 slopdex cross-search --uncommitted --cross-file-only --threshold 0.9
 slopdex cross-search --changed-since origin/main --threshold 0.9
 slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 0.9
+slopdex cross-search -q 'load configuration' --cross-file-only --threshold 0.9
 slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 slopdex --root /path/to/other/repo --index /path/to/other/index.sqlite update
 slopdex cross-search --target-root /path/to/other/repo \
@@ -337,6 +414,8 @@ three-way average only when both indexes are complete and their configured
 description profiles match; otherwise the entire comparison uses code alone.
 JSON exposes the applicable `codeSimilarity`, `descriptionSimilarity`, and
 `fileDescriptionSimilarity`; cross-search rows include scoring mode and weights.
+Symbol rows expose both `similarity` and `symbolSimilarity`, separately from
+content-fusion scores.
 
 **Neighbor retrieval remains approximate.** Filters run inside USearch graph
 traversal, not on an unfiltered top-k list. Threshold ranges can trigger wider
@@ -351,7 +430,7 @@ Text is the default for `map`, `search`, `cross-search`, and `describe`.
 `--detail standard` also shows declaration attributes, a 160-character
 Markdown body preview; `--detail expanded` additionally shows full signatures,
 saved file and callable descriptions, Markdown body text (full selected bodies for
-map, matched chunks for search), component scores,
+map and direct symbol-heading hits, matched chunks for content search), component scores,
 for file-oriented output. Clusters always print compact symbol locations. File descriptions are rendered as
 language-specific comments immediately after the file header. Callable
 descriptions are flattened into one language-specific comment on the
@@ -390,6 +469,36 @@ repeats the complete heading path for each result, since hits are not in file
 order. Its range identifies the matched chunk; expanded detail prints the full
 chunk text. Mixed search without an explicit description selector keeps saved
 descriptions at expanded detail.
+Symbol excerpts include ancestor context and a `symbol score=...` annotation;
+expanded detail also shows `[symbol ...]` from `symbolSimilarity`. Direct heading
+hits display their saved body in expanded output via the structure snapshot;
+ancestor-only headings remain heading-only. Bodies/code are display context,
+not inputs to symbol ranking. Only callable symbol hits seed call expansion.
+
+Symbol JSON rows have this shape:
+
+```json
+{
+  "type": "symbol",
+  "symbol": {
+    "id": 2,
+    "kind": "heading",
+    "name": "Setup",
+    "qualifiedName": "Guide.Setup",
+    "path": "guide.md",
+    "sourceMode": "working-tree"
+  },
+  "similarity": 0.8,
+  "symbolSimilarity": 0.8
+}
+```
+
+The abbreviated `symbol` above contains the full serialized `StructureNode` in
+actual output (ranges, signature, parent, aliases, and other metadata), plus
+`path` and `sourceMode`. Its `id` is **file-local**, not a name-vocabulary/vector
+ID. Callable symbol rows can include `relatedCallables` and `callees` when call
+expansion is requested, as function rows do; noncallable symbols do not seed it.
+
 Cross-search clusters print one `path:start-end:qualifiedName` location per
 multiline symbol, or `path:line:qualifiedName` for a single-line symbol, under
 a cluster header. For example:
@@ -465,7 +574,8 @@ format and wording are not deterministic.
 ### Create and refresh
 
 Run `slopdex update` once for the selected root/index path before searching.
-`search`, `search-code`, `search-md`, `search-descriptions`, and `cross-search`
+`search`, `search-code`, `search-md`, `search-descriptions`, `search-symbols`,
+and `cross-search`
 fail promptly if the resolved source index does not exist, with an instruction to
 run `slopdex update`, including with `--no-reindex`. Cross-search also requires
 the target index to exist and validates it before opening or refreshing the
@@ -535,7 +645,7 @@ name, callable source hash, file-description text, and system instruction. The
 path and content hashes are saved alongside the cached answer for inspection and
 future invalidation policy. Thus a rename or model-setting change can reuse a
 matching answer, even when the prompt for a new request would differ. Existing live descriptions
-retain their normal reuse/staleness policy. Map never contacts S3. An uncached
+retain their normal reuse/staleness policy. Map without `-q` never contacts S3. An uncached
 semantic query with `--no-reindex` may consult S3 before its provider call.
 Opening an existing workspace index also imports its valid provider artifacts into
 the per-user cache. When S3 is enabled later, the next successful semantic refresh
@@ -566,7 +676,9 @@ To run the MinIO integration test against a local server with
 
 Persistent derived indexes sit beside the database:
 `<index>.code.usearch`, `<index>.markdown.usearch`, and, when descriptions are
-complete, `<index>.descriptions.usearch` and `<index>.combined.usearch`. Each has
+complete, `<index>.descriptions.usearch` and `<index>.combined.usearch`. Semantic
+symbol selection adds a lazy `<index>.symbols.usearch` built from name-only
+embeddings derived from saved structures, independently of content indexes. Each has
 a `.manifest.json` sidecar. Valid caches are reconciled incrementally by stable
 item ID and vector hash; unchanged vectors retain their graph entries. Missing,
 corrupt, or incompatible sidecars are rebuilt from SQLite without model calls.
@@ -612,8 +724,12 @@ offline when the matching artifacts/results exist. Catalog commands still fetch
 their catalogs. Use the CLI flag: the CLI overwrites a JSON `noReindex` value with
 the flag's value on every invocation.
 
-`map --no-reindex` needs neither providers nor sidecar repair. With no index it
-parses current files directly; with an existing index it uses saved structure.
+`map --no-reindex` without `-q` needs neither providers nor sidecar repair. With no
+index it parses current files directly; with an existing index it uses saved structure.
+With an existing index, adding `-q` may populate symbol/query vectors and repair
+the separate symbol sidecar, using a provider when cache entries are missing.
+Without an index, map warns on stdout that `-q` is ignored and parses current
+files directly, including with `--no-reindex`.
 A structure-only index can have search units without vectors; `--no-reindex`
 does not prepare those missing vectors. Run a semantic command with normal
 refresh to prepare them.
@@ -741,6 +857,7 @@ Example `.slopdex/config.json`:
 | JSON settings | Native behavior/default |
 | --- | --- |
 | `provider`, `model`, `dimensions` | OpenAI / `text-embedding-3-large` / `3072`; Jina defaults to `jina-embeddings-v4` / `1024`. OpenAI small/ada models default to `1536`. CLI: `--provider`, `--model`, `--dimensions`. |
+| `symbolDimensions` | Optional native dimension for name-only symbol embeddings; default `min(256, dimensions)`. OpenAI ada uses full dimensions. Separate from content embeddings. |
 | `descriptionProvider`, `descriptionModel` | OpenAI / `gpt-5.6-luna`; OpenCode Zen (`opencode`) and Go (`opencode-go`) default to `muse-spark-1.3-contributor`. Corresponding `--description-*` options override them. |
 | `descriptionFallbackModel` | Optional same-provider fallback; CLI `--description-fallback-model`. Successful fallback stays active within that provider instance until it fails. |
 | `descriptionsEnabled` | Explicit enabled state, otherwise saved state/default false. |

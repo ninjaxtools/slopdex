@@ -235,7 +235,13 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
     });
     let (status, response) = match path.as_str() {
         "/v1/embeddings" => {
-            ensure!(body["dimensions"] == 4, "unexpected embedding dimensions");
+            let dimensions = body["dimensions"]
+                .as_u64()
+                .context("missing embedding dimensions")? as usize;
+            ensure!(
+                matches!(dimensions, 2 | 4),
+                "unexpected embedding dimensions: {dimensions}"
+            );
             let inputs = body["input"]
                 .as_array()
                 .context("missing embedding inputs")?;
@@ -249,7 +255,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
             } else {
                 // Reverse wire order to exercise the real provider's index mapping.
                 let data: Vec<_> = inputs.iter().enumerate().rev().map(|(index, text)| {
-                    json!({"index": index, "embedding": embedding(text.as_str().unwrap())})
+                    json!({"index": index, "embedding": &embedding(text.as_str().unwrap())[..dimensions]})
                 }).collect();
                 (200, json!({"data": data}))
             }
@@ -276,7 +282,9 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
                 .iter()
                 .enumerate()
                 .map(|(index, doc)| {
-                    let score = if doc.as_str().unwrap().contains("rerank_winner") {
+                    let score = if doc.as_str().unwrap().contains("rerank_winner")
+                        || doc.as_str().unwrap().contains("rerank winner")
+                    {
                         0.99
                     } else {
                         0.1
@@ -456,16 +464,18 @@ impl ConcurrentRequests {
 
 // Independent, hand-selected unit vectors give exact ranking expectations. In
 // particular, descriptions disagree with code, so averaging cannot pass by accident.
+// Lowercase word forms let normalized symbol names use the same known geometry;
+// plain existing queries such as "north" retain their original eastward vector.
 fn embedding(text: &str) -> [f32; 4] {
     if text.starts_with("file-summary:") {
         [0.6, 0.0, 0.8, 0.0]
     } else if text.starts_with("callable-summary:") {
         [0.0, 1.0, 0.0, 0.0]
-    } else if text.contains("VECTOR_MID") {
+    } else if text.contains("VECTOR_MID") || text.contains("vector mid") {
         [0.8, 0.6, 0.0, 0.0]
-    } else if text.contains("VECTOR_NORTH") {
+    } else if text.contains("VECTOR_NORTH") || text.contains("vector north") {
         [0.0, 1.0, 0.0, 0.0]
-    } else if text.contains("VECTOR_WEST") {
+    } else if text.contains("VECTOR_WEST") || text.contains("vector west") {
         [-1.0, 0.0, 0.0, 0.0]
     } else {
         [1.0, 0.0, 0.0, 0.0]
@@ -582,13 +592,17 @@ impl Repo {
     }
 
     fn cli(&self, args: &[&str]) -> Result<Output> {
+        self.cli_format(args, "json")
+    }
+
+    fn cli_format(&self, args: &[&str], format: &str) -> Result<Output> {
         let output = self
             .child(env!("CARGO_BIN_EXE_slopdex"))
             .arg("--root")
             .arg(&self.root)
             .arg("--index")
             .arg(&self.index)
-            .args(["--format", "json"])
+            .args(["--format", format])
             .args(args)
             .output()?;
         assert!(
@@ -5118,6 +5132,1617 @@ fn partially_prepared_profile_rejects_search_and_reuses_successful_batches_on_re
             .count(),
         2
     );
+    Ok(())
+}
+
+#[test]
+fn symbol_map_normalizes_bare_names_and_indexes_noncallables_without_content() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(
+        "api.ts",
+        "export const VECTOR_NORTH_LIMIT = 1;\nexport type VectorNorthType = number;\nexport function HTTP2VectorNorth() { return 'VECTOR_WEST'; }\nexport function http2_vector_north() { return 'VECTOR_WEST'; }\nexport function Ordinary() { return 'VECTOR_NORTH VECTOR_WEST'; }\nexport class VectorNorthContainer { ordinaryMember() { return 'VECTOR_NORTH'; } }\n",
+    )?;
+    repo.write("guide.md", "# Guide\n\nVECTOR_WEST body only.\n\n## Vector North\n\nVECTOR_WEST selected body.\n\n### Ordinary\n\nVECTOR_NORTH body only.\n")?;
+    // The public Engine API must honor its configured provider after a structure-only refresh.
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    let ordinary = engine.map(&json!({}))?;
+    assert!(map_names(&ordinary).contains("Ordinary"));
+    assert_eq!(mock.count(), 0);
+    assert!(!PathBuf::from(format!("{}.symbols.usearch", repo.index.display())).exists());
+
+    let options = json!({"symbolQuery":"VECTOR_NORTH"});
+    let selected = engine.map(&options)?;
+    assert_eq!(
+        map_names(&selected),
+        strings(&[
+            "VECTOR_NORTH_LIMIT",
+            "VectorNorthType",
+            "HTTP2VectorNorth",
+            "http2_vector_north",
+            "VectorNorthContainer",
+            "Guide",
+            "Vector North"
+        ])
+    );
+    assert!(
+        engine
+            .map(&json!({"symbolQuery":"VECTOR_WEST"}))?
+            .is_empty(),
+        "body-only terms must not select declarations or headings"
+    );
+    assert!(
+        engine
+            .map(&json!({"symbolQuery":"VECTOR_NORTH", "regexp":"ordinary", "ignoreCase":true}))?
+            .is_empty(),
+        "qualified parents must not make bare child names eligible"
+    );
+
+    let inputs = mock.embedding_inputs();
+    assert!(
+        inputs.iter().all(|input| !input.contains("VECTOR_")
+            && !input.contains('\n')
+            && !input.contains("return")),
+        "name/query inputs only: {inputs:?}"
+    );
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| *input == "http 2 vector north")
+            .count(),
+        1,
+        "equivalent identifier spellings share one vocabulary vector"
+    );
+    for normalized in [
+        "vector north limit",
+        "vector north type",
+        "vector north container",
+    ] {
+        assert!(
+            inputs.iter().any(|input| input == normalized),
+            "missing {normalized}: {inputs:?}"
+        );
+    }
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| *input == "vector north")
+            .count(),
+        2,
+        "heading and query normalize identically, with separate document/query keys"
+    );
+    let calls = mock.count();
+    for query in [
+        "HTTP2VectorNorth",
+        "http2_vector_north",
+        "http 2 vector north",
+    ] {
+        assert_eq!(engine.map(&json!({"symbolQuery":query}))?, selected);
+    }
+    let normalized_query_calls = mock.count();
+    assert_eq!(
+        normalized_query_calls,
+        calls + 1,
+        "one normalized query embedding for all spellings"
+    );
+    drop(engine);
+    let engine = repo.open(&config)?;
+    assert_eq!(engine.map(&options)?, selected);
+    assert_eq!(
+        engine.map(&json!({"symbolQuery":"http2_vector_north"}))?,
+        selected
+    );
+    assert_eq!(mock.count(), normalized_query_calls);
+    assert!(mock.requests("/responses").is_empty());
+    assert_eq!(artifact_counts(&repo)?.2, 0);
+    let unit_embeddings: i64 =
+        repo.db()?
+            .query_row("SELECT count(*) FROM unit_embeddings", [], |r| r.get(0))?;
+    assert_eq!(
+        unit_embeddings, 0,
+        "symbol map must not prepare content vectors"
+    );
+    assert_incomplete(&engine);
+    Ok(())
+}
+
+#[test]
+fn symbol_map_saved_import_aliases_share_the_normalized_vocabulary() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("api.ts", "import { original as HTTP2VectorNorthAlias } from './dependency';\nexport function Ordinary() {}\n")?;
+    let config = mock.config();
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    let selected =
+        engine.map(&json!({"symbolQuery":"HTTP2VectorNorthAlias", "kinds":"imports"}))?;
+    assert_eq!(selected.len(), 1);
+    let nodes = selected[0]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["kind"], "import");
+    assert!(
+        nodes[0]["names"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("HTTP2VectorNorthAlias"))
+    );
+    assert_eq!(
+        mock.embedding_inputs()
+            .iter()
+            .filter(|input| *input == "http 2 vector north alias")
+            .count(),
+        2
+    );
+    let calls = mock.count();
+    drop(engine);
+    assert_eq!(
+        repo.open(&config)?
+            .map(&json!({"symbolQuery":"http_2_vector_north_alias", "kinds":"imports"}))?,
+        selected
+    );
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn symbol_map_cli_repeated_queries_or_then_intersect_regex_globs_kinds_and_visibility() -> Result<()>
+{
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    let source = "export class Api {\n public VectorNorth() {}\n public VectorWest() {}\n public VectorMid() {}\n private VectorNorthSecret() {}\n ordinary() { return 'VECTOR_NORTH'; }\n}\nexport const VECTOR_NORTH_CONSTANT = 1;\n";
+    for path in ["src/api.ts", "src/excluded.ts", "outside/api.ts"] {
+        repo.write(path, source)?;
+    }
+    repo.open(&config)?.refresh_structure()?;
+    let selector = [
+        "--no-reindex",
+        "map",
+        "src",
+        "-q",
+        "VECTOR_NORTH",
+        "--symbol-query",
+        "VECTOR_WEST",
+        "-e",
+        "^API\\.VECTOR(NORTH|WEST|MID)(SECRET)?$",
+        "-e",
+        "^absent$",
+        "-i",
+        "-g",
+        "**/*.ts",
+        "-g",
+        "!**/excluded.ts",
+        "-k",
+        "methods",
+    ];
+    let selected = repo.cli_json(&selector)?;
+    assert_eq!(selected.as_array().unwrap().len(), 1);
+    assert_eq!(selected[0]["path"], "src/api.ts");
+    assert_eq!(
+        map_names(selected.as_array().unwrap()),
+        strings(&["Api", "VectorNorth", "VectorWest", "VectorMid"]),
+        "default .5 admits north/mid cosine .6, and repeated queries admit west"
+    );
+    let calls = mock.count();
+    assert_eq!(repo.cli_json(&selector)?, selected);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "cached CLI repeat/reopen must not call providers"
+    );
+    let mut strict = selector.to_vec();
+    strict.extend(["--symbol-threshold", "0.7"]);
+    assert_eq!(
+        map_names(repo.cli_json(&strict)?.as_array().unwrap()),
+        strings(&["Api", "VectorNorth", "VectorWest"])
+    );
+    strict.push("--private");
+    assert_eq!(
+        map_names(repo.cli_json(&strict)?.as_array().unwrap()),
+        strings(&["Api", "VectorNorth", "VectorWest", "VectorNorthSecret"])
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "threshold/visibility changes reuse paid name and query vectors"
+    );
+    assert!(mock.requests("/responses").is_empty());
+    Ok(())
+}
+
+#[test]
+fn symbol_map_cli_no_reindex_populates_lazy_cache_and_expands_only_direct_selected_body()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write("guide.md", "# Guide\n\nAncestor body VECTOR_WEST.\n\n## Vector North\n\nSelected café 🚀 body VECTOR_WEST.\n\n### Ordinary\n\nDescendant body VECTOR_NORTH.\n\n## Other\n\nSibling body VECTOR_NORTH.\n")?;
+    repo.write(
+        "code.ts",
+        "export function Ordinary() { return 'VECTOR_NORTH'; }\n",
+    )?;
+    let mut engine = repo.open_map(&config)?;
+    engine.refresh_structure()?;
+    let generation = engine.status()?["generation"].clone();
+    let saved = file_record(&repo, "guide.md")?;
+    let before = artifact_counts(&repo)?;
+    assert_eq!(before.0, 0);
+    assert_eq!(mock.count(), 0);
+    drop(engine);
+    repo.write("guide.md", "# Vector West\n\nChanged live body.\n")?;
+    repo.write("code.ts", "export function VectorNorthNew() {}\n")?;
+
+    let args = ["--no-reindex", "map", "-q", "VECTOR_NORTH"];
+    let selected = repo.cli_json(&args)?;
+    assert_eq!(
+        map_names(selected.as_array().unwrap()),
+        strings(&["Guide", "Vector North"])
+    );
+    assert!(
+        mock.count() > 0,
+        "noReindex still permits lazy symbol/query cache population"
+    );
+    let calls = mock.count();
+    let output = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args([
+            "--no-reindex",
+            "--format",
+            "summary",
+            "--detail",
+            "expanded",
+            "map",
+            "-q",
+            "VECTOR_NORTH",
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    for included in [
+        "# Guide",
+        "## Vector North",
+        "Selected café 🚀 body VECTOR_WEST.",
+    ] {
+        assert_eq!(text.matches(included).count(), 1, "{text}");
+    }
+    for omitted in [
+        "Ancestor body",
+        "Descendant body",
+        "Sibling body",
+        "### Ordinary",
+        "## Other",
+        "Changed live body",
+        "VectorNorthNew",
+    ] {
+        assert!(!text.contains(omitted), "{omitted}: {text}");
+    }
+    assert_eq!(repo.cli_json(&args)?, selected);
+    assert_eq!(mock.count(), calls);
+    assert_eq!(file_record(&repo, "guide.md")?, saved);
+    assert_eq!(
+        repo.cli_json(&["--no-reindex", "status"])?["generation"],
+        generation
+    );
+    let after = artifact_counts(&repo)?;
+    assert!(after.0 > before.0);
+    assert_eq!((after.1, after.2), (before.1, before.2));
+    assert!(mock.requests("/responses").is_empty());
+    for kind in ["code", "markdown", "descriptions", "combined"] {
+        assert!(!PathBuf::from(format!("{}.{kind}.usearch", repo.index.display())).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn symbol_search_filters_before_content_limits_with_independent_thresholds_and_unchanged_scores()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    let distractors: String = (0..48)
+        .map(|i| function(&format!("ordinary_{i}"), "VECTOR_EAST"))
+        .collect();
+    repo.write("other.rs", &distractors)?;
+    repo.write(
+        "selected.rs",
+        &(function("VectorNorth", "VECTOR_NORTH")
+            + &function("VectorMid", "VECTOR_MID")
+            + &function("VectorWest", "VECTOR_EAST")),
+    )?;
+    repo.write("guide.md", "# Guide\n\nOverview VECTOR_EAST.\n\n## Vector North\n\nVECTOR_NORTH.\n\n## Vector Mid\n\nVECTOR_MID.\n\n## Ordinary\n\nVECTOR_EAST VECTOR_NORTH.\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let strict =
+        json!({"symbolQuery":"VECTOR_NORTH", "symbolThreshold":0.7, "minSimilarity":-1, "limit":1});
+    for kind in ["search-code", "search-descriptions", "search-md", "search"] {
+        let unfiltered = engine.search("east", kind, &all())?;
+        let selected = engine.search("east", kind, &strict)?;
+        assert_eq!(selected.len(), 1, "{kind}: {selected:?}");
+        let expected = unfiltered
+            .iter()
+            .find(|row| {
+                row["function"]["name"] == "VectorNorth"
+                    || row["chunk"]["headingPath"] == json!(["Guide", "Vector North"])
+            })
+            .unwrap();
+        assert_eq!(
+            &selected[0], expected,
+            "{kind}: symbol similarity must not replace or modify content scores"
+        );
+        let expected_score = match kind {
+            "search-descriptions" => 0.3, // callable 0 plus file .6, averaged
+            "search" => 0.2,              // code 0, callable 0, file .6, averaged
+            _ => 0.0,
+        };
+        near(&selected[0]["similarity"], expected_score);
+        let mut content_strict = strict.clone();
+        content_strict["minSimilarity"] = json!(0.4);
+        assert!(
+            engine.search("east", kind, &content_strict)?.is_empty(),
+            "{kind}: independent content threshold"
+        );
+    }
+    let relaxed = json!({"symbolQuery":"VECTOR_NORTH", "minSimilarity":0.7, "limit":1});
+    let code = engine.search("east", "search-code", &relaxed)?;
+    assert_eq!(names(&code), strings(&["VectorMid"]));
+    near(&code[0]["similarity"], 0.8);
+    let md = engine.search("east", "search-md", &relaxed)?;
+    assert_eq!(
+        md[0]["chunk"]["headingPath"],
+        json!(["Guide", "Vector Mid"])
+    );
+    near(&md[0]["similarity"], 0.8);
+    let mixed = engine.search("east", "search", &json!({"code":true, "md":true, "symbolQuery":["VECTOR_NORTH", "VECTOR_WEST"], "symbolThreshold":0.7, "minSimilarity":-1, "limit":1}))?;
+    assert_eq!(names(&mixed), strings(&["VectorWest"]));
+    near(&mixed[0]["similarity"], 1.0);
+    let composition = json!({"symbolQuery":["VECTOR_NORTH", "VECTOR_WEST"], "symbolThreshold":0.7, "regexp":["^vectOrnorth$", "^absent$"], "ignoreCase":true, "glob":"selected.rs", "minSimilarity":-1, "limit":1});
+    let composed = engine.search("east", "search-code", &composition)?;
+    assert_eq!(names(&composed), strings(&["VectorNorth"]));
+    near(&composed[0]["similarity"], 0.0);
+    let calls = mock.count();
+    assert_eq!(
+        engine.search("east", "search-code", &composition)?,
+        composed
+    );
+    drop(engine);
+    assert_eq!(
+        repo.open(&config)?
+            .search("east", "search-code", &composition)?,
+        composed
+    );
+    assert_eq!(
+        repo.cli_json(&[
+            "--no-reindex",
+            "search-code",
+            "east",
+            "-q",
+            "VECTOR_NORTH",
+            "--symbol-query",
+            "VECTOR_WEST",
+            "--symbol-threshold",
+            "0.7",
+            "-e",
+            "^vectOrnorth$",
+            "-e",
+            "^absent$",
+            "-i",
+            "-g",
+            "selected.rs",
+            "--threshold",
+            "-1",
+            "--limit",
+            "1"
+        ])?,
+        json!(composed)
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "cached Engine/CLI search repeats and reopen must make no requests"
+    );
+    Ok(())
+}
+
+fn symbol_names(rows: &[Value]) -> BTreeSet<String> {
+    rows.iter()
+        .map(|row| row["symbol"]["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn assert_name_only_work(repo: &Repo, mock: &Mock) -> Result<()> {
+    assert!(mock.requests("/responses").is_empty());
+    assert_eq!(artifact_counts(repo)?.2, 0);
+    let unit_embeddings: i64 =
+        repo.db()?
+            .query_row("SELECT count(*) FROM unit_embeddings", [], |row| row.get(0))?;
+    assert_eq!(
+        unit_embeddings, 0,
+        "symbols must not prepare content vectors"
+    );
+    let inputs = mock.embedding_inputs();
+    assert!(
+        inputs.iter().all(|input| !input.contains('\n')
+            && !input.contains("BODY_ONLY")
+            && !input.contains("body only")
+            && !input.contains("return")
+            && input == &input.to_lowercase()),
+        "normalized name/query inputs only: {inputs:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn search_symbols_engine_ranks_all_declarations_and_preserves_duplicate_occurrences() -> Result<()>
+{
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write("api.ts", "import { original as HTTP2VectorNorthAlias, other as VectorWestAlias } from './dependency';\nexport const VECTOR_NORTH_LIMIT = 1;\nexport class VectorNorthContainer {\n public VectorNorthField = 1;\n ordinaryMember() { return 'VECTOR_NORTH BODY_ONLY'; }\n}\nexport class First { VectorNorth() {} }\nexport class Second { VectorNorth() {} }\nexport function HTTP2VectorNorth() { return 'VECTOR_WEST BODY_ONLY'; }\nexport function http2_vector_north() { return 'VECTOR_WEST BODY_ONLY'; }\nexport function Ordinary() { return 'VECTOR_NORTH BODY_ONLY'; }\n")?;
+    repo.write("other.ts", "export function HTTP2VectorNorth() {}\n")?;
+    repo.write("guide.md", "# Guide\n\nVECTOR_NORTH BODY_ONLY parent.\n\n## Vector North Empty\n\n## Ordinary\n\nVECTOR_NORTH BODY_ONLY section.\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    assert_eq!(mock.count(), 0);
+
+    let options = json!({"minSimilarity":0.9});
+    let rows = engine.search("VECTOR_NORTH", "search-symbols", &options)?;
+    assert_eq!(
+        rows.len(),
+        10,
+        "one row per declaration, including aliases: {rows:?}"
+    );
+    let selected = symbol_names(&rows);
+    for name in [
+        "VECTOR_NORTH_LIMIT",
+        "VectorNorthContainer",
+        "VectorNorthField",
+        "VectorNorth",
+        "HTTP2VectorNorth",
+        "http2_vector_north",
+        "Vector North Empty",
+    ] {
+        assert!(selected.contains(name), "missing {name}: {rows:?}");
+    }
+    for name in ["Guide", "Ordinary", "ordinaryMember", "First", "Second"] {
+        assert!(
+            !selected.contains(name),
+            "bare names exclude bodies and parents: {name}"
+        );
+    }
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["symbol"]["name"] == "VectorNorth")
+            .count(),
+        2
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["symbol"]["name"] == "HTTP2VectorNorth")
+            .count(),
+        2
+    );
+    let identities: BTreeSet<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["symbol"]["path"].as_str().unwrap(),
+                row["symbol"]["id"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(identities.len(), rows.len());
+    for row in &rows {
+        assert_eq!(row["type"], "symbol");
+        near(&row["similarity"], 1.0);
+        near(&row["symbolSimilarity"], 1.0);
+        assert!(row.get("codeSimilarity").is_none());
+        let symbol = &row["symbol"];
+        let path = symbol["path"].as_str().unwrap();
+        let structure = engine.presentation_structure(path)?.unwrap();
+        let node = structure
+            .nodes
+            .iter()
+            .find(|node| json!(node.id) == symbol["id"])
+            .unwrap();
+        let mut expected = serde_json::to_value(node)?;
+        expected["path"] = json!(path);
+        expected["sourceMode"] = json!("working-tree");
+        assert_eq!(
+            *symbol, expected,
+            "preserve serialized StructureNode fields"
+        );
+    }
+    let import = rows
+        .iter()
+        .find(|row| row["symbol"]["kind"] == "import")
+        .unwrap();
+    assert!(
+        import["symbol"]["names"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("HTTP2VectorNorthAlias"))
+    );
+    // The declaration has eastward and westward names too: use the maximum,
+    // rather than an average or only the primary import name.
+    let west = engine.search(
+        "VectorWest",
+        "search-symbols",
+        &json!({"minSimilarity":0.9}),
+    )?;
+    assert_eq!(west.len(), 1, "body-only VECTOR_WEST must not add hits");
+    assert_eq!(west[0]["symbol"], import["symbol"]);
+    near(&west[0]["similarity"], 1.0);
+    let mut selector = options.clone();
+    selector["symbols"] = json!(true);
+    assert_eq!(engine.search("vector north", "search", &selector)?, rows);
+    for limit in [1, 6, 9, 10, 20] {
+        let mut limited = options.clone();
+        limited["limit"] = json!(limit);
+        assert_eq!(
+            engine.search("VECTOR_NORTH", "search-symbols", &limited)?,
+            rows[..limit.min(rows.len())],
+            "limit counts occurrences, rather than vocabulary names"
+        );
+    }
+    assert_name_only_work(&repo, &mock)?;
+    Ok(())
+}
+
+#[test]
+fn search_symbols_filters_and_threshold_ranges_precede_global_occurrence_limit() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(
+        "nearest.rs",
+        &(0..48)
+            .map(|i| function(&format!("ordinary_{i}"), "BODY_ONLY"))
+            .collect::<String>(),
+    )?;
+    let source = function("VectorEast", "BODY_ONLY")
+        + &function("VectorMid", "BODY_ONLY")
+        + &function("VectorNorth", "BODY_ONLY")
+        + &function("VectorWest", "BODY_ONLY");
+    repo.write("src/selected.rs", &source)?;
+    repo.write(
+        "src/excluded.rs",
+        &function("VectorEastExcluded", "BODY_ONLY"),
+    )?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    for (minimum, maximum, expected) in [
+        (1.0, None, vec!["VectorEast"]),
+        (0.0, Some(1.0), vec!["VectorMid", "VectorNorth"]),
+        (-1.0, Some(0.0), vec!["VectorWest"]),
+        (-1.0, Some(-0.5), vec!["VectorWest"]),
+        (0.9, Some(1.0), vec![]),
+    ] {
+        let options =
+            json!({"glob":"src/selected.rs", "minSimilarity":minimum, "maxSimilarity":maximum});
+        let rows = engine.search("east", "search-symbols", &options)?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["symbol"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "{options}"
+        );
+        let mut limited = options.clone();
+        limited["limit"] = json!(1);
+        assert_eq!(
+            engine.search("east", "search-symbols", &limited)?,
+            rows[..rows.len().min(1)]
+        );
+    }
+    let selected = engine.search(
+        "east",
+        "search-symbols",
+        &json!({
+            "glob":["src/**", "!src/excluded.rs"], "regexp":["^vectOrnorth$", "^absent$"],
+            "ignoreCase":true, "minSimilarity":-1, "limit":1
+        }),
+    )?;
+    assert_eq!(symbol_names(&selected), strings(&["VectorNorth"]));
+    near(&selected[0]["similarity"], 0.0);
+    let strict = json!({"glob":"src/selected.rs", "symbolQuery":"VECTOR_NORTH", "symbolThreshold":0.7, "minSimilarity":-1, "limit":1});
+    let north = engine.search("east", "search-symbols", &strict)?;
+    assert_eq!(symbol_names(&north), strings(&["VectorNorth"]));
+    near(&north[0]["similarity"], 0.0);
+    near(&north[0]["symbolSimilarity"], 0.0);
+    let mut relaxed = strict.clone();
+    relaxed["symbolThreshold"] = json!(0.5);
+    let mid = engine.search("east", "search-symbols", &relaxed)?;
+    assert_eq!(symbol_names(&mid), strings(&["VectorMid"]));
+    near(&mid[0]["similarity"], 0.8);
+    let mut intersection = strict.clone();
+    intersection["minSimilarity"] = json!(0.7);
+    assert!(
+        engine
+            .search("east", "search-symbols", &intersection)?
+            .is_empty()
+    );
+    assert_name_only_work(&repo, &mock)?;
+    Ok(())
+}
+
+#[test]
+fn search_symbols_cli_command_selector_parity_and_normalized_q_regex_composition() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write("src/api.ts", "import { original as HTTP2VectorNorthAlias } from './dependency';\nexport class Api { HTTP2VectorNorth() {} ordinary() { return 'VECTOR_NORTH BODY_ONLY'; } }\nexport function VectorWest() {}\nexport function VectorMid() {}\n")?;
+    repo.write("outside.ts", "export function HTTP2VectorNorth() {}\n")?;
+    repo.write("guide.md", "# Guide\n\n## HTTP2VectorNorth\n")?;
+    repo.open_map(&config)?.refresh_structure()?;
+    let filters = [
+        "-q",
+        "http_2_vector_north",
+        "--symbol-threshold",
+        "0.7",
+        "-e",
+        "^api\\.http2vectornorth$",
+        "-e",
+        "^http2vectornorthalias$",
+        "-i",
+        "-g",
+        "src/**",
+        "--threshold",
+        "0.9",
+        "--limit",
+        "10",
+    ];
+    let command_args = [
+        vec!["--no-reindex", "search-symbols", "HTTP2VectorNorth"],
+        filters.to_vec(),
+    ]
+    .concat();
+    let command = repo.cli_json(&command_args)?;
+    assert_eq!(
+        command.as_array().unwrap().len(),
+        2,
+        "qualified method and import alias: {command}"
+    );
+    assert!(
+        command
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["symbol"]["qualifiedName"] == "Api.HTTP2VectorNorth")
+    );
+    assert!(
+        command
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["symbol"]["kind"] == "import")
+    );
+    let calls = mock.count();
+    let selector_args = [
+        vec!["--no-reindex", "search", "http 2 vector north", "--symbols"],
+        filters.to_vec(),
+    ]
+    .concat();
+    assert_eq!(repo.cli_json(&selector_args)?, command);
+    assert_eq!(repo.cli_json(&command_args)?, command);
+    for command in [
+        vec!["search-symbols", "HTTP2VectorNorth"],
+        vec!["search", "http_2_vector_north", "--symbols"],
+    ] {
+        let args = [
+            vec!["--no-reindex"],
+            command,
+            vec!["-g", "src/**", "--threshold", "0.5-1", "--limit", "1"],
+        ]
+        .concat();
+        let range = repo.cli_json(&args)?;
+        assert_eq!(
+            symbol_names(range.as_array().unwrap()),
+            strings(&["VectorMid"])
+        );
+        near(&range[0]["similarity"], 0.6);
+    }
+    assert_eq!(
+        mock.count(),
+        calls,
+        "repeat/reopen and alternate spelling share vectors"
+    );
+    assert_eq!(
+        mock.embedding_inputs()
+            .iter()
+            .filter(|input| *input == "http 2 vector north")
+            .count(),
+        2,
+        "one vocabulary vector plus one query shared by positional query and -q"
+    );
+    assert_name_only_work(&repo, &mock)?;
+    Ok(())
+}
+
+#[test]
+fn search_symbols_native_dimensions_share_map_vectors_and_support_cached_readonly_reopen()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let first = Repo::new()?;
+    let second = Repo::new()?;
+    let mut config = mock.config();
+    config["symbolDimensions"] = json!(2);
+    for repo in [&first, &second] {
+        repo.write(
+            "api.ts",
+            "export function HTTP2VectorNorth() { return 'BODY_ONLY'; }\n",
+        )?;
+    }
+    let mut engine = first.open(&config)?;
+    engine.refresh_structure()?;
+    let mapped = engine.map(&json!({"symbolQuery":"HTTP2VectorNorth"}))?;
+    assert_eq!(map_names(&mapped), strings(&["HTTP2VectorNorth"]));
+    let manifest = symbol_manifest(&first)?;
+    assert_eq!(manifest["dimensions"], 2);
+    let calls = mock.count();
+    assert_eq!(calls, 2, "one symbol vocabulary batch and one query");
+    let rows = engine.search("http_2_vector_north", "search-symbols", &all())?;
+    assert_eq!(rows.len(), 1);
+    near(&rows[0]["similarity"], 1.0);
+    assert_eq!(
+        symbol_manifest(&first)?,
+        manifest,
+        "reuse the existing .symbols.usearch vocabulary"
+    );
+    let selector = json!({"symbols":true, "minSimilarity":-1});
+    assert_eq!(
+        engine.search("HTTP2VectorNorth", "search", &selector)?,
+        rows
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "positional symbol queries reuse map -q embeddings"
+    );
+    let mut profile = slopdex::providers::Providers::new(&config)?.embedding_profile();
+    profile["dimensions"] = json!(2);
+    profile["symbolNormalizationVersion"] = json!("symbols-v1");
+    for query in [false, true] {
+        let key = slopdex::storage::Database::embedding_key(&profile, query, "http 2 vector north");
+        let bytes: i64 = first.db()?.query_row(
+            "SELECT length(vector) FROM embeddings WHERE key=?",
+            [key],
+            |row| row.get(0),
+        )?;
+        assert_eq!(bytes, 8);
+    }
+    for request in mock.requests("/embeddings") {
+        assert_eq!(request.body["dimensions"], 2, "request native dimensions");
+        assert_eq!(request.body["input"], json!(["http 2 vector north"]));
+    }
+    drop(engine);
+    for _ in 0..2 {
+        let reader = Engine::open_readonly(&first.root, &first.index, config.clone())?;
+        let before = filesystem_snapshot(first._temp.path())?;
+        assert_eq!(
+            reader.search("http_2_vector_north", "search-symbols", &all())?,
+            rows
+        );
+        assert_eq!(
+            reader.search("HTTP2VectorNorth", "search", &selector)?,
+            rows
+        );
+        assert_eq!(filesystem_snapshot(first._temp.path())?, before);
+        assert_eq!(mock.count(), calls);
+    }
+    let mut other = second.open(&config)?;
+    other.refresh_structure()?;
+    let shared = other.search("http 2 vector north", "search-symbols", &all())?;
+    assert_eq!(symbol_names(&shared), strings(&["HTTP2VectorNorth"]));
+    near(&shared[0]["similarity"], 1.0);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "a different index hydrates shared symbol document/query artifacts"
+    );
+    assert_eq!(symbol_manifest(&second)?["dimensions"], 2);
+    assert_name_only_work(&first, &mock)?;
+    assert_name_only_work(&second, &mock)?;
+    Ok(())
+}
+
+#[test]
+fn search_symbols_mixed_modes_rank_separate_streams_with_global_limits_and_explicit_selection()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write(
+        "code.rs",
+        &(function("VectorNorth", "VECTOR_EAST")
+            + &function("VectorMid", "VECTOR_NORTH")
+            + &function("VectorWest", "VECTOR_MID")),
+    )?;
+    repo.write(
+        "guide.md",
+        "# Ordinary\n\nVECTOR_MID\n\n## Vector North Empty\n",
+    )?;
+    repo.write("config.json", "{\"setting\": 42}\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let plain = engine.search("east", "search", &all())?;
+    assert!(plain.iter().all(|row| row["type"] != "symbol"));
+    assert!(plain.iter().any(|row| row["type"] == "document"));
+    assert!(
+        !PathBuf::from(format!("{}.symbols.usearch", repo.index.display())).exists(),
+        "plain search does not implicitly initialize symbols"
+    );
+    let options = json!({"glob":["*.rs", "*.md"], "minSimilarity":-1});
+    let code = engine.search("east", "search-code", &options)?;
+    let markdown = engine.search("east", "search-md", &options)?;
+    let symbols = engine.search("east", "search-symbols", &options)?;
+    for mask in 1..8 {
+        let mut selected = options.clone();
+        selected["code"] = json!(mask & 1 != 0);
+        selected["md"] = json!(mask & 2 != 0);
+        selected["symbols"] = json!(mask & 4 != 0);
+        let rows = engine.search("east", "search", &selected)?;
+        let mut expected = Vec::new();
+        for (bit, stream) in [(1, &code), (2, &markdown), (4, &symbols)] {
+            if mask & bit != 0 {
+                expected.extend(stream.iter().map(Value::to_string));
+            }
+        }
+        let mut actual: Vec<_> = rows.iter().map(Value::to_string).collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "select only requested streams: {selected}"
+        );
+        assert!(
+            rows.windows(2)
+                .all(|pair| pair[0]["similarity"].as_f64().unwrap()
+                    >= pair[1]["similarity"].as_f64().unwrap())
+        );
+        for limit in [1, 2, 4, 20] {
+            let mut limited = selected.clone();
+            limited["limit"] = json!(limit);
+            assert_eq!(
+                engine.search("east", "search", &limited)?,
+                rows[..limit.min(rows.len())],
+                "one global occurrence limit: {limited}"
+            );
+        }
+    }
+    near(
+        &code
+            .iter()
+            .find(|row| row["function"]["name"] == "VectorNorth")
+            .unwrap()["similarity"],
+        1.0,
+    );
+    near(
+        &symbols
+            .iter()
+            .find(|row| row["symbol"]["name"] == "VectorNorth")
+            .unwrap()["similarity"],
+        0.0,
+    );
+    assert!(
+        symbols
+            .iter()
+            .any(|row| row["symbol"]["name"] == "Vector North Empty")
+    );
+    assert_eq!(
+        markdown.len(),
+        1,
+        "empty headings exist only in the structural stream"
+    );
+    let mixed_options = json!({"code":true, "md":true, "symbols":true, "glob":["*.rs", "*.md"], "minSimilarity":-1, "limit":4});
+    let mixed = engine.search("east", "search", &mixed_options)?;
+    drop(engine);
+    assert_eq!(
+        repo.cli_json(&[
+            "--no-reindex",
+            "search",
+            "east",
+            "--code",
+            "--md",
+            "--symbols",
+            "-g",
+            "*.rs",
+            "-g",
+            "*.md",
+            "--threshold",
+            "-1",
+            "--limit",
+            "4"
+        ])?,
+        json!(mixed)
+    );
+    Ok(())
+}
+
+#[test]
+fn search_symbols_reranking_uses_names_without_bodies_or_descriptions() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["rerankingEnabled"] = json!(true);
+    config["descriptionsEnabled"] = json!(true);
+    repo.write("api.rs", "pub fn Ordinary() { let rerank_winner = \"BODY_ONLY_RERANK_SECRET\"; }\npub fn rerank_winner() { let marker = \"BODY_ONLY_OTHER\"; }\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    let options = json!({"minSimilarity":-1, "limit":1});
+    let rows = engine.search("east", "search-symbols", &options)?;
+    assert_eq!(symbol_names(&rows), strings(&["rerank_winner"]));
+    near(&rows[0]["similarity"], 1.0);
+    near(&rows[0]["symbolSimilarity"], 1.0);
+    near(&rows[0]["rerankScore"], 0.99);
+    let requests = mock.requests("/rerank");
+    assert_eq!(requests.len(), 1);
+    let documents = requests[0].body["documents"].as_array().unwrap();
+    assert_eq!(documents.len(), 2);
+    for document in documents {
+        let document = document.as_str().unwrap();
+        for omitted in [
+            "BODY_ONLY",
+            "pub fn",
+            "let marker",
+            "signature",
+            "description",
+            "code",
+        ] {
+            assert!(
+                !document.contains(omitted),
+                "name-only symbol rerank data excludes {omitted}: {document}"
+            );
+        }
+    }
+    assert_eq!(
+        documents
+            .iter()
+            .filter(|document| {
+                let document = document.as_str().unwrap();
+                document.contains("rerank_winner") || document.contains("rerank winner")
+            })
+            .count(),
+        1,
+        "body-only winner text must not influence ranking"
+    );
+    let calls = mock.count();
+    assert_eq!(engine.search("east", "search-symbols", &options)?, rows);
+    drop(engine);
+    assert_eq!(
+        repo.open(&config)?
+            .search("east", "search-symbols", &options)?,
+        rows
+    );
+    assert_eq!(mock.count(), calls);
+    assert_name_only_work(&repo, &mock)?;
+    Ok(())
+}
+
+#[test]
+fn search_symbols_cli_saved_snapshot_json_summary_and_expanded_callable_heading_context()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write("guide.md", "# Guide\n\nBODY_ONLY ancestor.\n\n## Vector North\n\nSaved café 🚀 BODY_ONLY selected.\n\n### Vector North Empty\n\n## Other\n\nBODY_ONLY sibling.\n")?;
+    repo.write(
+        "a.py",
+        "from b import HTTP2VectorNorth\n\ndef outer():\n    return HTTP2VectorNorth()\n",
+    )?;
+    repo.write("b.py", "def HTTP2VectorNorth():\n    return 'BODY_ONLY saved callable'\n\ndef ordinary():\n    return 'VECTOR_NORTH BODY_ONLY'\n")?;
+    let mut engine = repo.open_map(&config)?;
+    engine.refresh_structure()?;
+    let generation = engine.status()?["generation"].clone();
+    let saved_guide = file_record(&repo, "guide.md")?;
+    let saved_callable = file_record(&repo, "b.py")?;
+    let before = artifact_counts(&repo)?;
+    assert_eq!(before.0, 0);
+    assert_eq!(mock.count(), 0);
+    drop(engine);
+    repo.write("guide.md", "# Changed\n\nNew live body.\n")?;
+    repo.write("a.py", "def changed_caller():\n    return 0\n")?;
+    repo.write("b.py", "def Changed():\n    return 'new live callable'\n")?;
+    let args = [
+        "--no-reindex",
+        "search-symbols",
+        "VECTOR_NORTH",
+        "--threshold",
+        "0.9",
+        "-g",
+        "guide.md",
+        "-g",
+        "b.py",
+        "-e",
+        "^HTTP2VectorNorth$",
+        "-e",
+        "^Guide\\.Vector North(\\.Vector North Empty)?$",
+    ];
+    let compact = repo.cli_json(&args)?;
+    assert_eq!(
+        symbol_names(compact.as_array().unwrap()),
+        strings(&["HTTP2VectorNorth", "Vector North", "Vector North Empty"])
+    );
+    assert_eq!(compact.as_array().unwrap().len(), 3);
+    assert!(
+        compact
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("relatedCallables").is_none())
+    );
+    let calls = mock.count();
+    assert!(
+        calls > 0,
+        "no-reindex can populate lazy name/query artifacts"
+    );
+    let expanded_args = [vec!["--detail", "expanded"], args.to_vec()].concat();
+    let expanded = repo.cli_json(&expanded_args)?;
+    for row in expanded.as_array().unwrap() {
+        let original = compact
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|original| {
+                original["symbol"]["path"] == row["symbol"]["path"]
+                    && original["symbol"]["id"] == row["symbol"]["id"]
+            })
+            .unwrap();
+        assert_eq!(row["symbol"], original["symbol"]);
+        if row["symbol"]["kind"] == "heading" {
+            assert!(row.get("relatedCallables").is_none());
+        } else {
+            assert!(
+                row["relatedCallables"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|related| related["path"] == "a.py" && related["node"]["name"] == "outer")
+            );
+        }
+    }
+    for detail in ["compact", "expanded"] {
+        let output = repo
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .args(["--format", "summary", "--detail", detail])
+            .args(args)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        for included in [
+            "# Guide",
+            "## Vector North",
+            "### Vector North Empty",
+            "def HTTP2VectorNorth()",
+            "symbol score=1.00",
+        ] {
+            assert!(
+                text.contains(included),
+                "{detail}: missing {included}: {text}"
+            );
+        }
+        assert_eq!(text.matches("# Guide").count(), 1, "{text}");
+        assert_eq!(
+            text.contains("Saved café 🚀 BODY_ONLY selected."),
+            detail == "expanded",
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("BODY_ONLY saved callable"),
+            detail == "expanded",
+            "{text}"
+        );
+        if detail == "expanded" {
+            assert_eq!(
+                text.matches("Saved café 🚀 BODY_ONLY selected.").count(),
+                1,
+                "{text}"
+            );
+            assert!(text.contains("def outer()"), "saved caller context: {text}");
+            assert!(text.contains("[symbol 1.00]"), "{text}");
+        }
+        for omitted in [
+            "BODY_ONLY ancestor",
+            "BODY_ONLY sibling",
+            "## Other",
+            "Changed",
+            "New live",
+            "new live",
+            "changed_caller",
+            "def ordinary()",
+        ] {
+            assert!(
+                !text.contains(omitted),
+                "{detail}: unexpected {omitted}: {text}"
+            );
+        }
+    }
+    assert_eq!(repo.cli_json(&args)?, compact);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "presentation and cached CLI reopen require no provider work"
+    );
+    assert_eq!(file_record(&repo, "guide.md")?, saved_guide);
+    assert_eq!(file_record(&repo, "b.py")?, saved_callable);
+    assert_eq!(
+        repo.cli_json(&["--no-reindex", "status"])?["generation"],
+        generation
+    );
+    let after = artifact_counts(&repo)?;
+    assert!(after.0 > before.0);
+    assert_eq!((after.1, after.2), (before.1, before.2));
+    for kind in ["code", "markdown", "descriptions", "combined"] {
+        assert!(!PathBuf::from(format!("{}.{kind}.usearch", repo.index.display())).exists());
+    }
+    assert_name_only_work(&repo, &mock)?;
+    Ok(())
+}
+
+#[test]
+fn search_symbols_cli_refreshes_only_structure_even_when_descriptions_are_enabled() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["descriptionsEnabled"] = json!(true);
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write(
+        "api.ts",
+        "export function VectorNorthOld() { return 'BODY_ONLY old'; }\n",
+    )?;
+    let mut engine = repo.open_map(&config)?;
+    engine.refresh_structure()?;
+    let generation = engine.status()?["generation"].as_u64().unwrap();
+    drop(engine);
+    repo.write("api.ts", "export const VECTOR_NORTH_NEW = 1;\nexport function Ordinary() { return 'VECTOR_NORTH BODY_ONLY new'; }\n")?;
+    repo.write("guide.md", "# Vector North Empty\n")?;
+    let rows = repo.cli_json(&["search-symbols", "VECTOR_NORTH", "--threshold", "0.9"])?;
+    assert_eq!(
+        symbol_names(rows.as_array().unwrap()),
+        strings(&["VECTOR_NORTH_NEW", "Vector North Empty"])
+    );
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+    assert!(
+        repo.cli_json(&["--no-reindex", "status"])?["generation"]
+            .as_u64()
+            .unwrap()
+            > generation
+    );
+    let calls = mock.count();
+    assert_eq!(
+        repo.cli_json(&["search", "vector north", "--symbols", "--threshold", "0.9"])?,
+        rows
+    );
+    assert_eq!(mock.count(), calls);
+    for kind in ["code", "markdown", "descriptions", "combined"] {
+        assert!(!PathBuf::from(format!("{}.{kind}.usearch", repo.index.display())).exists());
+    }
+    assert_name_only_work(&repo, &mock)?;
+    Ok(())
+}
+
+#[test]
+fn search_symbols_cli_missing_index_fails_before_providers_or_filesystem_writes() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    for key in ["embeddingApiKey", "descriptionApiKey", "rerankerApiKey"] {
+        config.as_object_mut().unwrap().remove(key);
+    }
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write("api.ts", "export function VectorNorth() {}\n")?;
+    let before = filesystem_snapshot(repo._temp.path())?;
+    for args in [
+        vec!["search-symbols", "VECTOR_NORTH"],
+        vec!["search", "VECTOR_NORTH", "--symbols"],
+        vec!["--no-reindex", "search-symbols", "VECTOR_NORTH"],
+        vec!["--no-reindex", "search", "VECTOR_NORTH", "--symbols"],
+    ] {
+        assert_missing_index(&repo.cli(&args)?);
+        assert_eq!(filesystem_snapshot(repo._temp.path())?, before, "{args:?}");
+        assert_eq!(mock.count(), 0);
+    }
+    Ok(())
+}
+
+fn symbol_manifest(repo: &Repo) -> Result<Value> {
+    Ok(serde_json::from_slice(&fs::read(format!(
+        "{}.symbols.usearch.manifest.json",
+        repo.index.display()
+    ))?)?)
+}
+
+#[test]
+fn symbol_map_refresh_reconciles_new_deleted_and_renamed_names_without_reembedding_unchanged_names()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write("keep.ts", "export function VectorNorthKeep() { return 'old body'; }\nexport function VectorNorthRename() {}\n")?;
+    repo.write("deleted.ts", "export const VECTOR_WEST_DELETE = 1;\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    let options = json!({"symbolQuery":"VECTOR_NORTH", "symbolThreshold":0.7});
+    assert_eq!(
+        map_names(&engine.map(&options)?),
+        strings(&["VectorNorthKeep", "VectorNorthRename"])
+    );
+    let manifest = symbol_manifest(&repo)?;
+    assert_eq!(manifest["vectors"].as_object().unwrap().len(), 3);
+    let inputs = mock.embedding_inputs().len();
+    repo.write("keep.ts", "export function VectorNorthKeep() { return 'changed VECTOR_WEST body'; }\nexport function VectorMidRenamed() {}\nexport const VECTOR_WEST_NEW = 2;\n")?;
+    fs::remove_file(repo.root.join("deleted.ts"))?;
+    let refreshed = engine.refresh_structure()?;
+    assert_eq!(refreshed["filesUpdated"], 1);
+    assert_eq!(refreshed["filesDeleted"], 1);
+    assert_eq!(
+        mock.embedding_inputs().len(),
+        inputs,
+        "structure refresh must remain provider-free"
+    );
+    assert_eq!(
+        map_names(&engine.map(&options)?),
+        strings(&["VectorNorthKeep"]),
+        "old selection cache must be invalidated"
+    );
+    let delta = mock.embedding_inputs()[inputs..].to_vec();
+    assert_eq!(delta.len(), 2, "only new vocabulary names: {delta:?}");
+    assert_eq!(
+        delta.into_iter().collect::<BTreeSet<_>>(),
+        strings(&["vector mid renamed", "vector west new"])
+    );
+    let reconciled = symbol_manifest(&repo)?;
+    assert_eq!(reconciled["generation"], refreshed["generation"]);
+    assert_ne!(reconciled["fingerprint"], manifest["fingerprint"]);
+    assert_eq!(reconciled["vectors"].as_object().unwrap().len(), 3);
+    assert_eq!(
+        map_names(&engine.map(&json!({"symbolQuery":"VECTOR_WEST", "symbolThreshold":0.7}))?),
+        strings(&["VECTOR_WEST_NEW"])
+    );
+    // Returning to a previously saved name reuses its durable embedding.
+    let calls = mock.count();
+    repo.write("restored.ts", "export function VectorNorthRename() {}\n")?;
+    engine.refresh_structure()?;
+    assert_eq!(
+        map_names(&engine.map(&options)?),
+        strings(&["VectorNorthKeep", "VectorNorthRename"])
+    );
+    assert_eq!(mock.count(), calls);
+    assert_eq!(
+        symbol_manifest(&repo)?["vectors"]
+            .as_object()
+            .unwrap()
+            .len(),
+        4
+    );
+    drop(engine);
+    assert_eq!(
+        map_names(&repo.open(&config)?.map(&options)?),
+        strings(&["VectorNorthKeep", "VectorNorthRename"])
+    );
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn symbol_selection_cache_is_cleared_when_live_snapshot_is_reset() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    let options = json!({"symbolQuery":"VECTOR_NORTH"});
+    repo.write("api.ts", "export function VectorNorthOld() {}\n")?;
+    let mut engine = repo.open_map(&config)?;
+    engine.refresh_structure()?;
+    let generation = engine.status()?["generation"].clone();
+    // Open a configured engine to prepare the name-only vectors.
+    drop(engine);
+    assert_eq!(
+        map_names(&repo.open(&config)?.map(&options)?),
+        strings(&["VectorNorthOld"])
+    );
+    let db = slopdex::storage::Database::open(&repo.index, &repo.root, &Value::Null, false)?;
+    db.reset()?;
+    drop(db);
+    repo.write("api.ts", "export function VectorNorthNew() {}\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    assert_eq!(engine.status()?["generation"], generation);
+    assert_eq!(
+        map_names(&engine.map(&options)?),
+        strings(&["VectorNorthNew"])
+    );
+    Ok(())
+}
+
+#[test]
+fn symbol_native_dimensions_profiles_and_shared_cache_are_isolated_and_reusable() -> Result<()> {
+    let mock = Mock::start()?;
+    let first = Repo::new()?;
+    let second = Repo::new()?;
+    let mut small = mock.config();
+    small["symbolDimensions"] = json!(2);
+    let mut default = small.clone();
+    default.as_object_mut().unwrap().remove("symbolDimensions");
+    for repo in [&first, &second] {
+        repo.write(
+            "api.ts",
+            "export function VectorNorth() { return 'VECTOR_NORTH'; }\n",
+        )?;
+    }
+    let mut engine = first.open(&small)?;
+    engine.refresh()?;
+    let content = engine.search("vector north", "search-code", &all())?;
+    near(&content[0]["similarity"], 1.0);
+    let content_calls = mock.count();
+    let options = json!({"symbolQuery":"VectorNorth"});
+    let selected = engine.map(&options)?;
+    assert_eq!(map_names(&selected), strings(&["VectorNorth"]));
+    let requests = mock.requests("/embeddings");
+    let symbol_requests = &requests[content_calls..];
+    assert_eq!(
+        symbol_requests.len(),
+        2,
+        "one document and one query in the separate symbol profile"
+    );
+    for request in symbol_requests {
+        assert_eq!(
+            request.body["dimensions"], 2,
+            "native dimension request, not client truncation"
+        );
+        assert_eq!(request.body["input"], json!(["vector north"]));
+    }
+    let manifest = symbol_manifest(&first)?;
+    assert_eq!(manifest["dimensions"], 2);
+    let content_profile = slopdex::providers::Providers::new(&small)?.embedding_profile();
+    assert_eq!(content_profile["dimensions"], 4);
+    assert!(content_profile.get("symbolNormalizationVersion").is_none());
+    let mut symbol_profile = content_profile.clone();
+    symbol_profile["dimensions"] = json!(2);
+    symbol_profile["symbolNormalizationVersion"] = json!("symbols-v1");
+    let bytes_for = |repo: &Repo, profile: &Value, query| -> Result<i64> {
+        let key = slopdex::storage::Database::embedding_key(profile, query, "vector north");
+        Ok(repo.db()?.query_row(
+            "SELECT length(vector) FROM embeddings WHERE key=?",
+            [key],
+            |r| r.get(0),
+        )?)
+    };
+    assert_eq!(bytes_for(&first, &content_profile, true)?, 16);
+    for query in [false, true] {
+        assert_eq!(bytes_for(&first, &symbol_profile, query)?, 8);
+    }
+    assert_eq!(
+        engine.search("vector north", "search-code", &all())?,
+        content
+    );
+    let small_calls = mock.count();
+    drop(engine);
+    let mut other = second.open(&small)?;
+    other.refresh_structure()?;
+    assert_eq!(other.map(&options)?, selected);
+    assert_eq!(symbol_manifest(&second)?["dimensions"], 2);
+    assert_eq!(
+        mock.count(),
+        small_calls,
+        "another workspace hydrates symbol document/query artifacts"
+    );
+    drop(other);
+
+    let engine = first.open(&default)?;
+    assert_eq!(engine.map(&options)?, selected);
+    assert_eq!(
+        symbol_manifest(&first)?["dimensions"],
+        4,
+        "default symbol dimensions are min(content, 256)"
+    );
+    assert_eq!(
+        mock.count(),
+        small_calls + 2,
+        "neither two-dimensional symbols nor same-text content query may satisfy a new symbol profile"
+    );
+    symbol_profile["dimensions"] = json!(4);
+    for query in [false, true] {
+        assert_eq!(bytes_for(&first, &symbol_profile, query)?, 16);
+    }
+    assert_eq!(
+        engine.search("vector north", "search-code", &all())?,
+        content,
+        "symbol profile switch must preserve content scores/readiness"
+    );
+    let calls = mock.count();
+    drop(engine);
+    for config in [&default, &small, &default, &small] {
+        for repo in [&first, &second] {
+            let engine = repo.open(config)?;
+            assert_eq!(engine.map(&options)?, selected);
+            assert_eq!(
+                mock.count(),
+                calls,
+                "warm profiles reuse local/shared artifacts"
+            );
+        }
+    }
+    let mut isolated = small.clone();
+    isolated["embeddingModel"] = json!("isolated-symbol-model");
+    let mut engine = second.open(&isolated)?;
+    engine.refresh_structure()?;
+    assert_eq!(engine.map(&options)?, selected);
+    assert_eq!(
+        mock.count(),
+        calls + 2,
+        "shared cache must isolate embedding model profiles"
+    );
+    for request in &mock.requests("/embeddings")[calls..] {
+        assert_eq!(request.body["model"], "isolated-symbol-model");
+        assert_eq!(request.body["dimensions"], 2);
+    }
+    drop(engine);
+    assert_eq!(second.open(&small)?.map(&options)?, selected);
+    assert_eq!(mock.count(), calls + 2);
+    Ok(())
+}
+
+#[test]
+fn symbol_map_without_index_warns_on_stdout_and_ignores_queries_without_provider() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    // The local fallback must work without provider credentials or cache writes.
+    for key in ["embeddingApiKey", "descriptionApiKey", "rerankerApiKey"] {
+        config.as_object_mut().unwrap().remove(key);
+    }
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write("api.ts", "export function VectorNorth() {}\n")?;
+    let warning = "slopdex: warning: no active index; -q is ignored.\n";
+    let before = filesystem_snapshot(repo._temp.path())?;
+    for (prefix, format) in [
+        (vec![], "json"),
+        (vec!["--no-reindex"], "json"),
+        (vec![], "summary"),
+    ] {
+        let ordinary = repo.cli_format(&[prefix.clone(), vec!["map"]].concat(), format)?;
+        assert!(ordinary.status.success());
+        for queries in [
+            vec!["-q", "VECTOR_NORTH"],
+            vec!["--symbol-query", "absent"],
+            vec![
+                "-q",
+                "absent",
+                "-q",
+                "also absent",
+                "--symbol-threshold",
+                "1",
+            ],
+        ] {
+            let output =
+                repo.cli_format(&[prefix.clone(), vec!["map"], queries].concat(), format)?;
+            assert!(output.status.success(), "{:?}", output.stderr);
+            assert_eq!(
+                output.stdout.strip_prefix(warning.as_bytes()),
+                Some(ordinary.stdout.as_slice())
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("no active index"));
+        }
+        assert!(!repo.index.exists());
+        assert_eq!(mock.count(), 0);
+        assert_eq!(filesystem_snapshot(repo._temp.path())?, before);
+    }
+    assert_eq!(
+        map_names(repo.cli_json(&["map"])?.as_array().unwrap()),
+        strings(&["VectorNorth"])
+    );
+    assert!(!repo.index.exists());
+    let mut engine = repo.open_map(&config)?;
+    engine.refresh_structure()?;
+    assert_eq!(
+        map_names(&engine.map(&json!({}))?),
+        strings(&["VectorNorth"])
+    );
+    drop(engine);
+    assert_eq!(
+        map_names(repo.cli_json(&["map"])?.as_array().unwrap()),
+        strings(&["VectorNorth"])
+    );
+    assert_eq!(mock.count(), 0);
+    assert_eq!(artifact_counts(&repo)?.0, 0);
+    assert!(!PathBuf::from(format!("{}.symbols.usearch", repo.index.display())).exists());
+    Ok(())
+}
+
+#[test]
+fn symbol_map_without_index_preserves_other_selectors_and_expanded_heading_bodies() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write(
+        "docs/guide.md",
+        "# Guide\n\nAncestor body.\n\n## Setup\n\nSelected body.\n\n## Other\n\nSibling body.\n",
+    )?;
+    repo.write("excluded.md", "# Setup\n\nExcluded body.\n")?;
+    let args = [
+        "--no-reindex",
+        "--detail",
+        "expanded",
+        "map",
+        "docs",
+        "-g",
+        "*.md",
+        "-k",
+        "headings",
+        "-e",
+        "^guide\\.setup$",
+        "-i",
+        "--private",
+    ];
+    let warning = "slopdex: warning: no active index; -q is ignored.\n";
+    for format in ["json", "summary"] {
+        let ordinary = repo.cli_format(&args, format)?;
+        assert!(ordinary.status.success(), "{:?}", ordinary.stderr);
+        let output = repo.cli_format(
+            &[
+                args.to_vec(),
+                vec!["-q", "unrelated query", "--symbol-threshold", "1"],
+            ]
+            .concat(),
+            format,
+        )?;
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            output.stdout.strip_prefix(warning.as_bytes()),
+            Some(ordinary.stdout.as_slice())
+        );
+        if format == "summary" {
+            let text = String::from_utf8(output.stdout)?;
+            assert!(
+                text.contains("# Guide")
+                    && text.contains("## Setup")
+                    && text.contains("Selected body."),
+                "{text}"
+            );
+            for omitted in [
+                "Ancestor body.",
+                "Sibling body.",
+                "Excluded body.",
+                "## Other",
+            ] {
+                assert!(!text.contains(omitted), "{text}");
+            }
+        }
+    }
+    let missing = repo.cli(&["map", "missing", "-q", "absent"])?;
+    assert!(missing.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(missing.stdout.strip_prefix(warning.as_bytes()).unwrap())?,
+        json!([])
+    );
+    assert!(!repo.index.exists());
+    assert_eq!(mock.count(), 0);
     Ok(())
 }
 

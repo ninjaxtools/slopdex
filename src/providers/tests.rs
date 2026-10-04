@@ -260,6 +260,151 @@ fn constructor_is_offline_and_supports_legacy_and_qualified_config() {
 }
 
 #[test]
+fn symbol_vectors_are_lazy_and_have_separate_profiles_and_dimensions() {
+    for (config, primary_dimensions, symbol_dimensions) in [
+        (json!({}), 3072, 256),
+        (json!({"dimensions": 128}), 128, 128),
+        (json!({"dimensions": 256}), 256, 256),
+        (json!({"symbolDimensions": 512}), 3072, 512),
+        (
+            json!({"embeddingProvider": "jina", "embeddingDimensions": 768,
+                "embeddingModel": "jina/jina-embeddings-v4", "symbolDimensions": 64}),
+            768,
+            64,
+        ),
+    ] {
+        let p = Providers::new(&config).unwrap();
+        assert!(p.symbol_vector.get().is_none());
+        let primary_profile = p.embedding_profile();
+        let symbols = p.symbol_vector().unwrap();
+        assert_eq!(symbols.dimensions(), symbol_dimensions);
+        assert_eq!(p.dimensions(), primary_dimensions);
+        assert_eq!(p.embedding_profile(), primary_profile);
+        assert_ne!(symbols.profile(), primary_profile);
+        assert_eq!(
+            symbols.profile()["symbolNormalizationVersion"],
+            "symbols-v1"
+        );
+        assert_eq!(symbols.profile()["provider"], primary_profile["provider"]);
+        assert_eq!(symbols.profile()["model"], primary_profile["model"]);
+        assert!(std::ptr::eq(symbols, p.symbol_vector().unwrap()));
+        assert!(symbols.embed(&[], false).unwrap().is_empty());
+    }
+    for invalid in [json!(0), json!(-1), json!(1.5), json!("256")] {
+        let p = Providers::new(&json!({"symbolDimensions": invalid})).unwrap();
+        for _ in 0..2 {
+            let error = p.symbol_vector().err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("symbolDimensions must be a positive integer")
+            );
+            assert!(p.symbol_vector.get().is_none());
+        }
+    }
+}
+
+#[test]
+fn symbol_vectors_request_native_dimensions_and_preserve_provider_configuration() {
+    for provider in ["openai", "jina"] {
+        for configured_dimensions in [None, Some(128)] {
+            let dimensions = configured_dimensions.unwrap_or(256);
+            let mock = Mock::new(vec![
+                (
+                    200,
+                    json!({"data": [{"index": 0, "embedding": vec![1; dimensions]}]}),
+                ),
+                (
+                    200,
+                    json!({"data": [{"index": 0, "embedding": vec![1; dimensions]}]}),
+                ),
+                (
+                    200,
+                    json!({"data": [{"index": 0, "embedding": vec![1; 512]}]}),
+                ),
+            ]);
+            let mut config = mock.config();
+            config["provider"] = json!(provider);
+            config["dimensions"] = json!(512);
+            config["embeddingBatchSize"] = json!(1);
+            config["embeddingBaseUrl"] = json!(format!("{}/embeddings/", mock.base));
+            if provider == "jina" {
+                config.as_object_mut().unwrap().remove("embeddingApiKey");
+                config["jinaApiKey"] = json!("provider-secret");
+            }
+            if let Some(dimensions) = configured_dimensions {
+                config["symbolDimensions"] = json!(dimensions);
+            }
+            let p = Providers::new(&config).unwrap();
+            let symbols = p.symbol_vector().unwrap();
+            assert_eq!(symbols.batch_limit(), 1);
+            assert_eq!(
+                symbols.profile()["endpoint"],
+                p.embedding_profile()["endpoint"]
+            );
+            assert!(symbols.embed(&["a".into(), "b".into()], false).is_err());
+            assert!(mock.requests.lock().unwrap().is_empty());
+            for query in [false, true] {
+                let result = symbols.embed(&["getHTTP2Response".into()], query).unwrap();
+                assert_eq!(result[0].len(), dimensions);
+            }
+            p.embed(&["getHTTP2Response".into()], false).unwrap();
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            for request in &requests[..2] {
+                assert_eq!(request.path, "/v1/embeddings");
+                assert_eq!(request.body["dimensions"], dimensions);
+                assert_eq!(request.body["input"], json!(["get http 2 response"]));
+                let key = if provider == "jina" {
+                    "provider-secret"
+                } else {
+                    "mock-secret"
+                };
+                assert!(
+                    request
+                        .headers
+                        .contains(&format!("authorization: bearer {key}"))
+                );
+            }
+            if provider == "jina" {
+                assert_eq!(requests[0].body["task"], "code.passage");
+                assert_eq!(requests[1].body["task"], "code.query");
+            }
+            assert_eq!(requests[2].body["dimensions"], 512);
+            assert_eq!(requests[2].body["input"], json!(["getHTTP2Response"]));
+        }
+    }
+}
+
+#[test]
+fn symbol_vectors_preserve_legacy_ada_dimensions_without_requesting_them() {
+    for symbol_dimensions in [None, Some(256)] {
+        let mock = Mock::new(vec![(
+            200,
+            json!({"data": [{"index": 0, "embedding": vec![1; 1536]}]}),
+        )]);
+        let mut config = mock.config();
+        config.as_object_mut().unwrap().remove("dimensions");
+        config["embeddingModel"] = json!("openai/text-embedding-ada-002");
+        if let Some(dimensions) = symbol_dimensions {
+            config["symbolDimensions"] = json!(dimensions);
+        }
+        let p = Providers::new(&config).unwrap();
+        let symbols = p.symbol_vector().unwrap();
+        assert_eq!(p.dimensions(), 1536);
+        assert_eq!(symbols.dimensions(), 1536);
+        assert_ne!(symbols.profile(), p.embedding_profile());
+        let result = symbols.embed(&["GLOBAL_CONSTANT".into()], false).unwrap();
+        assert_eq!(result[0].len(), 1536);
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body["model"], "text-embedding-ada-002");
+        assert!(requests[0].body.get("dimensions").is_none());
+        assert_eq!(requests[0].body["input"], json!(["global constant"]));
+    }
+}
+
+#[test]
 fn embeddings_batch_reorder_normalize_and_use_jina_tasks() {
     let mock = Mock::new(vec![
         (

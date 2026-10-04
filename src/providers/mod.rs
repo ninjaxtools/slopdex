@@ -81,6 +81,7 @@ fn should_report_call(
 pub struct Providers {
     context: Arc<Context>,
     vector: Box<dyn Vector>,
+    symbol_vector: OnceLock<Box<dyn Vector>>,
     llm: Box<dyn Llm>,
     reranker: OnceLock<Box<dyn Rerank>>,
 }
@@ -102,6 +103,7 @@ impl Providers {
         });
         Ok(Self {
             vector: vector::create(context.clone())?,
+            symbol_vector: OnceLock::new(),
             llm: llm::create(context.clone())?,
             context,
             reranker: OnceLock::new(),
@@ -110,6 +112,35 @@ impl Providers {
 
     pub fn vector(&self) -> &dyn Vector {
         self.vector.as_ref()
+    }
+
+    /// A separate, lazily constructed embedding space for normalized symbol names.
+    pub(crate) fn symbol_vector(&self) -> Result<&dyn Vector> {
+        if self.symbol_vector.get().is_none() {
+            let mut config = self.context.config.clone();
+            let dimensions = positive(&config, &["symbolDimensions"], self.dimensions().min(256))?;
+            // Ada cannot request reduced dimensions; retain the original space.
+            config["dimensions"] = json!(if self.vector.profile()["model"]
+                == "text-embedding-ada-002"
+            {
+                self.dimensions()
+            } else {
+                dimensions
+            });
+            let context = Arc::new(Context {
+                http: Http::new(&config)?,
+                config,
+            });
+            let vector = Box::new(SymbolVector {
+                inner: vector::create(context)?,
+            });
+            let _ = self.symbol_vector.set(vector);
+        }
+        Ok(self
+            .symbol_vector
+            .get()
+            .expect("symbol vector initialized")
+            .as_ref())
     }
 
     pub fn llm(&self) -> &dyn Llm {
@@ -164,6 +195,34 @@ impl Providers {
 
     pub fn models(provider: Option<&str>) -> Result<Value> {
         models(provider)
+    }
+}
+
+struct SymbolVector {
+    inner: Box<dyn Vector>,
+}
+
+impl Vector for SymbolVector {
+    fn profile(&self) -> Value {
+        let mut profile = self.inner.profile();
+        profile["symbolNormalizationVersion"] = json!(crate::symbols::NORMALIZATION_VERSION);
+        profile
+    }
+
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn batch_limit(&self) -> usize {
+        self.inner.batch_limit()
+    }
+
+    fn embed(&self, inputs: &[String], query: bool) -> Result<Vec<Vec<f32>>> {
+        let normalized: Vec<_> = inputs
+            .iter()
+            .map(|s| crate::symbols::normalize(s))
+            .collect();
+        self.inner.embed(&normalized, query)
     }
 }
 

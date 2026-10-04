@@ -22,6 +22,10 @@ pub(crate) trait StructureSource {
     fn source(&self, path: &str) -> Option<&str>;
     fn call_graph(&self) -> Result<CallGraph>;
 
+    fn selection(&self, options: &Value) -> Result<Selection> {
+        Selection::compile(options)
+    }
+
     fn file_description(&self, _path: &str) -> Option<&str> {
         None
     }
@@ -144,7 +148,7 @@ pub(crate) fn query(
     root: &Path,
     options: &Value,
 ) -> Result<Vec<Value>> {
-    let selection = Selection::compile(options)?;
+    let selection = source.selection(options)?;
     let paths = selected_paths(root, options)?;
     let (callers, callees) = call_depths(options);
     let mut selected = BTreeMap::<String, Vec<StructureNode>>::new();
@@ -768,13 +772,15 @@ pub fn matching_node<'a>(structure: &'a FileStructure, unit: &Value) -> Option<&
         .nodes
         .iter()
         .filter(|node| {
-            matches!(
-                node.kind.as_str(),
-                "function" | "method" | "constructor" | "generator"
-            ) && (qualified == Some(node.qualified_name.as_str())
-                || name == Some(node.name.as_str())
-                    && node.start_line <= end
-                    && node.end_line >= start)
+            (unit["startByte"].is_u64()
+                || matches!(
+                    node.kind.as_str(),
+                    "function" | "method" | "constructor" | "generator"
+                ))
+                && (qualified == Some(node.qualified_name.as_str())
+                    || name == Some(node.name.as_str())
+                        && node.start_line <= end
+                        && node.end_line >= start)
         })
         .min_by_key(|node| {
             (
@@ -790,6 +796,54 @@ pub fn matching_node<'a>(structure: &'a FileStructure, unit: &Value) -> Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_uses_source_resolved_semantic_selection() -> Result<()> {
+        struct Resolved(FileStructure);
+        impl StructureSource for Resolved {
+            fn paths(&self) -> Result<Vec<String>> {
+                Ok(vec!["guide.md".into()])
+            }
+            fn structure(&self, _path: &str) -> Result<Option<FileStructure>> {
+                Ok(Some(self.0.clone()))
+            }
+            fn source(&self, _path: &str) -> Option<&str> {
+                None
+            }
+            fn call_graph(&self) -> Result<CallGraph> {
+                anyhow::bail!("call graph is not requested")
+            }
+            fn selection(&self, options: &Value) -> Result<Selection> {
+                Ok(Selection::compile(options)?.with_symbol_names(HashSet::from(["setup".into()])))
+            }
+        }
+        let source = Resolved(
+            parse::parse("guide.md", "# Guide\n## Setup\n### Linux\n## Other\n")?.structure,
+        );
+        let options = json!({"symbolQuery": ["setup"]});
+        let rows = query(&source, Path::new("."), &options)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node| node["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["Guide", "Setup"]
+        );
+        let unresolved = Unindexed {
+            files: BTreeMap::from([(
+                "guide.md".into(),
+                (
+                    String::new(),
+                    parse::parse("guide.md", "# Guide\n## Setup\n")?,
+                ),
+            )]),
+        };
+        assert!(query(&unresolved, Path::new("."), &options)?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn source_order_and_ranges_without_bodies_or_kind_sections() {
