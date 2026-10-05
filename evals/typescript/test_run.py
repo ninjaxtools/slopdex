@@ -405,6 +405,26 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(call.args[8], structural)
             self.assertEqual(call.kwargs["instruction"], runner.arm_instructions(call.args[0]["arm"]))
 
+    def test_readme_map_arm_prepares_symbol_vectors_without_content_index(self):
+        corpus = {"repository_commit": "a" * 40, "tasks": [self.task]}
+        symbols = self.root / "symbols"
+        with patch.object(runner, "load_inputs", return_value=(self.config, corpus)), \
+                patch.object(runner, "ensure_source"), patch.object(runner, "target_lines", return_value=self.gold), \
+                patch.object(runner, "executable", side_effect=lambda name: name), \
+                patch.object(runner, "command", return_value="fixture-version"), \
+                patch.object(runner, "prepare_index", side_effect=AssertionError("content preparation")), \
+                patch.object(runner, "prepare_map_index", return_value=(symbols, {})) as prepare, \
+                patch.object(runner, "report"), \
+                patch.object(runner, "run_trial", return_value={"status": "ok", "grade": {"f1": 1}, "wall_seconds": 1}) as trial, \
+                patch("sys.stdout", new=io.StringIO()):
+            runner.main(["run", "--arms", "map", "--output", str(self.root / "symbol-map")])
+        prepare.assert_called_once()
+        self.assertEqual(prepare.call_args.kwargs, {"symbols": True})
+        self.assertEqual(trial.call_count, 2)
+        for call in trial.call_args_list:
+            self.assertEqual(call.args[8], symbols)
+            self.assertIn('-q "<short symbol concept>"', call.kwargs["instruction"])
+
     def test_multi_arm_order_balances_every_position(self):
         arms = ["off", "map", "map-first", "map-follow"]
         tasks = [dict(self.task, id=f"task-{index}") for index in range(4)]

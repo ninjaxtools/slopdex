@@ -42,17 +42,18 @@ files, fetch external material, or delegate. Return the requested JSON answer.
 """
 ARM_INSTRUCTIONS = {
     "off": "\nUse conventional local code navigation: glob, grep/rg, and targeted reads.\nSlopdex is unavailable in this trial; do not invoke it.\n",
-    "map": "\nOnly `slopdex map` is available for slopdex navigation in this trial.\nUse it successfully at least once; other slopdex navigation commands are blocked.\nInclude --private when mapping Go internals so unexported symbols are visible.\nThe structural index is prebuilt; do not rebuild it.\nConventional local tools remain available for finding paths and verifying source.\n",
+    "map": "\nUse `slopdex map` successfully; other slopdex navigation is blocked.\nCheckout and symbol vectors are ready: skip setup/help; never override root/index/config.\nDiscover with --ignore-errors -g '*.go' -g '!**/*_test.go'; then read source.\n",
     "search": "\nOnly `slopdex search` is available for slopdex navigation in this trial.\nUse it successfully at least once; other slopdex navigation commands are blocked.\nRead the relevant source lines to verify your findings.\nThe semantic index is prebuilt; do not rebuild it.\nConventional local tools remain available for finding paths and verifying source.\n",
     "map-search": "\nOnly `slopdex map` and `slopdex search` are available for slopdex navigation in this trial.\nUse both successfully at least once; other slopdex navigation commands are blocked.\nInclude --private when mapping Go internals so unexported symbols are visible.\nRead the relevant source lines to verify your findings.\nThe semantic and structural index is prebuilt; do not rebuild it.\nConventional local tools remain available for finding paths and verifying source.\n",
     "slopdex": "\nUse slopdex for code navigation:\n- `slopdex search \"describe the implementation you need\" --threshold 0.3 --limit 50`\n- `slopdex map --private -g \"*.go\" -e \"symbol regex\" tsc/internal`\nInclude --private when mapping Go internals so unexported symbols are visible.\nMap's -e matches symbol names and qualified names, not declaration text or function bodies.\nNarrow paths and symbol filters before reading the returned implementation line ranges.\nLimit search candidates before rendering; avoid head as a result selector.\nThen read the relevant source lines to verify your findings. Vary queries if needed.\nThe index is prebuilt; do not rebuild it. Conventional local tools are also available.\n",
 }
 for _arm in ("map-first", "map-follow", "map-verify"):
-    ARM_INSTRUCTIONS[_arm] = ARM_INSTRUCTIONS["map"]
+    ARM_INSTRUCTIONS[_arm] = "\nOnly `slopdex map` is available for slopdex navigation in this trial.\nUse it successfully at least once; other slopdex navigation commands are blocked.\nInclude --private when mapping Go internals so unexported symbols are visible.\nThe structural index is prebuilt; do not rebuild it.\nConventional local tools remain available for finding paths and verifying source.\n"
 DEFAULT_ARMS = ["map", "search"]
 ARM_NAVIGATION = {"map": ("map",), "map-first": ("map",), "map-follow": ("map",), "map-verify": ("map",),
                   "search": ("search",), "map-search": ("map", "search")}
 MAP_ARMS = {arm for arm, commands in ARM_NAVIGATION.items() if commands == ("map",)}
+STRUCTURAL_MAP_ARMS = MAP_ARMS - {"map"}
 MAP_PROMPTS = {arm: HERE / "prompts" / f"{arm}.md" for arm in ("map-first", "map-follow", "map-verify")}
 SEMANTIC_ARMS = {"search", "map-search", "slopdex"}
 
@@ -264,15 +265,15 @@ def file_digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def native_ann_snapshot(index: Path):
+def native_ann_snapshot(index: Path, *, symbol_only=False):
     """Validate the native sidecars against their binaries and SQLite identity."""
     with closing(sqlite3.connect(f"{index.as_uri()}?mode=ro", uri=True)) as db:
         metadata = dict(db.execute("SELECT key, value FROM metadata"))
     generation = int(metadata["generation"])
-    profile = json.loads(metadata["active_embedding_profile"])
+    profile = None if symbol_only else json.loads(metadata["active_embedding_profile"])
     descriptions = metadata.get("descriptions_enabled") == "true"
-    kinds = {"code": 1, "markdown": 1}
-    if descriptions:
+    kinds = {"symbols": 1} if symbol_only else {"code": 1, "markdown": 1}
+    if descriptions and not symbol_only:
         kinds.update({"descriptions": 2, "combined": 3})
     artifacts = {}
     for kind, parts in kinds.items():
@@ -284,7 +285,8 @@ def native_ann_snapshot(index: Path):
             raise ValueError(f"Native ANN manifest must be an object: {manifest_path}")
         binary_hash = file_digest(binary)
         if (manifest.get("version") != 1 or manifest.get("generation") != generation
-            or manifest.get("dimensions") != profile["dimensions"] * parts
+            or (not symbol_only and manifest.get("dimensions") != profile["dimensions"] * parts)
+            or (symbol_only and (not isinstance(manifest.get("dimensions"), int) or manifest["dimensions"] <= 0))
             or manifest.get("binary_hash") != binary_hash):
             raise ValueError(f"Native ANN sidecar is stale or corrupt: {binary}")
         artifacts[suffix] = {"sha256": binary_hash, "size_bytes": binary.stat().st_size}
@@ -293,34 +295,37 @@ def native_ann_snapshot(index: Path):
             "descriptions_enabled": descriptions, "artifacts": artifacts}
 
 
-def native_ann_ready(index: Path, metadata: dict) -> bool:
+def native_ann_ready(index: Path, metadata: dict, *, symbol_only=False) -> bool:
     saved = metadata.get("native_ann", {})
     if not isinstance(saved, dict):
         return False
     try:
-        return {key: value for key, value in saved.items() if key != "wall_seconds"} == native_ann_snapshot(index)
+        return {key: value for key, value in saved.items() if key != "wall_seconds"} == native_ann_snapshot(index, symbol_only=symbol_only)
     except (OSError, ValueError, KeyError, sqlite3.Error):
         return False
 
 
-def offline_ann_command(binary: str, workspace: Path, config_path: Path, index: Path):
+def offline_ann_command(binary: str, workspace: Path, config_path: Path, index: Path, *, symbol_only=False):
     # Cross-search opens the semantic engine for writing, persisting/reusing every
     # ANN index. An impossible source regex avoids comparisons and provider calls.
+    # Symbol probes preembed vocabulary/query once, then reuse those cached vectors;
+    # search-symbols always opens the graph, bypassing map's selector-result cache.
+    navigation = ["search-symbols", "slopdex eval warmup", "-e", "a^"] if symbol_only else ["cross-search", "-e", "a^"]
     return [binary, "--root", str(workspace), "--config", str(config_path), "--index", str(index),
-            "--no-reindex", "--format", "json", "cross-search", "-e", "a^"]
+            "--no-reindex", "--format", "json", *navigation]
 
 
-def warm_native_ann(directory: Path, metadata: dict, binary: str, workspace: Path, timeout: int):
+def warm_native_ann(directory: Path, metadata: dict, binary: str, workspace: Path, timeout: int, *, symbol_only=False):
     index = directory / "index.sqlite"
     with closing(sqlite3.connect(index)) as db, db:
         relocate_index(db, workspace, metadata["identity"]["commit"])
     logs = directory / "ann-warmup"
     logs.mkdir(exist_ok=True)
-    argv = offline_ann_command(binary, workspace, directory / "config.json", index)
+    argv = offline_ann_command(binary, workspace, directory / "config.json", index, symbol_only=symbol_only)
     code, expired, elapsed = logged_process(argv, workspace, os.environ.copy(), logs, timeout)
     if code or expired:
         raise RuntimeError(f"Native ANN warm-up failed; see {logs / 'stderr.log'}")
-    metadata["native_ann"] = {**native_ann_snapshot(index), "wall_seconds": elapsed}
+    metadata["native_ann"] = {**native_ann_snapshot(index, symbol_only=symbol_only), "wall_seconds": elapsed}
     metadata["status"]["rootDir"] = str(workspace.resolve())
     write_json(directory / "manifest.json", metadata)
     return metadata
@@ -364,10 +369,10 @@ def prepare_index(config, commit: str, cache: Path, slopdex: str, tasks):
     return directory, {**metadata, "coverage": coverage}
 
 
-def prepare_map_index(config, commit: str, cache: Path, slopdex: str, tasks):
-    """Build a provider-free structural snapshot for the README's map workflow."""
+def prepare_map_index(config, commit: str, cache: Path, slopdex: str, tasks, *, symbols=False):
+    """Build structure, optionally preembedding names for the README's -q workflow."""
     settings = {**config["slopdex"], "descriptionsEnabled": False, "rerankingEnabled": False}
-    identity = {"kind": "map", "commit": commit, "slopdex_version": command([slopdex, "--version"]), "config": settings}
+    identity = {"kind": "map-symbols" if symbols else "map", "commit": commit, "slopdex_version": command([slopdex, "--version"]), "config": settings}
     directory = cache / digest(identity)[:20]
     directory.mkdir(parents=True, exist_ok=True)
     index, manifest = directory / "index.sqlite", directory / "manifest.json"
@@ -381,7 +386,12 @@ def prepare_map_index(config, commit: str, cache: Path, slopdex: str, tasks):
                 workspace = Path(temporary) / "repo"
                 clone(workspace, commit)
                 argv = [slopdex, "--root", str(workspace), "--config", str(directory / "config.json"), "--index", str(index)]
-                retry = ["--force-reindex", "--yes-really-rebuild-the-index"] if index.exists() else []
+                retry = ["--force-reindex", "--yes-really-rebuild-the-index"]
+                if not index.exists():
+                    # Map without an index now parses directly without persisting.
+                    # An empty SQLite file opts into indexed structural preparation.
+                    with closing(sqlite3.connect(index)):
+                        pass
                 code, expired, elapsed = logged_process(argv + retry + ["map", "--private", "-e", "a^"], workspace, os.environ.copy(), directory, config["index_timeout_seconds"])
                 if code or expired:
                     raise RuntimeError(f"Structural index preparation failed; see {directory / 'stderr.log'}")
@@ -389,6 +399,8 @@ def prepare_map_index(config, commit: str, cache: Path, slopdex: str, tasks):
             metadata = {"identity": identity, "wall_seconds": elapsed, "status": status}
             write_json(manifest, metadata)
         coverage = index_coverage(index, tasks, semantic=False)
+        if symbols and not native_ann_ready(index, metadata, symbol_only=True):
+            metadata = warm_native_ann(directory, metadata, slopdex, SUBMODULE, config["index_timeout_seconds"], symbol_only=True)
     return directory, {**metadata, "coverage": coverage}
 
 
@@ -473,9 +485,9 @@ def relocate_index(db, workspace: Path, commit: str):
     db.execute("UPDATE metadata SET value=? WHERE key='identity'", (json.dumps(identity),))
 
 
-def copy_index(source_path: Path, destination: Path, workspace: Path, commit: str, *, include_ann=True):
+def copy_index(source_path: Path, destination: Path, workspace: Path, commit: str, *, include_ann=True, symbol_only=False):
     """Relocate SQLite and its warmed ANN sidecars without changing vector identity."""
-    native_ann = native_ann_snapshot(source_path) if include_ann else None
+    native_ann = native_ann_snapshot(source_path, symbol_only=symbol_only) if include_ann else None
     with closing(sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)) as source:
         with closing(sqlite3.connect(destination)) as target, target:
             source.backup(target)
@@ -483,23 +495,69 @@ def copy_index(source_path: Path, destination: Path, workspace: Path, commit: st
     if native_ann is not None:
         for suffix in native_ann["artifacts"]:
             shutil.copy2(Path(str(source_path) + suffix), Path(str(destination) + suffix))
-        if native_ann_snapshot(destination) != native_ann:
+        if native_ann_snapshot(destination, symbol_only=symbol_only) != native_ann:
             raise ValueError("Copied ANN sidecars do not match the trial SQLite snapshot")
 
 
-def verify_native_ann_reuse(binary: str, workspace: Path, config_path: Path, index: Path, directory: Path, timeout: int):
+def verify_native_ann_reuse(binary: str, workspace: Path, config_path: Path, index: Path, directory: Path, timeout: int, *, symbol_only=False):
     """Prove the writable native loader accepts copied sidecars before agent timing."""
-    before = native_ann_snapshot(index)
+    before = native_ann_snapshot(index, symbol_only=symbol_only)
     stamps = {suffix: Path(str(index) + suffix).stat().st_mtime_ns for suffix in before["artifacts"]}
     logs = directory / "ann-validation"
     logs.mkdir(exist_ok=True)
-    code, expired, elapsed = logged_process(offline_ann_command(binary, workspace, config_path, index), workspace, os.environ.copy(), logs, timeout)
+    argv = offline_ann_command(binary, workspace, config_path, index, symbol_only=symbol_only)
+    env = os.environ.copy()
+    symbol_query = None
+    symbol_manifest = None
+    if symbol_only:
+        symbol_manifest = read_json(Path(str(index) + ".symbols.usearch.manifest.json"))
+        # Force the actual map -q path through the graph rather than a cached
+        # selector result. This is the trial's disposable copy, not the cache.
+        with closing(sqlite3.connect(index)) as db, db:
+            db.execute("DELETE FROM search_cache")
+            embedding_count = db.execute("SELECT count(*) FROM embeddings").fetchone()[0]
+        settings = read_json(config_path)
+        for key in ("embeddingApiKey", "openaiApiKey", "jinaApiKey"):
+            settings.pop(key, None)
+        for key in ("OPENAI_API_KEY", "JINA_API_KEY"):
+            env.pop(key, None)
+        offline_config = logs / "config.json"
+        write_json(offline_config, settings)
+        # With the root already relocated, force only selects the writable loader.
+        # Any graph rebuild is observable in the sidecars. A structural refresh
+        # may advance generation while retaining the identical vocabulary/graph;
+        # that only updates manifest generation/fingerprint, not the binary.
+        argv = [binary, "--root", str(workspace), "--config", str(offline_config), "--index", str(index),
+                "--force-reindex", "--yes-really-rebuild-the-index", "--ignore-errors", "--format", "json", "map", "--private", "-k", "fns",
+                "-q", "slopdex eval warmup", "--symbol-threshold", "0", "-e", "a^"]
+        symbol_query = {"command": "map -q", "provider_credentials_removed": True,
+                        "selector_cache_cleared": True, "embedding_count": embedding_count}
+    code, expired, elapsed = logged_process(argv, workspace, env, logs, timeout)
     if code or expired:
         raise RuntimeError(f"Trial ANN validation failed; see {logs / 'stderr.log'}")
     after_stamps = {suffix: Path(str(index) + suffix).stat().st_mtime_ns for suffix in before["artifacts"]}
-    if native_ann_snapshot(index) != before or after_stamps != stamps:
+    after = native_ann_snapshot(index, symbol_only=symbol_only)
+    unchanged = after == before and after_stamps == stamps
+    if symbol_only:
+        current_manifest = read_json(Path(str(index) + ".symbols.usearch.manifest.json"))
+        graph = ".symbols.usearch"
+        generation_only = current_manifest["generation"] != symbol_manifest["generation"]
+        comparable = lambda manifest: {key: value for key, value in manifest.items() if key not in {"generation", "fingerprint"}}
+        unchanged = (comparable(current_manifest) == comparable(symbol_manifest)
+                     and after["artifacts"][graph] == before["artifacts"][graph]
+                     and after_stamps[graph] == stamps[graph]
+                     and (generation_only or after_stamps == stamps))
+        symbol_query["manifest_generation_updated"] = generation_only
+    if not unchanged:
         raise ValueError("Slopdex rebuilt a trial's copied ANN index; preparation is incompatible")
-    result = {"validated": True, "wall_seconds": elapsed, "snapshot": before}
+    if symbol_only:
+        with closing(sqlite3.connect(index)) as db:
+            after_count = db.execute("SELECT count(*) FROM embeddings").fetchone()[0]
+        if after_count != embedding_count or "external model call" in (logs / "stderr.log").read_text():
+            raise ValueError("Map -q did not reuse the prebuilt symbol vectors offline")
+    result = {"validated": True, "wall_seconds": elapsed, "snapshot": after}
+    if symbol_query is not None:
+        result["symbol_query"] = symbol_query
     write_json(directory / "ann-validation.json", result)
     return result
 
@@ -512,7 +570,8 @@ def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None
     if arm != "off":
         # SQLite backup includes any WAL pages; each trial gets an independent index.
         destination = sandbox / "index.sqlite"
-        copy_index(index_dir / "index.sqlite", destination, workspace, commit, include_ann=arm in SEMANTIC_ARMS)
+        copy_index(index_dir / "index.sqlite", destination, workspace, commit,
+                   include_ann=arm in SEMANTIC_ARMS or arm == "map", symbol_only=arm == "map")
         arguments = [binary, "--root", str(workspace), "--config", str(index_dir / "config.json"), "--index", str(destination), "--no-reindex"]
     script = f"""#!{sys.executable}
 import json, subprocess, sys, time, uuid
@@ -612,7 +671,7 @@ def slopdex_command(argv: list[str]) -> str:
             return "version"
         if arg.startswith("-") and not arg.startswith("--"):
             for letter in arg[1:]:
-                if letter in {"g", "e", "k"}:
+                if letter in {"g", "e", "k", "q"}:
                     break  # The rest of a value-taking short option is its value.
                 if letter == "h":
                     return "help"
@@ -779,6 +838,8 @@ def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, i
         native_ann = None
         if trial["arm"] in SEMANTIC_ARMS:
             native_ann = verify_native_ann_reuse(slopdex, workspace, index_dir / "config.json", sandbox / "index.sqlite", directory, config["index_timeout_seconds"])
+        elif trial["arm"] == "map":
+            native_ann = verify_native_ann_reuse(slopdex, workspace, index_dir / "config.json", sandbox / "index.sqlite", directory, config["index_timeout_seconds"], symbol_only=True)
         check_effective_config(opencode, workspace, env, cli_config, directory)
         argv = [opencode, "run", "--model", trial["model"], "--variant", trial["variant"],
                 "--agent", "build", "--format", "json", "--dir", str(workspace), "--title", trial["id"], "--", prompt]
@@ -953,6 +1014,11 @@ def report(output: Path):
         lines += ["", "## Structural-index preparation", "",
                   f"One-time structural-index preparation: {manifest['map_index']['wall_seconds']:.1f}s (cached across map trials).",
                   "Structural-index preparation is excluded from agent wall time and reported model cost."]
+    if manifest.get("map_symbol_index"):
+        metadata = manifest["map_symbol_index"]
+        lines += ["", "## Map symbol-index preparation", "",
+                  f"One-time structural preparation: {metadata['wall_seconds']:.1f}s; symbol embedding/ANN preparation: {metadata['native_ann']['wall_seconds']:.1f}s (cached).",
+                  "Map trials receive normalized-name vectors and the symbol ANN sidecar, with reuse validated before timing. Preparation and validation are excluded from agent wall time and reported model cost."]
     lines += ["", "Scoring measures symbol identification with valid declaration citations. Explanation correctness requires manual review of `answer.txt`; no LLM judge is used.", ""]
     write_json(output / "summary.json", summary)
     (output / "report.md").write_text("\n".join(lines))
@@ -1017,9 +1083,12 @@ def main(argv=None):
             if len(set(args.arms)) != len(args.arms):
                 raise ValueError("Use unique preparation arms")
             slopdex = executable("slopdex")
-            if set(args.arms) & MAP_ARMS:
+            if set(args.arms) & STRUCTURAL_MAP_ARMS:
                 directory, metadata = prepare_map_index(config, commit, args.cache.resolve(), slopdex, tasks)
                 print(f"Structural index ready: {directory}\n{json.dumps(metadata, indent=2)}")
+            if "map" in args.arms:
+                directory, metadata = prepare_map_index(config, commit, args.cache.resolve(), slopdex, tasks, symbols=True)
+                print(f"Map symbol index ready: {directory}\n{json.dumps(metadata, indent=2)}")
             if set(args.arms) & SEMANTIC_ARMS:
                 directory, metadata = prepare_index(config, commit, args.cache.resolve(), slopdex, tasks)
                 print(f"Semantic index ready: {directory}\n{json.dumps(metadata, indent=2)}")
@@ -1054,18 +1123,22 @@ def main(argv=None):
         gold = {task["id"]: target_lines(task) for task in tasks}
         index_dir, metadata = (None, saved.get("index") if saved else None)
         map_index_dir, map_metadata = (None, saved.get("map_index") if saved else None)
+        symbol_index_dir, symbol_metadata = (None, saved.get("map_symbol_index") if saved else None)
         if any(trial["arm"] in SEMANTIC_ARMS for trial in pending):
             index_dir, metadata = prepare_index(config, commit, args.cache.resolve(), slopdex, tasks)
-        if any(trial["arm"] in MAP_ARMS for trial in pending):
+        if any(trial["arm"] in STRUCTURAL_MAP_ARMS for trial in pending):
             map_index_dir, map_metadata = prepare_map_index(config, commit, args.cache.resolve(), slopdex, tasks)
-        manifest = {**identity, "fingerprint": digest(identity), "index": metadata, "map_index": map_metadata, "seed": args.seed}
+        if any(trial["arm"] == "map" for trial in pending):
+            symbol_index_dir, symbol_metadata = prepare_map_index(config, commit, args.cache.resolve(), slopdex, tasks, symbols=True)
+        manifest = {**identity, "fingerprint": digest(identity), "index": metadata, "map_index": map_metadata,
+                    "map_symbol_index": symbol_metadata, "seed": args.seed}
         write_json(output / "manifest.json", manifest)
         for number, trial in enumerate(trials, 1):
             directory = output / "trials" / trial["id"]
             if (directory / "result.json").exists():
                 continue
             print(f"[{number}/{len(trials)}] {trial['model']} / {trial['variant']} / {trial['task']} / {trial['arm']}", flush=True)
-            trial_index = map_index_dir if trial["arm"] in MAP_ARMS else index_dir
+            trial_index = symbol_index_dir if trial["arm"] == "map" else map_index_dir if trial["arm"] in STRUCTURAL_MAP_ARMS else index_dir
             result = run_trial(trial, task_by_id[trial["task"]], gold[trial["task"]], config, commit, directory, opencode, slopdex, trial_index,
                                instruction=instructions_by_arm[trial["arm"]])
             print(f"  {result['status']}: F1={result['grade']['f1']:.3f}, {result['wall_seconds']:.1f}s", flush=True)

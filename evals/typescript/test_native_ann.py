@@ -134,11 +134,21 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
         cls.update_requests = list(cls.requests)
         cls.metadata = runner.warm_native_ann(cls.cache, cls.metadata, cls.binary, cls.source, 30)
         cls.warm_requests = list(cls.requests)
+        symbol_config = {"slopdex": dict(cls.config), "index_timeout_seconds": 30}
+        tasks = [{"targets": [{"path": "source.go", "symbol": name} for name in ("alpha", "beta", "gamma")]}]
+        with patch.object(runner, "SUBMODULE", cls.source):
+            cls.symbol_cache, cls.symbol_metadata = runner.prepare_map_index(
+                symbol_config, cls.commit, cls.root / "symbol-cache", cls.binary, tasks, symbols=True)
+        runner.command([cls.binary, "--root", str(cls.source), "--config", str(cls.symbol_cache / "config.json"),
+                        "--index", str(cls.symbol_cache / "index.sqlite"), "--no-reindex", "map", "--private",
+                        "-q", "alpha", "--symbol-threshold", "0.99"], cwd=cls.source)
+        cls.symbol_requests = list(cls.requests)
         stop_server()
         # Preserve the endpoint/profile, but make accidental provider use fail
         # against a stopped localhost server without any available credentials.
         cls.config.pop("embeddingApiKey")
         runner.write_json(cls.config_path, cls.config)
+        runner.write_json(cls.symbol_cache / "config.json", cls.config)
         cls.source_snapshot = runner.native_ann_snapshot(cls.index)
         cls.source_files = cls.file_snapshot(cls.index, cls.source_snapshot)
         cls.source_metadata = cls.sqlite_metadata(cls.index)
@@ -167,7 +177,7 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
 
     def test_writable_native_reuse_after_real_git_clone_relocation(self):
         self.assertGreater(len(self.update_requests), 0)
-        self.assertEqual(self.warm_requests, self.update_requests, "ANN warm-up called the provider")
+        self.assertEqual(self.warm_requests, self.update_requests, "Content ANN warm-up called the provider")
         inputs = [text for path, authorization, payload in self.update_requests
                   for text in payload["input"]]
         for name in ("alpha", "beta", "gamma"):
@@ -209,7 +219,7 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
             self.assertEqual(after[suffix], before[suffix], f"Native artifact rebuilt: {suffix}")
         self.assertEqual(self.sqlite_metadata(destination)["generation"], copied_metadata["generation"])
         self.assertTrue(runner.native_ann_ready(destination, self.metadata))
-        self.assertEqual(self.requests, self.update_requests)
+        self.assertEqual(self.requests, self.symbol_requests)
         for logs in (self.cache / "ann-warmup", self.trial / "ann-validation"):
             for name in ("stdout.jsonl", "stderr.log"):
                 self.assertNotIn("external model call", (logs / name).read_text())
@@ -241,7 +251,7 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
                     runner.verify_native_ann_reuse(self.binary, self.workspace, self.config_path,
                                                   index, directory, 30)
                 self.assertFalse((directory / "ann-validation.json").exists())
-        self.assertEqual(self.requests, self.update_requests)
+        self.assertEqual(self.requests, self.symbol_requests)
         self.assertEqual(runner.native_ann_snapshot(self.index), self.source_snapshot)
         self.assertEqual(self.file_snapshot(self.index, self.source_snapshot), self.source_files)
 
@@ -263,14 +273,51 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
         output = runner.command([self.binary, "--root", str(self.workspace), "--config", str(cache / "config.json"),
                                  "--index", str(destination), "--no-reindex", "map", "--private", "-e", "alpha"], cwd=self.workspace)
         self.assertIn("alpha", output)
-        self.assertEqual(self.requests, self.update_requests)
+        self.assertEqual(self.requests, self.symbol_requests)
+
+    def test_symbol_map_snapshot_reuses_vectors_and_graph_offline(self):
+        index = self.symbol_cache / "index.sqlite"
+        with closing(sqlite3.connect(index)) as db:
+            self.assertGreater(db.execute("SELECT count(*) FROM embeddings").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM unit_embeddings").fetchone()[0], 0)
+        snapshot = runner.native_ann_snapshot(index, symbol_only=True)
+        self.assertEqual(set(snapshot["artifacts"]), {".symbols.usearch", ".symbols.usearch.manifest.json"})
+        destination = self.trial / "symbols.sqlite"
+        runner.copy_index(index, destination, self.workspace, self.commit, symbol_only=True)
+        result = runner.verify_native_ann_reuse(self.binary, self.workspace, self.symbol_cache / "config.json",
+                                               destination, self.trial, 30, symbol_only=True)
+        self.assertTrue(result["validated"])
+        self.assertEqual(result["symbol_query"]["command"], "map -q")
+        self.assertTrue(result["symbol_query"]["provider_credentials_removed"])
+        self.assertTrue(result["symbol_query"]["selector_cache_cleared"])
+        self.assertNotIn("external model call", (self.trial / "ann-validation" / "stderr.log").read_text())
+        output = runner.command([self.binary, "--root", str(self.workspace), "--config", str(self.symbol_cache / "config.json"),
+                                 "--index", str(destination), "--no-reindex", "map", "--private", "-g", "*.go",
+                                 "-q", "alpha", "--symbol-threshold", "0.99"], cwd=self.workspace)
+        self.assertIn("func alpha", output)
+        self.assertEqual(runner.native_ann_snapshot(destination, symbol_only=True), snapshot)
+        self.assertEqual(self.requests, self.symbol_requests)
+
+    def test_symbol_preflight_rejects_stale_graph(self):
+        destination = self.trial / "stale-symbols.sqlite"
+        runner.copy_index(self.symbol_cache / "index.sqlite", destination, self.workspace, self.commit, symbol_only=True)
+        path = Path(str(destination) + ".symbols.usearch.manifest.json")
+        manifest = runner.read_json(path)
+        manifest["dimensions"] += 1
+        runner.write_json(path, manifest)
+        with self.assertRaisesRegex(ValueError, "rebuilt.*ANN index"):
+            runner.verify_native_ann_reuse(self.binary, self.workspace, self.symbol_cache / "config.json",
+                                          destination, self.trial, 30, symbol_only=True)
+        self.assertFalse((self.trial / "ann-validation.json").exists())
+        self.assertEqual(self.requests, self.symbol_requests)
 
     def test_real_cli_help_clusters_and_protected_overrides_are_not_navigation(self):
         for arm in ("map", "search"):
             with self.subTest(arm=arm):
                 sandbox = self.trial / arm
                 sandbox.mkdir()
-                binaries, log = runner.install_wrapper(sandbox, self.workspace, arm, self.binary, self.cache, self.commit)
+                cache = self.symbol_cache if arm == "map" else self.cache
+                binaries, log = runner.install_wrapper(sandbox, self.workspace, arm, self.binary, cache, self.commit)
                 wrapper = str(binaries / "slopdex")
                 result = runner.command([wrapper, arm, "-ih"], cwd=self.workspace)
                 self.assertIn("Usage:", result)
@@ -284,7 +331,7 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
                 self.assertFalse(other_index.exists())
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     runner.command([wrapper, "help", "models"], cwd=self.workspace)
-        self.assertEqual(self.requests, self.update_requests)
+        self.assertEqual(self.requests, self.symbol_requests)
 
 
 if __name__ == "__main__":

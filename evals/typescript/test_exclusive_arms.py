@@ -193,14 +193,14 @@ class ExclusiveArmTests(unittest.TestCase):
         index = directory / "index.sqlite"
         metadata = {"identity": json.dumps({"schema": 3, "root": "/original/root"}),
                     "checkpoint": "fixture-commit"}
-        if arm in runner.SEMANTIC_ARMS:
+        if arm in runner.SEMANTIC_ARMS or arm == "map":
             metadata.update({"generation": "1", "descriptions_enabled": "false",
                              "active_embedding_profile": json.dumps({"dimensions": 3, "model": "fixture"})})
         with closing(sqlite3.connect(index)) as db, db:
             db.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
             db.executemany("INSERT INTO metadata VALUES (?, ?)", metadata.items())
-        if arm in runner.SEMANTIC_ARMS:
-            for kind in ("code", "markdown"):
+        if arm in runner.SEMANTIC_ARMS or arm == "map":
+            for kind in (("symbols",) if arm == "map" else ("code", "markdown")):
                 binary = Path(str(index) + f".{kind}.usearch")
                 binary.write_bytes(f"fake warm ANN for {kind}".encode())
                 runner.write_json(Path(str(binary) + ".manifest.json"), {
@@ -234,12 +234,12 @@ sys.exit(9 if '--fixture-fail' in sys.argv[1:] else 0)
         self.assertEqual(json.loads(metadata["identity"])["root"], str(workspace.resolve()))
         self.assertEqual(metadata["checkpoint"], "fixture-commit")
         self.assertEqual(source.read_bytes(), source_bytes)
-        if arm in runner.MAP_ARMS:
+        if arm in runner.STRUCTURAL_MAP_ARMS:
             self.assertNotIn("active_embedding_profile", metadata)
             self.assertEqual(list(sandbox.glob("index.sqlite.*usearch*")), [])
         else:
-            before = runner.native_ann_snapshot(source)
-            self.assertEqual(runner.native_ann_snapshot(copied), before)
+            before = runner.native_ann_snapshot(source, symbol_only=arm == "map")
+            self.assertEqual(runner.native_ann_snapshot(copied, symbol_only=arm == "map"), before)
             for suffix in before["artifacts"]:
                 original, destination = Path(str(source) + suffix), Path(str(copied) + suffix)
                 self.assertEqual(original.read_bytes(), destination.read_bytes())
@@ -271,6 +271,8 @@ sys.exit(9 if '--fixture-fail' in sys.argv[1:] else 0)
         invoke([blocked, "target"], blocked, False, 126)
         self.assertFalse(executions.exists())
         invoke([primary, "target"], primary, True, 0)
+        if arm == "map":
+            invoke(["map", "--private", "-g", "*.go", "-q", "validate session"], "map", True, 0)
         if arm == "map-search":
             invoke(["search", "query", "--limit", "50"], "search", True, 0)
         invoke([primary, "--index", "other.sqlite"], primary, False, 126)
@@ -308,10 +310,10 @@ sys.exit(9 if '--fixture-fail' in sys.argv[1:] else 0)
             {"reason": "command_not_allowed", "command": command, "argv": argv}
             for argv, command, allowed, _ in expected if not allowed])
         self.assertEqual(source.read_bytes(), source_bytes)
-        if arm in runner.SEMANTIC_ARMS:
-            self.assertEqual(runner.native_ann_snapshot(copied), before)
+        if arm in runner.SEMANTIC_ARMS or arm == "map":
+            self.assertEqual(runner.native_ann_snapshot(copied, symbol_only=arm == "map"), before)
 
-    def test_generated_map_wrapper_blocks_executes_and_journals_with_structural_only_snapshot(self):
+    def test_generated_map_wrapper_blocks_executes_and_journals_with_symbol_snapshot(self):
         self.exercise_wrapper("map")
 
     def test_generated_search_wrapper_blocks_executes_and_journals_with_warm_ann_snapshot(self):

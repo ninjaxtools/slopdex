@@ -31,6 +31,12 @@ python3 evals/typescript/run.py run --arms map search --output evals/typescript/
 # Repeating the same command resumes, skipping trials with saved results.
 python3 evals/typescript/run.py run --arms map search --output evals/typescript/jobs/map-vs-search
 
+# Rerun only the README map arm with symbol-vector -q: 20 tasks × 2 models = 40 trials.
+PATH="$PWD/target/release:$PATH" TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run --arms map --output evals/typescript/jobs/map-symbol-query
+
+# Rerun with concise discovery-and-follow guidance and offline map -q preflight.
+PATH="$PWD/target/release:$PATH" TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run --arms map --output evals/typescript/jobs/map-concise-symbols
+
 # Regenerate the comparison from saved artifacts.
 python3 evals/typescript/run.py report evals/typescript/jobs/map-vs-search
 
@@ -49,9 +55,12 @@ Authenticate OpenCode to the `opencode-go` provider first, or supply its API key
 through the usual environment variables. Existing OpenCode authentication in
 the user's XDG data directory is copied for the selected provider into a temporary
 data directory. Set `OPENAI_API_KEY` for the default
-embedding configuration for the search arm. Map-only runs need no embedding API
-key or provider calls. Neither TypeScript build dependencies nor a Go toolchain
-are needed: tasks inspect source rather than compiling or changing it.
+embedding configuration for the map and search arms. The default map arm needs an
+embedding key to prepare a cold symbol cache, and `map -q` queries may call the
+embedding provider. The experimental `map-first`, `map-follow` and `map-verify`
+arms use provider-free structural caches. Neither TypeScript build dependencies
+nor a Go toolchain are needed: tasks inspect source rather than compiling or
+changing it.
 
 The runner honors `TMPDIR`. Trial index snapshots can be large; on hosts with a
 small RAM-backed `/tmp`, use disk-backed scratch space under the ignored jobs
@@ -80,7 +89,7 @@ python3 evals/typescript/run.py run --repeats 3 --seed 42 \
 python3 evals/typescript/run.py run --arms off \
   --output evals/typescript/jobs/baseline
 
-# Map alone builds only local structure and needs no embedding key.
+# README map alone prepares structure and symbol-name embeddings; a cold cache needs an embedding key.
 python3 evals/typescript/run.py prepare --arms map
 python3 evals/typescript/run.py run --arms map \
   --output evals/typescript/jobs/map-only
@@ -190,29 +199,39 @@ balance every arm position. Each arm gets the same
 task prompt, model, iteration budget and fresh checkout. Navigation guidance and
 available slopdex commands differ between arms:
 
-| Arm | Agent navigation guidance | Allowed slopdex navigation |
-|---|---|---|
-| `map` (default) | Root README's exact structural-map agent snippet with `--private`, symbol-name regexes, narrow paths and targeted reads | `map` only |
-| `search` (default) | Root README's exact semantic-search agent snippet with threshold 0.3, limit 50 and query variation | `search` only |
-| `map-search` (optional) | Both exact README snippets, with targeted reads and bounded output | `map` and `search` only; both must succeed at least once |
-| `map-first` (experimental) | [Map-first discovery prompt](prompts/map-first.md), immediately followed by implementation reads | `map` only |
-| `map-follow` (experimental) | [One discovery pass, then follow source](prompts/map-follow.md), with an explicit stop rule | `map` only |
-| `map-verify` (experimental) | [Source-following with predicate/cleanup verification](prompts/map-verify.md) | `map` only |
-| `off` (optional legacy baseline) | Conventional glob/grep/reads | None |
-| `slopdex` (optional legacy combined arm) | Original combined map/search guidance | All slopdex commands |
+| Arm | Agent navigation guidance | Allowed slopdex navigation | Cache |
+|---|---|---|---|
+| `map` (default) | Root README's concise discovery-and-follow snippet: one scoped function map, `-e` name terms or `-q` short concepts, then implementation reads | `map` only | Separate symbol-only cache |
+| `search` (default) | Root README's exact semantic-search agent snippet with threshold 0.3, limit 50 and query variation | `search` only | Semantic/ANN cache |
+| `map-search` (optional) | Both exact README snippets, with targeted reads and bounded output | `map` and `search` only; both must succeed at least once | Semantic/ANN cache |
+| `map-first` (experimental) | [Map-first discovery prompt](prompts/map-first.md), immediately followed by implementation reads | `map` only | Provider-free structural cache |
+| `map-follow` (experimental) | [One discovery pass, then follow source](prompts/map-follow.md), with an explicit stop rule | `map` only | Provider-free structural cache |
+| `map-verify` (experimental) | [Source-following with predicate/cleanup verification](prompts/map-verify.md) | `map` only | Provider-free structural cache |
+| `off` (optional legacy baseline) | Conventional glob/grep/reads | None | None |
+| `slopdex` (optional legacy combined arm) | Original combined map/search guidance | All slopdex commands | Semantic/ANN cache |
 
-README instruction blocks are read when planning the run and frozen in its
+README instruction blocks are read verbatim when planning the run and frozen in its
 manifest's `arm_instructions` and resume fingerprint. Each trial's `AGENTS.md`
 contains its selected block plus common evaluation controls. Map guidance also
 reminds agents to include `--private` for unexported Go implementation symbols.
-The experimental map prompts use the same provider-free structural cache and
-map-only controls. Their exact text is frozen in each manifest. They suppress
+The experimental `map-first`, `map-follow` and `map-verify` prompts share a
+provider-free structural cache and map-only controls. The default README `map`
+arm instead uses a separate symbol-only cache. The experimental prompts' exact
+text is frozen in each manifest. They suppress
 prevalidated parser warnings, exclude test files during declaration discovery,
 batch terms/paths and avoid metadata/help inventories. Source verification is
 still required. Compare steps, model tokens/cost, tool-output characters and
 discovery timing alongside citation and answer-format validity.
-Map's `-e` filters symbol names and qualified names rather than raw source text;
-the README example explicitly distinguishes those patterns. The earlier
+Map's `-g` selects path globs, `-e` filters symbol names and qualified names rather
+than raw source text, and `-q` performs symbol-vector search. The root README NOTE
+uses `-e` for known name fragments and `-q` instead when names are unclear. Agents
+make one discovery pass, then follow source; only unknown declaration locations
+warrant another map. Discovery excludes Go tests and suppresses prevalidated
+parser diagnostics; setup/help and root/index/config overrides are discouraged.
+Use `jobs/map-concise-symbols` for the current 40-trial rerun; `jobs/map-symbol-query`
+preserves the earlier broad guidance. The
+historical [map prompt study](MAP_PROMPTS.md) describes its original structural-only
+runs. The earlier
 `jobs/map-vs-search` run used the prior map guidance and search threshold 0.5;
 use a fresh output directory, such as `jobs/map-vs-search-03`, for the updated
 instructions. Existing run manifests preserve the instructions used at the time.
@@ -257,7 +276,8 @@ effective benchmark configuration with `opencode debug config` before timing.
 
 ## Indexing and costs
 
-The default index uses OpenAI `text-embedding-3-large`, 3072 dimensions, embeddings
+The search, `map-search` and `slopdex` arms retain their existing semantic-index
+setup. That index uses OpenAI `text-embedding-3-large`, 3072 dimensions, embeddings
 only, and no reranker. It indexes `tsc/internal/**/*.go`, including compiler tests
 but excluding the unrelated baseline corpus outside that subtree. `maxFileSize`
 is 16 MiB so the large checker implementation is not skipped. Agents can still
@@ -265,16 +285,26 @@ read the entire checkout. The scope/configuration is saved in the run manifest.
 To use another embedding provider, edit the `slopdex` object in `config.json` and
 set that provider's key in the environment.
 
-The map arm has a separate provider-free structural cache, built with `slopdex
-map` rather than semantic preparation. It contains local symbols and source
-metadata, without embedding vectors or ANN files. Structural target coverage is
-verified before trials. `prepare --arms map` and `run --arms map` therefore work
-without an embedding API key, even on a cold cache. The search and optional
-combined arms use the semantic/ANN cache described below.
+The default README `map` arm has a separate symbol-only map cache containing
+structural symbols and source metadata, normalized-name embeddings, and a native
+`.symbols.usearch` sidecar. Symbol embeddings default to 256 dimensions and use
+the same configured embedding provider/model as the semantic index. Full
+code-body embeddings are not required for this arm. Structural target coverage
+is verified before trials. `prepare --arms map` needs the embedding provider's
+key on a cold symbol cache; `run --arms map` performs that preparation automatically,
+and agents' `map -q` queries may call the provider. Agents remain restricted to
+`map` navigation.
+
+The experimental `map-first`, `map-follow` and `map-verify` arms keep a separate
+provider-free structural cache containing local symbols and source metadata,
+without embedding vectors or ANN files. Their cold-cache preparation requires no
+embedding key. The search and optional combined arms continue to use the
+semantic/ANN cache described below.
 
 Index caches are keyed by repository commit, slopdex version, and full slopdex
 configuration. Preparation fails on operational indexing failures, an empty
-index, or missing searchable vectors for any selected task's target function.
+index, or missing required structural/vector coverage for any selected task's
+target function.
 Parser-recovery diagnostics elsewhere in the checkout are retained and reported;
 they do not prevent running a fully covered task. A failed preparation can be
 retried while preserving paid embedding artifacts. Cache builds and result-directory
@@ -283,8 +313,8 @@ WAL pages, plus the warmed native ANN binaries and their manifests. The schema-3
 root identity is adjusted to the clone's root; generation, vector IDs, paths and
 reference commit remain unchanged. An unsupported schema fails explicitly.
 
-Preparation runs an offline, no-reindex `cross-search` with an impossible source
-regex to load and persist the native indexes without querying a provider. Cache
+Semantic-cache preparation runs an offline, no-reindex `cross-search` with an
+impossible source regex to load and persist the native indexes without querying a provider. Cache
 metadata records the ANN generation, embedding profile, artifact sizes and SHA-256
 hashes. Older embedding-only caches are warmed in place; missing, stale or corrupt
 sidecars are repaired during preparation. Code and Markdown indexes are always
@@ -296,6 +326,20 @@ manifests and opens them through the writable native loader using the same offli
 probe. Their hashes and modification times must remain unchanged. This verifies
 the relocated snapshot is reusable; an unexpected rebuild fails preparation.
 The check is recorded in `ann-validation.json` and its CLI logs.
+
+Before timing each default `map` trial, the runner also copies the symbol sidecar
+and validates its reuse with an actual `map -q` query in the relocated symbol-only
+snapshot. The preflight clears selector-result caches, removes embedding credentials,
+and uses the preembedded warm-up query with the writable loader. This prevents
+read-only in-memory rebuilding from passing unnoticed. The native graph's hash/mtime,
+vocabulary, dimensions and embedding count must remain unchanged, with no external
+model calls. A structural refresh may update only the manifest generation/fingerprint;
+that metadata-only update is recorded separately. Thus `-q` must use the
+prebuilt symbol vectors and graph. New agent queries may still embed their query text.
+The evidence is recorded under `symbol_query` in `ann-validation.json`. Symbol-cache
+preparation, native sidecar construction, copying and reuse validation are
+excluded from model timing; ordinary map loading and any `-q` query embedding
+latency remain included.
 
 Reports separate one-time index preparation time from trial time. OpenCode's
 reported USD cost covers its model calls, **not** embedding preparation/query
@@ -309,7 +353,7 @@ run. Ordinary per-command index loading and query embedding time remain included
 Reports record cache-level ANN warm-up separately from embedding preparation;
 per-trial results record reuse-validation time separately from agent wall time.
 The earlier mixed-tool experiments have different arm definitions; use a new
-output directory such as `jobs/map-vs-search` for this default comparison.
+output directory such as `jobs/map-symbol-query` for the README map rerun.
 Provider-side prompt caches cannot be reset by
 this harness; cache-token counters and counterbalanced order help interpret them.
 
@@ -338,12 +382,12 @@ there is no extra model judge or hidden grading model cost.
 Each output directory contains:
 
 - `manifest.json`: pinned commit, exact config/prompts, ordered trial matrix, tool
-  versions, frozen README instructions, structural/semantic index metadata and
-  resume fingerprint.
+  versions, frozen README instructions, structural/symbol/semantic index metadata
+  and resume fingerprint.
 - `trials/ID/`: prompt, arm instructions, generated OpenCode config, CLI argv,
   raw JSONL events, stderr, final answer, slopdex invocation log if used, and graded
   `result.json` with time, cost, tokens, steps, tool counts and command-protocol
-  violations. Search/combined trials also
+  violations. Default map and search/combined trials also
   include `ann-validation.json` and `ann-validation/` logs from the untimed reuse
   check.
 - `summary.json` and `report.md`: per-model/variant/arm statistics and paired
@@ -406,8 +450,9 @@ map/search, legacy off/slopdex, partial runs, and all multi-arm comparisons.
 Native ANN tests verify sidecar integrity and optional description indexes. The
 installed-slopdex test builds a tiny real index using a localhost embedding
 fixture, then verifies relocated native binaries are reused unchanged offline.
-It also builds and uses a local map-only index with the provider offline and no
-embedding credentials.
+It also builds and uses a local structural-only map index with the provider
+offline and no embedding credentials, matching the experimental map arms' cache
+requirements.
 
 To add tasks, add prompts and at least three distinct reference declarations to
 `tasks.json`, then run `validate`. Cases marked `difficulty: "advanced"` must have

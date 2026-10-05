@@ -87,7 +87,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > Add this to your `AGENTS.md` to let the agent use the map command to explore the codebase:
 >
 > ```text
-> - use `slopdex map --private -g "<glob>" -i -e "<regex>" -q "<symbol-for-vector-search>" <files or directories...>` to obtain a compact structural code skeleton, and then perform targeted reads using the line numbers for implementation details. Once a plausible entry point is mapped, **stop browsing and read the implementation using the returned lines numbers**. Do not repeat searches for names and locations already found.
+> - Make one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" --private --callers 2 --callees 2 <paths...>` discovery pass. Read the first plausible implementation, then follow its calls. Map again only for unknown declaration locations; Batch reads; avoid repeated inventories.
 > ```
 
 ### Search
