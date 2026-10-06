@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
-pub const STRUCTURE_PARSER_VERSION: &str = "structure-v4-calls";
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v6-language-scopes";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);

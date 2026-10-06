@@ -1028,7 +1028,10 @@ mod tests {
             .filter(|node| node.id == parent.id || node.parent_id == Some(parent.id))
             .cloned()
             .collect();
-        let expected = "@@ 36-45 @@\npub struct MarkdownChunk\n  pub heading_path: Vec<String>\n  pub start_line: usize\n  pub end_line: usize\n  pub content: String\n  pub source_hash: String\n  pub embedding_input: String\n";
+        let expected = format!(
+            "@@ {}-{} @@\npub struct MarkdownChunk\n  pub heading_path: Vec<String>\n  pub start_line: usize\n  pub end_line: usize\n  pub content: String\n  pub source_hash: String\n  pub embedding_input: String\n",
+            parent.start_line, parent.end_line
+        );
         for output in [
             render_with_structure(
                 &selected,

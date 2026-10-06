@@ -2,7 +2,20 @@
 
 use super::{Diagnostic, FileStructure, ParsedFile, StructureNode};
 use anyhow::{Context, Result};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 use tree_sitter::{Language, Node, Parser};
+
+#[path = "document.rs"]
+pub(super) mod document;
+#[path = "data_recovery.rs"]
+mod recovery;
+#[path = "data_strings.rs"]
+mod strings;
+
+use document::{Positions, children, text};
 
 pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<ParsedFile> {
     let grammar: Language = match language {
@@ -22,12 +35,6 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
     let tree = parser
         .parse(source, None)
         .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
-    let mut collector = Collector {
-        language,
-        source,
-        nodes: Vec::new(),
-    };
-    collector.walk(tree.root_node(), None);
     let mut errors = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -45,12 +52,25 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
             stack.extend(children(node));
         }
     }
+    let tree = recovery::recover(&mut parser, tree, source, language);
+    let mut collector = Collector {
+        language,
+        source,
+        positions: Positions::new(source),
+        nodes: Vec::new(),
+        tables: HashMap::new(),
+        array_tables: HashSet::new(),
+        array_counts: HashMap::new(),
+    };
+    collector.walk(tree.root_node(), None);
+    let filtered =
+        document::without_spans(source, &mut comments(tree.root_node(), language, source));
     // A comment-only configuration file has no search content. HTML/XML text
     // without elements is still useful as a search unit.
     let chunks = if collector.nodes.is_empty() && !matches!(language, "xml" | "html") {
         Vec::new()
     } else {
-        super::markdown::parse_plain(source)
+        super::markdown::parse_plain(&filtered)
     };
     Ok(ParsedFile {
         chunks,
@@ -62,25 +82,78 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
     })
 }
 
-fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
-    source.get(node.byte_range()).unwrap_or("")
+fn literal(language: &str, kind: &str) -> bool {
+    matches!(
+        (language, kind),
+        ("json", "string")
+            | (
+                "yaml",
+                "block_scalar"
+                    | "plain_scalar"
+                    | "single_quote_scalar"
+                    | "double_quote_scalar"
+                    | "alias"
+                    | "anchor"
+                    | "tag"
+            )
+            | ("toml", "string" | "quoted_key")
+            | (
+                "terraform",
+                "string_lit" | "quoted_template" | "heredoc_template"
+            )
+            | ("css", "string_value")
+            | ("xml", "CDSect" | "PI")
+            | ("html", "quoted_attribute_value" | "attribute_value")
+    )
 }
 
-fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
+fn opening_tag(node: Node<'_>) -> Option<Node<'_>> {
+    children(node).into_iter().find(|child| {
+        matches!(
+            child.kind(),
+            "STag" | "EmptyElemTag" | "start_tag" | "self_closing_tag"
+        )
+    })
 }
 
-fn unquote(name: &str) -> String {
-    let name = name.trim();
-    serde_json::from_str::<String>(name)
-        .unwrap_or_else(|_| name.trim_matches(['\'', '"']).to_owned())
+fn tag_name(tag: Node<'_>) -> Option<Node<'_>> {
+    children(tag)
+        .into_iter()
+        .find(|child| matches!(child.kind(), "Name" | "tag_name"))
+}
+
+pub(super) fn html_text_element(node: Node<'_>, source: &str) -> bool {
+    opening_tag(node).and_then(tag_name).is_some_and(|name| {
+        matches!(
+            text(source, name).to_ascii_lowercase().as_str(),
+            "title" | "textarea" | "script" | "style" | "iframe" | "noembed" | "noframes" | "xmp"
+        )
+    })
+}
+
+fn comments(root: Node<'_>, language: &str, source: &str) -> Vec<Range<usize>> {
+    let mut result = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "comment" | "Comment" | "js_comment") {
+            result.push(node.byte_range());
+        } else if !(literal(language, node.kind())
+            || language == "html" && html_text_element(node, source))
+        {
+            stack.extend(children(node));
+        }
+    }
+    result
 }
 
 struct Collector<'a> {
     language: &'static str,
     source: &'a str,
+    positions: Positions,
     nodes: Vec<StructureNode>,
+    tables: HashMap<Vec<String>, usize>,
+    array_tables: HashSet<usize>,
+    array_counts: HashMap<(Option<usize>, Vec<String>), usize>,
 }
 
 impl Collector<'_> {
@@ -120,17 +193,31 @@ impl Collector<'_> {
     }
 
     fn walk(&mut self, node: Node<'_>, parent: Option<usize>) {
-        if node.has_error() && (node.is_error() || node.is_missing()) {
+        if node.is_missing()
+            || literal(self.language, node.kind())
+            || matches!(node.kind(), "comment" | "Comment" | "js_comment")
+        {
             return;
         }
         let syntax = node.kind();
-        if !node.has_error()
-            && matches!(
-                (self.language, syntax),
-                ("json", "array") | ("yaml", "block_sequence" | "flow_sequence")
-            )
-        {
-            for (index, child) in children(node).into_iter().enumerate() {
+        if self.language == "toml" && matches!(syntax, "table" | "table_array_element") {
+            self.toml_table(node);
+            return;
+        }
+        if matches!(
+            (self.language, syntax),
+            ("json" | "toml", "array")
+                | ("yaml", "block_sequence" | "flow_sequence")
+                | ("terraform", "tuple")
+        ) {
+            for (index, child) in children(node)
+                .into_iter()
+                .filter(|child| {
+                    !matches!(child.kind(), "comment" | "tuple_start" | "tuple_end")
+                        && !child.is_missing()
+                })
+                .enumerate()
+            {
                 let name = format!("[{index}]");
                 let id = self.push(child, parent, "item", name.clone(), name);
                 self.walk(child, Some(id));
@@ -139,16 +226,16 @@ impl Collector<'_> {
         }
         let source = self.source;
         let mut descendants = None;
-        let declaration = if node.has_error() {
+        let declaration = if node.is_error() {
             None
         } else {
             match (self.language, syntax) {
                 ("json", "pair") => {
                     let key = node.child_by_field_name("key");
                     let value = node.child_by_field_name("value");
-                    key.map(|key| {
+                    key.filter(|key| !key.has_error()).map(|key| {
                         descendants = value;
-                        let name = unquote(text(source, key));
+                        let name = strings::decode("json", text(source, key));
                         let signature = match value {
                             Some(value) if matches!(value.kind(), "object" | "array") => format!(
                                 "{}: {}",
@@ -165,29 +252,11 @@ impl Collector<'_> {
                 }
                 ("yaml", "block_mapping_pair" | "flow_pair") => {
                     let key = node.child_by_field_name("key");
-                    key.map(|key| {
+                    key.filter(|key| !key.has_error()).map(|key| {
                         descendants = node.child_by_field_name("value");
                         (
                             "field",
-                            unquote(text(source, key)),
-                            text(source, node)
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .trim()
-                                .to_owned(),
-                        )
-                    })
-                }
-                ("toml", "table" | "table_array_element") => {
-                    let header = children(node).into_iter().find(|child| {
-                        matches!(child.kind(), "bare_key" | "quoted_key" | "dotted_key")
-                    });
-                    header.map(|header| {
-                        let name = unquote(text(source, header));
-                        (
-                            "module",
-                            name,
+                            strings::yaml_key(source, key),
                             text(source, node)
                                 .lines()
                                 .next()
@@ -200,29 +269,34 @@ impl Collector<'_> {
                 ("toml", "pair") => children(node)
                     .into_iter()
                     .find(|child| matches!(child.kind(), "bare_key" | "quoted_key" | "dotted_key"))
+                    .filter(|key| !key.has_error())
                     .map(|key| {
+                        descendants = children(node)
+                            .into_iter()
+                            .find(|child| child.id() != key.id() && child.kind() != "comment");
                         (
                             "field",
-                            unquote(text(source, key)),
+                            strings::toml_key(source, key).join("."),
                             text(source, node).trim().to_owned(),
                         )
                     }),
                 ("terraform", "block") => {
+                    let start = children(node)
+                        .into_iter()
+                        .find(|child| child.kind() == "block_start");
                     let name = children(node)
                         .into_iter()
                         .take_while(|child| child.kind() != "block_start")
                         .filter(|child| matches!(child.kind(), "identifier" | "string_lit"))
-                        .map(|child| unquote(text(source, child)))
+                        .filter(|child| !child.has_error())
+                        .map(|child| strings::decode("terraform", text(source, child)))
                         .collect::<Vec<_>>()
                         .join(".");
-                    (!name.is_empty()).then(|| {
+                    start.filter(|_| !name.is_empty()).map(|start| {
                         (
                             "module",
                             name,
-                            text(source, node)
-                                .split('{')
-                                .next()
-                                .unwrap_or("")
+                            source[node.start_byte()..start.start_byte()]
                                 .trim()
                                 .to_owned(),
                         )
@@ -231,7 +305,11 @@ impl Collector<'_> {
                 ("terraform", "attribute") => children(node)
                     .into_iter()
                     .find(|child| child.kind() == "identifier")
+                    .filter(|key| !key.has_error())
                     .map(|key| {
+                        descendants = children(node)
+                            .into_iter()
+                            .find(|child| child.kind() == "expression");
                         (
                             "field",
                             text(source, key).to_owned(),
@@ -243,9 +321,21 @@ impl Collector<'_> {
                                 .to_owned(),
                         )
                     }),
+                ("terraform", "object_elem") => node
+                    .child_by_field_name("key")
+                    .filter(|key| !key.has_error())
+                    .map(|key| {
+                        descendants = node.child_by_field_name("val");
+                        (
+                            "field",
+                            strings::hcl_key(source, key),
+                            text(source, node).trim().to_owned(),
+                        )
+                    }),
                 ("css", "rule_set") => children(node)
                     .into_iter()
                     .find(|child| child.kind() == "selectors")
+                    .filter(|selector| !selector.has_error())
                     .map(|selector| {
                         (
                             "rule",
@@ -253,9 +343,30 @@ impl Collector<'_> {
                             text(source, selector).trim().to_owned(),
                         )
                     }),
+                ("css", "keyframes_statement") => children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "keyframes_name")
+                    .filter(|name| !name.has_error())
+                    .map(|name| {
+                        (
+                            "module",
+                            text(source, name).to_owned(),
+                            source[node.start_byte()..name.end_byte()].trim().to_owned(),
+                        )
+                    }),
+                ("css", "keyframe_block") => children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "block")
+                    .map(|block| {
+                        let name = source[node.start_byte()..block.start_byte()]
+                            .trim()
+                            .to_owned();
+                        ("rule", name.clone(), name)
+                    }),
                 ("css", "declaration") => children(node)
                     .into_iter()
                     .find(|child| child.kind() == "property_name")
+                    .filter(|key| !key.has_error())
                     .map(|key| {
                         (
                             "field",
@@ -264,37 +375,112 @@ impl Collector<'_> {
                         )
                     }),
                 ("xml" | "html", "element" | "script_element" | "style_element") => {
-                    let tag = children(node).into_iter().find(|child| {
-                        matches!(
-                            child.kind(),
-                            "STag" | "EmptyElemTag" | "start_tag" | "self_closing_tag"
-                        )
-                    });
+                    let tag = opening_tag(node).filter(|tag| !tag.has_error());
                     tag.and_then(|tag| {
-                        children(tag)
-                            .into_iter()
-                            .find(|child| matches!(child.kind(), "Name" | "tag_name"))
-                            .map(|name| {
-                                (
-                                    "element",
-                                    text(source, name).to_owned(),
-                                    text(source, tag).to_owned(),
-                                )
-                            })
+                        tag_name(tag).map(|name| {
+                            (
+                                "element",
+                                text(source, name).to_owned(),
+                                text(source, tag).to_owned(),
+                            )
+                        })
                     })
                 }
                 _ => None,
             }
         };
         let parent = declaration.map_or(parent, |(kind, name, signature)| {
-            Some(self.push(node, parent, kind, name, signature))
+            let id = self.push(node, parent, kind, name, signature);
+            if self.language == "css"
+                && syntax == "rule_set"
+                && let Some(selectors) = children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "selectors")
+            {
+                for selector in children(selectors)
+                    .into_iter()
+                    .filter(|child| child.kind() != "comment")
+                {
+                    let name = text(source, selector).trim().to_owned();
+                    if !self.nodes[id].names.contains(&name) {
+                        self.nodes[id].names.push(name);
+                    }
+                }
+            }
+            Some(id)
         });
+        if self.language == "html" && html_text_element(node, source) {
+            return;
+        }
         if let Some(value) = descendants {
             self.walk(value, parent);
         } else {
             for child in children(node) {
                 self.walk(child, parent);
             }
+        }
+    }
+
+    fn toml_table(&mut self, node: Node<'_>) {
+        let header = children(node)
+            .into_iter()
+            .find(|child| matches!(child.kind(), "bare_key" | "quoted_key" | "dotted_key"));
+        let Some(header) = header.filter(|header| !header.has_error()) else {
+            for child in children(node) {
+                self.walk(child, None);
+            }
+            return;
+        };
+        let path = strings::toml_key(self.source, header);
+        let parent = (1..path.len())
+            .rev()
+            .find_map(|length| self.tables.get(&path[..length]).map(|id| (length, *id)));
+        let parent_id = parent.map(|(_, id)| id);
+        let mut name = path[parent.map_or(0, |(length, _)| length)..].join(".");
+        if node.kind() == "table_array_element" {
+            // A new outer array item invalidates its previous subtables. Nested
+            // counts follow array instances, not explicitly declared ordinary
+            // supertables: declaring [a] must not reset the count for [[a.b]].
+            let enclosing_array = (1..path.len()).rev().find_map(|length| {
+                self.tables
+                    .get(&path[..length])
+                    .copied()
+                    .filter(|id| self.array_tables.contains(id))
+            });
+            self.tables.retain(|key, _| !key.starts_with(&path));
+            let index = self
+                .array_counts
+                .entry((enclosing_array, path.clone()))
+                .or_default();
+            name.push_str(&format!(".[{index}]"));
+            *index += 1;
+        }
+        let signature = text(self.source, node)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let id = self.push(node, parent_id, "module", name, signature);
+        if node.kind() == "table_array_element" {
+            self.array_tables.insert(id);
+        }
+        self.tables.insert(path, id);
+        for child in children(node)
+            .into_iter()
+            .filter(|child| child.id() != header.id())
+        {
+            self.walk(child, Some(id));
+        }
+        let mut ancestor = parent_id;
+        while let Some(parent) = ancestor {
+            if self.nodes[parent].end_byte < node.end_byte() {
+                let end = self.positions.point(node.end_byte());
+                self.nodes[parent].end_byte = node.end_byte();
+                self.nodes[parent].end_line = end.row + 1;
+                self.nodes[parent].end_column = end.column + 1;
+            }
+            ancestor = self.nodes[parent].parent_id;
         }
     }
 }

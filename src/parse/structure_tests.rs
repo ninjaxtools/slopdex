@@ -468,6 +468,154 @@ fn assert_callable_scopes(path: &str, source: &str) -> crate::parse::ParsedFile 
 }
 
 #[test]
+fn javascript_callbacks_and_payloads_do_not_create_data_symbols() {
+    let source = r#"
+it("should drop snapshot overlap before changing the visible error or transcript", async () => {
+    const f = fixture();
+    f.client.restore = async () => restoreConversation([{
+      branch: {
+        branchId: "main", chatId: "chat", sequence: 3, parent: null,
+        kind: "jonin", status: "active", createdAt: "2026-09-27", updatedAt: "2026-09-27",
+      },
+      events: [{
+        branchId: "main", chatId: "chat", eventId: 2, sequence: 2, createdAt: "2026-09-27",
+        data: { type: "text", messageId: "message", stepIndex: 1, id: "answer", text: "Recovered" },
+      }],
+    }]);
+    const error = { type: "error", message: "failed", branchId: "main", sequence: 3 };
+    const delta = { type: "text", id: "answer", partId: "part", stepIndex: 1, text: "next", sequence: 4, branchId: "main" };
+});
+"#;
+    for path in ["x.js", "x.jsx", "x.ts", "x.tsx"] {
+        let parsed = assert_callable_scopes(path, source);
+        assert_eq!(
+            parsed.structure.nodes.len(),
+            1,
+            "{path}: {:#?}",
+            parsed.structure
+        );
+        assert_eq!(parsed.structure.nodes[0].name, "restore");
+        assert_eq!(parsed.structure.nodes[0].kind, "function");
+        assert_eq!(
+            crate::map::render_nodes(&parsed.structure.nodes, None),
+            "@@ 4-13 @@\nf.client.restore = async () =>\n"
+        );
+    }
+}
+
+#[test]
+fn javascript_executable_objects_preserve_declarations_without_data_fields() {
+    let body = r#"
+  const scalar = 1;
+  const payload = { nested: { value: 1 }, items: [{ id: 2 }] };
+  service.state = { nested: { value: 1 } };
+  const local = {
+    value: 1,
+    nested: { run() { const data = { value: 1 }; } },
+    arrow: () => ({ nested: { value: 1 } }),
+    Type: class { field = 1; run() {} },
+  };
+  const helper = () => { const data = { value: 1 }; };
+  class Inner { field = 1; run() {} }
+  consume({ nested: { value: 1 }, items: [{ id: 2 }] });
+  return { nested: { value: 1 }, result: () => ({ value: 1 }) };
+"#;
+    for path in ["x.js", "x.jsx", "x.ts", "x.tsx"] {
+        for (prefix, suffix, scope) in [
+            ("function outer() {", "}", "outer."),
+            ("invoke(async () => {", "});", ""),
+            ("invoke(function () {", "});", ""),
+            ("invoke(function* () {", "});", ""),
+            ("(() => {", "})();", ""),
+        ] {
+            let source = format!("{prefix}{body}{suffix}");
+            let parsed = assert_callable_scopes(path, &source);
+            let names: Vec<_> = parsed
+                .structure
+                .nodes
+                .iter()
+                .map(|node| node.qualified_name.as_str())
+                .collect();
+            let mut expected = Vec::new();
+            if !scope.is_empty() {
+                expected.push("outer".to_owned());
+            }
+            expected.extend(
+                [
+                    "local",
+                    "local.nested",
+                    "local.nested.run",
+                    "local.arrow",
+                    "local.Type",
+                    "local.Type.field",
+                    "local.Type.run",
+                    "helper",
+                    "Inner",
+                    "Inner.field",
+                    "Inner.run",
+                    "result",
+                ]
+                .map(|name| format!("{scope}{name}")),
+            );
+            assert_eq!(names, expected, "{path}: {prefix}");
+        }
+    }
+}
+
+#[test]
+fn javascript_local_object_spreads_and_wrappers_preserve_callable_scopes() {
+    let source = r#"
+function outer() {
+  const spread = { ...({ run() {} }) };
+  const wrapped = { task: wrap(() => { function nested() {} }) };
+  const list = { items: [{ run() {} }] };
+}
+invoke((callback = function fallback() { const data = { value: 1 }; }) => {});
+"#;
+    for path in ["x.js", "x.jsx", "x.ts", "x.tsx"] {
+        let parsed = assert_callable_scopes(path, source);
+        for name in [
+            "outer.spread.run",
+            "outer.wrapped.nested",
+            "outer.list.run",
+            "fallback",
+        ] {
+            named(&parsed.structure, name);
+        }
+        assert!(
+            !parsed
+                .structure
+                .nodes
+                .iter()
+                .any(|node| node.name == "data" || node.name == "value")
+        );
+    }
+}
+
+#[test]
+fn javascript_payload_value_callbacks_do_not_create_object_symbols() {
+    let source = r#"
+it("example", () => {
+  const error = { message: (() => "failed")() };
+  const payload = {
+    values: [1, 2].map(value => ({ id: value })),
+    nested: { message: (function () { return "failed"; })() },
+    items: consume(function* () { yield 1; }),
+  };
+});
+"#;
+    for path in ["x.js", "x.jsx", "x.ts", "x.tsx"] {
+        let parsed = assert_callable_scopes(path, source);
+        assert!(
+            parsed.structure.nodes.is_empty(),
+            "{path}: {:#?}",
+            parsed.structure
+        );
+        assert!(parsed.callables.is_empty());
+    }
+}
+
+#[test]
 fn javascript_assignment_object_and_class_expression_scopes_match_callables() {
     for path in ["x.js", "x.ts", "x.tsx"] {
         let source = r#"

@@ -1,9 +1,13 @@
 //! Tree-sitter Markdown headings and heading-aware search chunks.
 
+use super::data::document::{self, Positions, children, text};
 use super::{FileStructure, MarkdownChunk, ParsedFile, StructureNode};
 use crate::hash;
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
+
+#[path = "markdown_comments.rs"]
+mod comments;
 
 const MARKDOWN_MAX_BYTES: usize = 8192;
 const MARKDOWN_MAX_LINES: usize = 120;
@@ -15,22 +19,24 @@ struct Heading {
     source: String,
     start_byte: usize,
     start_row: usize,
+    start_column: usize,
     end_row: usize,
 }
 
-fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
-    source.get(node.byte_range()).unwrap_or("")
-}
-
-fn blocks(root: Node<'_>, source: &str) -> (Vec<Heading>, Vec<(usize, usize)>) {
+fn blocks(root: Node<'_>, source: &str, comments: &[std::ops::Range<usize>]) -> Vec<Heading> {
     let mut headings = Vec::new();
-    let mut comments = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match node.kind() {
             "atx_heading" | "setext_heading" if !node.has_error() => {
                 let atx = node.kind() == "atx_heading";
-                let marker = node.named_child(0);
+                let marker = if atx {
+                    node.named_child(0)
+                } else {
+                    children(node).into_iter().find(|child| {
+                        matches!(child.kind(), "setext_h1_underline" | "setext_h2_underline")
+                    })
+                };
                 let level = if atx {
                     marker.and_then(|m| {
                         m.kind()
@@ -40,63 +46,78 @@ fn blocks(root: Node<'_>, source: &str) -> (Vec<Heading>, Vec<(usize, usize)>) {
                             .ok()
                     })
                 } else {
-                    let mut cursor = node.walk();
-                    node.named_children(&mut cursor)
-                        .find_map(|child| match child.kind() {
-                            "setext_h1_underline" => Some(1),
-                            "setext_h2_underline" => Some(2),
-                            _ => None,
-                        })
+                    marker.and_then(|child| match child.kind() {
+                        "setext_h1_underline" => Some(1),
+                        "setext_h2_underline" => Some(2),
+                        _ => None,
+                    })
                 };
                 if let Some(level) = level {
-                    let content = node
-                        .child_by_field_name("heading_content")
-                        .map(|content| text(source, content).trim())
-                        .unwrap_or("");
-                    let title = if atx {
-                        let without_hashes = content.trim_end_matches('#');
-                        if without_hashes.is_empty() || without_hashes.ends_with([' ', '\t']) {
-                            without_hashes.trim_end()
-                        } else {
-                            content
-                        }
+                    let content_node = if atx {
+                        node.child_by_field_name("heading_content")
                     } else {
-                        content
+                        children(node)
+                            .into_iter()
+                            .find(|child| child.kind() == "paragraph")
+                            .and_then(|paragraph| {
+                                children(paragraph)
+                                    .into_iter()
+                                    .find(|child| child.kind() == "inline")
+                            })
                     };
+                    let content = content_node
+                        .map(|content| {
+                            let mut range = content.byte_range();
+                            if atx {
+                                // Comments cannot create a closing marker that
+                                // was not present in the original heading.
+                                let raw = text(source, content).trim_end_matches([' ', '\t']);
+                                let without_hashes = raw.trim_end_matches('#');
+                                if without_hashes.is_empty()
+                                    || without_hashes.ends_with([' ', '\t'])
+                                {
+                                    range.end = range.start + without_hashes.len();
+                                }
+                            }
+                            let mut excluded = comments.to_vec();
+                            excluded.extend(
+                                children(content)
+                                    .into_iter()
+                                    .filter(|child| child.kind() == "block_continuation")
+                                    .map(|child| child.byte_range()),
+                            );
+                            document::clean_range(source, range, &excluded)
+                        })
+                        .unwrap_or_default();
+                    let title = content.trim();
                     let signature = if atx {
-                        text(source, node)
+                        let end = source[node.start_byte()..]
+                            .find('\n')
+                            .map_or(source.len(), |end| node.start_byte() + end);
+                        document::clean_range(source, node.start_byte()..end, comments)
                             .trim_start_matches(' ')
                             .trim_end_matches(['\r', '\n'])
                             .to_owned()
                     } else {
-                        let raw = text(source, node).trim_end_matches(['\r', '\n']);
                         format!(
                             "{title}\n{}",
-                            raw.rsplit('\n').next().unwrap_or("").trim_end_matches('\r')
+                            text(source, marker.unwrap()).trim_end_matches(['\r', '\n'])
                         )
                     };
-                    let end = node.end_position();
+                    let end_row = marker.unwrap().start_position().row;
                     headings.push(Heading {
                         level,
                         title: title.to_owned(),
                         source: signature,
                         start_byte: node.start_byte(),
                         start_row: node.start_position().row,
-                        end_row: end.row.saturating_sub(usize::from(
-                            end.column == 0 && end.row > node.start_position().row,
-                        )),
+                        start_column: node.start_position().column,
+                        end_row,
                     });
                 }
                 continue;
             }
-            "html_block" if text(source, node).trim_start().starts_with("<!--") => {
-                let end = node.end_position();
-                let last = end.row.saturating_sub(usize::from(
-                    end.column == 0 && end.row > node.start_position().row,
-                ));
-                comments.push((node.start_position().row, last));
-                continue;
-            }
+            "html_block" => continue,
             "fenced_code_block" | "indented_code_block" => continue,
             _ => {}
         }
@@ -104,7 +125,7 @@ fn blocks(root: Node<'_>, source: &str) -> (Vec<Heading>, Vec<(usize, usize)>) {
         stack.extend(node.named_children(&mut cursor));
     }
     headings.sort_by_key(|heading| heading.start_byte);
-    (headings, comments)
+    headings
 }
 
 /// Bounded text search units for structured data, without interpreting `#` as headings.
@@ -130,6 +151,7 @@ pub(super) fn parse(source: &str) -> Result<ParsedFile> {
     // its opener. CommonMark treats it as code. Mask only those false closers
     // and reparse with identical byte offsets, as for TypeScript grammar gaps.
     let mut masked = source.as_bytes().to_vec();
+    let positions = Positions::new(source);
     loop {
         let mut changed = false;
         let mut stack = vec![tree.root_node()];
@@ -141,16 +163,8 @@ pub(super) fn parse(source: &str) -> Result<ParsedFile> {
                     .filter(|child| child.kind() == "fenced_code_block_delimiter")
                     .collect();
                 if let Some(closer) = fences.get(1) {
-                    let line_start = source[..closer.start_byte()]
-                        .rfind('\n')
-                        .map_or(0, |i| i + 1);
-                    let indent = source[line_start..closer.start_byte()]
-                        .bytes()
-                        .take_while(|b| *b == b' ')
-                        .count();
-                    if indent > node.start_position().column + 3
-                        && masked[closer.start_byte()] != b'X'
-                    {
+                    let indent = fence_indent(node, *closer, source, &positions);
+                    if indent > 3 && masked[closer.start_byte()] != b'X' {
                         masked[closer.start_byte()] = b'X';
                         changed = true;
                     }
@@ -167,9 +181,11 @@ pub(super) fn parse(source: &str) -> Result<ParsedFile> {
             .parse(&masked, None)
             .context("Cannot recover Markdown fence: tree-sitter returned no tree")?;
     }
-    let (detected, comments) = blocks(tree.root_node(), source);
+    let mut comments = comments::collect(tree.root_node(), source)?;
+    let detected = blocks(tree.root_node(), source, &comments);
     let structure = structure(source, &detected);
-    let mut lines: Vec<&str> = source
+    let filtered = document::without_spans(source, &mut comments);
+    let lines: Vec<&str> = filtered
         .split('\n')
         .map(|l| l.strip_suffix('\r').unwrap_or(l))
         .collect();
@@ -177,11 +193,6 @@ pub(super) fn parse(source: &str) -> Result<ParsedFile> {
     let mut headings: Vec<Heading> = Vec::new();
     let mut section_start = 0;
     let mut body_start = 0;
-    for (start, end) in comments {
-        for line in lines.iter_mut().take(end + 1).skip(start) {
-            *line = "";
-        }
-    }
     for heading in detected {
         flush_markdown(
             &lines,
@@ -213,6 +224,31 @@ pub(super) fn parse(source: &str) -> Result<ParsedFile> {
     })
 }
 
+/// Container prefixes are explicit AST nodes. Count only content indentation,
+/// with CommonMark's four-column tab stops, rather than physical line columns.
+fn fence_indent(block: Node<'_>, closer: Node<'_>, source: &str, positions: &Positions) -> usize {
+    let mut start = positions.line_start(closer.start_position().row);
+    let mut stack = vec![block];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "block_continuation"
+            && node.start_position().row == closer.start_position().row
+            && node.end_byte() <= closer.start_byte()
+        {
+            start = start.max(node.end_byte());
+        }
+        stack.extend(children(node));
+    }
+    source[start..closer.start_byte()]
+        .bytes()
+        .fold(0, |column, byte| {
+            if byte == b'\t' {
+                column + 4 - column % 4
+            } else {
+                column + 1
+            }
+        })
+}
+
 /// Structural headings are independent of embedding chunks: no size limits,
 /// continuation chunks, or synthetic headings are introduced into this model.
 fn structure(source: &str, headings: &[Heading]) -> FileStructure {
@@ -225,6 +261,7 @@ fn structure(source: &str, headings: &[Heading]) -> FileStructure {
             source: signature,
             start_byte: byte,
             start_row: heading_row,
+            start_column: heading_column,
             ..
         } = heading;
         while stack
@@ -232,7 +269,12 @@ fn structure(source: &str, headings: &[Heading]) -> FileStructure {
             .is_some_and(|id| result.nodes[*id].heading_level.unwrap() >= *level)
         {
             let id = stack.pop().unwrap();
-            set_heading_end(&mut result.nodes[id], *byte, heading_row + 1, 1);
+            set_heading_end(
+                &mut result.nodes[id],
+                *byte,
+                heading_row + 1,
+                heading_column + 1,
+            );
         }
         let parent_id = stack.last().copied();
         let qualified_name = parent_id.map_or_else(
@@ -251,7 +293,7 @@ fn structure(source: &str, headings: &[Heading]) -> FileStructure {
             signature: signature.clone(),
             start_byte: *byte,
             start_line: heading_row + 1,
-            start_column: 1,
+            start_column: heading_column + 1,
             heading_level: Some(*level),
             ..StructureNode::default()
         });

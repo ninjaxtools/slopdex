@@ -77,8 +77,7 @@ pub(super) fn extract(language: &str, root: Node<'_>, source: &str) -> FileStruc
 }
 
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
+    super::syntax::children(node)
 }
 
 fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
@@ -175,13 +174,8 @@ fn value(node: Node<'_>) -> Option<Node<'_>> {
     Some(unwrap_value(value))
 }
 
-fn unwrap_value(mut value: Node<'_>) -> Node<'_> {
-    while matches!(value.kind(), "parenthesized_expression" | "expression_list")
-        && value.named_child_count() == 1
-    {
-        value = value.named_child(0).unwrap();
-    }
-    value
+fn unwrap_value(value: Node<'_>) -> Node<'_> {
+    super::syntax::unwrap_value(value)
 }
 
 fn function_value(node: Node<'_>) -> bool {
@@ -195,6 +189,42 @@ fn function_value(node: Node<'_>) -> bool {
             | "func_literal"
             | "lambda_expression"
     )
+}
+
+fn js_declaration_value(node: Node<'_>) -> bool {
+    function_value(node)
+        || node.kind() == "class"
+        || node.kind() == "object" && contains_js_declaration(node)
+}
+
+fn contains_js_declaration(node: Node<'_>) -> bool {
+    // Anonymous callbacks that compute property values do not turn a data
+    // object into a declaration. Keep bindings that scope real declarations.
+    matches!(
+        node.kind(),
+        "class"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "enum_declaration"
+            | "internal_module"
+            | "module"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+    ) || matches!(node.kind(), "function_expression" | "generator_function")
+        && node.child_by_field_name("name").is_some()
+        || matches!(
+            node.kind(),
+            "variable_declarator"
+                | "assignment_expression"
+                | "pair"
+                | "public_field_definition"
+                | "property_definition"
+                | "field_definition"
+        ) && value(node).is_some_and(|v| function_value(v) || v.kind() == "class")
+        || children(node).into_iter().any(contains_js_declaration)
 }
 
 struct Collector<'a> {
@@ -246,7 +276,11 @@ impl Collector<'_> {
             qualified_name = format!("{}.{}", text(self.source, receiver), name);
         }
         let attributes = self.attributes(node);
-        let mut range = node;
+        let mut range = if self.language == "bash" {
+            super::syntax::shell_range(node)
+        } else {
+            node
+        };
         if let Some(wrapper) = node.parent()
             && matches!(
                 wrapper.kind(),
@@ -346,13 +380,13 @@ impl Collector<'_> {
 
     fn walk(&mut self, node: Node<'_>, parent: Option<usize>, in_callable: bool) {
         let syntax = node.kind();
-        // These members are already present in the containing type signature.
-        // Treating them as children of the alias loses their branch context.
+        // Inline object members belong to their type expression, not the
+        // nearest named scope. Only direct object aliases expose child symbols.
         if matches!(self.language, "typescript" | "tsx")
             && syntax == "object_type"
             && node
                 .parent()
-                .is_some_and(|p| matches!(p.kind(), "union_type" | "intersection_type"))
+                .is_none_or(|parent| parent.kind() != "type_alias_declaration")
         {
             return;
         }
@@ -376,6 +410,28 @@ impl Collector<'_> {
         if syntax == "export_statement" && node.child_by_field_name("source").is_some() {
             self.import(node, parent);
             return;
+        }
+        if self.language == "bash"
+            && syntax == "redirected_statement"
+            && let Some(body) = node.child_by_field_name("body")
+            && body.kind() == "function_definition"
+        {
+            self.walk(body, parent, in_callable);
+            for sibling in super::syntax::shell_siblings(body) {
+                self.walk(sibling, parent, in_callable);
+            }
+            return;
+        }
+        if self.language == "python"
+            && self.python_assignment_declarations(node, parent, in_callable)
+        {
+            return;
+        }
+        if self.language == "c"
+            && syntax == "function_definition"
+            && let Some(ty) = node.child_by_field_name("type")
+        {
+            self.walk(ty, parent, in_callable);
         }
         if self.language == "go"
             && matches!(
@@ -493,10 +549,12 @@ impl Collector<'_> {
                     | "property_definition"
                     | "field_definition"
             ) {
-                if let Some(value) = value(node)
-                    && (callable(kind) || container(kind) || value.kind() == "object")
-                {
-                    self.walk_bound(value, id, kind);
+                if let Some(value) = value(node) {
+                    if callable(kind) || container(kind) || value.kind() == "object" {
+                        self.walk_bound(value, id, kind, in_callable);
+                    } else {
+                        self.walk(value, parent, in_callable);
+                    }
                 }
                 return;
             }
@@ -511,6 +569,15 @@ impl Collector<'_> {
                 // Names/types/parameter expressions cannot introduce declarations
                 // belonging to this scope; only bodies and declaration lists do.
                 if node.child_by_field_name("name") == Some(child) {
+                    continue;
+                }
+                if self.language == "bash" && child.kind().ends_with("redirect") {
+                    continue;
+                }
+                if self.language == "c"
+                    && syntax == "function_definition"
+                    && node.child_by_field_name("type") == Some(child)
+                {
                     continue;
                 }
                 if self.language == "java"
@@ -541,15 +608,28 @@ impl Collector<'_> {
                 ) {
                     continue;
                 }
-                self.walk(child, Some(id), local);
+                let child_parent = if callable(kind) || container(kind) {
+                    Some(id)
+                } else {
+                    parent
+                };
+                self.walk(child, child_parent, local);
+            }
+            if self.language == "bash" && syntax == "function_definition" {
+                for redirect in super::syntax::shell_redirections(node) {
+                    self.walk(redirect, Some(id), true);
+                }
             }
         } else {
-            if function_value(node)
-                && self.language != "javascript"
-                && self.language != "jsx"
-                && self.language != "typescript"
-                && self.language != "tsx"
-            {
+            if function_value(node) {
+                // Anonymous closures introduce executable scope without a symbol.
+                if matches!(self.language, "javascript" | "jsx" | "typescript" | "tsx") {
+                    for child in children(node) {
+                        self.walk(child, parent, true);
+                    }
+                } else if let Some(body) = node.child_by_field_name("body") {
+                    self.walk(body, parent, true);
+                }
                 return;
             }
             for child in children(node) {
@@ -558,7 +638,7 @@ impl Collector<'_> {
         }
     }
 
-    fn walk_bound(&mut self, value: Node<'_>, id: usize, kind: &str) {
+    fn walk_bound(&mut self, value: Node<'_>, id: usize, kind: &str, in_callable: bool) {
         if callable(kind) {
             if let Some(body) = value.child_by_field_name("body") {
                 self.walk(body, Some(id), true);
@@ -566,7 +646,9 @@ impl Collector<'_> {
         } else {
             for child in children(value) {
                 if value.child_by_field_name("name") != Some(child) {
-                    self.walk(child, Some(id), false);
+                    // Object bindings preserve the surrounding executable scope;
+                    // only actual declaration containers (such as classes) reset it.
+                    self.walk(child, Some(id), in_callable && !container(kind));
                 }
             }
         }
@@ -578,44 +660,108 @@ impl Collector<'_> {
         parent: Option<usize>,
         local: bool,
     ) -> bool {
-        let names = if node.kind() == "var_spec" {
-            self.field_names(node, "name")
+        let targets: Vec<_> = if node.kind() == "var_spec" {
+            let mut cursor = node.walk();
+            node.children_by_field_name("name", &mut cursor).collect()
         } else {
             node.child_by_field_name("left")
-                .map(children)
+                .map(super::syntax::children)
                 .unwrap_or_default()
-                .into_iter()
-                .map(|n| text(self.source, n).to_owned())
-                .collect()
         };
         let values = node
             .child_by_field_name("value")
             .or_else(|| node.child_by_field_name("right"))
-            .map(children)
+            .map(super::syntax::children)
             .unwrap_or_default();
-        if names.len() != values.len()
+        if targets.len() != values.len()
             || !values
                 .iter()
-                .any(|n| unwrap_value(*n).kind() == "func_literal")
+                .any(|n| super::syntax::unwrap_value(*n).kind() == "func_literal")
         {
             return false;
         }
-        for (name, value) in names.into_iter().zip(values) {
-            let value = unwrap_value(value);
-            if value.kind() == "func_literal" {
+        for (target, value) in targets.into_iter().zip(values) {
+            let value = super::syntax::unwrap_value(value);
+            if value.kind() == "func_literal"
+                && let Some(target) = go_callable_target(self.source, target)
+            {
+                let name = text(self.source, target).to_owned();
                 let signature = format!("{name} = {}", self.signature(value, "function"));
                 let id = self.push(value, parent, "function", vec![name], signature);
-                self.walk_bound(value, id, "function");
-            } else if !local {
-                let ty = self.field(node, "type").unwrap_or_default();
+                self.walk_bound(value, id, "function", local);
+            } else {
+                if !local
+                    && node.kind() == "var_spec"
+                    && target.kind() == "identifier"
+                    && text(self.source, target) != "_"
+                {
+                    let name = text(self.source, target).to_owned();
+                    let ty = self.field(node, "type").unwrap_or_default();
+                    self.push(
+                        node,
+                        parent,
+                        "variable",
+                        vec![name.clone()],
+                        format!("var {name} {ty}").trim_end().to_owned(),
+                    );
+                }
+                self.walk(value, parent, local);
+            }
+        }
+        true
+    }
+
+    fn python_assignment_declarations(
+        &mut self,
+        node: Node<'_>,
+        parent: Option<usize>,
+        local: bool,
+    ) -> bool {
+        if node.kind() != "assignment"
+            || node
+                .child_by_field_name("right")
+                .is_none_or(|right| right.kind() != "assignment")
+        {
+            return false;
+        }
+        let mut assignments = Vec::new();
+        let mut assignment = node;
+        let initializer = loop {
+            assignments.push(assignment);
+            let Some(right) = assignment.child_by_field_name("right") else {
+                return false;
+            };
+            let right = super::syntax::unwrap_value(right);
+            if right.kind() != "assignment" {
+                break right;
+            }
+            assignment = right;
+        };
+        let mut bound = false;
+        for assignment in assignments {
+            let Some(target) = assignment.child_by_field_name("left") else {
+                continue;
+            };
+            if initializer.kind() == "lambda" && matches!(target.kind(), "identifier" | "attribute")
+            {
+                let name = text(self.source, target).to_owned();
+                let signature = format!("{name} = {}", self.signature(initializer, "function"));
+                let id = self.push(assignment, parent, "function", vec![name], signature);
+                self.walk_bound(initializer, id, "function", local);
+                bound = true;
+            } else if let Some((kind, names)) = self.classify(assignment, parent, local) {
                 self.push(
-                    node,
+                    assignment,
                     parent,
-                    "variable",
-                    vec![name.clone()],
-                    format!("var {name} {ty}").trim_end().to_owned(),
+                    kind,
+                    names,
+                    self.signature(assignment, kind),
                 );
             }
+            self.walk(target, parent, local);
+        }
+        if !bound {
+            self.walk(initializer, parent, local);
         }
         true
     }
@@ -638,7 +784,10 @@ impl Collector<'_> {
             .field(node, "name")
             .or_else(|| self.field(node, "property"));
         if matches!(self.language, "javascript" | "jsx" | "typescript" | "tsx") {
-            name = name.map(|n| n.trim_start_matches('#').to_owned());
+            name = node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("property"))
+                .map(|key| compact(&super::syntax::js_key(self.source, key), self.language));
         }
         let member = parent.is_some_and(|p| {
             matches!(
@@ -679,16 +828,13 @@ impl Collector<'_> {
                 | "field_definition"
                 | "property_signature" => "field",
                 "variable_declarator"
-                    if !local
-                        || value(node).is_some_and(|v| {
-                            function_value(v) || matches!(v.kind(), "object" | "class")
-                        }) =>
+                    if !local || value(node).is_some_and(js_declaration_value) =>
                 {
                     "variable"
                 }
                 "assignment_expression"
                     if value(node).is_some_and(|v| {
-                        function_value(v) || matches!(v.kind(), "object" | "class")
+                        js_declaration_value(v) || !local && v.kind() == "object"
                     }) =>
                 {
                     let left = node.child_by_field_name("left")?;
@@ -702,13 +848,12 @@ impl Collector<'_> {
                     "variable"
                 }
                 "pair"
-                    if parent.is_some()
-                        && (!local
-                            || value(node).is_some_and(|v| {
-                                function_value(v) || matches!(v.kind(), "object" | "class")
-                            })) =>
+                    if !local && parent.is_some()
+                        || value(node).is_some_and(js_declaration_value) =>
                 {
-                    name = self.field(node, "key").map(|s| unquote(&s));
+                    name = node.child_by_field_name("key").map(|key| {
+                        compact(&super::syntax::js_key(self.source, key), self.language)
+                    });
                     "field"
                 }
                 "shorthand_property_identifier" if !local && parent.is_some() => {
@@ -757,7 +902,10 @@ impl Collector<'_> {
                 "field_declaration" => "field",
                 "macro_definition" => "macro",
                 "let_declaration" if value(node).is_some_and(function_value) => {
-                    name = self.field(node, "pattern");
+                    name = node
+                        .child_by_field_name("pattern")
+                        .and_then(super::syntax::rust_binding)
+                        .map(|binding| text(self.source, binding).to_owned());
                     "function"
                 }
                 _ => return None,
@@ -772,12 +920,26 @@ impl Collector<'_> {
                 }
                 "class_definition" => "class",
                 "assignment" if !local || value(node).is_some_and(function_value) => {
-                    name = self.field(node, "left");
+                    let target = node.child_by_field_name("left")?;
+                    let bound = value(node).is_some_and(function_value);
+                    let declaration_target = match target.kind() {
+                        "identifier" => true,
+                        "attribute" => bound,
+                        "pattern_list" | "tuple_pattern" | "list_pattern" => !bound,
+                        _ => false,
+                    };
+                    if !declaration_target {
+                        return None;
+                    }
+                    name = Some(compact(text(self.source, target), self.language));
                     if member { "field" } else { "variable" }
                 }
                 "named_expression" if value(node).is_some_and(function_value) => "function",
                 "type_alias_statement" => {
-                    name = self.field(node, "left");
+                    name = node
+                        .child_by_field_name("left")
+                        .and_then(python_type_identifier)
+                        .map(|binding| text(self.source, binding).to_owned());
                     "type"
                 }
                 _ => return None,
@@ -796,10 +958,30 @@ impl Collector<'_> {
                         _ => "type",
                     }
                 }
-                "const_spec" if !local => "constant",
-                "var_spec" if !local || value(node).is_some_and(function_value) => "variable",
+                "const_spec" | "var_spec" if syntax == "const_spec" || !local => {
+                    let names: Vec<_> = self
+                        .field_names(node, "name")
+                        .into_iter()
+                        .filter(|name| name != "_")
+                        .collect();
+                    return (!names.is_empty()).then_some((
+                        if syntax == "const_spec" {
+                            "constant"
+                        } else {
+                            "variable"
+                        },
+                        names,
+                    ));
+                }
                 "short_var_declaration" if value(node).is_some_and(function_value) => {
-                    name = self.field(node, "left");
+                    name = node
+                        .child_by_field_name("left")
+                        .and_then(|left| {
+                            let targets = super::syntax::children(left);
+                            (targets.len() == 1).then(|| targets[0])
+                        })
+                        .and_then(|target| go_callable_target(self.source, target))
+                        .map(|binding| text(self.source, binding).to_owned());
                     "function"
                 }
                 "package_clause" => {
@@ -832,15 +1014,33 @@ impl Collector<'_> {
                         .and_then(|n| declarator_name(self.source, n));
                     "function"
                 }
-                "struct_specifier" => "struct",
-                "union_specifier" => "union",
-                "enum_specifier" => "enum",
+                "struct_specifier" | "union_specifier" | "enum_specifier"
+                    if node.child_by_field_name("body").is_some()
+                        || node.parent().is_some_and(|declaration| {
+                            matches!(
+                                declaration.kind(),
+                                "translation_unit" | "compound_statement"
+                            ) || declaration.kind() == "declaration"
+                                && !children(declaration)
+                                    .iter()
+                                    .any(|child| child.kind().ends_with("declarator"))
+                        }) =>
+                {
+                    match syntax {
+                        "struct_specifier" => "struct",
+                        "union_specifier" => "union",
+                        _ => "enum",
+                    }
+                }
                 "enumerator" => "variant",
                 "preproc_def" | "preproc_function_def" => "macro",
                 _ => return None,
             },
             "bash" => match syntax {
-                "function_definition" => "function",
+                "function_definition" => {
+                    name = super::shell::function_name(self.source, node);
+                    "function"
+                }
                 _ => return None,
             },
             _ => return None,
@@ -888,6 +1088,10 @@ impl Collector<'_> {
                 }
             }
             if kind == "variable"
+                && matches!(
+                    self.language,
+                    "javascript" | "jsx" | "typescript" | "tsx" | "python"
+                )
                 && (syntax == "variable_declarator"
                     && node
                         .parent()
@@ -916,7 +1120,14 @@ impl Collector<'_> {
         {
             kind = "constructor";
         }
-        if kind == "method" && name.as_deref() == Some("constructor") {
+        if kind == "method"
+            && name.as_deref() == Some("constructor")
+            && matches!(self.language, "javascript" | "jsx" | "typescript" | "tsx")
+            && syntax == "method_definition"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "class_body")
+        {
             kind = "constructor";
         }
         let mut names = if matches!(syntax, "const_spec" | "var_spec") {
@@ -960,6 +1171,9 @@ impl Collector<'_> {
     }
 
     fn signature(&self, node: Node<'_>, kind: &str) -> String {
+        if self.language == "bash" && node.kind() == "function_definition" {
+            return super::shell::function_signature(self.source, node);
+        }
         let mut edits = Vec::new();
         self.signature_edits(node, node, kind, &mut edits);
         edits.sort_unstable();
@@ -1207,6 +1421,12 @@ impl Collector<'_> {
                 "variable"
             };
             if local && kind == "variable" {
+                if let Some(value) = value(*declaration) {
+                    self.walk(value, parent, true);
+                }
+                if anonymous_binding && let Some(ty) = node.child_by_field_name("type") {
+                    self.c_nested_types(ty, parent, local);
+                }
                 continue;
             }
             let prefix_end = declarations
@@ -1230,17 +1450,26 @@ impl Collector<'_> {
                 .trim()
                 .to_owned();
             let id = self.push(
-                node,
+                if bound_function { *declaration } else { node },
                 parent,
                 kind,
                 vec![name],
                 compact(&signature, self.language),
             );
-            if let Some(value) = value(*declaration).filter(|_| self.language == "java") {
+            if let Some(value) = value(*declaration) {
                 if bound_function {
-                    self.walk_bound(value, id, kind);
+                    self.walk_bound(value, id, kind, local);
                 } else {
                     self.walk(value, parent, local);
+                }
+            }
+            if self.language == "c" {
+                for child in children(*declaration) {
+                    if child.kind() == "parameter_list" {
+                        self.walk(child, Some(id), true);
+                    } else if child.kind().ends_with("declarator") {
+                        self.c_parameters(child, Some(id));
+                    }
                 }
             }
             if anonymous_binding
@@ -1251,6 +1480,31 @@ impl Collector<'_> {
                 for child in children(body) {
                     self.walk(child, Some(id), false);
                 }
+            }
+        }
+    }
+
+    fn c_parameters(&mut self, node: Node<'_>, parent: Option<usize>) {
+        for child in children(node) {
+            if child.kind() == "parameter_list" {
+                self.walk(child, parent, true);
+            } else if child.kind().ends_with("declarator") {
+                self.c_parameters(child, parent);
+            }
+        }
+    }
+
+    fn c_nested_types(&mut self, node: Node<'_>, parent: Option<usize>, local: bool) {
+        if matches!(
+            node.kind(),
+            "struct_specifier" | "union_specifier" | "enum_specifier"
+        ) && node.child_by_field_name("name").is_some()
+            && node.child_by_field_name("body").is_some()
+        {
+            self.walk(node, parent, local);
+        } else {
+            for child in children(node) {
+                self.c_nested_types(child, parent, local);
             }
         }
     }
@@ -1313,13 +1567,27 @@ fn declarator_name(source: &str, node: Node<'_>) -> Option<String> {
     if let Some(name) = node.child_by_field_name("name") {
         return Some(text(source, name).to_owned());
     }
-    if let Some(inner) = node.child_by_field_name("declarator") {
+    if let Some(inner) = super::syntax::declarator_inner(node) {
         return declarator_name(source, inner);
     }
-    if node.kind() == "parenthesized_declarator" {
-        return node.named_child(0).and_then(|n| declarator_name(source, n));
-    }
     None
+}
+
+pub(super) fn go_callable_target<'tree>(source: &str, node: Node<'tree>) -> Option<Node<'tree>> {
+    (matches!(node.kind(), "identifier" | "selector_expression") && text(source, node) != "_")
+        .then_some(node)
+}
+
+fn python_type_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "type" | "generic_type" => {
+                node = super::syntax::children(node).into_iter().next()?;
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn binding_names(source: &str, node: Node<'_>, names: &mut Vec<String>) {
@@ -1337,6 +1605,7 @@ fn binding_names(source: &str, node: Node<'_>, names: &mut Vec<String>) {
                 binding_names(source, left, names);
             }
         }
+        "attribute" | "subscript" => {}
         _ => {
             for child in children(node) {
                 binding_names(source, child, names);
@@ -1355,11 +1624,7 @@ fn function_declarator(mut node: Node<'_>) -> bool {
             "pointer_declarator" | "array_declarator" => function = false,
             _ => {}
         }
-        let next = node.child_by_field_name("declarator").or_else(|| {
-            (node.kind() == "parenthesized_declarator")
-                .then(|| node.named_child(0))
-                .flatten()
-        });
+        let next = super::syntax::declarator_inner(node);
         let Some(next) = next else {
             return function;
         };

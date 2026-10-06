@@ -25,6 +25,9 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
     let mut tree = parser
         .parse(source, None)
         .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
+    if language == "bash" {
+        tree = super::shell::recover(&mut parser, tree, source);
+    }
     if tree.root_node().has_error()
         && matches!(language, "typescript" | "tsx")
         && let Some(recovered) = recover_typescript(&mut parser, &tree, source)
@@ -50,7 +53,7 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
     };
     collect_calls(tree.root_node(), source, language, &mut result.structure);
     for candidate in collector.candidates {
-        if candidate.node.has_error() {
+        if super::shell::callable_has_error(candidate.node) {
             continue;
         }
         let qualified_name = qualified(&candidate.scope, &candidate.name);
@@ -115,6 +118,12 @@ fn collect_calls(
         if identifier(name)
             && receiver.is_none_or(|r| identifier(r) || r.split("::").all(identifier))
         {
+            let shell_owner = if language == "bash" {
+                super::syntax::shell_owner(node)
+                    .map(|owner| super::syntax::shell_range(owner).start_byte())
+            } else {
+                None
+            };
             let owner = structure
                 .nodes
                 .iter_mut()
@@ -124,6 +133,7 @@ fn collect_calls(
                         "function" | "method" | "constructor" | "generator"
                     ) && n.start_byte <= node.start_byte()
                         && node.end_byte() <= n.end_byte
+                        && (language != "bash" || shell_owner == Some(n.start_byte))
                 })
                 .min_by_key(|n| n.end_byte - n.start_byte);
             if let Some(owner) = owner {
@@ -152,8 +162,7 @@ fn field<'a>(source: &'a str, node: Node<'_>, name: &str) -> Option<&'a str> {
 }
 
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
+    super::syntax::children(node)
 }
 
 fn scoped(scope: &[String], name: &str) -> Vec<String> {
@@ -182,7 +191,12 @@ struct Collector<'source, 'tree> {
 }
 
 fn js_kind(node: Node<'_>, name: &str) -> &'static str {
-    if node.kind() == "method_definition" && name == "constructor" {
+    if node.kind() == "method_definition"
+        && name == "constructor"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "class_body")
+    {
         "constructor"
     } else if node.kind().contains("generator") || has_token(node, "*") {
         "generator"
@@ -200,7 +214,9 @@ fn has_token(node: Node<'_>, token: &str) -> bool {
 }
 
 fn binding_name(source: &str, node: Node<'_>) -> Option<String> {
-    let name = node.child_by_field_name("name")?;
+    let name = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("property"))?;
     matches!(
         name.kind(),
         "identifier" | "property_identifier" | "private_property_identifier"
@@ -219,31 +235,36 @@ fn assignment_name(source: &str, node: Node<'_>) -> Option<String> {
     }
 }
 
-fn key_name(name: &str) -> String {
-    name.replace(['\'', '"'], "")
-}
-
 fn object_scope(source: &str, node: Node<'_>) -> Option<String> {
-    let parent = node.parent()?;
+    let mut wrapped = node;
+    while let Some(parent) = wrapped.parent()
+        && parent.kind() == "parenthesized_expression"
+        && unwrap(parent) == node
+    {
+        wrapped = parent;
+    }
+    let parent = wrapped.parent()?;
     match parent.kind() {
-        "variable_declarator" if parent.child_by_field_name("value") == Some(node) => {
+        "variable_declarator" if parent.child_by_field_name("value") == Some(wrapped) => {
             binding_name(source, parent)
         }
-        "pair" if parent.child_by_field_name("value") == Some(node) => {
-            field(source, parent, "key").map(key_name)
-        }
-        "assignment_expression" if parent.child_by_field_name("right") == Some(node) => {
+        "pair" if parent.child_by_field_name("value") == Some(wrapped) => parent
+            .child_by_field_name("key")
+            .map(|key| super::syntax::js_key(source, key)),
+        "assignment_expression" if parent.child_by_field_name("right") == Some(wrapped) => {
             assignment_name(source, parent)
+        }
+        "public_field_definition" | "property_definition" | "field_definition"
+            if parent.child_by_field_name("value") == Some(wrapped) =>
+        {
+            binding_name(source, parent)
         }
         _ => None,
     }
 }
 
-fn unwrap(mut node: Node<'_>) -> Node<'_> {
-    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
-        node = node.named_child(0).unwrap();
-    }
-    node
+fn unwrap(node: Node<'_>) -> Node<'_> {
+    super::syntax::unwrap_value(node)
 }
 
 impl<'tree> Collector<'_, 'tree> {
@@ -276,7 +297,9 @@ impl<'tree> Collector<'_, 'tree> {
             | "module" => {
                 let name = match node.kind() {
                     "object" => object_scope(source, node),
-                    "internal_module" | "module" => field(source, node, "name").map(key_name),
+                    "internal_module" | "module" => node
+                        .child_by_field_name("name")
+                        .map(|name| super::syntax::js_key(source, name)),
                     _ => field(source, node, "name")
                         .map(str::to_owned)
                         .or_else(|| object_scope(source, node)),
@@ -290,9 +313,9 @@ impl<'tree> Collector<'_, 'tree> {
                 return;
             }
             "function_declaration" | "generator_function_declaration" | "method_definition" => {
-                if let Some(name) = field(source, node, "name") {
-                    let name = name.trim_start_matches('#');
-                    self.add_js(node, name.to_owned(), js_kind(node, name), scope);
+                if let Some(name) = node.child_by_field_name("name") {
+                    let name = super::syntax::js_key(source, name);
+                    self.add_js(node, name.clone(), js_kind(node, &name), scope);
                 }
                 return;
             }
@@ -312,7 +335,8 @@ impl<'tree> Collector<'_, 'tree> {
                 false,
             ),
             "pair" => (
-                field(source, node, "key").map(key_name),
+                node.child_by_field_name("key")
+                    .map(|key| super::syntax::js_key(source, key)),
                 node.child_by_field_name("value"),
                 false,
             ),
@@ -370,6 +394,8 @@ impl<'tree> Collector<'_, 'tree> {
             node.parent()
                 .filter(|p| p.kind() == "decorated_definition")
                 .unwrap_or(node)
+        } else if self.language == "bash" {
+            super::syntax::shell_range(node)
         } else {
             node
         };
@@ -389,7 +415,9 @@ impl<'tree> Collector<'_, 'tree> {
             name: name.to_owned(),
             kind,
             scope: scope.to_vec(),
-            signature: Some(if bound {
+            signature: Some(if self.language == "bash" {
+                super::shell::function_signature(self.source, node)
+            } else if bound {
                 format!("{name} = {header}")
             } else {
                 header.to_owned()
@@ -398,6 +426,11 @@ impl<'tree> Collector<'_, 'tree> {
         });
         if let Some(body) = body {
             self.walk_native(body, &scoped(scope, name));
+        }
+        if self.language == "bash" {
+            for redirect in super::syntax::shell_redirections(node) {
+                self.walk_native(redirect, &scoped(scope, name));
+            }
         }
         true
     }
@@ -411,13 +444,19 @@ impl<'tree> Collector<'_, 'tree> {
         let (Some(value), Some(name)) = (value, name) else {
             return false;
         };
-        let value = unwrap(value);
-        if !matches!(
-            name.kind(),
-            "identifier" | "attribute" | "selector_expression"
-        ) {
+        let value = super::syntax::unwrap_value(value);
+        let name = match self.language {
+            "rust" => super::syntax::rust_binding(name),
+            "go" => super::structure::go_callable_target(self.source, name),
+            _ => matches!(
+                name.kind(),
+                "identifier" | "attribute" | "selector_expression"
+            )
+            .then_some(name),
+        };
+        let Some(name) = name else {
             return false;
-        }
+        };
         let closure = match self.language {
             "python" => "lambda",
             "rust" => "closure_expression",
@@ -431,6 +470,17 @@ impl<'tree> Collector<'_, 'tree> {
 
     fn walk_native(&mut self, node: Node<'tree>, scope: &[String]) {
         let source = self.source;
+        if self.language == "bash"
+            && node.kind() == "redirected_statement"
+            && let Some(body) = node.child_by_field_name("body")
+            && body.kind() == "function_definition"
+        {
+            self.walk_native(body, scope);
+            for sibling in super::syntax::shell_siblings(body) {
+                self.walk_native(sibling, scope);
+            }
+            return;
+        }
         match (self.language, node.kind()) {
             ("python", "class_definition") => {
                 if let Some(body) = node.child_by_field_name("body") {
@@ -461,6 +511,36 @@ impl<'tree> Collector<'_, 'tree> {
                         "function"
                     };
                     self.add_native(node, name, kind, scope, false);
+                }
+                return;
+            }
+            ("python", "assignment")
+                if node
+                    .child_by_field_name("right")
+                    .is_some_and(|right| right.kind() == "assignment") =>
+            {
+                let mut targets = Vec::new();
+                let mut assignment = node;
+                let initializer = loop {
+                    if let Some(target) = assignment.child_by_field_name("left") {
+                        targets.push(target);
+                    }
+                    let Some(right) = assignment.child_by_field_name("right") else {
+                        return;
+                    };
+                    let right = super::syntax::unwrap_value(right);
+                    if right.kind() != "assignment" {
+                        break right;
+                    }
+                    assignment = right;
+                };
+                let mut bound = false;
+                for target in targets {
+                    bound |= self.add_bound(Some(initializer), Some(target), scope);
+                    self.walk_native(target, scope);
+                }
+                if !bound {
+                    self.walk_native(initializer, scope);
                 }
                 return;
             }
@@ -543,13 +623,13 @@ impl<'tree> Collector<'_, 'tree> {
                     node.children_by_field_name("name", &mut cursor).collect()
                 } else {
                     node.child_by_field_name("left")
-                        .map(children)
+                        .map(super::syntax::children)
                         .unwrap_or_default()
                 };
                 let values = node
                     .child_by_field_name("right")
                     .or_else(|| node.child_by_field_name("value"))
-                    .map(children)
+                    .map(super::syntax::children)
                     .unwrap_or_default();
                 if names.len() == values.len() {
                     for (name, value) in names.into_iter().zip(values) {
@@ -632,8 +712,8 @@ impl<'tree> Collector<'_, 'tree> {
                 return;
             }
             ("bash", "function_definition") => {
-                if let Some(name) = field(source, node, "name") {
-                    self.add_native(node, name, "function", scope, false);
+                if let Some(name) = super::shell::function_name(source, node) {
+                    self.add_native(node, &name, "function", scope, false);
                 }
                 return;
             }
@@ -643,6 +723,9 @@ impl<'tree> Collector<'_, 'tree> {
             node.kind(),
             "lambda" | "closure_expression" | "func_literal" | "lambda_expression"
         ) {
+            if let Some(body) = node.child_by_field_name("body") {
+                self.walk_native(body, scope);
+            }
             return;
         }
         for child in children(node) {
@@ -702,11 +785,7 @@ fn c_function_name<'a>(source: &'a str, mut node: Node<'_>) -> Option<&'a str> {
             return Some(text(source, node));
         }
         // Only follow the declarator spine, never a parameter's identifier.
-        node = node.child_by_field_name("declarator").or_else(|| {
-            (node.kind() == "parenthesized_declarator")
-                .then(|| node.named_child(0))
-                .flatten()
-        })?;
+        node = super::syntax::declarator_inner(node)?;
     }
 }
 
@@ -785,7 +864,10 @@ fn diagnostics(root: Node<'_>, source: &str, candidates: &[Candidate<'_>]) -> Ve
     }
     let mut errors = Vec::new();
     let mut broken = HashSet::new();
-    for candidate in candidates.iter().filter(|c| c.node.has_error()) {
+    for candidate in candidates
+        .iter()
+        .filter(|c| super::shell::callable_has_error(c.node))
+    {
         errors.push(diagnostic(
             candidate.node,
             format!(

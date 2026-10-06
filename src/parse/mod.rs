@@ -8,7 +8,9 @@ mod code;
 mod data;
 mod imports;
 mod markdown;
+mod shell;
 mod structure;
+mod syntax;
 
 pub use structure::{CallSite, FileStructure, ImportBinding, StructureNode};
 
