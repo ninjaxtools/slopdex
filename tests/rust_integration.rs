@@ -5173,11 +5173,16 @@ fn symbol_map_normalizes_bare_names_and_indexes_noncallables_without_content() -
             .is_empty(),
         "body-only terms must not select declarations or headings"
     );
-    assert!(
-        engine
-            .map(&json!({"symbolQuery":"VECTOR_NORTH", "regexp":"ordinary", "ignoreCase":true}))?
-            .is_empty(),
-        "qualified parents must not make bare child names eligible"
+    let mut union_expected = map_names(&selected);
+    union_expected.extend(strings(&["Ordinary", "ordinaryMember"]));
+    assert_eq!(
+        map_names(
+            &engine.map(
+                &json!({"symbolQuery":"VECTOR_NORTH", "regexp":"ordinary", "ignoreCase":true})
+            )?
+        ),
+        union_expected,
+        "regex-only children join semantic matches without inheriting parent semantics"
     );
 
     let inputs = mock.embedding_inputs();
@@ -5287,8 +5292,8 @@ fn symbol_map_saved_import_aliases_share_the_normalized_vocabulary() -> Result<(
 }
 
 #[test]
-fn symbol_map_cli_repeated_queries_or_then_intersect_regex_globs_kinds_and_visibility() -> Result<()>
-{
+fn symbol_map_cli_unions_queries_and_regexes_with_glob_kind_and_visibility_restrictions()
+-> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let config = mock.config();
@@ -5307,7 +5312,7 @@ fn symbol_map_cli_repeated_queries_or_then_intersect_regex_globs_kinds_and_visib
         "--symbol-query",
         "VECTOR_WEST",
         "-e",
-        "^API\\.VECTOR(NORTH|WEST|MID)(SECRET)?$",
+        "^API\\.VECTORMID$",
         "-e",
         "^absent$",
         "-i",
@@ -5324,7 +5329,7 @@ fn symbol_map_cli_repeated_queries_or_then_intersect_regex_globs_kinds_and_visib
     assert_eq!(
         map_names(selected.as_array().unwrap()),
         strings(&["Api", "VectorNorth", "VectorWest", "VectorMid"]),
-        "default .5 admits north/mid cosine .6, and repeated queries admit west"
+        "regex admits mid, and repeated semantic queries admit north/west"
     );
     let calls = mock.count();
     assert_eq!(repo.cli_json(&selector)?, selected);
@@ -5337,12 +5342,19 @@ fn symbol_map_cli_repeated_queries_or_then_intersect_regex_globs_kinds_and_visib
     strict.extend(["--symbol-threshold", "0.7"]);
     assert_eq!(
         map_names(repo.cli_json(&strict)?.as_array().unwrap()),
-        strings(&["Api", "VectorNorth", "VectorWest"])
+        strings(&["Api", "VectorNorth", "VectorWest", "VectorMid"]),
+        "raising the semantic threshold must not remove the regex-only match"
     );
     strict.push("--private");
     assert_eq!(
         map_names(repo.cli_json(&strict)?.as_array().unwrap()),
-        strings(&["Api", "VectorNorth", "VectorWest", "VectorNorthSecret"])
+        strings(&[
+            "Api",
+            "VectorNorth",
+            "VectorWest",
+            "VectorMid",
+            "VectorNorthSecret"
+        ])
     );
     assert_eq!(
         mock.count(),
@@ -5510,10 +5522,52 @@ fn symbol_search_filters_before_content_limits_with_independent_thresholds_and_u
     let mixed = engine.search("east", "search", &json!({"code":true, "md":true, "symbolQuery":["VECTOR_NORTH", "VECTOR_WEST"], "symbolThreshold":0.7, "minSimilarity":-1, "limit":1}))?;
     assert_eq!(names(&mixed), strings(&["VectorWest"]));
     near(&mixed[0]["similarity"], 1.0);
-    let composition = json!({"symbolQuery":["VECTOR_NORTH", "VECTOR_WEST"], "symbolThreshold":0.7, "regexp":["^vectOrnorth$", "^absent$"], "ignoreCase":true, "glob":"selected.rs", "minSimilarity":-1, "limit":1});
+    let composition = json!({"symbolQuery":["VECTOR_NORTH", "VECTOR_WEST"], "symbolThreshold":0.7, "regexp":["^vectOrmid$", "^absent$"], "ignoreCase":true, "glob":"selected.rs", "minSimilarity":-1, "limit":1});
     let composed = engine.search("east", "search-code", &composition)?;
-    assert_eq!(names(&composed), strings(&["VectorNorth"]));
-    near(&composed[0]["similarity"], 0.0);
+    assert_eq!(names(&composed), strings(&["VectorWest"]));
+    near(&composed[0]["similarity"], 1.0);
+    let mut unlimited = composition.clone();
+    unlimited.as_object_mut().unwrap().remove("limit");
+    assert_eq!(
+        names(&engine.search("east", "search-code", &unlimited)?),
+        strings(&["VectorNorth", "VectorMid", "VectorWest"]),
+        "regex-only and semantic-only matches are both eligible before limiting"
+    );
+    let markdown = engine.search(
+        "east",
+        "search-md",
+        &json!({
+            "symbolQuery":"VECTOR_NORTH", "symbolThreshold":0.7,
+            "regexp":"^Guide\\.Ordinary$", "glob":"guide.md", "minSimilarity":-1
+        }),
+    )?;
+    assert_eq!(
+        markdown
+            .iter()
+            .map(|row| row["chunk"]["headingPath"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned())
+            .collect::<BTreeSet<_>>(),
+        strings(&["Vector North", "Ordinary"])
+    );
+    let mut cross_options = unlimited.clone();
+    cross_options["minLines"] = json!(0);
+    cross_options["crossFileOnly"] = json!(true);
+    cross_options["matches"] = json!(1);
+    assert_eq!(
+        engine
+            .cross_search(None, &cross_options)?
+            .iter()
+            .map(|row| row["source"]["name"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>(),
+        strings(&["VectorNorth", "VectorMid", "VectorWest"]),
+        "cross-search restricts the union to source globs, not target neighbors"
+    );
     let calls = mock.count();
     assert_eq!(
         engine.search("east", "search-code", &composition)?,
@@ -5537,7 +5591,7 @@ fn symbol_search_filters_before_content_limits_with_independent_thresholds_and_u
             "--symbol-threshold",
             "0.7",
             "-e",
-            "^vectOrnorth$",
+            "^vectOrmid$",
             "-e",
             "^absent$",
             "-i",
@@ -5833,6 +5887,26 @@ fn search_symbols_cli_command_selector_parity_and_normalized_q_regex_composition
             .any(|row| row["symbol"]["kind"] == "import")
     );
     let calls = mock.count();
+    let union_args = [
+        vec!["--no-reindex", "search-symbols", "HTTP2VectorNorth"],
+        vec![
+            "-q",
+            "http_2_vector_north",
+            "--symbol-threshold",
+            "0.7",
+            "-e",
+            "^VectorWest$",
+            "-g",
+            "src/**",
+            "--threshold",
+            "-1",
+        ],
+    ]
+    .concat();
+    assert_eq!(
+        symbol_names(repo.cli_json(&union_args)?.as_array().unwrap()),
+        strings(&["HTTP2VectorNorth", "./dependency.original", "VectorWest"])
+    );
     let selector_args = [
         vec!["--no-reindex", "search", "http 2 vector north", "--symbols"],
         filters.to_vec(),

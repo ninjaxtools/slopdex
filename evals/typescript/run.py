@@ -42,7 +42,7 @@ files, fetch external material, or delegate. Return the requested JSON answer.
 """
 ARM_INSTRUCTIONS = {
     "off": "\nUse conventional local code navigation: glob, grep/rg, and targeted reads.\nSlopdex is unavailable in this trial; do not invoke it.\n",
-    "map": "\nUse `slopdex map` successfully; other slopdex navigation is blocked.\nCheckout and symbol vectors are ready: skip setup/help; never override root/index/config.\nDiscover with --ignore-errors -g '*.go' -g '!**/*_test.go'; then read source.\n",
+    "map": "\nRequired: one successful `slopdex map` before grep/read; other slopdex navigation is blocked.\nCheckout and symbol vectors are ready; never override root/index/config.\nFor Go discovery add --ignore-errors -g '*.go' -g '!**/*_test.go'.\n",
     "search": "\nOnly `slopdex search` is available for slopdex navigation in this trial.\nUse it successfully at least once; other slopdex navigation commands are blocked.\nRead the relevant source lines to verify your findings.\nThe semantic index is prebuilt; do not rebuild it.\nConventional local tools remain available for finding paths and verifying source.\n",
     "map-search": "\nOnly `slopdex map` and `slopdex search` are available for slopdex navigation in this trial.\nUse both successfully at least once; other slopdex navigation commands are blocked.\nInclude --private when mapping Go internals so unexported symbols are visible.\nRead the relevant source lines to verify your findings.\nThe semantic and structural index is prebuilt; do not rebuild it.\nConventional local tools remain available for finding paths and verifying source.\n",
     "slopdex": "\nUse slopdex for code navigation:\n- `slopdex search \"describe the implementation you need\" --threshold 0.3 --limit 50`\n- `slopdex map --private -g \"*.go\" -e \"symbol regex\" tsc/internal`\nInclude --private when mapping Go internals so unexported symbols are visible.\nMap's -e matches symbol names and qualified names, not declaration text or function bodies.\nNarrow paths and symbol filters before reading the returned implementation line ranges.\nLimit search candidates before rendering; avoid head as a result selector.\nThen read the relevant source lines to verify your findings. Vary queries if needed.\nThe index is prebuilt; do not rebuild it. Conventional local tools are also available.\n",
@@ -529,7 +529,7 @@ def verify_native_ann_reuse(binary: str, workspace: Path, config_path: Path, ind
         # that only updates manifest generation/fingerprint, not the binary.
         argv = [binary, "--root", str(workspace), "--config", str(offline_config), "--index", str(index),
                 "--force-reindex", "--yes-really-rebuild-the-index", "--ignore-errors", "--format", "json", "map", "--private", "-k", "fns",
-                "-q", "slopdex eval warmup", "--symbol-threshold", "0", "-e", "a^"]
+                "-q", "slopdex eval warmup", "--symbol-threshold", "0", "-g", "*", "-g", "!*"]
         symbol_query = {"command": "map -q", "provider_credentials_removed": True,
                         "selector_cache_cleared": True, "embedding_count": embedding_count}
     code, expired, elapsed = logged_process(argv, workspace, env, logs, timeout)

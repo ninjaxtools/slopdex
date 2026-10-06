@@ -110,10 +110,27 @@ impl Selection {
             .is_none_or(|names| names.contains(&symbols::normalize(name)))
     }
 
+    /// Match either active name-selector family; omitted families add no matches.
+    pub(crate) fn names_match(&self, qualified_name: &str, bare_name: &str) -> bool {
+        self.combine_name_matches(
+            self.name_matches(qualified_name),
+            self.semantic_name_matches(bare_name),
+        )
+    }
+
+    fn combine_name_matches(&self, regex_matches: bool, semantic_matches: bool) -> bool {
+        match (&self.names, &self.semantic_names) {
+            (None, None) => true,
+            (Some(_), None) => regex_matches,
+            (None, Some(_)) => semantic_matches,
+            (Some(_), Some(_)) => regex_matches || semantic_matches,
+        }
+    }
+
     /// Declaration names use the same qualified-name contract as search. Imports
     /// additionally expose their source paths and aliases; multi-binding names
     /// are qualified in the declaration's enclosing scope. Semantic selection
-    /// independently matches bare names/aliases, then intersects the regex family.
+    /// independently matches bare names/aliases, then unions with the regex family.
     pub fn symbol_matches(&self, node: &StructureNode) -> bool {
         let prefix = if node.kind == "import" {
             ""
@@ -130,7 +147,7 @@ impl Selection {
                 .names
                 .iter()
                 .any(|name| self.semantic_name_matches(name));
-        regex_matches && semantic_matches
+        self.combine_name_matches(regex_matches, semantic_matches)
     }
 
     pub fn kind_matches(&self, kind: &str) -> bool {
@@ -517,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn regex_and_semantic_families_match_independently_and_intersect() {
+    fn regex_and_semantic_families_match_independently_and_union() {
         let selection = Selection::compile(&json!({
             "symbolQuery": ["read file", "write file"],
             "regexp": ["^Service\\.", "^fs(?:\\.|$)"],
@@ -527,7 +544,7 @@ mod tests {
         .with_symbol_names(HashSet::from(["read file".into(), "write file".into()]));
         assert!(selection.path_matches("src/service.ts"));
         assert!(!selection.path_matches("src/service.py"));
-        let parsed = crate::parse::parse("service.ts", "export class Service { readFile() {} writeFile() {} deleteFile() {} } export class Other { readFile() {} } import { readFile as load } from 'fs';").unwrap();
+        let parsed = crate::parse::parse("service.ts", "export class Service { readFile() {} writeFile() {} deleteFile() {} } export class Other { readFile() {} unrelated() {} } import { readFile as load } from 'fs';").unwrap();
         let nodes = selection.select_structure(&parsed.structure);
         assert!(
             nodes
@@ -540,16 +557,18 @@ mod tests {
                 .any(|node| node.qualified_name == "Service.writeFile")
         );
         assert!(
-            !nodes
+            nodes
                 .iter()
-                .any(|node| node.qualified_name == "Other.readFile" || node.name == "deleteFile")
+                .any(|node| node.qualified_name == "Other.readFile")
         );
+        assert!(nodes.iter().any(|node| node.name == "deleteFile"));
+        assert!(!nodes.iter().any(|node| node.name == "unrelated"));
         assert!(
             nodes.iter().any(|node| node.kind == "import"),
             "{:?}",
             parsed.structure.nodes
         );
-        // The regex can match the source path while semantics match an alias.
+        // Either the import source path or a semantic alias can select the declaration.
         let alias = StructureNode {
             kind: "import".into(),
             qualified_name: "fs".into(),
@@ -558,10 +577,71 @@ mod tests {
             ..StructureNode::default()
         };
         assert!(selection.symbol_matches(&alias));
+        assert!(selection.symbol_matches(&StructureNode {
+            names: vec!["deleteFile".into()],
+            ..alias.clone()
+        }));
+        assert!(selection.symbol_matches(&StructureNode {
+            qualified_name: "other".into(),
+            name: "other".into(),
+            ..alias.clone()
+        }));
         assert!(!selection.symbol_matches(&StructureNode {
+            qualified_name: "other".into(),
+            name: "other".into(),
             names: vec!["deleteFile".into()],
             ..alias
         }));
+    }
+
+    #[test]
+    fn name_union_does_not_treat_omitted_or_empty_families_as_match_all() {
+        let regex = json!({"regexp": "^Service\\.readFile$"});
+        let semantic = json!({"symbolQuery": "write file"});
+        let both = json!({"regexp": "^Service\\.readFile$", "symbolQuery": "write file"});
+        for (options, expected) in [
+            (json!({}), [true, true, true]),
+            (regex, [true, false, false]),
+            (semantic, [false, true, false]),
+            (both.clone(), [true, true, false]),
+        ] {
+            let mut selection = Selection::compile(&options).unwrap();
+            if options.get("symbolQuery").is_some() {
+                selection = selection.with_symbol_names(HashSet::from(["write file".into()]));
+            }
+            for ((qualified, bare), expected) in [
+                ("Service.readFile", "readFile"),
+                ("Other.writeFile", "writeFile"),
+                ("Other.deleteFile", "deleteFile"),
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                assert_eq!(
+                    selection.names_match(qualified, bare),
+                    expected,
+                    "{options}: {qualified}"
+                );
+                assert_eq!(
+                    selection.symbol_matches(&StructureNode {
+                        name: bare.into(),
+                        qualified_name: qualified.into(),
+                        ..StructureNode::default()
+                    }),
+                    expected,
+                    "{options}: {qualified}"
+                );
+            }
+        }
+        let empty = Selection::compile(&both).unwrap();
+        assert!(empty.names_match("Service.readFile", "readFile"));
+        assert!(!empty.names_match("Other.writeFile", "writeFile"));
+        assert!(
+            !Selection::compile(&json!({"symbolQuery": "write file"}))
+                .unwrap()
+                .with_symbol_names(HashSet::new())
+                .names_match("Other.writeFile", "writeFile")
+        );
     }
 
     #[test]
@@ -591,16 +671,20 @@ mod tests {
     fn semantic_selection_intersects_kind_and_visibility() {
         let parsed = crate::parse::parse(
             "files.rs",
-            "pub struct ReadFile; pub fn readFile() {} fn writeFile() {}",
+            "pub struct ReadFile; pub fn readFile() {} fn writeFile() {} pub fn regexOnly() {} fn regexPrivate() {}",
         )
         .unwrap();
         let names = HashSet::from(["read file".into(), "write file".into()]);
         for (private, expected) in [
-            (false, vec!["readFile"]),
-            (true, vec!["readFile", "writeFile"]),
+            (false, vec!["readFile", "regexOnly"]),
+            (
+                true,
+                vec!["readFile", "writeFile", "regexOnly", "regexPrivate"],
+            ),
         ] {
             let selection = Selection::compile(&json!({
-                "symbolQuery": ["read file", "write file"], "kinds": "functions", "private": private
+                "symbolQuery": ["read file", "write file"], "regexp": "^(ReadFile|regexOnly|regexPrivate)$",
+                "kinds": "functions", "private": private
             }))
             .unwrap()
             .with_symbol_names(names.clone());

@@ -37,6 +37,9 @@ PATH="$PWD/target/release:$PATH" TMPDIR="$PWD/evals/typescript/jobs/tmp" python3
 # Rerun with concise discovery-and-follow guidance and offline map -q preflight.
 PATH="$PWD/target/release:$PATH" TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run --arms map --output evals/typescript/jobs/map-concise-symbols
 
+# Rerun the OR-fixed selectors with concise guidance and both depth-2 expansion flags.
+PATH="$PWD/target/release:$PATH" TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run --arms map --output evals/typescript/jobs/map-or-discovery
+
 # Regenerate the comparison from saved artifacts.
 python3 evals/typescript/run.py report evals/typescript/jobs/map-vs-search
 
@@ -201,7 +204,7 @@ available slopdex commands differ between arms:
 
 | Arm | Agent navigation guidance | Allowed slopdex navigation | Cache |
 |---|---|---|---|
-| `map` (default) | Root README's concise discovery-and-follow snippet: one scoped function map, `-e` name terms or `-q` short concepts, then implementation reads | `map` only | Separate symbol-only cache |
+| `map` (default) | Root README's concise discovery-and-follow snippet: one scoped map, ORed `-e`/`-q`, depth-2 callers/callees, then implementation reads | `map` only | Separate symbol-only cache |
 | `search` (default) | Root README's exact semantic-search agent snippet with threshold 0.3, limit 50 and query variation | `search` only | Semantic/ANN cache |
 | `map-search` (optional) | Both exact README snippets, with targeted reads and bounded output | `map` and `search` only; both must succeed at least once | Semantic/ANN cache |
 | `map-first` (experimental) | [Map-first discovery prompt](prompts/map-first.md), immediately followed by implementation reads | `map` only | Provider-free structural cache |
@@ -224,12 +227,16 @@ still required. Compare steps, model tokens/cost, tool-output characters and
 discovery timing alongside citation and answer-format validity.
 Map's `-g` selects path globs, `-e` filters symbol names and qualified names rather
 than raw source text, and `-q` performs symbol-vector search. The root README NOTE
-uses `-e` for known name fragments and `-q` instead when names are unclear. Agents
-make one discovery pass, then follow source; only unknown declaration locations
-warrant another map. Discovery excludes Go tests and suppresses prevalidated
-parser diagnostics; setup/help and root/index/config overrides are discouraged.
-Use `jobs/map-concise-symbols` for the current 40-trial rerun; `jobs/map-symbol-query`
-preserves the earlier broad guidance. The
+combines `-e` name terms and `-q` short symbol concepts with OR semantics, retaining
+`--private --callers 2 --callees 2`. Agents start with map before grep/read, use
+known paths or `.` rather than guessed directories, and immediately read plausible
+implementation ranges. They follow source calls, using grep for usages or missing
+links, and remap only unknown declaration locations. Discovery excludes Go tests
+and suppresses prevalidated parser diagnostics; setup/help and root/index/config
+overrides are discouraged.
+Use `jobs/map-or-discovery` for the current 40-trial rerun. The previous
+`jobs/map-symbol-query`, `jobs/map-concise-symbols` and `jobs/map-callgraph-symbols`
+runs used the former AND composition when both name selectors were supplied. The
 historical [map prompt study](MAP_PROMPTS.md) describes its original structural-only
 runs. The earlier
 `jobs/map-vs-search` run used the prior map guidance and search threshold 0.5;

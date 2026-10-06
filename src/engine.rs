@@ -1300,7 +1300,7 @@ impl Engine {
         Selection::compile(options)?;
         let key = hash(
             json!([
-                "query-v2-symbols",
+                "query-v3-name-union",
                 self.db.generation()?,
                 self.enabled,
                 self.config,
@@ -1373,8 +1373,10 @@ impl Engine {
                 .filter(|i| {
                     i.kind == "function"
                         && selection.path_matches(&i.path)
-                        && selection.name_matches(i.data["qualifiedName"].as_str().unwrap_or(""))
-                        && selection.semantic_name_matches(i.data["name"].as_str().unwrap_or(""))
+                        && selection.names_match(
+                            i.data["qualifiedName"].as_str().unwrap_or(""),
+                            i.data["name"].as_str().unwrap_or(""),
+                        )
                 })
                 .map(|i| i.id)
                 .collect();
@@ -1401,8 +1403,8 @@ impl Engine {
                 .filter(|i| {
                     (i.kind == "markdown" || kind == "search" && !explicit && i.kind == "document")
                         && selection.path_matches(&i.path)
-                        && selection.name_matches(&heading_name(&i.data))
-                        && selection.semantic_name_matches(
+                        && selection.names_match(
+                            &heading_name(&i.data),
                             i.data["headingPath"]
                                 .as_array()
                                 .and_then(|path| path.last())
@@ -1619,7 +1621,7 @@ impl Engine {
             .transpose()?;
         let key = hash(
             json!([
-                "cross",
+                "cross-v2-name-union",
                 self.db.generation()?,
                 target.db.path.canonicalize()?,
                 target.db.generation()?,
@@ -1664,8 +1666,10 @@ impl Engine {
                 source.kind == "function"
                     && lines_match(source)
                     && selection.path_matches(&source.path)
-                    && selection.name_matches(source.data["qualifiedName"].as_str().unwrap_or(""))
-                    && selection.semantic_name_matches(source.data["name"].as_str().unwrap_or(""))
+                    && selection.names_match(
+                        source.data["qualifiedName"].as_str().unwrap_or(""),
+                        source.data["name"].as_str().unwrap_or(""),
+                    )
                     && source_path.as_ref().is_none_or(|p| under(&source.path, p))
                     && (!flag(options, "uncommitted")
                         || source.data["sourceMode"] == "working-tree")

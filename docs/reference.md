@@ -153,7 +153,7 @@ identify a selected public symbol remain as structural context.
 `methods` selects methods alone. `types` groups aliases, classes, structs, unions,
 interfaces, traits, and enums. Other selectors include `imports`, `modules`,
 `consts`, `variables`, `fields`, `variants`, `impls`, `macros`, and `headings`.
-Kinds are ORed and intersect regex and semantic name selectors. Matching nodes
+Kinds are ORed and restrict the union of regex and semantic name matches. Matching nodes
 retain their ancestors as context; a matching parent does not automatically include
 unmatched children.
 
@@ -252,8 +252,9 @@ Map, query searches, `describe`, and cross-search accept:
   or semantic matching.
 - `-q`, `--symbol-query <QUERY>`: repeatable semantic selector over **bare symbol
   names**, aliases, and Markdown heading titles. Repeated queries are ORed; the
-  resulting names intersect regexes, globs, and map kind/private filters. Regex
-  and semantic families can match different aliases on the same declaration.
+  resulting names are ORed with regex matches when `-e` is also supplied. A
+  declaration matching either family is eligible, including matches on different
+  aliases. Globs and map kind/private filters still restrict that union.
   Parent names do not contribute to semantics: selecting a parent does not select
   its children. Ancestors retained as context have no expanded heading body unless
   they directly match. The positional search/describe query ranks the chosen
@@ -315,8 +316,8 @@ types, imports and aliases, headings (including headings without body text),
 and other declarations. Scores use the maximum bare-name/alias similarity;
 parent names, signatures, code, descriptions, and heading bodies do not contribute.
 `--threshold` applies its inclusive minimum/exclusive maximum and `--limit`
-caps the ranked hits. Optional `-q` intersects an additional semantic name
-selection, using `--symbol-threshold` independently of the ranking threshold.
+caps the ranked hits. Optional `-q` filters eligible names (ORed with `-e`, if supplied),
+using `--symbol-threshold` independently of the ranking threshold.
 
 Combining `--symbols` with `--code`, `--md`, or `--descriptions` uses normal
 semantic refresh. Function/content, Markdown/document, and symbol hits remain

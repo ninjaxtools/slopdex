@@ -76,7 +76,7 @@ $ slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
 
 The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains structurally useful information that can act as an index into the source code, which improves context usage.
 
-Symbols can be filtered either by `-e <regex>` or `-q <symbol>`. The `-q` filter uses vector search
+Symbols can be filtered by using `-e <regex>` or `-q <symbol>` (OR). The `-q` filter uses vector search
 and will be ignored if an index doesn't exist.
 
 Use `--detail expanded` to to show full code or markdown of matched symbols.
@@ -87,7 +87,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > Add this to your `AGENTS.md` to let the agent use the map command to explore the codebase:
 >
 > ```text
-> - Make one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" --private --callers 2 --callees 2 <paths...>` discovery pass. Read the first plausible implementation, then follow its calls. Map again only for unknown declaration locations; Batch reads; avoid repeated inventories.
+> - Start discovery with one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" --private --callers 2 --callees 2 <paths...>`. Use known paths or `.`. Immediately read plausible implementation ranges and follow calls in source; grep for usages or missing links. Map again only for unknown declaration locations. Batch reads; skip repeated inventories and setup/help.
 > ```
 
 ### Search

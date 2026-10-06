@@ -8,13 +8,13 @@ use serde_json::{Value, json};
 use std::{collections::HashSet, fs};
 
 #[test]
-fn semantic_heading_selection_expands_only_direct_match_bodies() -> Result<()> {
+fn regex_or_semantic_heading_selection_expands_only_direct_match_bodies() -> Result<()> {
     let dir = tempfile::tempdir()?;
     fs::write(
         dir.path().join("guide.md"),
         "# Guide\nParent body.\n## Setup\nSelected body.\n### Linux\nChild body.\n## Other\nOther body.\n",
     )?;
-    let options = json!({"symbolQuery": ["setup"], "regexp": "^Guide\\.Setup$"});
+    let options = json!({"symbolQuery": ["setup"], "regexp": "^Guide\\.Other$"});
     let source = map::Unindexed::parse(
         dir.path(),
         &dir.path().join("index.sqlite"),
@@ -40,13 +40,11 @@ fn semantic_heading_selection_expands_only_direct_match_bodies() -> Result<()> {
         "{output}"
     );
     assert!(output.contains("Selected body."), "{output}");
-    for omitted in [
-        "Parent body.",
-        "Child body.",
-        "Other body.",
-        "### Linux",
-        "## Other",
-    ] {
+    assert!(
+        output.contains("## Other") && output.contains("Other body."),
+        "{output}"
+    );
+    for omitted in ["Parent body.", "Child body.", "### Linux"] {
         assert!(!output.contains(omitted), "{output}");
     }
     Ok(())

@@ -121,8 +121,10 @@ validates string queries and a finite scalar threshold in `[-1,1]`; a semantic
 selector starts with an empty resolved-name set, so unresolved selection cannot
 silently select everything. The engine fills the union through `with_symbol_names`.
 Regex matching remains qualified-name/alias based, while semantic matching uses
-normalized `node.name` or `node.names`. The two families intersect independently,
-including when different aliases match. Bare heading titles carry no parent
+normalized `node.name` or `node.names`. The two active families are ORed; an absent
+family contributes no matches, and with neither supplied all names are eligible.
+`names_match` shares this composition across callable, Markdown, and cross-search
+filters; `symbol_matches` also accounts for declaration aliases. Bare heading titles carry no parent
 semantics; ancestors are context and receive body text only if directly selected.
 `name_matches` stays regex-only and `-i` affects regexes only.
 
