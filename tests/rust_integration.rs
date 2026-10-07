@@ -6540,7 +6540,13 @@ fn symbol_selection_cache_is_cleared_when_live_snapshot_is_reset() -> Result<()>
         map_names(&repo.open(&config)?.map(&options)?),
         strings(&["VectorNorthOld"])
     );
-    let db = slopdex::storage::Database::open(&repo.index, &repo.root, &Value::Null, false)?;
+    // Match the canonical root identity stored by Engine, including Windows' verbatim prefix.
+    let db = slopdex::storage::Database::open(
+        &repo.index,
+        &repo.root.canonicalize()?,
+        &Value::Null,
+        false,
+    )?;
     db.reset()?;
     drop(db);
     repo.write("api.ts", "export function VectorNorthNew() {}\n")?;
