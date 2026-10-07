@@ -263,20 +263,59 @@ pub(crate) fn symbol_location(path: &str, start: usize, end: usize, name: &str) 
     format!("{path}:{range}:{name}")
 }
 
+pub(crate) fn group_symbol_locations<'a>(
+    locations: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<&'a str, Vec<&'a str>> {
+    let mut files = BTreeMap::<_, Vec<_>>::new();
+    for location in locations {
+        // The numeric range separates the path from the symbol; either can
+        // otherwise contain colons, including Rust's qualified names.
+        let parts = location.match_indices(':').find_map(|(index, _)| {
+            let symbol = &location[index + 1..];
+            let range = symbol.split_once(':')?.0;
+            let (start, end) = range.split_once('-').unwrap_or((range, range));
+            let start = start.parse::<usize>().ok()?;
+            end.parse::<usize>().ok()?;
+            Some((&location[..index], start, symbol))
+        });
+        if let Some((path, start, symbol)) = parts {
+            files.entry(path).or_default().push((start, symbol));
+        }
+    }
+    files
+        .into_iter()
+        .map(|(path, mut symbols)| {
+            symbols.sort_by_key(|(start, _)| *start);
+            (
+                path,
+                symbols.into_iter().map(|(_, symbol)| symbol).collect(),
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn render_callers<'a>(
     language: &str,
     callees: impl IntoIterator<Item = &'a str>,
     depth: usize,
 ) -> Option<String> {
-    let mut callees = callees.into_iter().peekable();
-    callees.peek()?;
+    let files = group_symbol_locations(callees);
+    if files.is_empty() {
+        return None;
+    }
     let indent = "  ".repeat(depth + 1);
     let mut output = format!("{indent}{}\n", comment(language, "callers:"));
-    for callee in callees {
+    for (path, symbols) in files {
         output.push_str(&format!(
             "{indent}{}\n",
-            comment_with_indent(language, callee, "  ")
+            comment_with_indent(language, &format!("{path}:"), "  ")
         ));
+        for symbol in symbols {
+            output.push_str(&format!(
+                "{indent}{}\n",
+                comment_with_indent(language, symbol, "    ")
+            ));
+        }
     }
     Some(output)
 }

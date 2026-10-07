@@ -172,11 +172,23 @@ pub(super) fn print_clusters(
             index + 1,
             cluster.members.len(),
         )?;
-        for member in &cluster.members {
-            if same_index {
-                writeln!(out, "{}", member.location())?;
-            } else {
-                writeln!(out, "{} [{}]", member.location(), member.role)?;
+        let locations: Vec<_> = cluster
+            .members
+            .iter()
+            .map(|member| {
+                if same_index {
+                    member.location()
+                } else {
+                    format!("{} [{}]", member.location(), member.role)
+                }
+            })
+            .collect();
+        for (path, symbols) in
+            crate::map::group_symbol_locations(locations.iter().map(String::as_str))
+        {
+            writeln!(out, "{path}:")?;
+            for symbol in symbols {
+                writeln!(out, "  {symbol}")?;
             }
         }
     }

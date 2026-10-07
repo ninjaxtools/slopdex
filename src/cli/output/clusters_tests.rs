@@ -32,7 +32,12 @@ fn clusters_are_transitive_and_limit_applies_after_components_form() {
     .unwrap();
     let output = String::from_utf8(out).unwrap();
     assert!(output.contains("*** Cluster 1 · 4 symbols · similarity 0.91-0.95"));
-    assert!(output.contains("src/d.rs:1:d\n"));
+    assert!(output.contains(concat!(
+        "src/a.rs:\n  1:a\n",
+        "src/b.rs:\n  1:b\n",
+        "src/c.rs:\n  1:c\n",
+        "src/d.rs:\n  1:d\n"
+    )));
     assert!(!output.contains("Cluster 2"));
     assert_eq!(clusters(&[edge("a", "a", 0.9)], false)[0].members.len(), 2);
 }
@@ -77,8 +82,9 @@ fn cross_repository_clusters_do_not_merge_swapped_or_identical_node_ids() {
         String::from_utf8(out).unwrap(),
         concat!(
             "*** Cluster 1 · 2 symbols · similarity 0.70\n",
-            "src/a.rs:1:a [source]\n",
-            "src/a.rs:1:a [target]\n"
+            "src/a.rs:\n",
+            "  1:a [source]\n",
+            "  1:a [target]\n"
         )
     );
 }
@@ -119,12 +125,10 @@ fn clusters_distinguish_missing_id_locations_and_ignore_self_edges() {
         None,
     )
     .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&expected)
-            .matches("same.rs:4:overload")
-            .count(),
-        2
-    );
+    let output = String::from_utf8_lossy(&expected);
+    assert_eq!(output.matches("  4:overload\n").count(), 2);
+    assert_eq!(output.matches("same.rs:\n").count(), 1);
+    assert!(output.contains("same.rs:\n  4:overload\n  4:overload\n  8:overload\n"));
     let mut reversed = rows;
     reversed.reverse();
     let mut actual = Vec::new();
@@ -160,7 +164,7 @@ fn cluster_members_in_one_file_follow_numeric_source_lines() {
     let output = String::from_utf8(output).unwrap();
     assert_eq!(
         output,
-        "*** Cluster 1 · 2 symbols · similarity 0.90\nsame.rs:2:first\nsame.rs:10:second\n"
+        "*** Cluster 1 · 2 symbols · similarity 0.90\nsame.rs:\n  2:first\n  10:second\n"
     );
 }
 
@@ -185,8 +189,8 @@ fn cluster_locations_use_ranges_only_for_multiline_symbols() {
             String::from_utf8(out).unwrap(),
             concat!(
                 "*** Cluster 1 · 2 symbols · similarity 0.91\n",
-                "src/api/routes.ts:12:validateSession\n",
-                "src/auth/session.ts:5-10:Session.validate\n"
+                "src/api/routes.ts:\n  12:validateSession\n",
+                "src/auth/session.ts:\n  5-10:Session.validate\n"
             )
         );
     }

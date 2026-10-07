@@ -185,23 +185,30 @@ cross-search clusters. Map JSON and related callable JSON nodes include indexed
 
 In text output, each function's displayed callees appear immediately below its
 declaration under a standalone `callers:` header. The header is indented two spaces
-deeper than the declaration. All comment markers align with the header's marker;
-each location is indented a further two spaces after its comment marker.
-The header and locations use language-specific comment markers, such as `#` for
-Python and `//` for Rust.
-Locations use repository-relative cluster format `path:start-end:qualifiedName`;
-single-line functions omit `-end`, for example `b.py:1:middle`. These annotation
-lines are generated comments, not source lines. For example, a top-level
-`outer` calling `middle` defined on lines 1–2 in `b.py` renders:
+deeper than the declaration. Callees are grouped under one repository-relative
+`path:` header per file, with paths sorted lexically and symbols in numeric source
+order within each file. After each comment marker, file-header text is indented
+two spaces deeper than `callers:`; symbol text is indented another two spaces and
+uses `start-end:qualifiedName`, or `line:qualifiedName` for single-line functions.
+All comment markers align with the `callers:` marker; only the nested contents
+after the markers are indented. The whole block follows the owning function's
+indentation, including for nested declarations. These lines use language-specific
+comment markers, such as `#` for Python and `//` for Rust, and are generated
+comments, not source lines. For example, a top-level `outer` calling `middle`
+defined on lines 1–2 and a single-line `helper` on line 5 in `b.py` renders:
 
 ```text
 def outer():
   # callers:
-  #   b.py:1-2:middle
+  #   b.py:
+  #     1-2:middle
+  #     5:helper
 ```
 
-JSON `callees` string arrays use the same location format, for example
-`["b.py:1-2:middle"]`, without a `calls ` prefix or ` :: ` separator.
+JSON `callees` string arrays remain flat locations in `path:start-end:qualifiedName`
+format, or `path:line:qualifiedName` for single-line functions, for example
+`["b.py:1-2:middle", "b.py:5:helper"]`, without file grouping, a `calls ` prefix,
+or a ` :: ` separator.
 JSON adds `callDepth` and `callees` to expanded map nodes and
 `relatedCallables`/`callees` to callable search results when expansion is enabled.
 Cross-search adds the same information to source and match objects; describe adds
@@ -516,20 +523,28 @@ actual output (ranges, signature, parent, aliases, and other metadata), plus
 ID. Callable symbol rows can include `relatedCallables` and `callees` when call
 expansion is requested, as function rows do; noncallable symbols do not seed it.
 
-Cross-search clusters print one `path:start-end:qualifiedName` location per
-multiline symbol, or `path:line:qualifiedName` for a single-line symbol, under
-a cluster header. For example:
+Cross-search clusters retain their cluster header and group members under one
+repository-relative `path:` header per file. File paths are sorted lexically;
+symbols within each file keep numeric source order. Each symbol line is indented
+two spaces and uses `start-end:qualifiedName` for multiline symbols or
+`line:qualifiedName` for single-line symbols. For example:
 
 ```text
-*** Cluster 1 · 2 symbols · similarity 0.91-0.95
-src/api/routes.ts:12:validateSession
-src/auth/session.ts:5-10:Session.validate
+*** Cluster 1 · 3 symbols · similarity 0.91-0.95
+src/api/routes.ts:
+  12:validateSession
+  20-24:refreshSession
+src/auth/session.ts:
+  5-10:Session.validate
 ```
 
-Cross-index members append `[source]` or `[target]` so identical paths remain
-distinct. The similarity range belongs to observed edges, not individual members. With
-`--cohesion` or `--format text`, cross-search can instead print source/match
-groups with per-match scores and optional filesystem distance.
+Cross-index members append `[source]` or `[target]` to their individual symbol
+lines to keep their identities distinct. Identical paths share one file header
+even when the symbols come from different indexes. The similarity range belongs
+to observed edges, not individual members. File grouping is a text presentation;
+JSON `callees` arrays keep flat `path:start-end:qualifiedName` locations. With
+`--cohesion` or `--format text`, cross-search can instead print source/match groups
+with per-match scores and optional filesystem distance.
 
 Reranking applies to query commands, including the search inside `describe`, not
 cross-search. Embedding thresholds are applied first. Cohere/Jina receive up to
