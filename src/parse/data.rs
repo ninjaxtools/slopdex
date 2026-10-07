@@ -3,8 +3,10 @@
 use super::{Diagnostic, FileStructure, ParsedFile, StructureNode};
 use anyhow::{Context, Result};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     ops::Range,
+    sync::OnceLock,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -32,9 +34,19 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
     parser
         .set_language(&grammar)
         .with_context(|| format!("Cannot initialize {language} parser for {path}"))?;
-    let tree = parser
+    let mut tree = parser
         .parse(source, None)
         .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
+    let input = if language == "css" && tree.root_node().has_error() {
+        css_compatibility(source, tree.root_node())
+    } else {
+        Cow::Borrowed(source)
+    };
+    if matches!(input, Cow::Owned(_)) {
+        tree = parser
+            .parse(input.as_bytes(), None)
+            .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
+    }
     let mut errors = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -49,10 +61,11 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
                 end_line: node.end_position().row + 1,
             });
         } else if node.has_error() {
-            stack.extend(children(node));
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
         }
     }
-    let tree = recovery::recover(&mut parser, tree, source, language);
+    let tree = recovery::recover(&mut parser, tree, &input, language);
     let mut collector = Collector {
         language,
         source,
@@ -80,6 +93,82 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
         },
         ..ParsedFile::default()
     })
+}
+
+fn css_compatibility<'a>(source: &'a str, root: Node<'_>) -> Cow<'a, str> {
+    const TRIVIA: &str = r"(?:[ \t\r\n\x0c]|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/)";
+    static SOURCE_PATH: OnceLock<regex::Regex> = OnceLock::new();
+    static CONTAINER_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    let mut replacements = Vec::new();
+    let mut stack = vec![(root, false)];
+    while let Some((node, in_block)) = stack.pop() {
+        if matches!(node.kind(), "string_value" | "comment" | "js_comment") {
+            continue;
+        }
+        if node.kind() == "at_keyword" {
+            match text(source, node) {
+                "@source" if !in_block => {
+                    let pattern = SOURCE_PATH.get_or_init(|| {
+                        regex::Regex::new(&format!(
+                            r#"^{TRIVIA}*(?:"(?:[^"\\\r\n]|\\[^\r\n])*"|'(?:[^'\\\r\n]|\\[^\r\n])*'){TRIVIA}*;"#,
+                        ))
+                        .unwrap()
+                    });
+                    if pattern.is_match(&source[node.end_byte()..]) {
+                        replacements.push((node.byte_range(), Some("@import")));
+                    }
+                }
+                "@container" => {
+                    let pattern = CONTAINER_NAME.get_or_init(|| {
+                        regex::Regex::new(&format!(
+                            r"^{TRIVIA}*(?P<name>(?:--|-?[_a-zA-Z\x{{80}}-\x{{10ffff}}])[-_a-zA-Z0-9\x{{80}}-\x{{10ffff}}]*){TRIVIA}+(?:not{TRIVIA}+)?\("
+                        ))
+                        .unwrap()
+                    });
+                    if node.parent().is_some_and(|parent| {
+                        parent.kind() == "at_rule"
+                            && children(parent).iter().any(|child| child.kind() == "block")
+                    }) && let Some(captures) = pattern.captures(&source[node.end_byte()..])
+                        && let Some(name) = captures.name("name")
+                        && !matches!(
+                            name.as_str().to_ascii_lowercase().as_str(),
+                            "none"
+                                | "and"
+                                | "or"
+                                | "not"
+                                | "default"
+                                | "initial"
+                                | "inherit"
+                                | "unset"
+                                | "revert"
+                                | "revert-layer"
+                        )
+                    {
+                        replacements.push((node.byte_range(), Some("@media    ")));
+                        replacements.push((
+                            node.end_byte() + name.start()..node.end_byte() + name.end(),
+                            None,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let in_block = in_block || matches!(node.kind(), "block" | "keyframe_block_list");
+        stack.extend(children(node).into_iter().map(|child| (child, in_block)));
+    }
+    if replacements.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    let mut input = source.as_bytes().to_vec();
+    for (range, replacement) in replacements {
+        if let Some(replacement) = replacement {
+            input[range].copy_from_slice(replacement.as_bytes());
+        } else {
+            input[range].fill(b' ');
+        }
+    }
+    Cow::Owned(String::from_utf8(input).expect("CSS compatibility edits preserve UTF-8"))
 }
 
 fn literal(language: &str, kind: &str) -> bool {
@@ -488,6 +577,31 @@ impl Collector<'_> {
 #[cfg(test)]
 mod tests {
     use crate::parse::{language_for_path, parse};
+
+    #[test]
+    fn css_compatibility_only_rewrites_supported_at_rules() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_css::LANGUAGE.into())
+            .unwrap();
+        for source in [
+            "@media all { @source \"./*.tsx\"; }",
+            ".panel { @source \"./*.tsx\"; color: @; }",
+            ".panel { content: '@source \"literal\";'; color: @; }",
+            "/* @source \"comment\"; */ .panel { color: @; }",
+            "@source-map \"./*.tsx\";",
+            "@container none (width: 1px) { .panel { color: red; } }",
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            assert!(
+                matches!(
+                    super::css_compatibility(source, tree.root_node()),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "unexpected normalization: {source}"
+            );
+        }
+    }
 
     #[test]
     fn supported_formats_produce_nested_structure_and_search_units() {

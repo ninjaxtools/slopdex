@@ -397,6 +397,115 @@ fn css_keyframes_are_named_scopes_for_frame_declarations() {
 }
 
 #[test]
+fn css_tailwind_source_directives_preserve_search_content() {
+    let source = "@import \"tailwindcss\";\n@source \"./**/*.{ts,tsx}\";\n.panel { color: red; }\n";
+    let parsed = accepted("tailwind.css", source);
+    assert_eq!(qualified(&parsed), [".panel", ".panel.color"]);
+    assert!(
+        parsed
+            .chunks
+            .iter()
+            .any(|chunk| chunk.content.contains("@source \"./**/*.{ts,tsx}\";"))
+    );
+    ranges(&parsed, source);
+}
+
+#[test]
+fn css_named_container_queries_preserve_nested_rules() {
+    let source = "@container session-store (min-width: 720px) {\n  .panel { color: red; }\n}\n";
+    let parsed = accepted("container.css", source);
+    assert_eq!(qualified(&parsed), [".panel", ".panel.color"]);
+    assert_eq!(named(&parsed, ".panel.color").signature, "color: red");
+    ranges(&parsed, source);
+}
+
+#[test]
+fn css_compatibility_preserves_literals_comments_and_byte_positions() {
+    let source = concat!(
+        "/* @source \"ghost\"; @container ghost (width: 1px) {} */\r\n",
+        "@source /* source-comment */ './café/**/*.{ts,tsx}';\r\n",
+        "@source \"./escaped\\\"quote/*.tsx\";\r\n",
+        "@media screen {\r\n",
+        "  @container /* container-comment */ café\r\n",
+        "    (min-width: 720px) and (max-width: 1200px) {\r\n",
+        "    .panel { content: '@source \"literal\"; @container literal (width: 1px) {}'; }\r\n",
+        "  }\r\n",
+        "}\r\n",
+    );
+    let parsed = accepted("compatibility.css", source);
+    assert_eq!(qualified(&parsed), [".panel", ".panel.content"]);
+    assert_eq!(
+        named(&parsed, ".panel.content").signature,
+        "content: '@source \"literal\"; @container literal (width: 1px) {}'"
+    );
+    let content = parsed
+        .chunks
+        .iter()
+        .map(|chunk| chunk.content.as_str())
+        .collect::<String>();
+    assert!(content.contains("@source \"./escaped\\\"quote/*.tsx\";"));
+    assert!(content.contains("./café/**/*.{ts,tsx}"));
+    assert!(
+        content
+            .lines()
+            .any(|line| line.contains("@container") && line.ends_with("café"))
+    );
+    assert!(!content.contains("ghost"));
+    assert!(!content.contains("source-comment"));
+    assert!(!content.contains("container-comment"));
+    ranges(&parsed, source);
+}
+
+#[test]
+fn css_compatibility_keeps_unrelated_diagnostics_and_recovery() {
+    for prefix in [
+        "@source \"./**/*.{ts,tsx}\";",
+        "@container session-store (min-width: 720px) { .before { color: red; } }",
+        "@source \"./**/*.{ts,tsx}\";\n@container session-store (min-width: 720px) { .before { color: red; } }",
+    ] {
+        let source =
+            format!("{prefix}\n.panel {{ color: @; display: grid; }}\n.after {{ margin: 0; }}");
+        let parsed = parse("compatibility.css", &source).unwrap();
+        assert!(!parsed.errors.is_empty(), "{source}");
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .all(|error| error.start_line == prefix.lines().count() + 1),
+            "{:?}",
+            parsed.errors
+        );
+        assert_eq!(named(&parsed, ".panel.display").signature, "display: grid");
+        assert_eq!(named(&parsed, ".after.margin").signature, "margin: 0");
+        ranges(&parsed, &source);
+    }
+}
+
+#[test]
+fn css_compatibility_does_not_accept_malformed_at_rules() {
+    for source in [
+        "@source \"unterminated;",
+        "@source \"./*.tsx\"",
+        "@source \"./*.tsx\" unexpected;",
+        "@source /* closed */ invalid /* other */ \"./*.tsx\";",
+        "@source \"./*.tsx\";\n.panel { color: red;",
+        "@container session-store (min-width: 720px) { .panel { color: red; } }; }",
+        "@source \"./*.tsx\";\n@container session-store (min-width: ) { .panel { color: red; } }",
+        "@container session-store (min-width: 720px { .panel { color: red; } }",
+        "@container session-store (min-width: 720px);",
+        "@container session-store (min-width: 720px) { .panel { color: red; }",
+        "@container first second (min-width: 720px) { .panel { color: red; } }",
+        "@container none (min-width: 720px) { .panel { color: red; } }",
+    ] {
+        let parsed = parse("malformed.css", source).unwrap();
+        assert!(
+            !parsed.errors.is_empty(),
+            "malformed CSS accepted: {source}"
+        );
+    }
+}
+
+#[test]
 fn css_selector_lists_expose_each_selector_for_symbol_filtering() {
     let source = "#app, .panel:hover, main > p { color: red; }";
     let parsed = accepted("selectors.css", source);
