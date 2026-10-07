@@ -186,6 +186,10 @@ pub(super) fn print_clusters(
         for (path, symbols) in
             crate::map::group_symbol_locations(locations.iter().map(String::as_str))
         {
+            if let [symbol] = symbols.as_slice() {
+                writeln!(out, "{path}:{symbol}")?;
+                continue;
+            }
             writeln!(out, "{path}:")?;
             for symbol in symbols {
                 writeln!(out, "  {symbol}")?;

@@ -306,6 +306,13 @@ pub(crate) fn render_callees<'a>(
     let indent = "  ".repeat(depth + 1);
     let mut output = format!("{indent}{}\n", comment(language, "callees:"));
     for (path, symbols) in files {
+        if let [symbol] = symbols.as_slice() {
+            output.push_str(&format!(
+                "{indent}{}\n",
+                comment_with_indent(language, &format!("{path}:{symbol}"), "  ")
+            ));
+            continue;
+        }
         output.push_str(&format!(
             "{indent}{}\n",
             comment_with_indent(language, &format!("{path}:"), "  ")

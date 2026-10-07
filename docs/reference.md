@@ -191,12 +191,15 @@ deeper than the declaration. Callees are grouped under one repository-relative
 order within each file. After each comment marker, file-header text is indented
 two spaces deeper than `callees:`; symbol text is indented another two spaces and
 uses `start-end:qualifiedName`, or `line:qualifiedName` for single-line functions.
+When a file has only one displayed symbol, its location follows the file's colon
+on the same line with no intervening space, for example `c.py:7:leaf`.
 All comment markers align with the `callees:` marker; only the nested contents
 after the markers are indented. The whole block follows the owning function's
 indentation, including for nested declarations. These lines use language-specific
 comment markers, such as `#` for Python and `//` for Rust, and are generated
 comments, not source lines. For example, a top-level `outer` calling `middle`
-defined on lines 1–2 and a single-line `helper` on line 5 in `b.py` renders:
+defined on lines 1–2 and a single-line `helper` on line 5 in `b.py`, plus `leaf`
+on line 7 in `c.py`, renders:
 
 ```text
 def outer():
@@ -204,6 +207,7 @@ def outer():
   #   b.py:
   #     1-2:middle
   #     5:helper
+  #   c.py:7:leaf
 ```
 
 JSON `callees` string arrays remain flat locations in `path:start-end:qualifiedName`
@@ -528,15 +532,16 @@ Cross-search clusters retain their cluster header and group members under one
 repository-relative `path:` header per file. File paths are sorted lexically;
 symbols within each file keep numeric source order. Each symbol line is indented
 two spaces and uses `start-end:qualifiedName` for multiline symbols or
-`line:qualifiedName` for single-line symbols. For example:
+`line:qualifiedName` for single-line symbols. Files with only one displayed symbol
+print it directly after the file's colon on the same line, with no intervening
+space. For example:
 
 ```text
 *** Cluster 1 · 3 symbols · similarity 0.91-0.95
 src/api/routes.ts:
   12:validateSession
   20-24:refreshSession
-src/auth/session.ts:
-  5-10:Session.validate
+src/auth/session.ts:5-10:Session.validate
 ```
 
 Cross-index members append `[source]` or `[target]` to their individual symbol

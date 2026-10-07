@@ -33,10 +33,10 @@ fn clusters_are_transitive_and_limit_applies_after_components_form() {
     let output = String::from_utf8(out).unwrap();
     assert!(output.contains("*** Cluster 1 · 4 symbols · similarity 0.91-0.95"));
     assert!(output.contains(concat!(
-        "src/a.rs:\n  1:a\n",
-        "src/b.rs:\n  1:b\n",
-        "src/c.rs:\n  1:c\n",
-        "src/d.rs:\n  1:d\n"
+        "src/a.rs:1:a\n",
+        "src/b.rs:1:b\n",
+        "src/c.rs:1:c\n",
+        "src/d.rs:1:d\n"
     )));
     assert!(!output.contains("Cluster 2"));
     assert_eq!(clusters(&[edge("a", "a", 0.9)], false)[0].members.len(), 2);
@@ -189,8 +189,8 @@ fn cluster_locations_use_ranges_only_for_multiline_symbols() {
             String::from_utf8(out).unwrap(),
             concat!(
                 "*** Cluster 1 · 2 symbols · similarity 0.91\n",
-                "src/api/routes.ts:\n  12:validateSession\n",
-                "src/auth/session.ts:\n  5-10:Session.validate\n"
+                "src/api/routes.ts:12:validateSession\n",
+                "src/auth/session.ts:5-10:Session.validate\n"
             )
         );
     }
