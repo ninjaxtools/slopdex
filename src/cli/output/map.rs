@@ -29,7 +29,7 @@ pub(in crate::cli) fn print_map(
         let path = row["path"].as_str().context("map result is missing path")?;
         let nodes: Vec<StructureNode> = serde_json::from_value(row["nodes"].clone())
             .with_context(|| format!("decode map nodes for {path}"))?;
-        let mut extras: HashMap<usize, String> = array(&row["nodes"])
+        let callees: HashMap<usize, Vec<String>> = array(&row["nodes"])
             .iter()
             .filter_map(|node| {
                 let id = usize::try_from(node["id"].as_u64()?).ok()?;
@@ -39,11 +39,12 @@ pub(in crate::cli) fn print_map(
                     calls
                         .iter()
                         .filter_map(Value::as_str)
-                        .map(|call| format!("{}\n", map::comment(path, call)))
+                        .map(str::to_owned)
                         .collect(),
                 ))
             })
             .collect();
+        let mut extras = HashMap::<usize, String>::new();
         if let Some(source) = source.and_then(|source| source.source(path)) {
             for (node, value) in nodes.iter().zip(array(&row["nodes"])) {
                 if value["expandedCode"] == true
@@ -102,6 +103,7 @@ pub(in crate::cli) fn print_map(
                 },
                 map::HitDetails {
                     annotations: None,
+                    callees: Some(&callees),
                     extras: Some(&extras),
                 },
             )

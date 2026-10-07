@@ -36,15 +36,10 @@ impl ClusterMember {
         let function = &self.function;
         let start = function["startLine"].as_u64().unwrap_or(1);
         let end = function["endLine"].as_u64().unwrap_or(start);
-        let range = if end > start {
-            format!("{start}-{end}")
-        } else {
-            start.to_string()
-        };
         let name = function["qualifiedName"]
             .as_str()
             .unwrap_or_else(|| text(function, "name"));
-        format!("{}:{range}:{name}", text(function, "path"))
+        crate::map::symbol_location(text(function, "path"), start as usize, end as usize, name)
     }
 
     fn label(&self) -> String {

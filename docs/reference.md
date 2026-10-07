@@ -183,10 +183,26 @@ cross-search clusters. Map JSON and related callable JSON nodes include indexed
 `callDepth` metadata.
 `--expand-callables` is an alias for `--expand-callees`.
 
-In text output, a virtual language-specific comment directly below each caller
-identifies displayed callees by repository-relative file and qualified symbol,
-for example `# calls src/task.py :: execute`. These are annotations, not source
-lines. JSON adds `callDepth` and `callees` to expanded map nodes and
+In text output, each function's displayed callees appear immediately below its
+declaration under a standalone `callers:` header. The header is indented two spaces
+deeper than the declaration. All comment markers align with the header's marker;
+each location is indented a further two spaces after its comment marker.
+The header and locations use language-specific comment markers, such as `#` for
+Python and `//` for Rust.
+Locations use repository-relative cluster format `path:start-end:qualifiedName`;
+single-line functions omit `-end`, for example `b.py:1:middle`. These annotation
+lines are generated comments, not source lines. For example, a top-level
+`outer` calling `middle` defined on lines 1–2 in `b.py` renders:
+
+```text
+def outer():
+  # callers:
+  #   b.py:1-2:middle
+```
+
+JSON `callees` string arrays use the same location format, for example
+`["b.py:1-2:middle"]`, without a `calls ` prefix or ` :: ` separator.
+JSON adds `callDepth` and `callees` to expanded map nodes and
 `relatedCallables`/`callees` to callable search results when expansion is enabled.
 Cross-search adds the same information to source and match objects; describe adds
 it to returned functions. With both depths zero, existing output is unchanged.

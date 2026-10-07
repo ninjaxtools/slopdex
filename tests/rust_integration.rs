@@ -3601,7 +3601,10 @@ fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_art
             "{expanded_text}"
         );
     }
-    assert!(expanded_text.contains("# calls c.py :: leaf"));
+    assert!(
+        expanded_text.contains("\ndef middle():\n  # callers:\n  #   c.py:3-4:leaf\n"),
+        "{expanded_text}"
+    );
     for name in ["outermost", "middle", "deepest"] {
         assert!(
             !expanded_text.contains(&format!("@ code:\ndef {name}():")),
@@ -3886,12 +3889,12 @@ fn map_call_graph_expands_cross_file_chains_and_rebuilds_after_edits() -> Result
         .iter()
         .find(|row| row["path"] == "b.py")
         .context("middle file")?;
-    assert_eq!(middle["nodes"][0]["callees"][0], "calls c.py :: leaf");
+    assert_eq!(middle["nodes"][0]["callees"][0], "c.py:3-4:leaf");
     let outer = rows
         .iter()
         .find(|row| row["path"] == "a.py")
         .context("outer file")?;
-    assert_eq!(outer["nodes"][0]["callees"][0], "calls b.py :: middle");
+    assert_eq!(outer["nodes"][0]["callees"][0], "b.py:3-4:middle");
     let two_levels = engine.map(&json!({"kinds":["functions"],"regexp":["^middle$"],"glob":["b.py"],"callers":2,"callees":2}))?;
     assert_eq!(
         map_names(&two_levels),
@@ -4360,8 +4363,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     let text = String::from_utf8(output.stdout)?;
     assert!(
         text.contains("*** a.py")
-            && text.contains("def outer():")
-            && text.contains("# calls b.py :: middle"),
+            && text.contains("\ndef outer():\n  # callers:\n  #   b.py:1-2:middle\n"),
         "{text}"
     );
     assert!(
@@ -4392,7 +4394,10 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
         String::from_utf8_lossy(&map_text.stderr)
     );
     let map_text = String::from_utf8(map_text.stdout)?;
-    assert!(map_text.contains("# calls b.py :: middle"), "{map_text}");
+    assert!(
+        map_text.contains("\ndef outer():\n  # callers:\n  #   b.py:1-2:middle\n"),
+        "{map_text}"
+    );
     let describe = repo.cli_json(&[
         "describe",
         "middle",
@@ -4469,7 +4474,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     let cluster = String::from_utf8(cluster.stdout)?;
     assert!(cluster.contains("a.py:3-4:outer"), "{cluster}");
     assert!(cluster.contains("b.py:1-2:middle"), "{cluster}");
-    assert!(!cluster.contains("# calls"), "{cluster}");
+    assert!(!cluster.contains("callers:"), "{cluster}");
     Ok(())
 }
 
@@ -4567,7 +4572,10 @@ fn expanded_detail_defaults_to_one_edge_and_includes_high_similarity_code() -> R
         with_code.contains("@ code:\ndef middle():\n    return 42"),
         "{with_code}"
     );
-    assert!(with_code.contains("# calls b.py :: middle"), "{with_code}");
+    assert!(
+        with_code.contains("\ndef outer():\n  # callers:\n  #   b.py:1-2:middle\n"),
+        "{with_code}"
+    );
     let without_code = run("1")?;
     assert!(!without_code.contains("@ code:"), "{without_code}");
     let score = expanded_json[0]["similarity"].as_f64().unwrap();

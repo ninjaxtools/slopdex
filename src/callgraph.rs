@@ -192,11 +192,14 @@ impl CallGraph {
                 if result.depths.contains_key(callee)
                     && let Some(node) = self.node(callee)
                 {
-                    result
-                        .comments
-                        .entry(caller.clone())
-                        .or_default()
-                        .push(format!("calls {} :: {}", callee.path, node.qualified_name));
+                    result.comments.entry(caller.clone()).or_default().push(
+                        crate::map::symbol_location(
+                            &callee.path,
+                            node.start_line,
+                            node.end_line,
+                            &node.qualified_name,
+                        ),
+                    );
                 }
             }
         }

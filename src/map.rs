@@ -250,22 +250,54 @@ pub struct Descriptions<'a> {
 #[derive(Default)]
 pub struct HitDetails<'a> {
     pub annotations: Option<&'a HashMap<usize, String>>,
+    pub callees: Option<&'a HashMap<usize, Vec<String>>>,
     pub extras: Option<&'a HashMap<usize, String>>,
+}
+
+pub(crate) fn symbol_location(path: &str, start: usize, end: usize, name: &str) -> String {
+    let range = if end > start {
+        format!("{start}-{end}")
+    } else {
+        start.to_string()
+    };
+    format!("{path}:{range}:{name}")
+}
+
+pub(crate) fn render_callers<'a>(
+    language: &str,
+    callees: impl IntoIterator<Item = &'a str>,
+    depth: usize,
+) -> Option<String> {
+    let mut callees = callees.into_iter().peekable();
+    callees.peek()?;
+    let indent = "  ".repeat(depth + 1);
+    let mut output = format!("{indent}{}\n", comment(language, "callers:"));
+    for callee in callees {
+        output.push_str(&format!(
+            "{indent}{}\n",
+            comment_with_indent(language, callee, "  ")
+        ));
+    }
+    Some(output)
 }
 
 /// Generated text is rendered as a language-appropriate comment, not source.
 pub fn comment(language: &str, description: &str) -> String {
+    comment_with_indent(language, description, "")
+}
+
+fn comment_with_indent(language: &str, description: &str, indent: &str) -> String {
     let description = description.trim();
     match crate::parse::language_for_path(language).unwrap_or(language) {
-        "python" | "bash" => format!("# {description}"),
+        "python" | "bash" => format!("# {indent}{description}"),
         "markdown" => {
             // `--` is invalid inside HTML comments, including generated descriptions.
-            format!("<!-- {} -->", description.replace("--", "- -"))
+            format!("<!-- {indent}{} -->", description.replace("--", "- -"))
         }
-        "c" | "css" => format!("/* {description} */"),
-        "terraform" | "yaml" | "toml" => format!("# {description}"),
-        "xml" | "html" => format!("<!-- {} -->", description.replace("--", "- -")),
-        _ => format!("// {description}"),
+        "c" | "css" => format!("/* {indent}{description} */"),
+        "terraform" | "yaml" | "toml" => format!("# {indent}{description}"),
+        "xml" | "html" => format!("<!-- {indent}{} -->", description.replace("--", "- -")),
+        _ => format!("// {indent}{description}"),
     }
 }
 
@@ -438,8 +470,7 @@ pub fn render_with_hits(
                 &by_id,
                 detail,
                 descriptions.symbols,
-                hits.annotations,
-                hits.extras,
+                &hits,
             );
             group.clear();
         }
@@ -452,8 +483,7 @@ pub fn render_with_hits(
             &by_id,
             detail,
             descriptions.symbols,
-            hits.annotations,
-            hits.extras,
+            &hits,
         );
     }
     output
@@ -465,8 +495,7 @@ fn append_group(
     by_id: &HashMap<usize, &StructureNode>,
     detail: Detail,
     descriptions: Option<&HashMap<usize, String>>,
-    annotations: Option<&HashMap<usize, String>>,
-    extras: Option<&HashMap<usize, String>>,
+    hits: &HitDetails<'_>,
 ) {
     if !output.is_empty() {
         output.push('\n');
@@ -487,14 +516,22 @@ fn append_group(
         qualified,
     ));
     for node in group {
+        let depth = depth(node, by_id);
         output.push_str(&declaration(
             node,
-            depth(node, by_id),
+            depth,
             detail,
             descriptions.and_then(|descriptions| descriptions.get(&node.id).map(String::as_str)),
-            annotations.and_then(|scores| scores.get(&node.id).map(String::as_str)),
+            hits.annotations
+                .and_then(|scores| scores.get(&node.id).map(String::as_str)),
         ));
-        if let Some(extra) = extras.and_then(|extras| extras.get(&node.id)) {
+        if let Some(callees) = hits.callees.and_then(|callees| callees.get(&node.id))
+            && let Some(calls) =
+                render_callers(&node.language, callees.iter().map(String::as_str), depth)
+        {
+            output.push_str(&calls);
+        }
+        if let Some(extra) = hits.extras.and_then(|extras| extras.get(&node.id)) {
             output.push_str(extra);
         }
     }
@@ -986,6 +1023,7 @@ mod tests {
             Descriptions::default(),
             HitDetails {
                 annotations: Some(&annotations),
+                callees: None,
                 extras: None,
             },
         );
@@ -1267,6 +1305,7 @@ mod tests {
                 Descriptions::default(),
                 HitDetails {
                     annotations: Some(&HashMap::from([(node.id, "score=0.90".to_owned())])),
+                    callees: None,
                     extras: None,
                 },
             ),

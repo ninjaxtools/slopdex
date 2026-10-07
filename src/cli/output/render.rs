@@ -148,17 +148,13 @@ impl<'a> Presentation<'a> {
         }
     }
 
-    fn call_comments(&self, path: &str, id: usize) -> Option<String> {
+    fn call_list(&self, path: &str, id: usize, depth: usize) -> Option<String> {
         let key = Key {
             path: path.to_owned(),
             id,
         };
-        self.expanded.as_ref()?.comments.get(&key).map(|calls| {
-            calls
-                .iter()
-                .map(|call| format!("{}\n", map::comment(path, call)))
-                .collect()
-        })
+        let calls = self.expanded.as_ref()?.comments.get(&key)?;
+        map::render_callers(path, calls.iter().map(String::as_str), depth)
     }
 
     fn code(
@@ -352,9 +348,10 @@ fn print_function_with_header(
         writeln!(out, "{}{name}{suffix}", map::hunk(start, end, None))?;
     }
     if let Some(key) = presentation.key(function)
-        && let Some(comments) = presentation.call_comments(&key.path, key.id)
+        && let Some(calls) =
+            presentation.call_list(&key.path, key.id, nodes.len().saturating_sub(1))
     {
-        write!(out, "{comments}")?;
+        write!(out, "{calls}")?;
     }
     if let Some(node) = nodes.last()
         && let Some(code) =
@@ -582,6 +579,7 @@ fn print_ranked_file(
     let structure = presentation.structure(path)?.cloned();
     let mut selected = HashMap::<usize, StructureNode>::new();
     let mut annotations: HashMap<usize, String> = HashMap::new();
+    let mut callees = HashMap::new();
     let mut extras = HashMap::new();
     let mut descriptions = HashMap::new();
     let mut unmatched = Vec::new();
@@ -675,11 +673,8 @@ fn print_ranked_file(
                 for ancestor in map::ancestors(structure, node) {
                     selected.entry(ancestor.id).or_insert(ancestor);
                 }
-                if let Some(comment) = presentation.call_comments(path, key.id) {
-                    extras
-                        .entry(key.id)
-                        .or_insert_with(String::new)
-                        .push_str(&comment);
+                if let Some(calls) = expanded.comments.get(key) {
+                    callees.insert(key.id, calls.clone());
                 }
                 if let Some(code) = presentation.code(path, node, None, detail) {
                     let extra = extras.entry(key.id).or_insert_with(String::new);
@@ -724,6 +719,7 @@ fn print_ranked_file(
                 },
                 map::HitDetails {
                     annotations: Some(&annotations),
+                    callees: Some(&callees),
                     extras: Some(&extras)
                 },
             )
