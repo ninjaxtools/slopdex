@@ -294,7 +294,7 @@ pub(crate) fn group_symbol_locations<'a>(
         .collect()
 }
 
-pub(crate) fn render_callers<'a>(
+pub(crate) fn render_callees<'a>(
     language: &str,
     callees: impl IntoIterator<Item = &'a str>,
     depth: usize,
@@ -304,7 +304,7 @@ pub(crate) fn render_callers<'a>(
         return None;
     }
     let indent = "  ".repeat(depth + 1);
-    let mut output = format!("{indent}{}\n", comment(language, "callers:"));
+    let mut output = format!("{indent}{}\n", comment(language, "callees:"));
     for (path, symbols) in files {
         output.push_str(&format!(
             "{indent}{}\n",
@@ -566,7 +566,7 @@ fn append_group(
         ));
         if let Some(callees) = hits.callees.and_then(|callees| callees.get(&node.id))
             && let Some(calls) =
-                render_callers(&node.language, callees.iter().map(String::as_str), depth)
+                render_callees(&node.language, callees.iter().map(String::as_str), depth)
         {
             output.push_str(&calls);
         }

@@ -183,14 +183,15 @@ cross-search clusters. Map JSON and related callable JSON nodes include indexed
 `callDepth` metadata.
 `--expand-callables` is an alias for `--expand-callees`.
 
+Callees are the functions a symbol calls; callers are the functions that call it.
 In text output, each function's displayed callees appear immediately below its
-declaration under a standalone `callers:` header. The header is indented two spaces
+declaration under a standalone `callees:` header. The header is indented two spaces
 deeper than the declaration. Callees are grouped under one repository-relative
 `path:` header per file, with paths sorted lexically and symbols in numeric source
 order within each file. After each comment marker, file-header text is indented
-two spaces deeper than `callers:`; symbol text is indented another two spaces and
+two spaces deeper than `callees:`; symbol text is indented another two spaces and
 uses `start-end:qualifiedName`, or `line:qualifiedName` for single-line functions.
-All comment markers align with the `callers:` marker; only the nested contents
+All comment markers align with the `callees:` marker; only the nested contents
 after the markers are indented. The whole block follows the owning function's
 indentation, including for nested declarations. These lines use language-specific
 comment markers, such as `#` for Python and `//` for Rust, and are generated
@@ -199,7 +200,7 @@ defined on lines 1–2 and a single-line `helper` on line 5 in `b.py` renders:
 
 ```text
 def outer():
-  # callers:
+  # callees:
   #   b.py:
   #     1-2:middle
   #     5:helper

@@ -154,7 +154,7 @@ impl<'a> Presentation<'a> {
             id,
         };
         let calls = self.expanded.as_ref()?.comments.get(&key)?;
-        map::render_callers(path, calls.iter().map(String::as_str), depth)
+        map::render_callees(path, calls.iter().map(String::as_str), depth)
     }
 
     fn code(
