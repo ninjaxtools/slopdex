@@ -461,8 +461,9 @@ does not change the selected-index ranking. Symbol-name rows additionally expose
 
 Cross-search always retrieves, thresholds, and ranks by code similarity. Its
 optional callable/file description similarities compare the corresponding
-descriptions when both sides have vectors. They do not change ranking or require
-complete description coverage or matching description-generator profiles. JSON
+descriptions when both sides have vectors. These supplementary scores do not
+affect ranking, match limits, or thresholds, and require neither complete
+description coverage nor matching description-generator profiles. JSON
 `scoring` reports `similarityMode: "code"` and weights of code `1`, description
 `0`, and file description `0`.
 

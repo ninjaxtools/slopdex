@@ -30,29 +30,36 @@ fn test_config(temp: &TempDir) -> Value {
 
 impl Fixture {
     fn new(descriptions: bool) -> Result<Self> {
+        Self::with_sources(
+            descriptions,
+            &[
+                (
+                    "a.rs",
+                    "//! file overview\n\n/// copper token\npub fn run() {\n    let value = 1;\n    println!(\"{value}\");\n}\n/// copper token\npub const LIMIT: usize = 1;\n",
+                ),
+                (
+                    "b.rs",
+                    "pub fn run() {\n    let value = 1;\n    println!(\"{value}\");\n}\n",
+                ),
+                (
+                    "guide.md",
+                    "# Guide\n\nInstructions.\n## Setup\n\nMore instructions.\n",
+                ),
+                (
+                    "settings.rs",
+                    "//! file overview\n\npub const SETTING: usize = 2;\n",
+                ),
+            ],
+        )
+    }
+
+    fn with_sources(descriptions: bool, sources: &[(&str, &str)]) -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let index = temp.path().join("index.sqlite");
         let config = test_config(&temp);
         let mut db = Database::open(&index, temp.path(), &Value::Null, false)?;
         let mut records = Vec::new();
-        for (path, source) in [
-            (
-                "a.rs",
-                "//! file overview\n\n/// copper token\npub fn run() {\n    let value = 1;\n    println!(\"{value}\");\n}\n/// copper token\npub const LIMIT: usize = 1;\n",
-            ),
-            (
-                "b.rs",
-                "pub fn run() {\n    let value = 1;\n    println!(\"{value}\");\n}\n",
-            ),
-            (
-                "guide.md",
-                "# Guide\n\nInstructions.\n## Setup\n\nMore instructions.\n",
-            ),
-            (
-                "settings.rs",
-                "//! file overview\n\npub const SETTING: usize = 2;\n",
-            ),
-        ] {
+        for &(path, source) in sources {
             fs::write(temp.path().join(path), source)?;
             let parsed = parse::parse(path, source)?;
             records.push((
@@ -243,6 +250,111 @@ fn description_similarity_is_independent_of_code_and_file_prose() -> Result<()> 
         description_index.with_extension("usearch.manifest.json"),
     )?)?;
     assert_eq!(manifest["dimensions"], 2);
+    Ok(())
+}
+
+#[test]
+fn cross_search_description_scores_do_not_affect_ranking_limits_or_thresholds() -> Result<()> {
+    let fixture = Fixture::with_sources(
+        true,
+        &[
+            (
+                "source.rs",
+                "//! source overview\n/// source description\npub fn source() {\n    println!(\"source\");\n}\n",
+            ),
+            (
+                "high.rs",
+                "//! high overview\n/// high description\npub fn high() {\n    println!(\"high\");\n}\n",
+            ),
+            (
+                "middle.rs",
+                "//! middle overview\n/// middle description\npub fn middle() {\n    println!(\"middle\");\n}\n",
+            ),
+            (
+                "low.rs",
+                "//! low overview\n/// low description\npub fn low() {\n    println!(\"low\");\n}\n",
+            ),
+        ],
+    )?;
+    let db = Database::open(&fixture.index, fixture.temp.path(), &Value::Null, false)?;
+    // Embeddings are immutable; replace the fixture's uniform vectors before opening.
+    db.conn.execute("DELETE FROM embeddings", [])?;
+    let profile = Providers::new(&fixture.config)?.embedding_profile();
+    let files = db.files()?;
+    for item in db.items()? {
+        let (code, description) = match item.path.as_str() {
+            "source.rs" => ([1.0, 0.0], [1.0, 0.0]),
+            "high.rs" => ([1.0, 0.0], [-1.0, 0.0]),
+            "middle.rs" => ([0.8, 0.6], [0.0, 1.0]),
+            "low.rs" => ([0.6, 0.8], [1.0, 0.0]),
+            path => panic!("Unexpected fixture path: {path}"),
+        };
+        let file = files.iter().find(|file| file.path == item.path).unwrap();
+        for (text, vector) in [
+            (item.data["embeddingInput"].as_str().unwrap(), code),
+            (item.data["description"].as_str().unwrap(), description),
+            (file.description.as_deref().unwrap(), description),
+        ] {
+            db.put_embedding(&Database::embedding_key(&profile, false, text), &vector)?;
+        }
+    }
+    drop(db);
+    let engine = fixture.engine()?;
+    let options = json!({"sourcePath":"source.rs", "crossFileOnly":true, "minSimilarity":0});
+    let rows = engine.cross_search(None, &options)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0]["scoring"],
+        json!({
+            "similarityMode":"code",
+            "similarityWeights":{"code":1,"description":0,"fileDescription":0}
+        })
+    );
+    let matches = rows[0]["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 3);
+    // Description rankings are the reverse of code rankings for both scopes.
+    for (row, (name, code, description)) in
+        matches
+            .iter()
+            .zip([("high", 1.0, -1.0), ("middle", 0.8, 0.0), ("low", 0.6, 1.0)])
+    {
+        assert_eq!(row["function"]["name"], name);
+        for key in ["similarity", "codeSimilarity"] {
+            assert!((row[key].as_f64().unwrap() - code).abs() < 1e-6, "{row:?}");
+        }
+        for key in [
+            "descriptionSimilarity",
+            "functionDescriptionSimilarity",
+            "fileDescriptionSimilarity",
+        ] {
+            assert_eq!(row[key], description, "{row:?}");
+        }
+    }
+    assert_eq!(rows, engine.cross_search(None, &options)?);
+    for (filters, expected) in [
+        (json!({"matches":1}), vec!["high"]),
+        (json!({"minSimilarity":0.7}), vec!["high", "middle"]),
+        (json!({"minSimilarity":0.9}), vec!["high"]),
+        (
+            json!({"minSimilarity":0.7,"maxSimilarity":0.9}),
+            vec!["middle"],
+        ),
+    ] {
+        let mut options = options.clone();
+        options
+            .as_object_mut()
+            .unwrap()
+            .extend(filters.as_object().unwrap().clone());
+        let rows = engine.cross_search(None, &options)?;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let names: Vec<_> = rows[0]["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, expected, "{options:?}: {rows:?}");
+    }
     Ok(())
 }
 

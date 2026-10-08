@@ -82,7 +82,9 @@ provider caches accelerate work but do not define the live repository snapshot.
    descriptions remain separate hits. `filter.rs` selects paths and declarations;
    `-q` matches names, available descriptions, and heading titles. USearch retrieves
    approximate neighbors, with optional query reranking. `cross-search` retrieves
-   and ranks indexed callables by code, reporting optional description scores.
+   and ranks indexed callables by code similarity; available callable/file
+   description similarities are supplementary scores and do not affect ranking
+   or thresholds.
    `describe` sends search context to an LLM. `map.rs`
    renders declaration excerpts, and `callgraph.rs` expands conservatively
    resolved caller/callee context from saved structure.
