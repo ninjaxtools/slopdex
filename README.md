@@ -13,24 +13,22 @@ Slopdex helps with doing analysis on codebases that contain a lot of AI generate
 
 The main supported functions are
 
-- `slopdex search <query>`
-   <br/>find code/docs similar to the query
-- `slopdex cross-search`
-   <br/>find clusters of similar code/docs
-- `slopdex describe <query>`
-   <br/>explain code relevant to a task
 - `slopdex map [PATH]...`
    <br/>show a map/skeleton of the code structure
-- `slopdex generate descriptions`
-   <br/>generate file and function descriptions explicitly
+- `slopdex cross-search`
+   <br/>find clusters of similar code/docs
+- `slopdex search <query>`
+   <br/>find code/docs similar to the query
+- `slopdex describe <query>`
+   <br/>explain code relevant to a task
 
-`search` does a vector search across all indexes: code, documentation, configuration and markup content, available source or generated descriptions, and symbol names/heading titles.
+`map` shows a map/skeleton of the code, excluding implementation details like function bodies. This can be helpful to get a concise map of the code to allow an LLM to explore the codebase incrementally.
+
+`search` does a vector search across all supported code/docs/config files.
 
 `cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
 
 `describe` does a `search` first, then passes the result through the configured LLM model to create a tailored description.
-
-`map` shows a map/skeleton of the code, excluding implementation details like function bodies. This can be helpful to get a concise map of the code to allow an LLM to explore the codebase incrementally.
 
 ## Installation
 
@@ -78,8 +76,7 @@ $ slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
 
 The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains structurally useful information that can act as an index into the source code, which improves context usage.
 
-Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). The `-q` filter semantically matches symbol names, source or generated descriptions, and heading titles
-and will be ignored if an index doesn't exist.
+Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). The `-q` filter uses vector search on symbol names and markdown heading titles.
 
 Use `--detail expanded` to to show full code or markdown of matched symbols.
 
@@ -94,7 +91,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 
 ### Search
 
-By default all indexes are searched and ranked together, including symbols and available source or generated descriptions. Code and descriptions are searched independently; a callable found through both keeps its highest matching score, rather than an average. File descriptions are separate hits.
+By default all indexes are searched and ranked together.
 
 ```console
 $ slopdex search "keep the repository index synchronized"
@@ -110,7 +107,7 @@ impl Engine
 ...
 ```
 
-To search explicit indexes individually:
+To search indexes individually:
 
 ```console
 $ slopdex search-code "configure the embedding provider"
@@ -118,7 +115,7 @@ $ slopdex search-md "configure the embedding provider"
 $ slopdex search-code 'reject expired credentials' -q 'validate session' --symbol-threshold 0.6
 ```
 
-To select only the symbol-name/heading-title index, use `search-symbols` or `--symbols`. Passing any of `--code`, `--descriptions`, `--md`, or `--symbols` restricts search to the selected indexes:
+Or pass any combination of `--symbols` `--code`, `--descriptions`, `--md`:
 
 ```console
 $ slopdex search-symbols 'validate session' --threshold 0.6 --limit 20
@@ -127,9 +124,7 @@ $ slopdex search 'validate session' --code --symbols
 $ slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
 ```
 
-Description text is optional, but descriptions are always indexed when present. Source comments attached to declarations and Python function/class docstrings supply descriptions automatically; a leading comment group can describe the file. Source descriptions take precedence over generated ones. See the [attachment rules](docs/reference.md#descriptions).
-
-Run `generate descriptions` explicitly to generate missing or stale file and function descriptions with the configured LLM provider. It skips source-described files/callables and Markdown files. Updates, searches, and maps do not generate descriptions automatically.
+Descriptions refer to source comments found above symbols or at the start of a file. Since not all symbols have descriptions, missing descriptions can optionally be generated with `generate descriptions`, but required an LLM to be configured.
 
 I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low-cost models. If you
 sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
@@ -157,7 +152,7 @@ $ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
 
 The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
 
-Generated file and function descriptions are cached by source and generation context, including the configured profile, settings, and system instruction. A rename can reuse matching artifacts; changes to source or generation inputs invalidate reuse. After edits or model/settings changes, run `generate descriptions` again to prepare missing or stale generated descriptions. Source descriptions are kept and never replaced by generation.
+Generated descriptions are cached by source and generation context, including the configured profile, settings, and system instruction.
 
 > [!NOTE]
 > Add this to your `AGENTS.md` to use semantic code search with your agent:
@@ -165,6 +160,8 @@ Generated file and function descriptions are cached by source and generation con
 > ```text
 > - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.3 --limit 20`; vary the search query if you get no results
 > ```
+
+See the [attachment rules](docs/reference.md#descriptions).
 
 ### Interactive Config
 
@@ -176,17 +173,17 @@ $ slopdex config
 
 ### Search and describe
 
-The intention of the `describe` command is to use a low-cost model to summarise vector search findings to provide more relevant pre-processed results to a more powerful calling agent. It first performs a vector search and then uses the results to provide a tailored summary/description of relevant code and available source or generated descriptions.
+The intention of the `describe` command is to use a low-cost model to summarise vector search findings to provide more relevant pre-processed results to a more powerful calling agent. It first performs a vector search and then uses the results to provide a tailored summary/description of relevant code.
 
 ```console
 $ slopdex describe "I want to implement a new rpc endpoint"
 ```
 
-First a `search` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which includes available source or generated descriptions and function implementations. The result is given to an LLM for interpretation, and the final output includes that explanation and the `compact` search references. This provides a tailored explanation for the query without generating indexed file/function descriptions.
+First a `search` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation which generates an explanation which will be emitted along with the `compact` search references. This provides a tailored explanation for the query based on the `expanded` search result along with the `compact` search result and thereby acts as a compaction of the `expanded` result.
 
 ### Find duplicate code
 
-Compare functions across files, exclude short wrappers, and group matches into clusters. Cross-search retrieves and ranks by code similarity; available callable/file description similarities are supplementary scores and do not affect rank or thresholds:
+Compare functions across files, exclude short wrappers, and group matches into clusters.
 
 ```console
 $ slopdex cross-search --cross-file-only --lines 4 --threshold 0.9
