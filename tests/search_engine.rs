@@ -54,7 +54,8 @@ impl Fixture {
     }
 
     fn with_sources(descriptions: bool, sources: &[(&str, &str)]) -> Result<Self> {
-        let temp = tempfile::tempdir()?;
+        // Database roots must match Engine's canonical paths, including symlinked TMPDIRs.
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
         let index = temp.path().join("index.sqlite");
         let config = test_config(&temp);
         let mut db = Database::open(&index, temp.path(), &Value::Null, false)?;
@@ -432,7 +433,7 @@ fn structural_map_description_queries_select_precise_declarations() -> Result<()
 
 #[test]
 fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
     fs::create_dir(temp.path().join(".slopdex"))?;
     let index = temp.path().join(".slopdex/index.sqlite");
     let config = test_config(&temp);
