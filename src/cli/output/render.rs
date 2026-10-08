@@ -55,6 +55,11 @@ pub(super) fn rank(row: &Value) -> String {
 }
 
 pub(super) fn score_details(row: &Value) -> String {
+    if row["type"] == "file"
+        && let Some(file) = row["fileDescriptionSimilarity"].as_f64()
+    {
+        return format!("  [file {file:.2}]");
+    }
     if let Some(symbol) = row["symbolSimilarity"].as_f64() {
         return format!("  [symbol {symbol:.2}]");
     }
@@ -507,7 +512,7 @@ pub(super) fn print_ranked_files(
     source.prepare(
         &hits
             .iter()
-            .filter(|hit| !hit.target && !hit.markdown)
+            .filter(|hit| !hit.target && !hit.markdown && hit.row["type"] != "file")
             .map(|hit| hit.item)
             .collect::<Vec<_>>(),
     );
@@ -515,7 +520,7 @@ pub(super) fn print_ranked_files(
         target.prepare(
             &hits
                 .iter()
-                .filter(|hit| hit.target && !hit.markdown)
+                .filter(|hit| hit.target && !hit.markdown && hit.row["type"] != "file")
                 .map(|hit| hit.item)
                 .collect::<Vec<_>>(),
         );
@@ -601,6 +606,9 @@ fn print_ranked_file(
         HashMap::new()
     };
     for hit in hits {
+        if hit.row["type"] == "file" {
+            continue;
+        }
         let chain = structure
             .as_ref()
             .map(|structure| {
@@ -693,6 +701,28 @@ fn print_ranked_file(
             hit.item["startColumn"].as_u64().unwrap_or(1),
         )
     });
+    let file_hit = hits.iter().find(|hit| hit.row["type"] == "file");
+    if let Some(hit) = file_hit {
+        let annotations = hits
+            .iter()
+            .filter(|hit| hit.row["type"] == "file")
+            .map(|hit| hit.annotation.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let language = hit.item["language"].as_str().unwrap_or(path);
+        writeln!(
+            out,
+            "*** {path}{}",
+            map::inline_note(language, Some(&annotations), None)
+        )?;
+        if (detail != Detail::Compact || hit.description)
+            && let Some(description) = hit.item["description"]
+                .as_str()
+                .filter(|description| !description.trim().is_empty())
+        {
+            write!(out, "{}", map::comment_block(language, description))?;
+        }
+    }
     if !nodes.is_empty() {
         let file_description = (detail == Detail::Expanded
             || hits.iter().any(|hit| hit.description))
@@ -702,12 +732,15 @@ fn print_ranked_file(
                 .and_then(|engine| engine.presentation_file_description(path))
         })
         .flatten();
+        if file_hit.is_some() {
+            writeln!(out)?;
+        }
         write!(
             out,
             "{}",
             map::render_with_hits(
                 &nodes,
-                Some(path),
+                file_hit.is_none().then_some(path),
                 detail.into(),
                 presentation
                     .engine
@@ -726,7 +759,7 @@ fn print_ranked_file(
         )?;
     }
     for (fallback_index, hit) in unmatched.iter().enumerate() {
-        if !nodes.is_empty() || fallback_index > 0 {
+        if !nodes.is_empty() || file_hit.is_some() || fallback_index > 0 {
             writeln!(out)?;
         }
         if hit.markdown {
@@ -736,7 +769,7 @@ fn print_ranked_file(
                 detail,
                 hit.description,
                 presentation,
-                nodes.is_empty() && fallback_index == 0,
+                nodes.is_empty() && file_hit.is_none() && fallback_index == 0,
             )?;
         } else {
             print_function_with_header(
@@ -749,7 +782,7 @@ fn print_ranked_file(
                     similarity: hit.row["similarity"].as_f64(),
                 },
                 presentation,
-                nodes.is_empty() && fallback_index == 0,
+                nodes.is_empty() && file_hit.is_none() && fallback_index == 0,
             )?;
         }
     }

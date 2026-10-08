@@ -8,6 +8,69 @@ fn clap_definition_is_consistent() {
 }
 
 #[test]
+fn help_describes_all_indexes_semantic_selection_and_explicit_generation() {
+    let help = |args: &[&str]| {
+        Cli::try_parse_from(std::iter::once("slopdex").chain(args.iter().copied()))
+            .unwrap_err()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let top = help(&["--help"]);
+    assert!(top.contains("Plain search includes all indexes"), "{top}");
+    assert!(
+        top.contains("queries and explicit generation may call providers"),
+        "{top}"
+    );
+    assert!(!top.contains("opt-in"), "{top}");
+    let search = help(&["search", "--help"]);
+    assert!(
+        search.contains("Semantic query over symbols, descriptions, and heading titles"),
+        "{search}"
+    );
+    for index in [
+        "callable code",
+        "generated callable/file description",
+        "Markdown content",
+        "symbol-name/alias and heading-title",
+    ] {
+        assert!(
+            search.contains(&format!("Select the {index} index")),
+            "{search}"
+        );
+    }
+    let generation = help(&["generate", "descriptions", "--help"]);
+    assert!(
+        generation.contains("Generate missing or stale file and callable descriptions"),
+        "{generation}"
+    );
+}
+
+#[test]
+fn description_generation_uses_content_mode_and_explicit_nested_action() {
+    for argv in [
+        vec!["generate", "descriptions"],
+        vec![
+            "generate",
+            "descriptions",
+            "--no-reindex",
+            "--format",
+            "json",
+        ],
+    ] {
+        let cli = parse(&argv);
+        assert!(matches!(
+            cli.command,
+            Command::Generate {
+                action: GenerateAction::Descriptions
+            }
+        ));
+        assert_eq!(CommandMode::for_command(&cli.command), CommandMode::Content);
+    }
+}
+
+#[test]
 fn shared_selection_arguments_reach_all_search_options() {
     for command in [
         "search",
@@ -75,7 +138,7 @@ fn shared_selection_arguments_reach_all_search_options() {
 }
 
 #[test]
-fn symbol_search_commands_select_explicit_streams_and_structural_mode() {
+fn search_commands_select_explicit_indexes_and_structural_mode() {
     let plain = parse(&["search", "query"]);
     let (_, kind, options, descriptions) = plain.command.search_request().unwrap();
     assert_eq!(kind, "search");
@@ -278,7 +341,7 @@ fn readme_commands_parse() {
         vec!["search", "keep the repository index synchronized"],
         vec!["search-code", "configure the embedding provider"],
         vec!["search-md", "configure the embedding provider"],
-        vec!["config", "set", "descriptionsEnabled", "true"],
+        vec!["generate", "descriptions"],
         vec![
             "search-descriptions",
             "keep the repository index synchronized",
@@ -554,7 +617,7 @@ fn validates_combinations_before_opening_an_index() {
         "--force-reindex",
         "--yes-really-rebuild-the-index",
     ]);
-    parse(&["index", "reindex-files", "--callables"]);
+    parse(&["generate", "descriptions"]);
     parse(&["search", "query", "--code", "--md", "--regex", "foo"]);
 }
 
@@ -574,6 +637,10 @@ fn argument_errors_cover_global_constraints_and_conflicting_model_selections() {
         vec!["status", "--dimensions", "18446744073709551616"],
         vec!["index-errors"],
         vec!["reindex-files"],
+        vec!["index", "reindex-files"],
+        vec!["index", "reindex-files", "--callables"],
+        vec!["generate"],
+        vec!["generate", "descriptions", "--callables"],
         vec!["descriptions", "enable"],
         vec!["models"],
         vec!["search-code", "query", "--regexp", "(?=lookahead)"],

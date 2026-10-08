@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
-pub const STRUCTURE_PARSER_VERSION: &str = "structure-v7-css-at-rules";
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v8-source-descriptions";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -425,7 +425,9 @@ impl Database {
             } else if data.get("description").is_some() {
                 data["description"] = Value::Null;
             }
-            let embedding = if let Some(profile) = profile {
+            let embedding = if kind == "symbol-description" {
+                None
+            } else if let Some(profile) = profile {
                 match data["embeddingInput"].as_str() {
                     Some(input) if hash(input) == input_hash => {
                         self.cached_embedding_key(profile, input)?
@@ -484,12 +486,12 @@ impl Database {
         read_structure(&self.conn, path)
     }
 
-    /// Saved callable descriptions keyed by their structural symbol, without
+    /// Saved declaration descriptions keyed by their structural symbol, without
     /// loading vectors or requiring a description provider for `map`.
     pub fn symbol_descriptions(&self, path: &str) -> Result<HashMap<usize, String>> {
         let mut stmt = self.conn.prepare("SELECT s.symbol_id,s.data,d.source_hash,d.text
             FROM search_units s JOIN descriptions d ON d.scope='callable' AND d.path=s.path AND d.identity=s.identity
-            WHERE s.path=? AND s.kind='function' AND s.symbol_id IS NOT NULL ORDER BY s.id")?;
+            WHERE s.path=? AND s.kind IN ('function','symbol-description') AND s.symbol_id IS NOT NULL ORDER BY s.id")?;
         let rows = stmt.query_map([path], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -502,10 +504,7 @@ impl Database {
         for row in rows {
             let (id, data, source_hash, description) = row?;
             let data: Value = serde_json::from_str(&data)?;
-            if source_hash
-                .as_deref()
-                .is_some_and(|hash| Some(hash) == data["sourceHash"].as_str())
-            {
+            if source_hash.as_deref() == data["sourceHash"].as_str() {
                 descriptions.insert(usize::try_from(id)?, description);
             }
         }
@@ -557,6 +556,21 @@ impl Database {
                 file.description_hash = source_hash;
                 file.description_embedding = embedding;
             }
+            if let Some(text) = &parsed.description {
+                if file.description.as_ref() != Some(text) {
+                    file.description_embedding = None;
+                }
+                file.description = Some(text.clone());
+                file.description_hash = Some(format!("source:{}", hash(text)));
+            } else if file
+                .description_hash
+                .as_deref()
+                .is_some_and(|hash| hash.starts_with("source:"))
+            {
+                file.description = None;
+                file.description_hash = None;
+                file.description_embedding = None;
+            }
             file.errors.extend(parsed.errors.iter().map(|e| json!({"path":file.path,"code":"parse-error",
                 "message":e.message,"startLine":e.start_line,"endLine":e.end_line,"sourceMode":file.source_mode})));
             let items = parsed_items(&file, parsed)?;
@@ -590,7 +604,7 @@ impl Database {
             tx.execute("DELETE FROM files WHERE path=?", [path])?;
         }
         for (file, items, structure) in changed {
-            write_file(&tx, file)?;
+            write_file(&tx, file, structure.is_some())?;
             if let Some(structure) = structure {
                 // IDs are file-local parser IDs. Relink all units after replacing
                 // symbols; deferred foreign keys keep the transaction atomic.
@@ -686,12 +700,34 @@ fn latest_embedding(
         params![i64::try_from(id)?, role, input_hash], |r| r.get(0)).optional()?)
 }
 
-fn write_file(conn: &Connection, file: &File) -> Result<()> {
+fn write_file(conn: &Connection, file: &File, structural: bool) -> Result<()> {
+    let mut file = file.clone();
+    if !structural
+        && !file
+            .description_hash
+            .as_deref()
+            .is_some_and(|hash| hash.starts_with("source:"))
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path=? AND hash=?)",
+            params![file.path, file.hash],
+            |row| row.get::<_, bool>(0),
+        )?
+        && let Some((source_hash, text, embedding)) = description(conn, "file", &file.path, "")?
+        && source_hash
+            .as_deref()
+            .is_some_and(|hash| hash.starts_with("source:"))
+    {
+        if file.description.as_ref() != Some(&text) {
+            file.description_embedding = embedding;
+        }
+        file.description = Some(text);
+        file.description_hash = source_hash;
+    }
     conn.execute("INSERT INTO files(path,source,hash,language,source_mode,data) VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
         source=excluded.source,hash=excluded.hash,language=excluded.language,source_mode=excluded.source_mode,data=excluded.data,
         parser_version=CASE WHEN files.hash=excluded.hash THEN files.parser_version END,
         structure_hash=CASE WHEN files.hash=excluded.hash THEN files.structure_hash END",
-        params![file.path, file.source, file.hash, file.language, file.source_mode, serde_json::to_string(file)?])?;
+            params![file.path, file.source, file.hash, file.language, file.source_mode, serde_json::to_string(&file)?])?;
     conn.execute(
         "DELETE FROM descriptions WHERE scope='file' AND path=?",
         [&file.path],
@@ -711,7 +747,7 @@ fn write_file(conn: &Connection, file: &File) -> Result<()> {
 
 fn write_structure(conn: &Connection, path: &str, structure: &FileStructure) -> Result<()> {
     for (ordinal, node) in structure.nodes.iter().enumerate() {
-        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level,"calls":node.calls});
+        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level,"calls":node.calls,"description":node.description});
         conn.execute("INSERT INTO symbols(path,id,parent_id,ordinal,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![path, i64::try_from(node.id)?, node.parent_id.map(i64::try_from).transpose()?, i64::try_from(ordinal)?, node.language, node.kind, node.name, node.qualified_name,
                 node.signature, i64::try_from(node.start_byte)?, i64::try_from(node.end_byte)?, i64::try_from(node.start_line)?, i64::try_from(node.start_column)?, i64::try_from(node.end_line)?, i64::try_from(node.end_column)?, metadata.to_string()])?;
@@ -773,6 +809,9 @@ fn read_structure(conn: &Connection, path: &str) -> Result<FileStructure> {
             node.heading_level = serde_json::from_value(metadata["headingLevel"].clone())?;
             node.calls =
                 serde_json::from_value(metadata.get("calls").cloned().unwrap_or(json!([])))?;
+            node.description = serde_json::from_value(
+                metadata.get("description").cloned().unwrap_or(Value::Null),
+            )?;
             node.names = names.remove(&node.id).unwrap_or_default();
             Ok(node)
         })
@@ -780,8 +819,9 @@ fn read_structure(conn: &Connection, path: &str) -> Result<FileStructure> {
     Ok(FileStructure { nodes })
 }
 
-fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
+pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
     let mut occurrences = HashMap::<&str, usize>::new();
+    let mut callable_symbols = HashSet::new();
     let mut items = Vec::with_capacity(parsed.callables.len() + parsed.chunks.len());
     for callable in &parsed.callables {
         let occurrence = occurrences.entry(&callable.qualified_name).or_default();
@@ -798,12 +838,49 @@ fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
         let mut data = serde_json::to_value(callable)?;
         data["path"] = json!(file.path);
         data["sourceMode"] = json!(file.source_mode);
-        data["description"] = Value::Null;
+        data["description"] = json!(callable.description);
+        data["sourceDescription"] = json!(callable.description.is_some());
+        if let Some(node) = map::matching_node(&parsed.structure, &data) {
+            callable_symbols.insert(node.id);
+        }
         items.push(Item {
             id: 0,
             path: file.path.clone(),
             identity,
             kind: "function".into(),
+            data,
+            embedding: String::new(),
+            description_embedding: None,
+        });
+    }
+    // Count every noncallable declaration, including those without prose, so
+    // removing a preceding comment cannot renumber a later declaration.
+    occurrences.clear();
+    for node in &parsed.structure.nodes {
+        if callable_symbols.contains(&node.id) {
+            continue;
+        }
+        let occurrence = occurrences.entry(&node.qualified_name).or_default();
+        let identity =
+            hash(json!([file.path, node.qualified_name, node.kind, *occurrence]).to_string());
+        *occurrence += 1;
+        if node.description.is_none() {
+            continue;
+        }
+        let mut data = serde_json::to_value(node)?;
+        data["path"] = json!(file.path);
+        data["sourceMode"] = json!(file.source_mode);
+        data["sourceDescription"] = json!(true);
+        data["sourceHash"] = json!(hash(
+            file.source
+                .get(node.start_byte..node.end_byte)
+                .context("Invalid described symbol source range")?
+        ));
+        items.push(Item {
+            id: 0,
+            path: file.path.clone(),
+            identity,
+            kind: "symbol-description".into(),
             data,
             embedding: String::new(),
             description_embedding: None,
@@ -834,6 +911,28 @@ fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
 fn symbol_for(item: &Item, structure: &FileStructure) -> Option<usize> {
     if item.kind == "document" {
         return None;
+    }
+    if item.kind == "symbol-description" {
+        let start = item.data["startLine"].as_u64()? as usize;
+        let end = item.data["endLine"].as_u64().unwrap_or(start as u64) as usize;
+        return structure
+            .nodes
+            .iter()
+            .filter(|node| {
+                item.data["qualifiedName"].as_str() == Some(node.qualified_name.as_str())
+                    && item.data["kind"]
+                        .as_str()
+                        .is_none_or(|kind| kind == node.kind)
+            })
+            .min_by_key(|node| {
+                (
+                    node.start_line.abs_diff(start) + node.end_line.abs_diff(end),
+                    node.start_column
+                        .abs_diff(item.data["startColumn"].as_u64().unwrap_or(1) as usize),
+                    node.id,
+                )
+            })
+            .map(|node| node.id);
     }
     if item.kind != "markdown" {
         return map::matching_node(structure, &item.data).map(|node| node.id);
@@ -917,45 +1016,74 @@ fn write_units(
             "Invalid search unit for {}",
             file.path
         );
-        let previous_path: Option<String> = conn
+        let previous: Option<(String, String)> = conn
             .query_row(
-                "SELECT path FROM search_units WHERE identity=?",
+                "SELECT path,data FROM search_units WHERE identity=?",
                 [&item.identity],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         ensure!(
-            previous_path.as_ref().is_none_or(|p| p == &file.path),
+            previous.as_ref().is_none_or(|(p, _)| p == &file.path),
             "Search unit identity belongs to another file"
         );
+        let old_source_description = previous
+            .map(|(_, data)| serde_json::from_str::<Value>(&data))
+            .transpose()?
+            .is_some_and(|data| data["sourceDescription"] == true);
         let mut data = item.data.clone();
         let old_description = description(conn, "callable", &file.path, &item.identity)?;
+        let symbol = symbol_for(item, structure);
+        // Structural publication is authoritative for comment removal. During
+        // semantic preparation, canonical source prose outranks generated prose.
+        if !structural
+            && matches!(item.kind.as_str(), "function" | "symbol-description")
+            && let Some(text) = symbol
+                .and_then(|id| structure.nodes.iter().find(|node| node.id == id))
+                .and_then(|node| node.description.as_ref())
+        {
+            data["description"] = json!(text);
+            data["sourceDescription"] = json!(true);
+        }
         if structural
+            && data["sourceDescription"] != true
+            && !old_source_description
             && let Some(d) = &old_description
             && d.0.as_deref() == data["sourceHash"].as_str()
         {
             data["description"] = json!(d.1);
         }
+        ensure!(
+            data["sourceDescription"] != true || data["description"].is_string(),
+            "Source description has no description text"
+        );
         let input = data["embeddingInput"].as_str().unwrap_or("");
         let input_hash = hash(input);
         conn.execute("INSERT INTO search_units(path,identity,kind,symbol_id,data,embedding_input_hash) VALUES(?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET
             kind=excluded.kind,symbol_id=excluded.symbol_id,data=excluded.data,embedding_input_hash=excluded.embedding_input_hash",
-            params![item.path, item.identity, item.kind, symbol_for(item, structure).map(i64::try_from).transpose()?, data.to_string(), input_hash])?;
+            params![item.path, item.identity, item.kind, symbol.map(i64::try_from).transpose()?, data.to_string(), input_hash])?;
         let id: i64 = conn.query_row(
             "SELECT id FROM search_units WHERE identity=?",
             [&item.identity],
             |r| r.get(0),
         )?;
-        associate(conn, id, "code", profile, input, &item.embedding)?;
+        if item.kind != "symbol-description" {
+            associate(conn, id, "code", profile, input, &item.embedding)?;
+        }
         conn.execute(
             "DELETE FROM descriptions WHERE scope='callable' AND path=? AND identity=?",
             params![item.path, item.identity],
         )?;
         if let Some(text) = data["description"].as_str() {
-            let embedding = if structural {
-                old_description.as_ref().and_then(|d| d.2.as_deref())
-            } else {
+            let embedding = if !structural && data["description"] == item.data["description"] {
                 item.description_embedding.as_deref()
+            } else if structural {
+                old_description
+                    .as_ref()
+                    .filter(|d| d.1 == text)
+                    .and_then(|d| d.2.as_deref())
+            } else {
+                None
             };
             conn.execute("INSERT INTO descriptions(scope,path,identity,source_hash,text,embedding_key) VALUES('callable',?,?,?,?,?)",
                 params![item.path, item.identity, data["sourceHash"].as_str(), text, embedding])?;
@@ -1792,6 +1920,236 @@ mod tests {
         assert_eq!(db.meta("active_embedding_profile")?, Some(b.to_string()));
         assert_eq!(db.structure("code.rs")?, record.1.structure);
         assert_eq!(db.items_for_profile(&b)?[0].embedding, wrong_key);
+        Ok(())
+    }
+
+    #[test]
+    fn source_descriptions_publish_without_vectors_and_hydrate_for_each_profile() -> Result<()> {
+        let (dir, mut db) = fixture()?;
+        let mut record = parsed_record(
+            "code.rs",
+            "const LIMIT: usize = 10;\nstruct Settings;\nfn example() {}\n",
+        )?;
+        record.1.description = Some("Configuration utilities".into());
+        record.1.callables[0].description = Some("Runs the example".into());
+        for node in &mut record.1.structure.nodes {
+            node.description = Some(
+                match node.kind.as_str() {
+                    "constant" => "Maximum number of requests",
+                    "struct" => "Request configuration",
+                    "function" => "Runs the example",
+                    kind => panic!("unexpected declaration: {kind}"),
+                }
+                .into(),
+            );
+        }
+        db.apply_structure(std::slice::from_ref(&record), &[], None)?;
+        assert_eq!(db.structure("code.rs")?, record.1.structure);
+        let file = db.files()?.remove(0);
+        assert_eq!(file.hash, hash(&record.0.source));
+        assert_eq!(file.description.as_deref(), Some("Configuration utilities"));
+        assert_eq!(
+            file.description_hash,
+            Some(format!("source:{}", hash("Configuration utilities")))
+        );
+        assert!(file.description_embedding.is_none());
+        let items = db.items()?;
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == "symbol-description")
+                .count(),
+            2
+        );
+        assert!(items.iter().all(|item| item.embedding.is_empty()
+            && item.description_embedding.is_none()
+            && item.data["sourceDescription"] == true));
+        let descriptions = db.symbol_descriptions("code.rs")?;
+        for node in &record.1.structure.nodes {
+            assert_eq!(descriptions.get(&node.id), node.description.as_ref());
+        }
+        let a = json!({"model":"a"});
+        let b = json!({"model":"b"});
+        for text in std::iter::once("Configuration utilities").chain(
+            items
+                .iter()
+                .map(|item| item.data["description"].as_str().unwrap()),
+        ) {
+            db.put_embedding(&Database::embedding_key(&a, false, text), &[1.0, 0.0])?;
+        }
+        assert!(db.files_for_profile(&a)?[0].description_embedding.is_some());
+        assert!(db.files_for_profile(&b)?[0].description_embedding.is_none());
+        assert!(
+            db.items_for_profile(&a)?
+                .iter()
+                .all(|item| item.description_embedding.is_some())
+        );
+        assert!(
+            db.items_for_profile(&b)?
+                .iter()
+                .all(|item| item.description_embedding.is_none())
+        );
+        // Publish the same description-only units through the engine contract,
+        // omitting byte offsets and code input; declaration links must survive.
+        db.set_projection_profile(&a)?;
+        let mut items = db.items_for_profile(&a)?;
+        for item in &mut items {
+            if item.kind == "symbol-description" {
+                item.data.as_object_mut().unwrap().remove("startByte");
+                item.data.as_object_mut().unwrap().remove("endByte");
+            }
+        }
+        db.apply(&[(file, items)], &[], None)?;
+        assert_eq!(db.symbol_descriptions("code.rs")?, descriptions);
+        assert_eq!(db.conn.query_row(
+            "SELECT count(*) FROM unit_embeddings u JOIN search_units s ON s.id=u.unit_id WHERE s.kind='symbol-description' AND u.role='code'",
+            [], |r| r.get::<_, i64>(0)
+        )?, 0);
+        drop(db);
+        let db = Database::open_readonly(&dir.path().join("index.sqlite"), dir.path())?;
+        assert_eq!(db.symbol_descriptions("code.rs")?, descriptions);
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
+            3
+        );
+        assert!(
+            db.items()?
+                .iter()
+                .all(|item| item.description_embedding.is_some())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_prose_supersedes_generated_prose_and_comment_removal_invalidates_it() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let original = parsed_record("code.rs", "fn example() -> i32 { 1 }")?;
+        db.apply_structure(std::slice::from_ref(&original), &[], None)?;
+        let mut file = db.files()?.remove(0);
+        file.description = Some("Generated file prose".into());
+        file.description_hash = Some(file.hash.clone());
+        file.description_embedding = Some("description".into());
+        let mut items = db.items()?;
+        items[0].data["description"] = json!("Generated callable prose");
+        items[0].description_embedding = Some("description".into());
+        db.apply(&[(file, items)], &[], None)?;
+
+        let mut commented = original.clone();
+        commented.1.description = Some("Source file prose".into());
+        commented.1.callables[0].description = Some("Source callable prose".into());
+        commented.1.structure.nodes[0].description = Some("Source callable prose".into());
+        db.apply_structure(std::slice::from_ref(&commented), &[], None)?;
+        let item = db.items()?.remove(0);
+        let id = item.id;
+        assert_eq!(item.data["description"], "Source callable prose");
+        assert_eq!(item.data["sourceDescription"], true);
+        assert!(item.description_embedding.is_none());
+        assert_eq!(
+            db.files()?[0].description.as_deref(),
+            Some("Source file prose")
+        );
+        assert!(db.files()?[0].description_embedding.is_none());
+
+        // Semantic generation cannot overwrite canonical declaration prose.
+        let mut generated = item;
+        generated.data["description"] = json!("Replacement generated prose");
+        generated.data["sourceDescription"] = json!(false);
+        generated.description_embedding = Some("description".into());
+        let mut generated_file = db.files()?.remove(0);
+        generated_file.description = Some("Replacement generated file prose".into());
+        generated_file.description_hash = Some(generated_file.hash.clone());
+        generated_file.description_embedding = Some("description".into());
+        db.apply(&[(generated_file, vec![generated])], &[], None)?;
+        assert_eq!(db.items()?[0].data["description"], "Source callable prose");
+        assert!(db.items()?[0].description_embedding.is_none());
+        assert_eq!(
+            db.files()?[0].description.as_deref(),
+            Some("Source file prose")
+        );
+        assert!(db.files()?[0].description_embedding.is_none());
+
+        // Source prose remains authoritative even when executable code changes.
+        let mut edited = parsed_record("code.rs", "\nfn example() -> i32 { 2 }")?;
+        edited.1.description = commented.1.description.clone();
+        edited.1.callables[0].description = commented.1.callables[0].description.clone();
+        edited.1.structure.nodes[0].description =
+            commented.1.structure.nodes[0].description.clone();
+        db.apply_structure(std::slice::from_ref(&edited), &[], None)?;
+        assert_eq!(db.items()?[0].id, id);
+        assert_eq!(db.items()?[0].data["description"], "Source callable prose");
+
+        // A removed comment must not be retained merely because callable source
+        // hashes match. The engine may pass the previously hydrated file slot.
+        edited.0 = db.files()?.remove(0);
+        edited.1.description = None;
+        edited.1.callables[0].description = None;
+        edited.1.structure.nodes[0].description = None;
+        db.apply_structure(&[edited], &[], None)?;
+        let item = db.items()?.remove(0);
+        assert_eq!(item.id, id);
+        assert!(item.data["description"].is_null());
+        assert_eq!(item.data["sourceDescription"], false);
+        assert!(item.description_embedding.is_none());
+        let file = db.files()?.remove(0);
+        assert!(file.description.is_none());
+        assert!(file.description_hash.is_none());
+        assert!(file.description_embedding.is_none());
+        assert!(db.symbol_descriptions("code.rs")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_description_occurrences_and_vectors_survive_structural_edits() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let mut record = parsed_record("code.ts", "type A = string;\ntype A = number;\n")?;
+        assert_eq!(record.1.structure.nodes.len(), 2);
+        record.1.structure.nodes[0].description = Some("First overload".into());
+        record.1.structure.nodes[1].description = Some("Second overload".into());
+        db.apply_structure(std::slice::from_ref(&record), &[], None)?;
+        let profile = json!({"model":"a"});
+        db.set_projection_profile(&profile)?;
+        let mut items = db.items_for_profile(&profile)?;
+        for item in &mut items {
+            let text = item.data["description"].as_str().unwrap();
+            let key = Database::embedding_key(&profile, false, text);
+            db.put_embedding(&key, &[1.0, 0.0])?;
+            item.description_embedding = Some(key);
+        }
+        let second_id = items[1].id;
+        let second_identity = items[1].identity.clone();
+        assert_eq!(
+            second_identity,
+            hash(json!(["code.ts", "A", record.1.structure.nodes[1].kind, 1]).to_string())
+        );
+        db.apply(&[(db.files()?.remove(0), items)], &[], None)?;
+        record.1.structure.nodes[0].description = None;
+        db.apply_structure(std::slice::from_ref(&record), &[], None)?;
+        let second = db.items()?.remove(0);
+        assert_eq!(second.id, second_id);
+        assert_eq!(second.identity, second_identity);
+        assert!(second.embedding.is_empty());
+        assert!(second.description_embedding.is_some());
+        assert_eq!(db.symbol_descriptions("code.ts")?.len(), 1);
+        record.1.structure.nodes[1].description = Some("Updated second overload".into());
+        db.apply_structure(std::slice::from_ref(&record), &[], None)?;
+        let second = db.items_for_profile(&profile)?.remove(0);
+        assert_eq!(second.id, second_id);
+        assert_eq!(second.data["description"], "Updated second overload");
+        assert!(second.description_embedding.is_none());
+        record.1.structure.nodes[1].description = None;
+        db.apply_structure(&[record], &[], None)?;
+        assert!(db.items()?.is_empty());
+        assert!(db.symbol_descriptions("code.ts")?.is_empty());
+        assert_eq!(
+            db.conn.query_row(
+                "SELECT count(*) FROM descriptions WHERE scope='callable'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            0
+        );
         Ok(())
     }
 }

@@ -51,7 +51,6 @@ pub struct Engine {
     artifacts: Artifacts,
     config: Value,
     providers: Providers,
-    enabled: bool,
     items: Vec<Item>,
     files: HashMap<String, File>,
     vectors: HashMap<String, Vec<f32>>,
@@ -68,6 +67,8 @@ struct SymbolIndex {
     names: BTreeMap<u64, String>,
     index: VectorIndex,
 }
+
+type DescriptionQueries<'a> = (Option<&'a [f32]>, Option<&'a [f32]>);
 
 #[derive(Debug)]
 pub(crate) struct NeedsWrite;
@@ -115,12 +116,12 @@ struct PrepareInput {
     source_mode: String,
     regenerate_file: bool,
     regenerate_callables: bool,
+    generate_descriptions: bool,
 }
 
 struct PreparedCallable {
     identity: String,
     data: Value,
-    description_embedding: Option<String>,
     generate_description: bool,
 }
 
@@ -238,16 +239,12 @@ impl Engine {
         if !structural_only && !readonly {
             db.set_projection_profile(&providers.vector().profile())?;
         }
-        let enabled = config["descriptionsEnabled"]
-            .as_bool()
-            .unwrap_or(db.meta("descriptions_enabled")?.as_deref() == Some("true"));
         let mut engine = Self {
             root,
             db,
             artifacts,
             config,
             providers,
-            enabled,
             items: Vec::new(),
             files: HashMap::new(),
             vectors: HashMap::new(),
@@ -273,32 +270,22 @@ impl Engine {
         );
         let mut paths = HashSet::new();
         for item in &self.items {
-            if item.embedding.is_empty()
-                || (self.enabled && item.kind == "function" && item.description_embedding.is_none())
+            if (item.kind != "symbol-description" && item.embedding.is_empty())
+                || (item.data["description"].is_string() && item.description_embedding.is_none())
             {
                 paths.insert(item.path.clone());
             }
         }
-        if self.enabled {
-            for file in self.files.values() {
-                if file.language != "markdown"
-                    && file.description_embedding.is_none()
-                    && !file.hash.is_empty()
-                {
-                    paths.insert(file.path.clone());
-                }
+        for file in self.files.values() {
+            if file.description.is_some() && file.description_embedding.is_none() {
+                paths.insert(file.path.clone());
             }
         }
         let mut paths: Vec<_> = paths.into_iter().collect();
         paths.sort();
         let profile = self.providers.vector().profile().to_string();
         let prepared = paths.is_empty()
-            && self.db.meta("active_embedding_profile")?.as_deref() == Some(&profile)
-            && self.db.meta("descriptions_enabled")?.as_deref()
-                == Some(if self.enabled { "true" } else { "false" })
-            && (!self.enabled
-                || self.db.meta("description_profile")?.as_deref()
-                    == Some(self.providers.llm().profile().to_string().as_str()));
+            && self.db.meta("active_embedding_profile")?.as_deref() == Some(&profile);
         if self.readonly && !prepared {
             return Err(NeedsWrite.into());
         }
@@ -318,6 +305,7 @@ impl Engine {
                 source_mode: file.source_mode.clone(),
                 regenerate_file: false,
                 regenerate_callables: false,
+                generate_descriptions: false,
             });
         }
         let changed = self.prepare_all(inputs)?;
@@ -334,16 +322,6 @@ impl Engine {
             );
         }
         self.db.apply(&changed, &[], checkpoint.as_deref())?;
-        self.db.set_meta(
-            "descriptions_enabled",
-            if self.enabled { "true" } else { "false" },
-        )?;
-        if self.enabled {
-            self.db.set_meta(
-                "description_profile",
-                &self.providers.llm().profile().to_string(),
-            )?;
-        }
         self.load()?;
         self.artifacts.backfill_remote(&self.db);
         Ok(
@@ -474,7 +452,7 @@ impl Engine {
         crate::map::query(self, &self.root, options)
     }
 
-    /// Resolve name-only semantic selectors against the current structural snapshot.
+    /// Resolve name and description selectors against the current structural snapshot.
     /// SQLite's symbols and content-addressed embeddings are authoritative; the
     /// separate USearch vocabulary index is a disposable materialized view.
     pub(crate) fn selection(&self, options: &Value) -> Result<Selection> {
@@ -490,31 +468,71 @@ impl Engine {
             .map(|query| symbols::normalize(query))
             .collect();
         let threshold = options["symbolThreshold"].as_f64().unwrap_or(0.5);
+        // Map can resolve source or generated prose with the symbol provider,
+        // even when the content indexes have never been prepared.
+        let structures = self.symbol_structures()?;
+        let mut descriptions = Vec::new();
+        for (path, structure) in &structures {
+            let stored = self.db.symbol_descriptions(path)?;
+            for node in &structure.nodes {
+                if let Some(text) = stored.get(&node.id).or(node.description.as_ref()) {
+                    descriptions.push((path.clone(), Some(node.id), text.clone()));
+                }
+            }
+            if let Some(text) = self
+                .files
+                .get(path)
+                .and_then(|file| file.description.as_ref())
+            {
+                descriptions.push((path.clone(), None, text.clone()));
+            }
+        }
         let key = hash(
             json!([
-                "symbol-selection-v1",
+                "symbol-selection-v2-descriptions",
                 self.db.generation()?,
                 profile,
                 queries,
-                threshold
+                threshold,
+                descriptions
             ])
             .to_string(),
         );
         if let Some(cached) = self.db.search_cache(&key)? {
-            let names = cached
-                .into_iter()
-                .map(|name| {
-                    Ok(name
-                        .as_str()
-                        .context("Invalid cached symbol name")?
-                        .to_owned())
-                })
-                .collect::<Result<_>>()?;
-            return Ok(selection.with_symbol_names(names));
+            let cached = cached
+                .first()
+                .context("Invalid cached semantic selection")?;
+            return Ok(selection.with_semantic_matches(
+                serde_json::from_value(cached["names"].clone())?,
+                serde_json::from_value(cached["symbols"].clone())?,
+                serde_json::from_value(cached["paths"].clone())?,
+            ));
         }
         let symbols = self.symbol_index()?;
         self.ensure_embedding_groups_with(vector, vec![queries.clone()], true)?;
+        self.ensure_embedding_groups_with(
+            vector,
+            vec![
+                descriptions
+                    .iter()
+                    .map(|(_, _, text)| text.clone())
+                    .collect(),
+            ],
+            false,
+        )?;
+        let description_vectors = descriptions
+            .iter()
+            .map(|(path, id, text)| {
+                let embedding = self
+                    .db
+                    .embedding(&Database::embedding_key(&profile, false, text))?
+                    .context("Missing selector description embedding")?;
+                Ok((path, id, embedding))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut matched = HashSet::new();
+        let mut matched_symbols = HashSet::new();
+        let mut matched_paths = HashSet::new();
         for query in queries {
             let query = self
                 .db
@@ -529,14 +547,23 @@ impl Engine {
                     matched.insert(symbols.names[&id].clone());
                 }
             }
+            for (path, id, description) in &description_vectors {
+                if cosine(&query, description) >= threshold {
+                    if let Some(id) = id {
+                        matched_symbols.insert(((*path).clone(), *id));
+                    } else {
+                        matched_paths.insert((*path).clone());
+                    }
+                }
+            }
         }
         if !self.readonly {
             self.db.put_search_cache(
                 &key,
-                &matched.iter().map(|name| json!(name)).collect::<Vec<_>>(),
+                &[json!({"names":matched, "symbols":matched_symbols, "paths":matched_paths})],
             )?;
         }
-        Ok(selection.with_symbol_names(matched))
+        Ok(selection.with_semantic_matches(matched, matched_symbols, matched_paths))
     }
 
     fn symbol_structures(&self) -> Result<BTreeMap<String, parse::FileStructure>> {
@@ -629,7 +656,8 @@ impl Engine {
                 continue;
             }
             for node in structure.nodes {
-                if !selection.kind_matches(&node.kind) || !selection.symbol_matches(&node) {
+                if !selection.kind_matches(&node.kind) || !selection.symbol_matches_at(&path, &node)
+                {
                     continue;
                 }
                 let similarity = std::iter::once(&node.name)
@@ -697,12 +725,13 @@ impl Engine {
     }
 
     fn prepare_all(&self, inputs: Vec<PrepareInput>) -> Result<Vec<(File, Vec<Item>)>> {
+        let generate = inputs.iter().any(|input| input.generate_descriptions);
         let mut prepared = Vec::with_capacity(inputs.len());
         for input in inputs {
             let source_hash = hash(&input.source);
             let parsed = self.parsed(&input.path, &input.source)?;
             let previous = self.files.get(&input.path);
-            let file = File {
+            let mut file = File {
                 path: input.path.clone(),
                 hash: source_hash,
                 source: input.source,
@@ -721,10 +750,23 @@ impl Engine {
                     })
                     .collect(),
             };
+            if let Some(description) = &parsed.description {
+                file.description = Some(description.clone());
+                file.description_hash = Some(format!("source:{}", hash(description)));
+            } else if file
+                .description_hash
+                .as_deref()
+                .is_some_and(|h| h.starts_with("source:"))
+            {
+                file.description = None;
+                file.description_hash = None;
+                file.description_embedding = None;
+            }
+            let source_description = parsed.description.is_some();
             prepared.push(PreparedFile {
                 file,
                 parsed,
-                regenerate_file: input.regenerate_file,
+                regenerate_file: input.regenerate_file && !source_description,
                 regenerate_callables: input.regenerate_callables,
                 callables: Vec::new(),
             });
@@ -750,37 +792,30 @@ impl Engine {
                 data["path"] = json!(prepared.file.path);
                 data["sourceMode"] = json!(prepared.file.source_mode);
                 let old = self.items.iter().find(|item| item.identity == identity);
-                let mut description_embedding =
-                    old.and_then(|item| item.description_embedding.clone());
-                data["description"] = old
-                    .map(|item| item.data["description"].clone())
-                    .unwrap_or(Value::Null);
+                data["sourceDescription"] = json!(callable.description.is_some());
                 let unchanged = old.is_some_and(|item| {
                     item.data["sourceHash"] == data["sourceHash"]
                         && item.data["description"].is_string()
+                        && !flag(&item.data, "sourceDescription")
                 });
-                if !unchanged {
-                    description_embedding = None;
-                    data["description"] = Value::Null;
+                if callable.description.is_none() {
+                    data["description"] = if unchanged {
+                        old.unwrap().data["description"].clone()
+                    } else {
+                        Value::Null
+                    };
                 }
-                let generate_description = self.enabled
-                    && (prepared.regenerate_callables
-                        || (!unchanged && description_embedding.is_none()));
-                if !self.enabled
-                    && old.is_some_and(|item| item.data["sourceHash"] != data["sourceHash"])
-                {
-                    description_embedding = None;
-                    data["description"] = Value::Null;
-                }
+                let generate_description = generate
+                    && callable.description.is_none()
+                    && (prepared.regenerate_callables || !unchanged);
                 prepared.callables.push(PreparedCallable {
                     identity,
                     data,
-                    description_embedding,
                     generate_description,
                 });
             }
         }
-        if self.enabled {
+        if generate {
             self.prepare_descriptions(&mut prepared)?;
         }
 
@@ -801,12 +836,20 @@ impl Engine {
                     .iter()
                     .map(|chunk| chunk.embedding_input.clone()),
             );
-            if self.enabled {
-                inputs.extend(prepared.file.description.clone());
-                inputs.extend(prepared.callables.iter().filter_map(|callable| {
+            inputs.extend(prepared.file.description.clone());
+            inputs.extend(
+                prepared.callables.iter().filter_map(|callable| {
                     callable.data["description"].as_str().map(str::to_owned)
-                }));
-            }
+                }),
+            );
+            inputs.extend(
+                prepared
+                    .parsed
+                    .structure
+                    .nodes
+                    .iter()
+                    .filter_map(|node| node.description.clone()),
+            );
             embedding_groups.push(inputs);
         }
         self.ensure_embedding_groups(embedding_groups, false)?;
@@ -814,60 +857,25 @@ impl Engine {
         let vector_profile = self.providers.vector().profile();
         let mut result = Vec::with_capacity(prepared.len());
         for mut prepared in prepared {
-            if self.enabled
-                && let Some(description) = &prepared.file.description
-            {
+            if let Some(description) = &prepared.file.description {
                 prepared.file.description_embedding =
                     Some(Database::embedding_key(&vector_profile, false, description));
             }
-            let mut items = Vec::new();
-            for (callable, mut prepared_callable) in prepared
-                .parsed
-                .callables
-                .into_iter()
-                .zip(prepared.callables)
-            {
-                if self.enabled
-                    && let Some(description) = prepared_callable.data["description"].as_str()
+            let mut items = crate::storage::parsed_items(&prepared.file, &prepared.parsed)?;
+            for item in &mut items {
+                if let Some(callable) = prepared
+                    .callables
+                    .iter()
+                    .find(|c| c.identity == item.identity)
                 {
-                    prepared_callable.description_embedding =
-                        Some(Database::embedding_key(&vector_profile, false, description));
+                    item.data = callable.data.clone();
                 }
-                items.push(Item {
-                    id: 0,
-                    path: prepared.file.path.clone(),
-                    identity: prepared_callable.identity,
-                    kind: "function".into(),
-                    data: prepared_callable.data,
-                    embedding: Database::embedding_key(
-                        &vector_profile,
-                        false,
-                        &callable.embedding_input,
-                    ),
-                    description_embedding: prepared_callable.description_embedding,
-                });
-            }
-            for (ordinal, chunk) in prepared.parsed.chunks.into_iter().enumerate() {
-                let embedding =
-                    Database::embedding_key(&vector_profile, false, &chunk.embedding_input);
-                let kind = if prepared.file.language == "markdown" {
-                    "markdown"
-                } else {
-                    "document"
-                };
-                let identity = hash(json!([prepared.file.path, kind, ordinal]).to_string());
-                let mut data = serde_json::to_value(chunk)?;
-                data["path"] = json!(prepared.file.path);
-                data["sourceMode"] = json!(prepared.file.source_mode);
-                items.push(Item {
-                    id: 0,
-                    path: prepared.file.path.clone(),
-                    identity,
-                    kind: kind.into(),
-                    data,
-                    embedding,
-                    description_embedding: None,
-                });
+                if let Some(input) = item.data["embeddingInput"].as_str() {
+                    item.embedding = Database::embedding_key(&vector_profile, false, input);
+                }
+                item.description_embedding = item.data["description"]
+                    .as_str()
+                    .map(|text| Database::embedding_key(&vector_profile, false, text));
             }
             result.push((prepared.file, items));
         }
@@ -919,7 +927,10 @@ impl Engine {
                     if !conversation.file_ready {
                         (
                             None,
-                            hash(json!([prepared.file.hash, DESCRIPTION_SYSTEM]).to_string()),
+                            hash(
+                                json!([prepared.file.hash, self.description_generation_profile()])
+                                    .to_string(),
+                            ),
                             None,
                             prepared.file.hash.clone(),
                             prepared.regenerate_file,
@@ -940,7 +951,7 @@ impl Engine {
                                 callable.qualified_name,
                                 callable.source_hash,
                                 prepared.file.description.as_deref().unwrap_or(""),
-                                DESCRIPTION_SYSTEM
+                                self.description_generation_profile()
                             ])
                             .to_string(),
                         );
@@ -1135,21 +1146,27 @@ impl Engine {
         self.files = files.into_iter().map(|f| (f.path.clone(), f)).collect();
         self.vectors.clear();
         self.indexes.clear();
-        self.complete_code =
-            !self.structural_only && self.items.iter().all(|i| !i.embedding.is_empty());
-        self.complete_descriptions = self.enabled
-            && self.complete_code
-            && self.items.iter().filter(|i| i.kind == "function").all(|i| {
-                i.description_embedding.is_some()
-                    && self
-                        .files
-                        .get(&i.path)
-                        .is_some_and(|f| f.description_embedding.is_some())
-            });
+        self.complete_code = !self.structural_only
+            && self
+                .items
+                .iter()
+                .filter(|i| i.kind != "symbol-description")
+                .all(|i| !i.embedding.is_empty());
+        self.complete_descriptions = !self.structural_only
+            && self
+                .items
+                .iter()
+                .filter(|i| i.data["description"].is_string())
+                .all(|i| i.description_embedding.is_some())
+            && self
+                .files
+                .values()
+                .filter(|f| f.description.is_some())
+                .all(|f| f.description_embedding.is_some());
         for item in &mut self.items {
             item.data["id"] = json!(item.id);
         }
-        if !self.complete_code {
+        if self.structural_only {
             return Ok(());
         }
         let keys: HashSet<_> = self
@@ -1163,6 +1180,7 @@ impl Engine {
                     .values()
                     .filter_map(|f| f.description_embedding.clone()),
             )
+            .filter(|key| !key.is_empty())
             .collect();
         let loading = ui::counted("Loading embeddings", keys.len());
         for key in keys {
@@ -1175,40 +1193,20 @@ impl Engine {
             loading.inc(1);
         }
         loading.finish();
-        self.complete_descriptions = self.enabled
-            && self.items.iter().filter(|i| i.kind == "function").all(|i| {
-                i.description_embedding.is_some()
-                    && self
-                        .files
-                        .get(&i.path)
-                        .is_some_and(|f| f.description_embedding.is_some())
-            });
-        for item in &mut self.items {
-            item.data["id"] = json!(item.id);
-        }
-        self.indexes.clear();
         let dimensions = self.providers.vector().dimensions();
-        let loading = ui::counted(
-            "Loading vector indexes",
-            if self.complete_descriptions { 4 } else { 2 },
-        );
-        for (kind, parts) in [
-            ("code", 1),
-            ("markdown", 1),
-            ("descriptions", 2),
-            ("combined", 3),
-        ] {
-            if parts > 1 && !self.complete_descriptions {
-                continue;
-            }
+        let loading = ui::counted("Loading vector indexes", 3);
+        for kind in ["code", "markdown", "descriptions"] {
             let items: Vec<_> = self
                 .items
                 .iter()
                 .filter(|i| {
-                    if kind == "markdown" {
+                    if kind == "descriptions" {
+                        i.data["description"].is_string() && i.description_embedding.is_some()
+                    } else if kind == "markdown" {
                         matches!(i.kind.as_str(), "markdown" | "document")
+                            && !i.embedding.is_empty()
                     } else {
-                        i.kind == "function"
+                        i.kind == "function" && !i.embedding.is_empty()
                     }
                 })
                 .collect();
@@ -1225,14 +1223,14 @@ impl Engine {
             let index = if self.readonly {
                 VectorIndex::open_readonly(
                     &PathBuf::from(path),
-                    dimensions * parts,
+                    dimensions,
                     self.db.generation()?,
                     &vectors,
                 )?
             } else {
                 VectorIndex::open(
                     &PathBuf::from(path),
-                    dimensions * parts,
+                    dimensions,
                     self.db.generation()?,
                     &vectors,
                 )?
@@ -1245,39 +1243,18 @@ impl Engine {
     }
 
     fn item_vector(&self, item: &Item, kind: &str) -> Result<Vec<f32>> {
-        let mut parts = Vec::new();
-        if kind != "descriptions" {
-            parts.push(
-                self.vectors
-                    .get(&item.embedding)
-                    .context("Missing code vector")?
-                    .as_slice(),
-            );
-        }
-        if kind == "descriptions" || kind == "combined" {
-            parts.push(
-                self.vectors
-                    .get(
-                        item.description_embedding
-                            .as_ref()
-                            .context("Missing description")?,
-                    )
-                    .context("Missing description vector")?
-                    .as_slice(),
-            );
-            let file = self.files.get(&item.path).context("Missing indexed file")?;
-            parts.push(
-                self.vectors
-                    .get(
-                        file.description_embedding
-                            .as_ref()
-                            .context("Missing file description")?,
-                    )
-                    .context("Missing file vector")?
-                    .as_slice(),
-            );
-        }
-        concatenate(&parts)
+        let key = if kind == "descriptions" {
+            item.description_embedding
+                .as_ref()
+                .context("Missing description")?
+        } else {
+            &item.embedding
+        };
+        Ok(self
+            .vectors
+            .get(key)
+            .context("Missing indexed vector")?
+            .clone())
     }
 
     pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>> {
@@ -1287,22 +1264,22 @@ impl Engine {
         let code =
             kind == "search-code" || (kind == "search" && (!explicit || flag(options, "code")));
         let descriptions = kind == "search-descriptions"
-            || (kind == "search"
-                && ((!explicit && self.complete_descriptions) || flag(options, "descriptions")));
+            || (kind == "search" && (!explicit || flag(options, "descriptions")));
         let markdown =
             kind == "search-md" || (kind == "search" && (!explicit || flag(options, "md")));
-        let symbols = kind == "search-symbols" || (kind == "search" && flag(options, "symbols"));
+        let symbols = kind == "search-symbols"
+            || (kind == "search" && (!explicit || flag(options, "symbols")));
         let content = code || descriptions || markdown;
         ensure!(
-            !content || self.complete_code && (!self.enabled || self.complete_descriptions),
+            (!(code || markdown) || self.complete_code)
+                && (!descriptions || self.complete_descriptions),
             "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"
         );
         Selection::compile(options)?;
         let key = hash(
             json!([
-                "query-v3-name-union",
+                "query-v4-independent-descriptions",
                 self.db.generation()?,
-                self.enabled,
                 self.config,
                 kind,
                 query,
@@ -1325,10 +1302,6 @@ impl Engine {
         } else {
             Vec::new()
         };
-        ensure!(
-            !descriptions || self.complete_descriptions,
-            "Descriptions are not enabled/complete; run slopdex descriptions enable"
-        );
         let rerank = flag(&self.config, "rerankingEnabled");
         let limit = options["limit"].as_u64().map(|v| v as usize);
         let candidate_limit = if rerank {
@@ -1346,54 +1319,92 @@ impl Engine {
             limit
         };
         let mut results = Vec::new();
+        let structures = if code || descriptions || markdown {
+            self.files
+                .keys()
+                .map(|path| Ok((path.clone(), self.presentation_structure(path)?)))
+                .collect::<Result<HashMap<_, _>>>()?
+        } else {
+            HashMap::new()
+        };
         let searching = ui::counted(
             "Searching vector indexes",
-            usize::from(code || descriptions) + usize::from(markdown) + usize::from(symbols),
+            usize::from(code)
+                + usize::from(descriptions)
+                + usize::from(markdown)
+                + usize::from(symbols),
         );
-        if code || descriptions {
-            let index_kind = if code && descriptions {
-                "combined"
-            } else if descriptions {
-                "descriptions"
-            } else {
-                "code"
-            };
+        let mut item_results: HashMap<u64, Value> = HashMap::new();
+        for index_kind in ["code", "descriptions"] {
+            if index_kind == "code" && !code || index_kind == "descriptions" && !descriptions {
+                continue;
+            }
             ui::progress(format_args!("Searching {index_kind} index"));
-            let repeats = if index_kind == "combined" {
-                3
-            } else if index_kind == "descriptions" {
-                2
-            } else {
-                1
-            };
-            let query_vector = concatenate(&vec![vector.as_slice(); repeats])?;
             let allowed = self
                 .items
                 .iter()
                 .filter(|i| {
-                    i.kind == "function"
-                        && selection.path_matches(&i.path)
-                        && selection.names_match(
-                            i.data["qualifiedName"].as_str().unwrap_or(""),
-                            i.data["name"].as_str().unwrap_or(""),
-                        )
+                    (if index_kind == "code" {
+                        i.kind == "function"
+                    } else {
+                        i.data["description"].is_string() && i.description_embedding.is_some()
+                    }) && selection.unit_matches(
+                        &i.path,
+                        &i.data,
+                        structures.get(&i.path).and_then(Option::as_ref),
+                    )
                 })
                 .map(|i| i.id)
                 .collect();
-            for (id, similarity) in self.neighbors(
-                index_kind,
-                &query_vector,
-                &allowed,
-                candidate_limit,
-                options,
-            )? {
+            for (id, similarity) in
+                self.neighbors(index_kind, &vector, &allowed, candidate_limit, options)?
+            {
                 let item = self.item(id)?;
-                let mut result =
-                    json!({"type":"function","function":item.data,"similarity":similarity});
+                let mut result = if item.kind == "symbol-description" {
+                    let mut symbol = item.data.clone();
+                    symbol.as_object_mut().unwrap().remove("calls");
+                    json!({"type":"symbol","symbol":symbol,"similarity":similarity})
+                } else {
+                    json!({"type":"function","function":item.data,"similarity":similarity})
+                };
                 self.add_scores(&mut result, item, &vector, None, index_kind)?;
-                results.push(result);
+                item_results
+                    .entry(id)
+                    .and_modify(|existing| {
+                        if similarity > score(existing, "similarity") {
+                            *existing = result.clone();
+                        }
+                    })
+                    .or_insert(result);
             }
             searching.inc(1);
+        }
+        results.extend(item_results.into_values());
+        if descriptions {
+            // Files are independent description hits, including files with no
+            // callable units. Direct comparison avoids synthetic item IDs.
+            let min = options["minSimilarity"].as_f64().unwrap_or(0.3);
+            let max = options["maxSimilarity"].as_f64().unwrap_or(f64::INFINITY);
+            for file in self
+                .files
+                .values()
+                .filter(|file| selection.file_matches(&file.path))
+            {
+                let Some(description) = file
+                    .description_embedding
+                    .as_ref()
+                    .and_then(|key| self.vectors.get(key))
+                else {
+                    continue;
+                };
+                let similarity = cosine(&vector, description);
+                if similarity >= min && similarity < max {
+                    results.push(json!({"type":"file", "file":{
+                        "path":file.path, "description":file.description,
+                        "sourceMode":file.source_mode, "language":file.language
+                    }, "similarity":similarity, "fileDescriptionSimilarity":similarity}));
+                }
+            }
         }
         if markdown {
             ui::progress("Searching markdown index");
@@ -1401,15 +1412,11 @@ impl Engine {
                 .items
                 .iter()
                 .filter(|i| {
-                    (i.kind == "markdown" || kind == "search" && !explicit && i.kind == "document")
-                        && selection.path_matches(&i.path)
-                        && selection.names_match(
-                            &heading_name(&i.data),
-                            i.data["headingPath"]
-                                .as_array()
-                                .and_then(|path| path.last())
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
+                    matches!(i.kind.as_str(), "markdown" | "document")
+                        && selection.unit_matches(
+                            &i.path,
+                            &i.data,
+                            structures.get(&i.path).and_then(Option::as_ref),
                         )
                 })
                 .map(|i| i.id)
@@ -1428,7 +1435,11 @@ impl Engine {
             searching.inc(1);
         }
         searching.finish();
-        sort_scores(&mut results, "similarity");
+        results.sort_by(|a, b| {
+            score(b, "similarity")
+                .total_cmp(&score(a, "similarity"))
+                .then_with(|| a.to_string().cmp(&b.to_string()))
+        });
         if let Some(limit) = candidate_limit {
             results.truncate(limit);
         }
@@ -1437,8 +1448,9 @@ impl Engine {
                 .iter()
                 .map(|row| {
                     if row["type"] == "symbol" {
-                        json!({"name": row["symbol"]["name"], "names": row["symbol"]["names"]})
-                            .to_string()
+                        json!({"name": row["symbol"]["name"], "names": row["symbol"]["names"],
+                            "description": row["symbol"]["description"]})
+                        .to_string()
                     } else {
                         row.to_string()
                     }
@@ -1560,25 +1572,31 @@ impl Engine {
         result: &mut Value,
         item: &Item,
         code: &[f32],
-        other: Option<(&[f32], &[f32])>,
-        kind: &str,
+        other: Option<DescriptionQueries<'_>>,
+        _kind: &str,
     ) -> Result<()> {
-        if kind != "descriptions" {
-            result["codeSimilarity"] = json!(cosine(code, &self.vectors[&item.embedding]));
+        if let Some(vector) = self.vectors.get(&item.embedding) {
+            result["codeSimilarity"] = json!(cosine(code, vector));
         }
-        if kind == "combined" || kind == "descriptions" {
-            let (description, file) = other.unwrap_or((code, code));
-            result["descriptionSimilarity"] = json!(cosine(
-                description,
-                &self.vectors[item.description_embedding.as_ref().unwrap()]
-            ));
-            result["fileDescriptionSimilarity"] = json!(cosine(
-                file,
-                &self.vectors[self.files[&item.path]
-                    .description_embedding
-                    .as_ref()
-                    .unwrap()]
-            ));
+        let (description, file) = other.unwrap_or((Some(code), Some(code)));
+        if let Some((query, vector)) = description.zip(
+            item.description_embedding
+                .as_ref()
+                .and_then(|key| self.vectors.get(key)),
+        ) {
+            let similarity = cosine(query, vector);
+            result["descriptionSimilarity"] = json!(similarity);
+            if item.kind == "function" {
+                result["functionDescriptionSimilarity"] = json!(similarity);
+            }
+        }
+        if let Some((query, vector)) = file.zip(
+            self.files
+                .get(&item.path)
+                .and_then(|file| file.description_embedding.as_ref())
+                .and_then(|key| self.vectors.get(key)),
+        ) {
+            result["fileDescriptionSimilarity"] = json!(cosine(query, vector));
         }
         Ok(())
     }
@@ -1594,10 +1612,7 @@ impl Engine {
         let options = &options;
         let target = target.unwrap_or(self);
         ensure!(
-            self.complete_code
-                && target.complete_code
-                && (!self.enabled || self.complete_descriptions)
-                && (!target.enabled || target.complete_descriptions),
+            self.complete_code && target.complete_code,
             "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"
         );
         ensure!(
@@ -1605,10 +1620,7 @@ impl Engine {
             "Cross-search requires identical embedding profiles"
         );
         let same = self.db.path.canonicalize()? == target.db.path.canonicalize()?;
-        let combined = self.complete_descriptions
-            && target.complete_descriptions
-            && self.providers.llm().profile() == target.providers.llm().profile();
-        let kind = if combined { "combined" } else { "code" };
+        let kind = "code";
         let base = options["changedSince"]
             .as_str()
             .map(|reference| {
@@ -1621,7 +1633,7 @@ impl Engine {
             .transpose()?;
         let key = hash(
             json!([
-                "cross-v2-name-union",
+                "cross-v3-code-only-descriptions",
                 self.db.generation()?,
                 target.db.path.canonicalize()?,
                 target.db.generation()?,
@@ -1643,6 +1655,11 @@ impl Engine {
             lines >= min_lines && max_lines.is_none_or(|max| lines < max)
         };
         let selection = self.selection(options)?;
+        let structures = self
+            .files
+            .keys()
+            .map(|path| Ok((path.clone(), self.presentation_structure(path)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
         let source_path = options["sourcePath"]
             .as_str()
             .map(|path| self.normalize_path(path))
@@ -1665,10 +1682,10 @@ impl Engine {
             .filter(|source| {
                 source.kind == "function"
                     && lines_match(source)
-                    && selection.path_matches(&source.path)
-                    && selection.names_match(
-                        source.data["qualifiedName"].as_str().unwrap_or(""),
-                        source.data["name"].as_str().unwrap_or(""),
+                    && selection.unit_matches(
+                        &source.path,
+                        &source.data,
+                        structures.get(&source.path).and_then(Option::as_ref),
                     )
                     && source_path.as_ref().is_none_or(|p| under(&source.path, p))
                     && (!flag(options, "uncommitted")
@@ -1704,18 +1721,18 @@ impl Engine {
                 }
                 let item = target.item(id)?;
                 let mut row = json!({"function":item.data,"similarity":similarity});
-                let other = if combined {
-                    Some((
-                        self.vectors[source.description_embedding.as_ref().unwrap()].as_slice(),
-                        self.vectors[self.files[&source.path]
-                            .description_embedding
-                            .as_ref()
-                            .unwrap()]
-                        .as_slice(),
-                    ))
-                } else {
-                    None
-                };
+                let other = Some((
+                    source
+                        .description_embedding
+                        .as_ref()
+                        .and_then(|key| self.vectors.get(key))
+                        .map(Vec::as_slice),
+                    self.files
+                        .get(&source.path)
+                        .and_then(|file| file.description_embedding.as_ref())
+                        .and_then(|key| self.vectors.get(key))
+                        .map(Vec::as_slice),
+                ));
                 target.add_scores(
                     &mut row,
                     item,
@@ -1740,7 +1757,9 @@ impl Engine {
                 });
             }
             if !matches.is_empty() {
-                results.push(json!({"source":source.data,"matches":matches,"scoring":{"similarityMode":if combined {"code-description-file-average"}else{"code"},"similarityWeights":if combined {json!({"code":1.0/3.0,"description":1.0/3.0,"fileDescription":1.0/3.0})}else{json!({"code":1,"description":0,"fileDescription":0})}}}));
+                results.push(json!({"source":source.data,"matches":matches,"scoring":{
+                    "similarityMode":"code", "similarityWeights":{"code":1,"description":0,"fileDescription":0}
+                }}));
             }
             searching.inc(1);
         }
@@ -1753,10 +1772,11 @@ impl Engine {
         let matches = self.search(query, "search", options)?;
         let mut files = BTreeMap::<String, Value>::new();
         for item in &matches {
-            let data = if item["type"] == "markdown" || item["type"] == "document" {
-                &item["chunk"]
-            } else {
-                &item["function"]
+            let data = match item["type"].as_str() {
+                Some("markdown" | "document") => &item["chunk"],
+                Some("symbol") => &item["symbol"],
+                Some("file") => &item["file"],
+                _ => &item["function"],
             };
             if let Some(path) = data["path"].as_str() {
                 let file = &self.files[path];
@@ -1841,45 +1861,82 @@ impl Engine {
         Ok(json!({"query":query,"description":description,"files":files,"functions":functions}))
     }
 
-    pub fn set_descriptions(&mut self, enabled: bool) -> Result<Value> {
-        self.enabled = enabled;
-        self.config["descriptionsEnabled"] = json!(enabled);
-        self.db.set_meta(
-            "descriptions_enabled",
-            if enabled { "true" } else { "false" },
-        )?;
-        self.refresh()?;
-        self.load()?;
-        self.status()
+    fn description_generation_profile(&self) -> Value {
+        json!([
+            self.providers.llm().profile(),
+            description_settings(&self.config),
+            DESCRIPTION_SYSTEM
+        ])
     }
 
-    pub fn reindex_files(&mut self, callables: bool) -> Result<Value> {
-        ensure!(self.enabled, "Enable descriptions first");
-        let inputs: Vec<_> = self
-            .files
-            .values()
-            .filter(|file| {
-                file.language != "markdown" && file.description_hash.as_deref() != Some(&file.hash)
-            })
-            .map(|file| PrepareInput {
-                path: file.path.clone(),
-                source: file.source.clone(),
-                source_mode: file.source_mode.clone(),
-                regenerate_file: true,
-                regenerate_callables: callables,
-            })
-            .collect();
+    pub fn generate_descriptions(&mut self) -> Result<Value> {
+        ensure!(
+            !self.readonly && !self.structural_only,
+            "Description generation requires a writable search engine"
+        );
+        let profile = self.description_generation_profile().to_string();
+        let settings_changed =
+            self.db.meta("description_generation_profile")?.as_deref() != Some(&profile);
+        let mut inputs = Vec::new();
+        for file in self.files.values() {
+            if file.language == "markdown" || file.hash.is_empty() {
+                continue;
+            }
+            let source_description = file
+                .description_hash
+                .as_deref()
+                .is_some_and(|h| h.starts_with("source:"));
+            let regenerate_file = !source_description
+                && (settings_changed || file.description_hash.as_deref() != Some(&file.hash));
+            let needs_callable = self.items.iter().any(|item| {
+                item.path == file.path
+                    && item.kind == "function"
+                    && !flag(&item.data, "sourceDescription")
+                    && (settings_changed || !item.data["description"].is_string())
+            });
+            if regenerate_file || needs_callable {
+                inputs.push(PrepareInput {
+                    path: file.path.clone(),
+                    source: file.source.clone(),
+                    source_mode: file.source_mode.clone(),
+                    regenerate_file,
+                    regenerate_callables: settings_changed,
+                    generate_descriptions: true,
+                });
+            }
+        }
+        inputs.sort_by(|a, b| a.path.cmp(&b.path));
         let changed = self.prepare_all(inputs)?;
         let checkpoint = self.db.meta("checkpoint")?;
+        ensure!(
+            git::head(&self.root) == checkpoint,
+            "Git HEAD changed during indexing; rerun"
+        );
+        for (file, _) in &changed {
+            ensure!(
+                hash(fs::read(self.root.join(&file.path))?) == file.hash,
+                "Source changed during indexing: {}; rerun",
+                file.path
+            );
+        }
         self.db.apply(&changed, &[], checkpoint.as_deref())?;
+        self.db
+            .set_meta("description_generation_profile", &profile)?;
+        self.db.set_meta(
+            "description_profile",
+            &self.providers.llm().profile().to_string(),
+        )?;
         self.load()?;
-        Ok(json!({"filesReindexed":changed.len(),"descriptionsEnabled":self.enabled}))
+        self.artifacts.backfill_remote(&self.db);
+        Ok(
+            json!({"filesPrepared":changed.len(),"descriptionCount":self.items.iter().filter(|i|i.data["description"].is_string()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count()}),
+        )
     }
 
     pub fn status(&self) -> Result<Value> {
         let errors = self.errors()?;
         Ok(
-            json!({"rootDir":self.root,"indexPath":self.db.path,"generation":self.db.generation()?,"gitCheckpoint":self.db.meta("checkpoint")?,"fileCount":self.files.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"markdownChunkCount":self.items.iter().filter(|i|i.kind=="markdown").count(),"embeddingProfile":self.providers.vector().profile(),"descriptionProfile":if self.enabled {self.providers.llm().profile()}else{Value::Null},"descriptionsEnabled":self.enabled,"descriptionCount":self.items.iter().filter(|i|i.description_embedding.is_some()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count(),"staleFileDescriptionCount":self.files.values().filter(|f|f.description.is_some() && f.description_hash.as_deref()!=Some(&f.hash)).count(),"indexingErrorCount":errors.len(),"failedFileCount":self.files.values().filter(|f|!f.errors.is_empty()).count(),"vectorBackend":"usearch","storageBackend":"sqlite"}),
+            json!({"rootDir":self.root,"indexPath":self.db.path,"generation":self.db.generation()?,"gitCheckpoint":self.db.meta("checkpoint")?,"fileCount":self.files.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"markdownChunkCount":self.items.iter().filter(|i|i.kind=="markdown").count(),"embeddingProfile":self.providers.vector().profile(),"descriptionProfile":self.providers.llm().profile(),"descriptionCount":self.items.iter().filter(|i|i.description_embedding.is_some()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count(),"staleFileDescriptionCount":self.files.values().filter(|f|f.description.is_some() && f.description_hash.as_deref()!=Some(&f.hash) && !f.description_hash.as_deref().is_some_and(|h|h.starts_with("source:"))).count(),"indexingErrorCount":errors.len(),"failedFileCount":self.files.values().filter(|f|!f.errors.is_empty()).count(),"vectorBackend":"usearch","storageBackend":"sqlite"}),
         )
     }
 
@@ -2054,23 +2111,8 @@ fn description_settings(config: &Value) -> Value {
         "retryDelayMs": config["retryDelayMs"],
     })
 }
-fn heading_name(data: &Value) -> String {
-    data["headingPath"]
-        .as_array()
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(".")
-        })
-        .unwrap_or_default()
-}
 fn score(value: &Value, key: &str) -> f64 {
     value[key].as_f64().unwrap_or(0.0)
-}
-fn sort_scores(values: &mut [Value], key: &str) {
-    values.sort_by(|a, b| score(b, key).total_cmp(&score(a, key)));
 }
 pub(crate) fn under(path: &str, parent: &str) -> bool {
     parent.is_empty()
@@ -2099,18 +2141,6 @@ fn globs(value: &Value) -> Result<GlobSet> {
     Ok(builder.build()?)
 }
 
-fn concatenate(parts: &[&[f32]]) -> Result<Vec<f32>> {
-    let mut values = Vec::new();
-    for part in parts {
-        let norm = part.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
-        ensure!(
-            norm.is_finite() && norm > 0.0,
-            "Cannot index a zero or non-finite vector"
-        );
-        values.extend(part.iter().map(|v| (*v as f64 / norm) as f32));
-    }
-    Ok(values)
-}
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let dot: f64 = a.iter().zip(b).map(|(a, b)| *a as f64 * *b as f64).sum();
     let norm = |v: &[f32]| v.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();

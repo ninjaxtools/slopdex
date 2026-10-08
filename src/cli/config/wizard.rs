@@ -141,7 +141,6 @@ impl Prompts for CliclackPrompts {
 }
 
 pub(super) const CONFIG_KEYS: &[&str] = &[
-    "descriptionsEnabled",
     "descriptionProvider",
     "descriptionModel",
     "descriptionFallbackModel",
@@ -180,13 +179,7 @@ fn configure_interactively_filtered(
     let mut config = saved.clone();
     normalize_config_aliases(&mut config);
     let existing = config.clone();
-    if selected(prefix, "descriptionsEnabled") {
-        config["descriptionsEnabled"] = json!(prompts.yes(
-            "Generate file and function descriptions with an LLM?",
-            existing["descriptionsEnabled"].as_bool().unwrap_or(false),
-        )?);
-    }
-    if (config["descriptionsEnabled"] == true && prefix.is_none())
+    if prefix.is_none()
         || prefix.is_some_and(|p| {
             [
                 "descriptionProvider",

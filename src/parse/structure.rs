@@ -47,6 +47,9 @@ pub struct StructureNode {
     pub kind: String,
     pub name: String,
     pub qualified_name: String,
+    /// Source-provided prose attached to this declaration or heading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// All declared/imported names, including aliases, for symbol filtering.
     pub names: Vec<String>,
     /// Complete declaration signature, without executable bodies/initializers.
@@ -311,6 +314,7 @@ impl Collector<'_> {
             kind: kind.to_owned(),
             name,
             qualified_name,
+            description: None,
             names,
             signature,
             start_byte,

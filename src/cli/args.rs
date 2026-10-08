@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
     version,
     disable_help_subcommand = true,
     about = "Semantic code, documentation, and configuration search",
-    after_help = "Examples:\n  slopdex update\n  slopdex search \"validate an authenticated session\"\n  slopdex search-symbols \"validate session\"\n  slopdex search \"validate session\" --code --symbols\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nSearch and cross-search require an existing index; run update first. Symbols are opt-in: plain search uses content streams. Pure symbol searches refresh only structure. --no-reindex reuses saved snapshots; uncached queries may call providers. Map without -q parses directly when no index exists."
+    after_help = "Examples:\n  slopdex update\n  slopdex generate descriptions\n  slopdex search \"validate an authenticated session\"\n  slopdex search-symbols \"validate session\"\n  slopdex search \"validate session\" --code --symbols\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nSearch and cross-search require an existing index; run update first. Plain search includes all indexes; selectors restrict it to explicit indexes. Descriptions are generated only by generate descriptions. Pure symbol searches refresh only structure. --no-reindex reuses saved snapshots; queries and explicit generation may call providers. Map without -q parses directly when no index exists."
 )]
 pub(super) struct Cli {
     #[command(flatten)]
@@ -61,7 +61,7 @@ pub(super) struct Global {
     /// Show full callable code in expanded text output when similarity is strictly above this value
     #[arg(long, global = true, default_value = "0.9", allow_hyphen_values = true, value_parser = similarity)]
     pub(super) expand_code_threshold: f64,
-    /// Reuse the saved index without refresh; uncached semantic queries may call providers
+    /// Reuse the saved index without refresh; queries and explicit generation may call providers
     #[arg(long, global = true, conflicts_with = "force_reindex")]
     pub(super) no_reindex: bool,
     /// Reset live index state while preserving reusable caches
@@ -108,28 +108,33 @@ impl From<Detail> for map::Detail {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
-    /// Search code, enabled descriptions, and Markdown together (symbols opt-in)
+    /// Search all indexes: code, descriptions, Markdown/documents, and symbols
     Search(SearchArgs),
-    /// Search callable code only
+    /// Search only the callable code index
     SearchCode(QueryArgs),
-    /// Search enabled callable and file descriptions
+    /// Search only the generated callable/file description index
     SearchDescriptions(QueryArgs),
-    /// Search heading-aware Markdown chunks
+    /// Search only the heading-aware Markdown content index
     SearchMd(QueryArgs),
-    /// Search bare symbol names, aliases, and heading titles only
+    /// Search only the symbol-name/alias and heading-title index
     SearchSymbols(QueryArgs),
     /// Explain existing code relevant to a task using the description model
     Describe(DescribeArgs),
     /// Compare functions; clusters are connected components of observed matches
     CrossSearch(CrossArgs),
-    /// Show code declarations and Markdown headings; -q selects semantic names
+    /// Show code declarations and Markdown headings; -q matches symbols, descriptions, and heading titles
     Map(MapArgs),
     /// Refresh and show index metadata, counts, and profiles as JSON
     Status,
-    /// Inspect and regenerate indexed data
+    /// Inspect indexed data
     Index {
         #[command(subcommand)]
         action: IndexAction,
+    },
+    /// Explicitly generate indexed data with configured providers
+    Generate {
+        #[command(subcommand)]
+        action: GenerateAction,
     },
     /// Refresh the current working tree and Git HEAD
     Update(UpdateArgs),
@@ -146,11 +151,12 @@ pub(super) enum Command {
 pub(super) enum IndexAction {
     /// Refresh and inspect saved file/function indexing failures
     Errors,
-    /// Regenerate stale file descriptions, optionally including their callables
-    ReindexFiles {
-        #[arg(long)]
-        callables: bool,
-    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum GenerateAction {
+    /// Generate missing or stale file and callable descriptions from indexed source
+    Descriptions,
 }
 
 #[derive(Debug, Subcommand)]
@@ -196,10 +202,10 @@ pub(super) struct SelectionArgs {
     /// Qualified-name or heading-path regex; repeat for OR; cross-search selects sources
     #[arg(short = 'e', long, alias = "regex", value_parser = valid_regex)]
     pub(super) regexp: Vec<String>,
-    /// Semantic bare-name/heading-title query; repeat for OR; cross-search selects sources
+    /// Semantic query over symbols, descriptions, and heading titles; repeat for OR; cross-search selects sources
     #[arg(short = 'q', long, value_parser = valid_symbol_query)]
     pub(super) symbol_query: Vec<String>,
-    /// Minimum symbol-name similarity in [-1,1], independent of --threshold (default: 0.5)
+    /// Minimum semantic selector similarity in [-1,1], independent of --threshold (default: 0.5)
     #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
     pub(super) symbol_threshold: Option<f64>,
     /// Match regexes case-insensitively
@@ -381,16 +387,16 @@ pub(super) struct QueryArgs {
 pub(super) struct SearchArgs {
     #[command(flatten)]
     pub(super) query: QueryArgs,
-    /// Select code; if any selector is passed, unselected indexes are omitted
+    /// Select the callable code index; any selector omits unselected indexes
     #[arg(long)]
     pub(super) code: bool,
-    /// Select descriptions (requires enabled descriptions)
+    /// Select the generated callable/file description index
     #[arg(long)]
     pub(super) descriptions: bool,
-    /// Select Markdown
+    /// Select the Markdown content index
     #[arg(long)]
     pub(super) md: bool,
-    /// Select bare symbol names and heading titles (opt-in)
+    /// Select the symbol-name/alias and heading-title index
     #[arg(long)]
     pub(super) symbols: bool,
 }

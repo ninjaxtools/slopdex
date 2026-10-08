@@ -66,7 +66,8 @@ pub(in crate::cli) fn print_map(
             for node in &nodes {
                 if node.kind == "heading"
                     && selection.is_none_or(|selection| {
-                        selection.kind_matches(&node.kind) && selection.symbol_matches(node)
+                        selection.kind_matches(&node.kind)
+                            && selection.symbol_matches_at(path, node)
                     })
                     && let Some(body) = bodies.get(&node.id)
                 {

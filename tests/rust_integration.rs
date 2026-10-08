@@ -632,7 +632,9 @@ fn function(name: &str, marker: &str) -> String {
 }
 
 fn all() -> Value {
-    json!({"minSimilarity": -1.0})
+    // Most fixtures compare content scores. Select those streams explicitly;
+    // tests of the default all-index search use their own options.
+    json!({"minSimilarity": -1.0, "code": true, "md": true})
 }
 
 fn names(rows: &[Value]) -> BTreeSet<String> {
@@ -805,7 +807,6 @@ fn concurrency_fixture(
     let mut config = mock.config();
     config["parallelism"] = json!(limit);
     config["embeddingBatchSize"] = json!(2);
-    config["descriptionsEnabled"] = json!(matches!(work, ConcurrentWork::Callables));
     config["providerMaxRetries"] = json!(0);
     Ok(config)
 }
@@ -817,7 +818,15 @@ fn assert_bounded_concurrency(work: ConcurrentWork) -> Result<()> {
         let mock = Mock::start_with(Some(concurrent.clone()))?;
         let config = concurrency_fixture(&repo, &mock, work, limit)?;
         let mut engine = repo.open(&config)?;
-        engine.refresh()?;
+        match work {
+            ConcurrentWork::Embeddings => {
+                engine.refresh()?;
+            }
+            ConcurrentWork::Callables => {
+                engine.refresh_structure()?;
+                engine.generate_descriptions()?;
+            }
+        }
         assert_eq!(engine.status()?["functionCount"], 10);
         let requests: Vec<_> = mock
             .requests("")
@@ -837,7 +846,7 @@ fn assert_bounded_concurrency(work: ConcurrentWork) -> Result<()> {
         }
         {
             let progress = concurrent.progress.lock().unwrap();
-            assert_eq!(progress.active, 0, "refresh must join every HTTP worker");
+            assert_eq!(progress.active, 0, "operation must join every HTTP worker");
             assert_eq!(progress.completed.len(), expected_requests);
             assert!(
                 progress.maximum <= limit,
@@ -851,7 +860,14 @@ fn assert_bounded_concurrency(work: ConcurrentWork) -> Result<()> {
             }
         }
         let calls = mock.count();
-        assert_eq!(engine.refresh()?["filesUpdated"], 0);
+        match work {
+            ConcurrentWork::Embeddings => {
+                assert_eq!(engine.refresh()?["filesUpdated"], 0);
+            }
+            ConcurrentWork::Callables => {
+                engine.generate_descriptions()?;
+            }
+        }
         assert_eq!(
             mock.count(),
             calls,
@@ -877,11 +893,9 @@ fn preparation_finishes_callable_descriptions_before_global_embeddings() -> Resu
     let repo = Repo::new()?;
     repo.write("a.rs", &function("alpha", "VECTOR_EAST"))?;
     repo.write("b.rs", &function("beta", "VECTOR_NORTH"))?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
-
-    let mut engine = repo.open(&config)?;
-    engine.refresh()?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh_structure()?;
+    engine.generate_descriptions()?;
 
     let requests = mock.requests("");
     let callable_indices: Vec<_> = requests
@@ -919,9 +933,14 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
     let mock = Mock::start_with(Some(concurrent.clone()))?;
     let config = concurrency_fixture(&repo, &mock, work, limit)?;
     let mut engine = repo.open(&config)?;
-    let error = engine
-        .refresh()
-        .expect_err("one request in the first window must fail");
+    if matches!(work, ConcurrentWork::Callables) {
+        engine.refresh_structure()?;
+    }
+    let error = match work {
+        ConcurrentWork::Embeddings => engine.refresh(),
+        ConcurrentWork::Callables => engine.generate_descriptions(),
+    }
+    .expect_err("one request in the first window must fail");
     assert!(format!("{error:#}").contains("HTTP 503"));
     mock.requests(""); // Surface any timeout/protocol failure in the scheduling harness.
     assert_eq!(engine.status()?["functionCount"], 10);
@@ -972,9 +991,16 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
     assert_eq!(work.paid_count(&repo.db()?)?, preserved);
     concurrent.fail_first.store(false, Ordering::Relaxed);
     let offset = mock.count();
-    let retry = engine.refresh()?;
-    assert_eq!(retry["filesUpdated"], 0, "structure was already published");
-    assert_eq!(retry["filesPrepared"], file_count);
+    match work {
+        ConcurrentWork::Embeddings => {
+            let retry = engine.refresh()?;
+            assert_eq!(retry["filesUpdated"], 0, "structure was already published");
+            assert_eq!(retry["filesPrepared"], file_count);
+        }
+        ConcurrentWork::Callables => {
+            engine.generate_descriptions()?;
+        }
+    }
     assert_eq!(engine.status()?["functionCount"], 10);
     let retry_inputs: Vec<_> = mock.requests("")[offset..]
         .iter()
@@ -998,12 +1024,19 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
                 work.inputs(request)
                     .iter()
                     .all(|input| retry_set.contains(input)),
-                "the failed request must be retried on the next refresh"
+                "the failed request must be retried on the next operation"
             );
         }
     }
     let calls = mock.count();
-    assert_eq!(engine.refresh()?["filesUpdated"], 0);
+    match work {
+        ConcurrentWork::Embeddings => {
+            assert_eq!(engine.refresh()?["filesUpdated"], 0);
+        }
+        ConcurrentWork::Callables => {
+            engine.generate_descriptions()?;
+        }
+    }
     assert_eq!(mock.count(), calls);
     Ok(())
 }
@@ -1254,13 +1287,13 @@ fn mixed_search_limits_are_global_and_explicit_modes_select_only_requested_strea
             engine.search(
                 "east",
                 "search",
-                &json!({"limit": limit, "minSimilarity": -1})
+                &json!({"limit": limit, "minSimilarity": -1, "code":true, "md":true})
             )?,
             rows[..limit.min(rows.len())]
         );
     }
     for (flag, kind) in [("code", "search-code"), ("md", "search-md")] {
-        let mut options = all();
+        let mut options = json!({"minSimilarity":-1});
         options[flag] = json!(true);
         assert_eq!(
             engine.search("east", "search", &options)?,
@@ -1525,9 +1558,9 @@ fn force_rebuild_for_moved_root_reuses_code_markdown_and_description_artifacts()
     repo.write("code.rs", &function("example", "VECTOR_EAST"))?;
     repo.write("guide.md", "# Guide\n\nVECTOR_MID\n")?;
     let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let before = engine.search("east", "search", &all())?;
     let artifacts = artifact_counts(&repo)?;
     let calls = mock.count();
@@ -1541,6 +1574,7 @@ fn force_rebuild_for_moved_root_reuses_code_markdown_and_description_artifacts()
     assert_eq!(engine.status()?["generation"], 0);
     assert_eq!(artifact_counts(&repo)?, artifacts);
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let after = engine.search("east", "search", &all())?;
     // A rebuild may allocate fresh IDs; source content and scores must agree.
     let without_ids = |rows: Vec<Value>| {
@@ -1569,15 +1603,12 @@ fn description_settings_are_restored_from_the_index_when_omitted_from_config() -
     repo.write("code.rs", &function("example", "VECTOR_EAST"))?;
     let mut config = mock.config();
     let mut engine = repo.open(&config)?;
-    engine.set_descriptions(true)?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
     let expected = engine.search("east", "search-descriptions", &all())?;
     let status = engine.status()?;
     drop(engine);
-    for key in [
-        "descriptionsEnabled",
-        "descriptionProvider",
-        "descriptionModel",
-    ] {
+    for key in ["descriptionProvider", "descriptionModel"] {
         config.as_object_mut().unwrap().remove(key);
     }
     let calls = mock.count();
@@ -1930,18 +1961,18 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
 {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     repo.write("a.rs", &function("east", "VECTOR_EAST"))?;
     repo.write("b.rs", &function("mid", "VECTOR_MID"))?;
     repo.write("guide.md", "# Guide\n\nVECTOR_EAST docs.\n")?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let expected = engine.search("east", "search", &all())?;
     let expected_status = engine.status()?;
     let calls = mock.count();
     drop(engine);
-    let sidecars: Vec<PathBuf> = ["code", "markdown", "descriptions", "combined"]
+    let sidecars: Vec<PathBuf> = ["code", "markdown", "descriptions"]
         .iter()
         .flat_map(|kind| {
             let path = format!("{}.{kind}.usearch", repo.index.display());
@@ -1975,14 +2006,14 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
             "persisted result cache survives restart"
         );
         // Different options bypass the result cache, proving rebuilt ANN indexes work.
-        let options = json!({"minSimilarity": -1, "limit": 20 + round});
+        let options = json!({"minSimilarity": -1, "limit": 20 + round, "code": true, "md": true});
         assert_eq!(engine.search("east", "search", &options)?, expected);
         assert_eq!(engine.search("east", "search-code", &options)?.len(), 2);
         assert_eq!(
             engine
                 .search("east", "search-descriptions", &options)?
                 .len(),
-            2
+            4
         );
         assert_eq!(engine.search("east", "search-md", &options)?.len(), 1);
         for path in &sidecars {
@@ -1998,8 +2029,8 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
 }
 
 #[test]
-fn description_lifecycle_fuses_scores_preserves_stale_files_and_reindexes_on_request() -> Result<()>
-{
+fn description_lifecycle_indexes_independent_scores_and_generates_only_missing_or_stale()
+-> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let config = mock.config();
@@ -2009,31 +2040,40 @@ fn description_lifecycle_fuses_scores_preserves_stale_files_and_reindexes_on_req
     engine.refresh()?;
     assert!(
         engine
-            .search("east", "search-descriptions", &all())
-            .is_err()
+            .search("east", "search-descriptions", &all())?
+            .is_empty()
     );
-    assert!(engine.reindex_files(false).is_err());
-    let enabled = engine.set_descriptions(true)?;
+    assert!(mock.requests("/responses").is_empty());
+    assert_eq!(engine.generate_descriptions()?["filesPrepared"], 2);
+    let enabled = engine.status()?;
     assert_eq!(enabled["descriptionCount"], 2);
     assert_eq!(enabled["fileDescriptionCount"], 2);
     assert_eq!(enabled["staleFileDescriptionCount"], 0);
     assert_eq!(mock.requests("/responses").len(), 4);
-    let fused = engine.search("east", "search", &all())?;
-    let alpha = row(&fused, "alpha");
+    let indexed = engine.search("east", "search", &json!({"minSimilarity":-1}))?;
+    let alpha = row(&indexed, "alpha");
     near(&alpha["codeSimilarity"], 1.0);
-    near(&alpha["descriptionSimilarity"], 0.0);
-    near(&alpha["fileDescriptionSimilarity"], 0.6);
-    near(&alpha["similarity"], 1.6 / 3.0);
-    near(&row(&fused, "beta")["similarity"], 1.4 / 3.0);
+    near(&alpha["similarity"], 1.0);
+    near(&row(&indexed, "beta")["similarity"], 0.8);
+    assert_eq!(indexed.iter().filter(|r| r["type"] == "file").count(), 2);
+    assert_eq!(indexed.iter().filter(|r| r["type"] == "symbol").count(), 2);
     let descriptions = engine.search("east", "search-descriptions", &all())?;
-    near(&descriptions[0]["similarity"], 0.3);
-    assert!(descriptions[0].get("codeSimilarity").is_none());
-    let cross = engine.cross_search(None, &json!({"minSimilarity": -1, "regexp": "^alpha$"}))?;
-    assert_eq!(
-        cross[0]["scoring"]["similarityMode"],
-        "code-description-file-average"
+    assert_eq!(descriptions.len(), 4);
+    near(&row(&descriptions, "alpha")["similarity"], 0.0);
+    let file_hit = descriptions
+        .iter()
+        .find(|r| r["file"]["path"] == "a.rs")
+        .unwrap();
+    near(&file_hit["similarity"], 0.6);
+    near(&row(&descriptions, "alpha")["codeSimilarity"], 1.0);
+    near(&row(&descriptions, "alpha")["descriptionSimilarity"], 0.0);
+    near(
+        &row(&descriptions, "alpha")["fileDescriptionSimilarity"],
+        0.6,
     );
-    near(&cross[0]["matches"][0]["similarity"], 2.8 / 3.0);
+    let cross = engine.cross_search(None, &json!({"minSimilarity": -1, "regexp": "^alpha$"}))?;
+    assert_eq!(cross[0]["scoring"]["similarityMode"], "code");
+    near(&cross[0]["matches"][0]["similarity"], 0.8);
     let old_file = file_record(&repo, "a.rs")?;
     let old_callable = alpha["function"]["description"].clone();
     repo.write("a.rs", &function("alpha", "VECTOR_NORTH"))?;
@@ -2045,17 +2085,20 @@ fn description_lifecycle_fuses_scores_preserves_stale_files_and_reindexes_on_req
     );
     assert_eq!(
         mock.requests("/responses").len(),
-        5,
-        "only the changed callable is redescribed"
+        4,
+        "refresh must never generate descriptions"
     );
     let changed = engine.search("east", "search", &all())?;
     assert_ne!(
         row(&changed, "alpha")["function"]["description"],
         old_callable
     );
-    let callable = row(&changed, "alpha")["function"]["description"].clone();
-    near(&row(&changed, "alpha")["similarity"], 0.2);
-    assert_eq!(engine.reindex_files(false)?["filesReindexed"], 1);
+    assert_eq!(
+        row(&changed, "alpha")["function"]["description"],
+        Value::Null
+    );
+    near(&row(&changed, "alpha")["similarity"], 0.0);
+    assert_eq!(engine.generate_descriptions()?["filesPrepared"], 1);
     assert_eq!(engine.status()?["staleFileDescriptionCount"], 0);
     assert_ne!(
         file_record(&repo, "a.rs")?["description"],
@@ -2063,10 +2106,9 @@ fn description_lifecycle_fuses_scores_preserves_stale_files_and_reindexes_on_req
     );
     assert_eq!(mock.requests("/responses").len(), 6);
     let refreshed = engine.search("east", "search", &all())?;
-    assert_eq!(
-        row(&refreshed, "alpha")["function"]["description"],
-        callable
-    );
+    let callable = row(&refreshed, "alpha")["function"]["description"].clone();
+    assert!(callable.is_string());
+    assert_ne!(callable, old_callable);
 
     // A file-only edit makes its context stale while callable source stays identical.
     repo.write(
@@ -2078,46 +2120,103 @@ fn description_lifecycle_fuses_scores_preserves_stale_files_and_reindexes_on_req
     )?;
     engine.refresh()?;
     assert_eq!(mock.requests("/responses").len(), 6);
-    assert_eq!(engine.reindex_files(true)?["filesReindexed"], 1);
+    assert_eq!(engine.generate_descriptions()?["filesPrepared"], 1);
     assert_eq!(
         mock.requests("/responses").len(),
-        8,
-        "--callables regenerates against the new file context"
+        7,
+        "only the stale file description is regenerated for a file-only edit"
     );
     let regenerated = engine.search("east", "search", &all())?;
-    assert_ne!(
+    assert_eq!(
         row(&regenerated, "alpha")["function"]["description"],
         callable
     );
     let calls = mock.count();
-    assert_eq!(engine.reindex_files(true)?["filesReindexed"], 0);
-    assert_eq!(
-        engine.set_descriptions(false)?["descriptionsEnabled"],
-        false
-    );
-    let code_only = engine.search("east", "search", &all())?;
-    assert!(
-        code_only
-            .iter()
-            .all(|r| r.get("descriptionSimilarity").is_none())
-    );
-    assert!(
-        engine
-            .search("east", "search-descriptions", &all())
-            .is_err()
-    );
-    assert_eq!(engine.set_descriptions(true)?["descriptionCount"], 2);
+    assert_eq!(engine.generate_descriptions()?["filesPrepared"], 0);
+    assert_eq!(engine.status()?["descriptionCount"], 2);
     assert_eq!(
         mock.count(),
         calls,
-        "toggle preserves reusable descriptions"
+        "generation is a no-op when every description is current"
     );
     drop(engine);
-    // The caller omitted descriptionsEnabled: the persisted setting must win.
     let reopened = repo.open(&config)?;
-    assert_eq!(reopened.status()?["descriptionsEnabled"], true);
+    assert_eq!(reopened.status()?["descriptionCount"], 2);
     assert_eq!(reopened.search("east", "search", &all())?, regenerated);
     assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn refresh_indexes_source_descriptions_and_generation_excludes_source_provided() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    let source = format!(
+        "//! Supplied file VECTOR_EAST.\n\n/// Supplied callable VECTOR_NORTH.\n{}\n{}",
+        function("documented", "VECTOR_MID"),
+        function("missing", "VECTOR_WEST")
+    );
+    repo.write("code.rs", &source)?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    assert!(mock.requests("/responses").is_empty());
+    assert_eq!(
+        file_record(&repo, "code.rs")?["description"],
+        "Supplied file VECTOR_EAST."
+    );
+    assert!(
+        file_record(&repo, "code.rs")?["description_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("source:")
+    );
+    assert_eq!(engine.status()?["staleFileDescriptionCount"], 0);
+    let supplied = engine.search("east", "search-descriptions", &all())?;
+    assert_eq!(supplied.len(), 2);
+    assert_eq!(
+        row(&supplied, "documented")["function"]["description"],
+        "Supplied callable VECTOR_NORTH."
+    );
+    near(&row(&supplied, "documented")["similarity"], 0.0);
+    engine.generate_descriptions()?;
+    assert_eq!(mock.requests("/responses").len(), 1);
+    assert!(description_prompt(&mock.requests("/responses")[0].body).contains("Symbol: missing\n"));
+    let generated = engine.search("east", "search-descriptions", &all())?;
+    assert_eq!(generated.len(), 3);
+    assert_eq!(row(&generated, "documented"), row(&supplied, "documented"));
+    drop(engine);
+
+    config["descriptionModel"] = json!("replacement-description-model");
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    assert_eq!(mock.requests("/responses").len(), 1);
+    engine.generate_descriptions()?;
+    assert_eq!(mock.requests("/responses").len(), 2);
+    assert_eq!(
+        file_record(&repo, "code.rs")?["description"],
+        "Supplied file VECTOR_EAST."
+    );
+    let changed_profile = engine.search("east", "search-descriptions", &all())?;
+    assert_eq!(
+        row(&changed_profile, "documented"),
+        row(&supplied, "documented")
+    );
+    repo.write(
+        "code.rs",
+        &source.replace(
+            "Supplied callable VECTOR_NORTH.",
+            "Updated callable VECTOR_EAST.",
+        ),
+    )?;
+    engine.refresh()?;
+    assert_eq!(mock.requests("/responses").len(), 2);
+    let edited = engine.search("east", "search-descriptions", &all())?;
+    assert_eq!(
+        row(&edited, "documented")["function"]["description"],
+        "Updated callable VECTOR_EAST."
+    );
+    near(&row(&edited, "documented")["similarity"], 1.0);
     Ok(())
 }
 
@@ -2135,7 +2234,7 @@ fn describe_uses_indexed_search_context_without_whole_files() -> Result<()> {
     engine.refresh()?;
     // describe must use its indexed snapshot, not a fresh read of the working tree.
     repo.write("a.rs", "fn not_indexed_yet() {}\n")?;
-    let answer = engine.describe("east", &json!({"minSimilarity": 0.9}))?;
+    let answer = engine.describe("east", &json!({"minSimilarity": 0.9, "code":true}))?;
     assert!(
         answer["description"]
             .as_str()
@@ -2220,11 +2319,11 @@ fn describe_bounds_expanded_markdown_search_on_utf8_boundary() -> Result<()> {
 fn failed_provider_publishes_structure_and_partial_artifacts_survive_restart() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     repo.write("baseline.rs", &function("baseline", "VECTOR_EAST"))?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     engine.search("east", "search", &all())?;
     let status = engine.status()?;
     let counts = artifact_counts(&repo)?;
@@ -2235,9 +2334,10 @@ fn failed_provider_publishes_structure_and_partial_artifacts_survive_restart() -
         &function("failing", "BROKEN_EMBED VECTOR_NORTH"),
     )?;
     mock.fail_on(Some("BROKEN_EMBED"));
+    engine.refresh_structure()?;
     let error = engine
-        .refresh()
-        .expect_err("injected provider failure must abort refresh");
+        .generate_descriptions()
+        .expect_err("injected provider failure must abort generation preparation");
     let error = format!("{error:#}");
     assert!(error.contains("HTTP 503"));
     assert!(!error.contains(TEST_KEY));
@@ -2264,10 +2364,8 @@ fn failed_provider_publishes_structure_and_partial_artifacts_survive_restart() -
     assert_incomplete(&engine);
     let request_offset = mock.count();
     mock.fail_on(None);
-    let retried = engine.refresh()?;
-    assert_eq!(retried["filesUpdated"], 0);
-    assert_eq!(retried["filesDeleted"], 0);
-    assert!(retried["generation"].as_u64() > status["generation"].as_u64());
+    engine.generate_descriptions()?;
+    assert!(engine.status()?["generation"].as_u64() > status["generation"].as_u64());
     assert_eq!(
         names(&engine.search("east", "search", &all())?),
         strings(&["completed", "failing"])
@@ -2503,7 +2601,6 @@ fn cli_missing_resolved_source_indexes_fail_without_artifacts_or_provider_calls(
         let mock = Mock::start()?;
         let repo = Repo::new()?;
         let mut config = mock.config();
-        config["descriptionsEnabled"] = json!(true);
         config["rerankingEnabled"] = json!(true);
         if selection == "config" {
             config["indexPath"] = json!("uncreated/configured.sqlite");
@@ -2908,8 +3005,7 @@ fn current_map_reads_share_the_lock_and_stale_maps_wait_for_writers() -> Result<
 }
 
 #[test]
-fn edits_while_descriptions_are_disabled_invalidate_only_changed_callable_descriptions()
--> Result<()> {
+fn refresh_invalidates_only_changed_callable_descriptions_without_generating() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     repo.write(
@@ -2917,11 +3013,11 @@ fn edits_while_descriptions_are_disabled_invalidate_only_changed_callable_descri
         &(function("edited", "VECTOR_EAST") + &function("untouched", "VECTOR_MID")),
     )?;
     let mut engine = repo.open(&mock.config())?;
-    engine.set_descriptions(true)?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
     let before = engine.search("east", "search", &all())?;
     let saved_file = file_record(&repo, "code.rs")?;
     assert_eq!(mock.requests("/responses").len(), 3);
-    engine.set_descriptions(false)?;
     repo.write(
         "code.rs",
         &(function("edited", "VECTOR_NORTH") + &function("untouched", "VECTOR_MID")),
@@ -2939,10 +3035,10 @@ fn edits_while_descriptions_are_disabled_invalidate_only_changed_callable_descri
     assert_eq!(engine.status()?["descriptionCount"], 1);
     assert_eq!(engine.status()?["staleFileDescriptionCount"], 1);
     assert_eq!(mock.requests("/responses").len(), 3);
-    engine.set_descriptions(true)?;
+    engine.generate_descriptions()?;
     assert_eq!(engine.status()?["descriptionCount"], 2);
-    assert_eq!(mock.requests("/responses").len(), 4);
-    assert_eq!(
+    assert_eq!(mock.requests("/responses").len(), 5);
+    assert_ne!(
         file_record(&repo, "code.rs")?["description"],
         saved_file["description"]
     );
@@ -2951,7 +3047,7 @@ fn edits_while_descriptions_are_disabled_invalidate_only_changed_callable_descri
         row(&enabled, "edited")["function"]["description"],
         row(&before, "edited")["function"]["description"]
     );
-    near(&row(&enabled, "edited")["similarity"], 0.2);
+    near(&row(&enabled, "edited")["similarity"], 0.0);
     Ok(())
 }
 
@@ -2960,13 +3056,14 @@ fn regression_descriptions_with_markdown_refresh_is_noop_and_keeps_query_caches(
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
     config["rerankingEnabled"] = json!(true);
     repo.write("code.rs", &function("alpha", "VECTOR_EAST"))?;
     repo.write("guide.md", "# Guide\n\nVECTOR_MID documentation.\n")?;
     let mut engine = repo.open(&config)?;
     let initial = engine.refresh()?;
     assert_eq!(initial["filesUpdated"], 2);
+    assert!(mock.requests("/responses").is_empty());
+    engine.generate_descriptions()?;
     assert_eq!(mock.requests("/responses").len(), 2);
     let mut expected = Vec::new();
     for kind in ["search", "search-code", "search-descriptions", "search-md"] {
@@ -2990,7 +3087,7 @@ fn regression_descriptions_with_markdown_refresh_is_noop_and_keeps_query_caches(
         let noop = engine.refresh()?;
         assert_eq!(noop["filesUpdated"], 0);
         assert_eq!(noop["filesDeleted"], 0);
-        assert_eq!(noop["generation"], initial["generation"]);
+        assert_eq!(noop["generation"], status["generation"]);
         assert_eq!(engine.status()?, status);
         assert_eq!(file_record(&repo, "guide.md")?, markdown);
         for (kind, rows) in &expected {
@@ -3008,12 +3105,12 @@ fn regression_descriptions_with_markdown_refresh_is_noop_and_keeps_query_caches(
 fn generated_descriptions_share_a_growing_file_conversation_in_source_order() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     let source = "pub fn run() -> i32 { helper() }\npub fn helper() -> i32 { 42 }\n";
     repo.write("api.rs", source)?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let requests = mock.requests("/responses");
     assert_eq!(requests.len(), 3);
     assert!(description_prompt(&requests[0].body).starts_with("Describe the purpose"));
@@ -3084,16 +3181,16 @@ fn generated_descriptions_share_a_growing_file_conversation_in_source_order() ->
 }
 
 #[test]
-fn regression_description_model_change_retains_unchanged_and_regenerates_only_edited_callable()
+fn regression_description_model_change_invalidates_generated_descriptions_only_on_generation()
 -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
     let untouched = function("untouched", "VECTOR_MID");
     repo.write("code.rs", &(function("edited", "VECTOR_EAST") + &untouched))?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let before = engine.search("east", "search", &all())?;
     let saved_file = file_record(&repo, "code.rs")?;
     let generation = engine.status()?["generation"].clone();
@@ -3120,6 +3217,12 @@ fn regression_description_model_change_retains_unchanged_and_regenerates_only_ed
         &(function("edited", "VECTOR_NORTH") + "\n\n" + &untouched),
     )?;
     assert_eq!(engine.refresh()?["filesUpdated"], 1);
+    assert_eq!(
+        mock.requests("/responses").len(),
+        3,
+        "refresh never generates after a profile change"
+    );
+    engine.generate_descriptions()?;
     let after = engine.search("east", "search", &all())?;
     assert_eq!(names(&after), strings(&["edited", "untouched"]));
     for name in ["edited", "untouched"] {
@@ -3128,7 +3231,7 @@ fn regression_description_model_change_retains_unchanged_and_regenerates_only_ed
             row(&before, name)["function"]["id"]
         );
     }
-    assert_eq!(
+    assert_ne!(
         row(&after, "untouched")["function"]["description"],
         row(&before, "untouched")["function"]["description"]
     );
@@ -3143,17 +3246,17 @@ fn regression_description_model_change_retains_unchanged_and_regenerates_only_ed
     let requests = mock.requests("/responses");
     assert_eq!(
         requests.len(),
-        4,
-        "only the edited callable needs a new description"
+        6,
+        "a changed generation profile invalidates file and callable descriptions"
     );
     assert_eq!(requests[3].body["model"], config["descriptionModel"]);
-    let prompt = description_prompt(&requests[3].body);
+    let prompt = description_prompt(&requests[4].body);
     assert!(prompt.starts_with("Describe what"));
     assert!(prompt.contains("Symbol: edited\n"));
     assert!(!prompt.contains("Symbol: untouched"));
     assert_eq!(
-        requests[3].body["input"][1]["content"][0]["text"],
-        saved_file["description"]
+        requests[4].body["input"][1]["content"][0]["text"],
+        file_record(&repo, "code.rs")?["description"]
     );
     assert!(
         requests[3].body["input"][0]["content"][0]["text"]
@@ -3162,9 +3265,9 @@ fn regression_description_model_change_retains_unchanged_and_regenerates_only_ed
             .contains("VECTOR_NORTH")
     );
     let file = file_record(&repo, "code.rs")?;
-    assert_eq!(file["description"], saved_file["description"]);
-    assert_eq!(file["description_hash"], saved_file["description_hash"]);
-    assert_eq!(engine.status()?["staleFileDescriptionCount"], 1);
+    assert_ne!(file["description"], saved_file["description"]);
+    assert_eq!(file["description_hash"], file["hash"]);
+    assert_eq!(engine.status()?["staleFileDescriptionCount"], 0);
     let calls = mock.count();
     drop(engine);
     let mut engine = repo.open(&config)?;
@@ -3329,18 +3432,18 @@ fn regression_git_subdirectory_root_scopes_uncommitted_and_changed_since_paths()
 }
 
 #[test]
-fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after_generation_change()
--> Result<()> {
+fn regression_failed_generation_reuses_completed_descriptions_after_generation_change() -> Result<()>
+{
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     repo.write(".slopdex/config.json", &config.to_string())?;
     let source = function("alpha", "VECTOR_EAST") + &function("beta", "VECTOR_MID");
     repo.write("code.rs", &source)?;
     repo.write("guide.md", "# Guide\n\nOriginal context.\n")?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let before = engine.search("east", "search", &all())?;
     repo.write("code.rs", &(source + "\nconst NEW_CONTEXT: i32 = 7;\n"))?;
     engine.refresh()?;
@@ -3353,7 +3456,7 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
          WHEN NEW.path='code.rs' BEGIN SELECT RAISE(ABORT, 'fixture forced reindex failure'); END;",
     )?;
     drop(engine);
-    let failed = repo.cli(&["--no-reindex", "index", "reindex-files", "--callables"])?;
+    let failed = repo.cli(&["generate", "descriptions"])?;
     assert!(!failed.status.success());
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(
@@ -3362,8 +3465,8 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
     );
     assert_eq!(
         mock.requests("/responses").len(),
-        6,
-        "file and both forced callable descriptions completed before publication failed"
+        4,
+        "stale file generation completed before publication failed"
     );
     let mut engine = repo.open(&config)?;
     assert_eq!(engine.status()?, status);
@@ -3371,8 +3474,8 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
     assert_eq!(engine.search("east", "search", &all())?, before);
     repo.db()?
         .execute_batch("DROP TRIGGER regression_reindex_abort")?;
-    // Move generation independently of the failed file's source. A force cache
-    // key tied to generation instead of source would repeat the completed calls.
+    // Move generation independently of the failed file's source. A cache key
+    // tied to generation instead of source would repeat the completed calls.
     repo.write("guide.md", "# Guide\n\nUpdated context.\n")?;
     assert_eq!(engine.refresh()?["filesUpdated"], 1);
     assert!(
@@ -3382,13 +3485,13 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
     let calls = mock.count();
     drop(engine);
     assert_eq!(
-        repo.cli_json(&["--no-reindex", "index", "reindex-files", "--callables"])?["filesReindexed"],
+        repo.cli_json(&["generate", "descriptions"])?["filesPrepared"],
         1
     );
     assert_eq!(
         mock.count(),
         calls,
-        "rerun must reuse completed forced descriptions and embeddings"
+        "rerun must reuse completed descriptions and embeddings"
     );
     let engine = repo.open(&config)?;
     assert_eq!(engine.status()?["staleFileDescriptionCount"], 0);
@@ -3397,7 +3500,7 @@ fn regression_failed_reindex_files_callables_reuses_completed_descriptions_after
     assert_ne!(file["description"], stale_file["description"]);
     let after = engine.search("east", "search", &all())?;
     for name in ["alpha", "beta"] {
-        assert_ne!(
+        assert_eq!(
             row(&after, name)["function"]["description"],
             row(&before, name)["function"]["description"]
         );
@@ -3413,7 +3516,6 @@ fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_art
     let repo = Repo::new()?;
     assert!(!repo.root.join(".git").exists());
     let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
     config["rerankingEnabled"] = json!(true);
     config["include"] = json!(["**/*.py", "**/*.ts", "**/*.md"]);
     config["exclude"] = json!(["excluded/**"]);
@@ -3760,7 +3862,6 @@ fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
     config["rerankingEnabled"] = json!(true);
     repo.write(".slopdex/config.json", &config.to_string())?;
     repo.write("src/api.ts", "export class Api {\n  run(value: string): string {\n    const BODY_ONLY_SENTINEL = value;\n    return BODY_ONLY_SENTINEL;\n  }\n}\n")?;
@@ -5380,8 +5481,7 @@ fn symbol_map_cli_no_reindex_populates_lazy_cache_and_expands_only_direct_select
 -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     repo.write(".slopdex/config.json", &config.to_string())?;
     repo.write("guide.md", "# Guide\n\nAncestor body VECTOR_WEST.\n\n## Vector North\n\nSelected café 🚀 body VECTOR_WEST.\n\n### Ordinary\n\nDescendant body VECTOR_NORTH.\n\n## Other\n\nSibling body VECTOR_NORTH.\n")?;
     repo.write(
@@ -5473,8 +5573,7 @@ fn symbol_search_filters_before_content_limits_with_independent_thresholds_and_u
 -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     repo.write(".slopdex/config.json", &config.to_string())?;
     let distractors: String = (0..48)
         .map(|i| function(&format!("ordinary_{i}"), "VECTOR_EAST"))
@@ -5489,9 +5588,14 @@ fn symbol_search_filters_before_content_limits_with_independent_thresholds_and_u
     repo.write("guide.md", "# Guide\n\nOverview VECTOR_EAST.\n\n## Vector North\n\nVECTOR_NORTH.\n\n## Vector Mid\n\nVECTOR_MID.\n\n## Ordinary\n\nVECTOR_EAST VECTOR_NORTH.\n")?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
-    let strict =
-        json!({"symbolQuery":"VECTOR_NORTH", "symbolThreshold":0.7, "minSimilarity":-1, "limit":1});
+    engine.generate_descriptions()?;
+    let strict = json!({"symbolQuery":"VECTOR_NORTH", "symbolThreshold":0.7, "minSimilarity":-1, "limit":1, "code":true, "md":true});
     for kind in ["search-code", "search-descriptions", "search-md", "search"] {
+        let mut strict = strict.clone();
+        if kind == "search-descriptions" {
+            // Exclude independent file hits to compare the selected callable's score.
+            strict["maxSimilarity"] = json!(0.1);
+        }
         let unfiltered = engine.search("east", kind, &all())?;
         let selected = engine.search("east", kind, &strict)?;
         assert_eq!(selected.len(), 1, "{kind}: {selected:?}");
@@ -5506,14 +5610,13 @@ fn symbol_search_filters_before_content_limits_with_independent_thresholds_and_u
             &selected[0], expected,
             "{kind}: symbol similarity must not replace or modify content scores"
         );
-        let expected_score = match kind {
-            "search-descriptions" => 0.3, // callable 0 plus file .6, averaged
-            "search" => 0.2,              // code 0, callable 0, file .6, averaged
-            _ => 0.0,
-        };
-        near(&selected[0]["similarity"], expected_score);
+        near(&selected[0]["similarity"], 0.0);
         let mut content_strict = strict.clone();
-        content_strict["minSimilarity"] = json!(0.4);
+        content_strict
+            .as_object_mut()
+            .unwrap()
+            .remove("maxSimilarity");
+        content_strict["minSimilarity"] = json!(0.7);
         assert!(
             engine.search("east", kind, &content_strict)?.is_empty(),
             "{kind}: independent content threshold"
@@ -5753,6 +5856,8 @@ fn search_symbols_engine_ranks_all_declarations_and_preserves_duplicate_occurren
     near(&west[0]["similarity"], 1.0);
     let mut selector = options.clone();
     selector["symbols"] = json!(true);
+    selector["code"] = json!(false);
+    selector["md"] = json!(false);
     assert_eq!(engine.search("vector north", "search", &selector)?, rows);
     for limit in [1, 6, 9, 10, 20] {
         let mut limited = options.clone();
@@ -6070,7 +6175,7 @@ fn search_symbols_mixed_modes_rank_separate_streams_with_global_limits_and_expli
     assert!(plain.iter().any(|row| row["type"] == "document"));
     assert!(
         !PathBuf::from(format!("{}.symbols.usearch", repo.index.display())).exists(),
-        "plain search does not implicitly initialize symbols"
+        "explicit content search does not initialize symbols"
     );
     let options = json!({"glob":["*.rs", "*.md"], "minSimilarity":-1});
     let code = engine.search("east", "search-code", &options)?;
@@ -6134,6 +6239,25 @@ fn search_symbols_mixed_modes_rank_separate_streams_with_global_limits_and_expli
         1,
         "empty headings exist only in the structural stream"
     );
+    let default = engine.search("east", "search", &json!({"minSimilarity":-1}))?;
+    assert!(default.iter().any(|row| row["type"] == "symbol"));
+    assert!(default.iter().any(|row| row["type"] == "function"));
+    assert!(default.iter().any(|row| row["type"] == "markdown"));
+    assert!(default.iter().any(|row| row["type"] == "document"));
+    assert_eq!(
+        engine.search("east", "search", &json!({"code":true, "md":true, "symbols":true, "descriptions":true, "minSimilarity":-1}))?,
+        default
+    );
+    for limit in [1, 2, 4, 20] {
+        assert_eq!(
+            engine.search(
+                "east",
+                "search",
+                &json!({"minSimilarity":-1, "limit":limit})
+            )?,
+            default[..limit.min(default.len())]
+        );
+    }
     let mixed_options = json!({"code":true, "md":true, "symbols":true, "glob":["*.rs", "*.md"], "minSimilarity":-1, "limit":4});
     let mixed = engine.search("east", "search", &mixed_options)?;
     drop(engine);
@@ -6165,7 +6289,6 @@ fn search_symbols_reranking_uses_names_without_bodies_or_descriptions() -> Resul
     let repo = Repo::new()?;
     let mut config = mock.config();
     config["rerankingEnabled"] = json!(true);
-    config["descriptionsEnabled"] = json!(true);
     repo.write("api.rs", "pub fn Ordinary() { let rerank_winner = \"BODY_ONLY_RERANK_SECRET\"; }\npub fn rerank_winner() { let marker = \"BODY_ONLY_OTHER\"; }\n")?;
     let mut engine = repo.open(&config)?;
     engine.refresh_structure()?;
@@ -6180,15 +6303,13 @@ fn search_symbols_reranking_uses_names_without_bodies_or_descriptions() -> Resul
     let documents = requests[0].body["documents"].as_array().unwrap();
     assert_eq!(documents.len(), 2);
     for document in documents {
+        let data: Value = serde_json::from_str(document.as_str().unwrap())?;
+        assert!(
+            data["description"].is_null(),
+            "symbol reranking has no description content before generation"
+        );
         let document = document.as_str().unwrap();
-        for omitted in [
-            "BODY_ONLY",
-            "pub fn",
-            "let marker",
-            "signature",
-            "description",
-            "code",
-        ] {
+        for omitted in ["BODY_ONLY", "pub fn", "let marker", "signature", "code"] {
             assert!(
                 !document.contains(omitted),
                 "name-only symbol rerank data excludes {omitted}: {document}"
@@ -6224,8 +6345,7 @@ fn search_symbols_cli_saved_snapshot_json_summary_and_expanded_callable_heading_
 -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     repo.write(".slopdex/config.json", &config.to_string())?;
     repo.write("guide.md", "# Guide\n\nBODY_ONLY ancestor.\n\n## Vector North\n\nSaved café 🚀 BODY_ONLY selected.\n\n### Vector North Empty\n\n## Other\n\nBODY_ONLY sibling.\n")?;
     repo.write(
@@ -6390,11 +6510,10 @@ fn search_symbols_cli_saved_snapshot_json_summary_and_expanded_callable_heading_
 }
 
 #[test]
-fn search_symbols_cli_refreshes_only_structure_even_when_descriptions_are_enabled() -> Result<()> {
+fn search_symbols_cli_refreshes_only_structure_without_generating_descriptions() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     repo.write(".slopdex/config.json", &config.to_string())?;
     repo.write(
         "api.ts",
@@ -6955,10 +7074,15 @@ fn configuration_markup_and_shell_are_indexed_end_to_end() -> Result<()> {
             .iter()
             .any(|row| row["type"] == "document" && row["chunk"]["path"] == "config/app.json")
     );
-    assert!(
-        engine
-            .search("north", "search-md", &json!({"minSimilarity":-1}))?
-            .is_empty()
+    let documents = engine.search("north", "search-md", &json!({"minSimilarity":-1}))?;
+    assert_eq!(documents.len(), 2);
+    assert!(documents.iter().all(|row| row["type"] == "document"));
+    assert_eq!(
+        documents
+            .iter()
+            .map(|row| row["chunk"]["path"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>(),
+        strings(&["config/app.json", "web/index.html"])
     );
     let code = engine.search("mid", "search-code", &json!({"minSimilarity":-1}))?;
     assert_eq!(names(&code), strings(&["deploy"]));
@@ -7067,7 +7191,6 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
     let temp = tempfile::tempdir()?;
     let cache = temp.path().join("shared.sqlite");
     let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
     config["artifactCachePath"] = json!(cache);
     let source = function("shared", "VECTOR_EAST");
     let roots: Vec<_> = ["first", "second"]
@@ -7082,6 +7205,7 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
     let second = roots[1].join("index.sqlite");
     let mut engine = Engine::open(&roots[0], &first, config.clone())?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let calls = mock.count();
     assert!(
         calls >= 3,
@@ -7091,6 +7215,7 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
 
     let mut engine = Engine::open(&roots[1], &second, config.clone())?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     assert_eq!(
         mock.count(),
         calls,
@@ -7146,7 +7271,6 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
     );
     let mock = Mock::start()?;
     let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
     config.as_object_mut().unwrap().remove("artifactCachePath");
     config["artifactS3"] =
         json!({"bucket": bucket, "endpoint": endpoint, "region": "us-east-1", "prefix":"tests"});
@@ -7167,7 +7291,7 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
             .arg(&repo.root)
             .arg("--format")
             .arg("json")
-            .arg("update")
+            .args(["generate", "descriptions"])
             .env("XDG_CACHE_HOME", repo.home.join("cache"))
             .env("AWS_ACCESS_KEY_ID", "minioadmin")
             .env("AWS_SECRET_ACCESS_KEY", "minioadmin");
@@ -7420,7 +7544,8 @@ fn existing_workspace_vectors_seed_new_shared_cache_without_provider_calls() -> 
 }
 
 #[test]
-fn description_keys_reuse_renames_and_models_while_retaining_generation_context() -> Result<()> {
+fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retain_context()
+-> Result<()> {
     let mock = Mock::start()?;
     let first = Repo::new()?;
     let second = Repo::new()?;
@@ -7428,10 +7553,10 @@ fn description_keys_reuse_renames_and_models_while_retaining_generation_context(
     let shared = first.home.join("artifacts.sqlite");
     let mut config = mock.config();
     config["artifactCachePath"] = json!(shared);
-    config["descriptionsEnabled"] = json!(true);
     first.write("src/old.rs", &source)?;
     let mut engine = first.open(&config)?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let description = file_record(&first, "src/old.rs")?["description"].clone();
     let callable: String = first.db()?.query_row(
         "SELECT text FROM descriptions WHERE scope='callable' AND path='src/old.rs'",
@@ -7464,20 +7589,8 @@ fn description_keys_reuse_renames_and_models_while_retaining_generation_context(
             Ok(text)
         };
         let system = content("system_hash")?;
-        let expected = if generation["scope"] == "file" {
-            slopdex::hash(json!([slopdex::hash(&source), system]).to_string())
-        } else {
-            slopdex::hash(
-                json!([
-                    "shared",
-                    generation["source_hash"],
-                    description.as_str().unwrap(),
-                    system
-                ])
-                .to_string(),
-            )
-        };
-        assert_eq!(*key, expected);
+        assert!(!key.is_empty());
+        assert!(!system.is_empty());
         assert_eq!(generation["path"], "src/old.rs");
         let profile: Value = serde_json::from_str(&content("profile_hash")?)?;
         assert_eq!(profile["model"], "integration-description");
@@ -7502,6 +7615,7 @@ fn description_keys_reuse_renames_and_models_while_retaining_generation_context(
     let calls = mock.requests("/responses").len();
     fs::rename(first.root.join("src/old.rs"), first.root.join("src/new.rs"))?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     assert_eq!(mock.requests("/responses").len(), calls);
     assert_eq!(
         file_record(&first, "src/new.rs")?["description"],
@@ -7523,18 +7637,55 @@ fn description_keys_reuse_renames_and_models_while_retaining_generation_context(
     different_model["descriptionFallbackModel"] = json!("fallback-model");
     let mut engine = second.open(&different_model)?;
     engine.refresh()?;
-    assert_eq!(mock.requests("/responses").len(), calls);
     assert_eq!(
+        mock.requests("/responses").len(),
+        calls,
+        "refresh must not generate for a new profile"
+    );
+    engine.generate_descriptions()?;
+    assert_eq!(mock.requests("/responses").len(), calls + 2);
+    assert_ne!(
         file_record(&second, "src/another.rs")?["description"],
         description
     );
-    assert_eq!(
+    assert_ne!(
         second.db()?.query_row::<String, _, _>(
             "SELECT text FROM descriptions WHERE scope='callable' AND path='src/another.rs'",
             [],
             |row| row.get(0)
         )?,
         callable
+    );
+    let profile_keys: BTreeSet<String> = second
+        .db()?
+        .prepare("SELECT key FROM cache WHERE kind='description'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert!(profile_keys.is_disjoint(&rows.iter().map(|(key, _)| key.clone()).collect()));
+    drop(engine);
+
+    different_model["descriptionFallbackModel"] = json!("replacement-fallback-model");
+    let mut engine = second.open(&different_model)?;
+    engine.refresh()?;
+    assert_eq!(mock.requests("/responses").len(), calls + 2);
+    engine.generate_descriptions()?;
+    assert_eq!(
+        mock.requests("/responses").len(),
+        calls + 4,
+        "generation settings invalidate both generated descriptions"
+    );
+    let setting_keys: BTreeSet<String> = second
+        .db()?
+        .prepare("SELECT key FROM cache WHERE kind='description'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(setting_keys.difference(&profile_keys).count(), 2);
+    let paid = mock.count();
+    engine.generate_descriptions()?;
+    assert_eq!(
+        mock.count(),
+        paid,
+        "unchanged settings reuse all generated artifacts"
     );
     Ok(())
 }
@@ -7543,14 +7694,14 @@ fn description_keys_reuse_renames_and_models_while_retaining_generation_context(
 fn description_context_is_stored_once_by_hash_across_callable_artifacts() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    let mut config = mock.config();
-    config["descriptionsEnabled"] = json!(true);
+    let config = mock.config();
     let source: String = (0..8)
         .map(|i| function(&format!("method_{i}"), "VECTOR_EAST"))
         .collect();
     repo.write("api.rs", &source)?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
+    engine.generate_descriptions()?;
     let db = repo.db()?;
     let rows: Vec<Value> = db
         .prepare("SELECT value FROM cache WHERE kind='description'")?

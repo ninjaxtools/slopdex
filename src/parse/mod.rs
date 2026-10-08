@@ -6,6 +6,7 @@
 
 mod code;
 mod data;
+mod descriptions;
 mod imports;
 mod markdown;
 mod shell;
@@ -24,6 +25,9 @@ pub struct Callable {
     pub kind: String,
     pub name: String,
     pub qualified_name: String,
+    /// Source comment prose and, for Python, a leading constant docstring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub signature: Option<String>,
     pub start_line: usize,
     pub start_column: usize,
@@ -57,6 +61,9 @@ pub struct Diagnostic {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ParsedFile {
+    /// The first contiguous comment group, after any leading blank lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub callables: Vec<Callable>,
     pub chunks: Vec<MarkdownChunk>,
     pub errors: Vec<Diagnostic>,
@@ -94,14 +101,17 @@ pub fn language_for_path(path: &str) -> Option<&'static str> {
 }
 
 pub fn parse(path: &str, source: &str) -> Result<ParsedFile> {
-    match language_for_path(path) {
-        Some("markdown") => markdown::parse(source),
+    let mut descriptions = descriptions::SourceDescriptions::default();
+    let mut parsed = match language_for_path(path) {
+        Some("markdown") => markdown::parse(source, &mut descriptions),
         Some(language @ ("json" | "terraform" | "yaml" | "toml" | "xml" | "html" | "css")) => {
-            data::parse(language, path, source)
+            data::parse(language, path, source, &mut descriptions)
         }
-        Some(language) => code::parse(language, path, source),
+        Some(language) => code::parse(language, path, source, &mut descriptions),
         None => Ok(ParsedFile::default()),
-    }
+    }?;
+    descriptions.apply(source, &mut parsed);
+    Ok(parsed)
 }
 
 #[cfg(test)]

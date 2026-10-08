@@ -19,7 +19,12 @@ mod strings;
 
 use document::{Positions, children, text};
 
-pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<ParsedFile> {
+pub(super) fn parse(
+    language: &'static str,
+    path: &str,
+    source: &str,
+    descriptions: &mut super::descriptions::SourceDescriptions,
+) -> Result<ParsedFile> {
     let grammar: Language = match language {
         "json" => tree_sitter_json::LANGUAGE.into(),
         "terraform" => tree_sitter_hcl::LANGUAGE.into(),
@@ -76,8 +81,8 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
         array_counts: HashMap::new(),
     };
     collector.walk(tree.root_node(), None);
-    let filtered =
-        document::without_spans(source, &mut comments(tree.root_node(), language, source));
+    descriptions.comments = comments(tree.root_node(), language, source);
+    let filtered = document::without_spans(source, &mut descriptions.comments.clone());
     // A comment-only configuration file has no search content. HTML/XML text
     // without elements is still useful as a search unit.
     let chunks = if collector.nodes.is_empty() && !matches!(language, "xml" | "html") {

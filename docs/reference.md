@@ -35,18 +35,18 @@ can also follow the command. Quote multiword queries.
 
 | Command | Actual operation | Default output |
 | --- | --- | --- |
-| `search <query>` | Search callable code, complete enabled descriptions, and Markdown together. | Summary |
-| `search-code <query>` | Search callable code. | Summary |
-| `search-descriptions <query>` | Search callable/file description fusion; descriptions must be enabled and complete. | Ranked declaration excerpts |
-| `search-md <query>` | Search heading-aware `.md`/`.markdown` chunks. | Ranked heading paths |
-| `search-symbols <query>` | Search bare names/aliases of all structural symbols and Markdown heading titles. | Ranked declaration/heading excerpts |
+| `search <query>` | Search all indexes: callable code, available descriptions, Markdown/documents, and symbols. | Summary |
+| `search-code <query>` | Search only the callable code index. | Summary |
+| `search-descriptions <query>` | Search only available source/generated callable, symbol, and file descriptions. | Ranked declaration/file excerpts |
+| `search-md <query>` | Search only the heading-aware `.md`/`.markdown` content index. | Ranked heading paths |
+| `search-symbols <query>` | Search only the bare symbol-name/alias and Markdown heading-title index. | Ranked declaration/heading excerpts |
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Show code declarations/Markdown headings; refresh existing index structure or parse directly if no index exists. | Summary |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
-| `index reindex-files [--callables]` | Regenerate stale file descriptions from indexed source; optionally regenerate their callable descriptions too. Requires enabled descriptions. | JSON statistics |
+| `generate descriptions` | Refresh normally, then explicitly generate missing or stale file and callable descriptions from indexed source. | JSON statistics |
 | `help models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
 | `config [prefix]` | Configure matching settings interactively without opening an index. | Updated-setting summary |
 | `config set <key> <value>` | Set a configuration value directly; JSON literals support booleans, numbers, arrays and objects. | Updated-setting summary |
@@ -60,7 +60,6 @@ slopdex help models opencode-go
 slopdex config set descriptionProvider opencode-go
 slopdex config set descriptionModel gpt-5.6-luna
 slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
-slopdex config set descriptionsEnabled true
 slopdex config set rerankerProvider cohere
 slopdex config set rerankingEnabled true
 slopdex config set parallelism 10
@@ -68,7 +67,8 @@ slopdex config set parallelism 10
 
 `config set` validates configuration values before writing; values that are not JSON
 literals are saved as strings. The global `--model` selects the embedding model.
-Setting `descriptionsEnabled` defers index work until the next index command.
+Description configuration selects the models used by explicit
+`generate descriptions` and task explanations; saving it does not generate descriptions.
 Interactive configuration requires terminal stdin/stderr; it asks
 about descriptions, reranking, embeddings, paths, filters, and common settings.
 Use arrow keys and Enter to select providers and models; typing in an OpenCode
@@ -85,7 +85,9 @@ Search commands and cross-search require an existing resolved index; run
 index is missing. With an existing index, `map -q` lazily prepares symbol-name
 vectors and query vectors using the embedding provider or cache. Without an
 index, map warns on stdout that `-q` is ignored and proceeds with local mapping.
-Semantic refresh also prepares missing embeddings and enabled descriptions.
+Semantic refresh prepares missing embeddings and reuses available descriptions,
+without generating descriptions. Only `generate descriptions` generates indexed
+file/callable descriptions.
 `search-symbols` and `search --symbols` with no other content flags use the same
 structure-only refresh as `map -q`; mixed content/symbol searches use normal
 semantic refresh.
@@ -136,13 +138,15 @@ SQLite structure without reading current source files. Selection narrows output,
 not repository discovery. Without `-q`, both paths make no provider requests or
 generate descriptions, embeddings, or USearch sidecars.
 
-`map -q 'validate session'` uses name-only semantic selection from saved structures.
+`map -q 'validate session'` uses semantic selection over symbols, available
+descriptions, and heading titles from saved snapshots.
 Run `slopdex update` first to enable semantic selection; without an index, map
 warns on stdout and ignores `-q` while performing normal local mapping.
-Its refresh remains structure-only; symbol vectors and query vectors are prepared
-lazily, and may use the configured provider or shared caches. It does not prepare
-content embeddings or descriptions. With `--no-reindex`, it uses saved structures
-but may still embed names/queries and populate the symbol cache and sidecar.
+Its refresh remains structure-only; name, description, and query vectors for
+selection are prepared lazily using the configured provider or shared caches.
+It does not prepare content indexes or generate prose. With `--no-reindex`, it
+uses saved structures and descriptions but may still populate selector vectors
+and the symbol cache/sidecar.
 
 Private and unexported symbols are omitted by default according to each language's
 visibility conventions. Pass `--private` to include them. Ancestors needed to
@@ -153,7 +157,7 @@ identify a selected public symbol remain as structural context.
 `methods` selects methods alone. `types` groups aliases, classes, structs, unions,
 interfaces, traits, and enums. Other selectors include `imports`, `modules`,
 `consts`, `variables`, `fields`, `variants`, `impls`, `macros`, and `headings`.
-Kinds are ORed and restrict the union of regex and semantic name matches. Matching nodes
+Kinds are ORed and restrict the union of regex and semantic matches. Matching nodes
 retain their ancestors as context; a matching parent does not automatically include
 unmatched children.
 
@@ -286,31 +290,35 @@ Map, query searches, `describe`, and cross-search accept:
   Look-around and backreferences are unsupported.
 - `-i`, `--ignore-case`: case-insensitive regex matching; does not change glob
   or semantic matching.
-- `-q`, `--symbol-query <QUERY>`: repeatable semantic selector over **bare symbol
-  names**, aliases, and Markdown heading titles. Repeated queries are ORed; the
-  resulting names are ORed with regex matches when `-e` is also supplied. A
+- `-q`, `--symbol-query <QUERY>`: repeatable semantic selector over **symbols,
+  available descriptions, and Markdown heading titles**. Repeated queries are ORed;
+  the resulting matches are ORed with regex matches when `-e` is also supplied. A
   declaration matching either family is eligible, including matches on different
   aliases. Globs and map kind/private filters still restrict that union.
-  Parent names do not contribute to semantics: selecting a parent does not select
-  its children. Ancestors retained as context have no expanded heading body unless
+  Names/aliases and heading titles match without parent-name context. A description
+  match selects its symbol; a matching file description selects declarations in
+  that file, still subject to globs and map kind/private filters. A parent-name
+  match alone does not select children. Ancestors have no expanded heading body unless
   they directly match. The positional search/describe query ranks the chosen
   streams; with `search-symbols` or `search --symbols` alone it ranks names.
 - `--symbol-threshold <NUMBER>`: optional finite scalar in `[-1,1]`, default
-  `0.5`; inclusive minimum symbol-name similarity, independent of `--threshold`.
+  `0.5`; inclusive minimum semantic selector similarity, independent of `--threshold`.
   Ranges are not accepted.
 
 Names and symbol queries normalize camelCase/PascalCase, snake_case, acronym and
 letter/digit boundaries, and punctuation into lowercase space-separated words.
 For example, `getHTTPResponse`, `get_http_response`, and `get HTTP response`
 normalize to `get http response`. A query must contain at least one letter or
-number after normalization. This selector uses name-only embeddings, not source,
-signatures, descriptions, parent scopes, or Markdown bodies.
+number after normalization. Symbol/heading matching uses name-only embeddings;
+available descriptions also contribute to semantic selection. Source,
+signatures, parent scopes, and Markdown bodies are not directly embedded for this selector.
 
 Symbol embeddings default to 256 native dimensions, capped at the configured
 content embedding dimensions. Optional JSON `symbolDimensions` sets a separate
 symbol embedding dimension; OpenAI `text-embedding-ada-002` uses its full
-dimensions. A separate `<index>.symbols.usearch` index is created lazily from
-normalized names in saved structures. Ordinary map initializes no model.
+dimensions. `-q` embeds available descriptions in the same selector space. A
+separate `<index>.symbols.usearch` index is created lazily from normalized names
+in saved structures. Ordinary map initializes no model.
 
 Path and name selection intersect and apply before query result limits, including
 to Markdown results. Cross-search applies these selectors **only to sources**,
@@ -330,13 +338,15 @@ Common query/cross-search filters:
   searched**.
 - `-g`, `-e`, `-i`, `-q`, and `--symbol-threshold`: the [shared selectors](#shared-selectors).
 
-`search` accepts the explicit stream selectors `--code`, `--descriptions`, `--md`,
-and `--symbols`. With no stream selector, it searches callable code, complete
-enabled descriptions, and Markdown/document content. **Symbols are opt-in**:
-plain `search` does not add symbol-name results. Any stream selector makes
-selection explicit, omitting unselected streams. Explicit description search
-requires complete enabled descriptions. `-q` is an additional shared filter,
-not a stream selector.
+`search` accepts the explicit index selectors `--code`, `--descriptions`, `--md`,
+and `--symbols`. With no selector, it searches all indexes: callable code,
+available descriptions, Markdown/document content, and symbol names/heading titles.
+Any selector makes selection explicit, omitting unselected indexes. Description
+search uses source descriptions and previously generated prose. Description text
+is optional; existing descriptions are indexed without an enable/disable setting.
+Run `slopdex generate descriptions` to prepare missing or stale generated prose
+where no source description exists. `-q` is an additional shared filter,
+not an index selector.
 
 `search-symbols <query>` is the canonical name-only command; `search <query>
 --symbols` without any other content flags is equivalent. Both require an
@@ -352,12 +362,14 @@ types, imports and aliases, headings (including headings without body text),
 and other declarations. Scores use the maximum bare-name/alias similarity;
 parent names, signatures, code, descriptions, and heading bodies do not contribute.
 `--threshold` applies its inclusive minimum/exclusive maximum and `--limit`
-caps the ranked hits. Optional `-q` filters eligible names (ORed with `-e`, if supplied),
+caps the ranked hits. Optional `-q` filters eligible symbols using names or descriptions
+(ORed with `-e`, if supplied),
 using `--symbol-threshold` independently of the ranking threshold.
 
 Combining `--symbols` with `--code`, `--md`, or `--descriptions` uses normal
-semantic refresh. Function/content, Markdown/document, and symbol hits remain
-separate scored streams with global ranking and one global output limit. A
+semantic refresh. Code and description hits for the same callable merge by maximum
+similarity; file, Markdown/document, and symbol hits remain independent, with
+global ranking and one global output limit. A
 declaration can appear in both function and symbol rows; text combines their
 annotations on the same declaration.
 
@@ -389,10 +401,9 @@ slopdex search 'installation' --symbols -g '*.md' --detail expanded
 slopdex search 'validate session' --code --symbols
 slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
 slopdex config set descriptionProvider opencode-go
-slopdex config set descriptionsEnabled true
+slopdex generate descriptions
 slopdex search-descriptions "keep the repository index synchronized"
 slopdex describe "I want to implement a new rpc endpoint"
-slopdex index reindex-files --callables
 slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 slopdex cross-search --uncommitted --cross-file-only --threshold 0.9
 slopdex cross-search --changed-since origin/main --threshold 0.9
@@ -424,48 +435,50 @@ because they are absent from the current index. Combined source filters intersec
 With `--no-reindex`, these filters use saved provenance/content; changed-since
 still needs the local Git history.
 
-### Scores, fusion, and ANN recall
+### Scores, independent indexes, and ANN recall
 
 SQLite stores the authoritative embeddings; USearch performs filtered F32 cosine
-HNSW search. Code and Markdown have separate indexes. Complete descriptions add
-two callable indexes: description fusion and code/description fusion.
+HNSW search over independent code, Markdown/document, and description indexes.
+Code and description vectors use the configured content dimension; no concatenated
+2D/3D vectors or combined index are used. Source or generated descriptions are
+indexed whenever present. Missing descriptions are allowed and do not prevent
+code search or require every callable to be described.
 
-Each component vector is normalized independently before concatenation. For unit
-vectors `c` (code), `d` (callable description), and `f` (file description):
+`search-code` ranks callable code alone. `search-descriptions` ranks available
+callable/symbol descriptions and independent file descriptions. When both indexes
+are selected, code and description retrieval apply score thresholds independently;
+hits for the same search unit merge by **maximum matching similarity**, not an
+average. File descriptions are scored directly against the query vector and can
+produce a file hit even without callables. Markdown/document and symbol-name hits
+retain their own scores; all selected results share global ranking and limits.
 
-```text
-cos([c₁, d₁, f₁], [c₂, d₂, f₂])
-  = (cos(c₁, c₂) + cos(d₁, d₂) + cos(f₁, f₂)) / 3
-```
+Query JSON exposes available component scores: `codeSimilarity`,
+`descriptionSimilarity`, `functionDescriptionSimilarity` for callables, and
+`fileDescriptionSimilarity`. These are supplementary measurements, not fusion
+weights; a component may be present even when its index was not selected and
+does not change the selected-index ranking. Symbol-name rows additionally expose
+`symbolSimilarity`.
 
-This is **exact averaged-cosine fusion mathematically**, subject to F32 rounding,
-rather than merging independent top-k lists. Query searches repeat the unit query
-vector in each component slot. `search-code` uses code alone;
-`search-descriptions` averages callable and file description similarities;
-`search` with code and descriptions averages all three. Markdown keeps its own
-chunk score and joins the final ranked result list.
-
-Descriptions are complete only when every indexed callable has both callable and
-file-description embeddings and descriptions are enabled. Cross-search uses the
-three-way average only when both indexes are complete and their configured
-description profiles match; otherwise the entire comparison uses code alone.
-JSON exposes the applicable `codeSimilarity`, `descriptionSimilarity`, and
-`fileDescriptionSimilarity`; cross-search rows include scoring mode and weights.
-Symbol rows expose both `similarity` and `symbolSimilarity`, separately from
-content-fusion scores.
+Cross-search always retrieves, thresholds, and ranks by code similarity. Its
+optional callable/file description similarities compare the corresponding
+descriptions when both sides have vectors. They do not change ranking or require
+complete description coverage or matching description-generator profiles. JSON
+`scoring` reports `similarityMode: "code"` and weights of code `1`, description
+`0`, and file description `0`.
 
 **Neighbor retrieval remains approximate.** Filters run inside USearch graph
 traversal, not on an unfiltered top-k list. Threshold ranges can trigger wider
-retrieval, but neither exact fusion nor an unlimited output limit guarantees
-exhaustive recall or exact top-k membership. There is no exhaustive scan fallback.
+retrieval, but neither independent-index merging nor an unlimited output limit
+guarantees exhaustive recall or exact top-k membership. There is no exhaustive
+scan fallback for ANN retrieval; file descriptions are scored directly.
 Similarity is model-dependent, not a probability of duplication.
 
 ### Reranking, clusters, and output
 
 Text is the default for `map`, `search`, `cross-search`, and `describe`.
 `--detail compact` (default) prints declaration signatures and scores only;
-`--detail standard` also shows declaration attributes, a 160-character
-Markdown body preview; `--detail expanded` additionally shows full signatures,
+`--detail standard` also shows declaration attributes, file-hit description prose,
+and a 160-character Markdown body preview; `--detail expanded` additionally shows full signatures,
 saved file and callable descriptions, Markdown body text (full selected bodies for
 map and direct symbol-heading hits, matched chunks for content search), component scores,
 for file-oriented output. Clusters always print compact symbol locations. File descriptions are rendered as
@@ -475,17 +488,18 @@ declaration line. Explicit `search-descriptions` or `search --descriptions`
 shows both descriptions even at compact detail. For example:
 
 ```text
-*** src/auth/session.rs
+*** src/auth/session.rs  // score=0.92
 // Session types and token validation.
 
-@@ 14-22 @@ score=0.9123
+@@ 14-22 @@
 impl SessionService
-  pub fn validate(&self, token: &str) -> Result<Session>  // Validates the token and returns its session.
+  pub fn validate(&self, token: &str) -> Result<Session>  // score=0.91 | Validates the token and returns its session.
 ```
 
 Rust, JavaScript/TypeScript, Go, and Java use `//` comments; C uses `/* */`,
-Python uses `#`, and Markdown uses HTML comments. Descriptions are generated annotations,
-not lines from the indexed source; their line numbers are not part of hunk ranges.
+Python uses `#`, and Markdown uses HTML comments. Description prose may come from
+source comments/docstrings or explicit generation. It is displayed as an annotation;
+its lines are not added to declaration hunk ranges.
 This setting affects text presentation, not which symbols are selected or the
 contents of JSON. Map's `-k` and `--private` remain selection filters.
 
@@ -498,14 +512,32 @@ impl SessionService
   pub fn validate(&self, token: &str) -> Result<Session>
 ```
 
-Search prints ranked excerpts with `score=...` (and `similarity=...` if
-reranked) on the hunk header. Every ranked code result includes its ancestor
-declarations above the match, even when another hit has the same ancestors;
-the hunk range still identifies the matched symbol. Markdown search likewise
-repeats the complete heading path for each result, since hits are not in file
-order. Its range identifies the matched chunk; expanded detail prints the full
-chunk text. Mixed search without an explicit description selector keeps saved
-descriptions at expanded detail.
+Search groups ranked hits by file, ordering files by their best score and keeping
+declarations in source order. Each matched declaration carries `score=...` (and
+`similarity=...` if reranked), with ancestor context emitted once. Markdown hits
+retain heading context; expanded detail prints matched chunk text. Callable
+description prose is shown at expanded detail or for an explicit description
+selector, including compact detail.
+
+File-description hits put their score on the file header, followed by prose at
+standard/expanded detail or at compact detail for explicit description search.
+They group naturally with symbol/function hits and have no synthetic function or
+source hunk. File JSON rows have this shape:
+
+```json
+{
+  "type": "file",
+  "file": {
+    "path": "src/auth/session.rs",
+    "description": "Session types and token validation.",
+    "sourceMode": "working-tree",
+    "language": "rust"
+  },
+  "similarity": 0.8,
+  "fileDescriptionSimilarity": 0.8
+}
+```
+
 Symbol excerpts include ancestor context and a `symbol score=...` annotation;
 expanded detail also shows `[symbol ...]` from `symbolSimilarity`. Direct heading
 hits display their saved body in expanded output via the structure snapshot;
@@ -594,7 +626,7 @@ with `0`.
 ### Task explanations
 
 `describe` sends the query and the expanded text search output (file headers,
-declaration skeletons, scores, generated descriptions where available, and
+declaration skeletons, scores, available source or generated descriptions, and
 Markdown content) to the configured description provider. The prompt includes
 indexed code for callers and callees up to two edges away
 by default, even below `--expand-code-threshold`. Use `--expand-callers N` and
@@ -684,19 +716,19 @@ payload, a newline, and the payload. This includes embeddings, description
 records and their referenced content, rerankings, and explanations; the local
 SQLite caches remain uncompressed. Earlier `v2` S3 objects are not read, and
 existing workspace artifacts can be republished under `v3` on refresh. Embedding identities distinguish
-query/document inputs, provider/model/dimensions, and custom endpoints. Description
-keys intentionally exclude paths and model settings: file keys include only the
-source-content hash and system instruction; callable keys include qualified symbol
-name, callable source hash, file-description text, and system instruction. The
-path and content hashes are saved alongside the cached answer for inspection and
-future invalidation policy. Thus a rename or model-setting change can reuse a
-matching answer, even when the prompt for a new request would differ. Existing live descriptions
-retain their normal reuse/staleness policy. Map without `-q` never contacts S3. An uncached
+query/document inputs, provider/model/dimensions, and custom endpoints. Generated
+description keys include relevant source hashes and a generation profile covering
+the configured LLM profile, generation settings, and system instruction. Callable
+keys also include qualified symbol name and file-description context. Paths are
+kept as provenance rather than key inputs, so a rename can reuse a matching answer;
+source, profile/settings, or system-instruction changes invalidate reuse. Source
+descriptions are extracted locally and never sent to a generator for replacement.
+Map without `-q` never contacts S3. An uncached
 semantic query with `--no-reindex` may consult S3 before its provider call.
 Opening an existing workspace index also imports its valid provider artifacts into
 the per-user cache. When S3 is enabled later, the next successful semantic refresh
 uploads existing paid artifacts best effort. Legacy description keys do not match
-these relaxed keys; there is no legacy description-cache import policy.
+the current keys; there is no legacy description-cache import policy.
 
 Example `.slopdex/config.json` fields (credentials come from standard AWS
 environment variables or credentials files, not this JSON):
@@ -721,8 +753,9 @@ To run the MinIO integration test against a local server with
 `SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 cargo test --test rust_integration minio_shares_artifacts`).
 
 Persistent derived indexes sit beside the database:
-`<index>.code.usearch`, `<index>.markdown.usearch`, and, when descriptions are
-complete, `<index>.descriptions.usearch` and `<index>.combined.usearch`. Semantic
+`<index>.code.usearch`, `<index>.markdown.usearch`, and the independent
+`<index>.descriptions.usearch`, which can be empty when no descriptions exist.
+There is no combined/fusion index. Semantic
 symbol selection adds a lazy `<index>.symbols.usearch` built from name-only
 embeddings derived from saved structures, independently of content indexes. Each has
 a `.manifest.json` sidecar. Valid caches are reconciled incrementally by stable
@@ -737,15 +770,43 @@ for transaction and sidecar publication details.
 
 ### Descriptions
 
-Descriptions are disabled initially. `config set descriptionsEnabled true` generates missing
-file/callable descriptions and saves the enabled setting; disabling stops their
-automatic generation and use in scoring while preserving reusable artifacts.
-Unchanged callable descriptions are reused. Ordinary edits refresh changed
-callables but retain existing file descriptions, which can become stale.
-`index reindex-files` refreshes stale file descriptions; `--callables` also prepares
-callable descriptions in those files. Matching cached artifacts are reused,
-including when the configured model has changed. Merely changing that model does not
-regenerate all existing descriptions.
+Description text is optional, but indexing it is always enabled. Source descriptions
+are extracted during parsing and take precedence over generated descriptions:
+
+- A standalone contiguous comment group immediately before a declaration attaches
+  when only whitespace, with no blank line, separates them. Attributes, decorators,
+  exports, and declaration bindings are included in the attachment anchor.
+- A trailing comment does not describe the next declaration. Comment-looking text
+  inside strings, heredocs, or fenced examples is not treated as a comment; shebangs
+  are interpreter directives rather than description prose.
+- The first contiguous comment group is the file description if only whitespace
+  precedes it. Leading blank lines are allowed. An adjacent first declaration can
+  receive the same description; a blank line separates file-only prose from it.
+- Comment delimiters and leading block-comment stars are stripped, preserving
+  internal prose line breaks. Python functions/classes also use a leading constant
+  docstring, with delimiters removed and indentation cleaned. An attached comment
+  and docstring combine with a paragraph break.
+
+These rules cover supported code, configuration/markup, and Markdown headings.
+Source descriptions for noncallable symbols are searchable too. Structural refresh
+saves them without requiring a description provider; normal semantic refresh
+prepares embeddings for available source/generated text.
+
+`slopdex generate descriptions` is the sole generation entry point for indexed
+file/callable prose. It skips source-described files and callables and all Markdown
+files. A source-described file may still have undescribed callables generated,
+using its source description as context. The command opens writable, refreshes
+normally unless `--no-reindex`, then calls `Engine::generate_descriptions()` on
+indexed source. With `--no-reindex`, it uses the saved snapshot but still validates
+Git HEAD and source hashes before publication. Updates, searches, maps, and status
+never generate indexed descriptions automatically. There is no enable/disable control.
+
+Matching generated artifacts are reused. Relevant source hashes, configured
+description profile, generation settings, and system instruction determine reuse;
+changes invalidate it. Generation settings include provider/model, fallback model,
+endpoint, timeout, retry count, and retry delay. Run `generate descriptions` after
+such changes to regenerate applicable missing/stale generated prose. Source
+descriptions are retained and never replaced by generation.
 
 Description generation uses one conversation per file, starting with the complete
 file source and a request for a one-paragraph file description. Its callables are
@@ -756,7 +817,7 @@ different files can run in parallel up to `parallelism`. Cached or saved file
 descriptions seed the conversation without another generation request. Previously
 saved callable descriptions are reused until regenerated, and multi-line callable
 descriptions are flattened for inline display. `status` reports
-enabled state, profiles, description counts, and stale-file-description count.
+profiles, description counts, and stale-file-description count.
 
 ### Native offline reuse and recovery
 
@@ -772,7 +833,7 @@ the flag's value on every invocation.
 
 `map --no-reindex` without `-q` needs neither providers nor sidecar repair. With no
 index it parses current files directly; with an existing index it uses saved structure.
-With an existing index, adding `-q` may populate symbol/query vectors and repair
+With an existing index, adding `-q` may populate name/description/query vectors and repair
 the separate symbol sidecar, using a provider when cache entries are missing.
 Without an index, map warns on stdout that `-q` is ignored and parses current
 files directly, including with `--no-reindex`.
@@ -821,9 +882,12 @@ slopdex --index /path/to/new-index.sqlite update
 ```
 
 Use that same `--index` path on subsequent commands, or save it as `indexPath` in
-config. Rebuilding scans current files and regenerates embeddings and enabled
-descriptions using the configured providers; old database artifacts and saved
-description settings are not imported. Derived USearch sidecars are reconciled
+config. Rebuilding scans current files and regenerates embeddings using the
+configured providers, including available source descriptions. Run
+`generate descriptions` separately to prepare generated prose where source
+descriptions are absent;
+old database artifacts and saved description settings are not imported.
+Derived USearch sidecars are reconciled
 or rebuilt from the new SQLite snapshot.
 
 Use `slopdex map` to inspect local structure before creating an index. Run
@@ -877,8 +941,9 @@ not the root or config's directory.
 Command-line provider/model/dimension settings override JSON. Target repositories
 load their own root-selected config, then receive the same global overrides.
 When neither description provider nor model is specified, the index's saved
-description profile supplies both. `descriptionsEnabled` in JSON overrides the
-saved index state; omission retains it. Config writes preserve unknown properties
+description profile supplies both. Description generation is always explicit;
+the removed description enablement setting is rejected. Config writes preserve
+other unknown properties
 and replace the JSON file through a synced temporary file.
 
 Example `.slopdex/config.json`:
@@ -888,7 +953,6 @@ Example `.slopdex/config.json`:
   "provider": "jina",
   "model": "jina-embeddings-v4",
   "dimensions": 1024,
-  "descriptionsEnabled": true,
   "descriptionProvider": "opencode-go",
   "descriptionModel": "gpt-5.6-luna",
   "descriptionFallbackModel": "muse-spark-1.3-contributor",
@@ -906,7 +970,6 @@ Example `.slopdex/config.json`:
 | `symbolDimensions` | Optional native dimension for name-only symbol embeddings; default `min(256, dimensions)`. OpenAI ada uses full dimensions. Separate from content embeddings. |
 | `descriptionProvider`, `descriptionModel` | OpenAI / `gpt-5.6-luna`; OpenCode Zen (`opencode`) and Go (`opencode-go`) default to `muse-spark-1.3-contributor`. Corresponding `--description-*` options override them. |
 | `descriptionFallbackModel` | Optional same-provider fallback; CLI `--description-fallback-model`. Successful fallback stays active within that provider instance until it fails. |
-| `descriptionsEnabled` | Explicit enabled state, otherwise saved state/default false. |
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel` | Disabled by default; models default to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, OpenAI `gpt-5.6-luna`. |
 | `rerankerCandidates` | OpenAI candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
@@ -922,9 +985,11 @@ Example `.slopdex/config.json`:
 Aliases `embeddingProvider`, `embeddingModel`, `embeddingDimensions`, and
 `fallbackModel` normalize to their canonical properties; canonical values win.
 Embedding profiles include `strategyVersion: "rust-v1"`. Description profiles
-identify the configured primary with `strategyVersion: "callable-purpose-v2"`,
-even while fallback serves requests. Base URLs and credentials are not part of
-these profiles; changing an endpoint alone does not invalidate cached vectors.
+identify the configured primary with `strategyVersion: "file-conversation-v3"`,
+even while fallback serves requests, and include configured endpoint/fallback
+information. Generation reuse also includes settings and system instruction.
+Credentials are not profile inputs. Content embedding profiles are independent
+of the description-generator profile.
 
 Embedding URLs may already end in `/embeddings`; Cohere/Jina reranking URLs may
 end in `/rerank`. Description and OpenAI reranking bases receive the required

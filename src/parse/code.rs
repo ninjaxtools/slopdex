@@ -6,7 +6,12 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use tree_sitter::{Language, Node, Parser, Tree};
 
-pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<ParsedFile> {
+pub(super) fn parse(
+    language: &'static str,
+    path: &str,
+    source: &str,
+    descriptions: &mut super::descriptions::SourceDescriptions,
+) -> Result<ParsedFile> {
     let grammar: Language = match language {
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
@@ -65,6 +70,7 @@ pub(super) fn parse(language: &'static str, path: &str, source: &str) -> Result<
             )),
         }
     }
+    descriptions.collect_code(tree.root_node(), source, language, &result.structure);
     Ok(result)
 }
 
@@ -743,6 +749,10 @@ fn contains_yield(node: Node<'_>) -> bool {
 }
 
 fn python_docstring<'a>(source: &'a str, body: Node<'_>) -> Option<&'a str> {
+    Some(text(source, python_docstring_node(source, body)?))
+}
+
+pub(super) fn python_docstring_node<'tree>(source: &str, body: Node<'tree>) -> Option<Node<'tree>> {
     let statement = children(body).into_iter().find(|n| n.kind() != "comment")?;
     if statement.kind() != "expression_statement" {
         return None;
@@ -765,7 +775,7 @@ fn python_docstring<'a>(source: &'a str, body: Node<'_>) -> Option<&'a str> {
             return None;
         }
     }
-    Some(text(source, value))
+    Some(value)
 }
 
 fn go_receiver<'a>(source: &'a str, node: Node<'_>) -> Option<&'a str> {
@@ -838,6 +848,7 @@ fn extract(
         kind: candidate.kind.to_owned(),
         name: candidate.name.clone(),
         qualified_name: qualified_name.to_owned(),
+        description: None,
         signature,
         start_line: start.row + 1,
         start_column: start.column + 1,

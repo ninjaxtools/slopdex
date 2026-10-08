@@ -157,7 +157,7 @@ pub(crate) fn query(
             continue;
         }
         if let Some(structure) = source.structure(&path)? {
-            let nodes = selection.select_structure(&structure);
+            let nodes = selection.select_structure_at(&path, &structure);
             if !nodes.is_empty() {
                 selected.insert(path, nodes);
             }

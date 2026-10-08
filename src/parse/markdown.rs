@@ -139,7 +139,10 @@ pub(super) fn parse_plain(source: &str) -> Vec<MarkdownChunk> {
     chunks
 }
 
-pub(super) fn parse(source: &str) -> Result<ParsedFile> {
+pub(super) fn parse(
+    source: &str,
+    descriptions: &mut super::descriptions::SourceDescriptions,
+) -> Result<ParsedFile> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_md_025::LANGUAGE.into())
@@ -182,6 +185,7 @@ pub(super) fn parse(source: &str) -> Result<ParsedFile> {
             .context("Cannot recover Markdown fence: tree-sitter returned no tree")?;
     }
     let mut comments = comments::collect(tree.root_node(), source)?;
+    descriptions.comments = comments.clone();
     let detected = blocks(tree.root_node(), source, &comments);
     let structure = structure(source, &detected);
     let filtered = document::without_spans(source, &mut comments);

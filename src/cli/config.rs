@@ -85,6 +85,10 @@ pub(super) fn effective_config(global: &Global, path: &Path) -> Result<Value> {
 
 fn validate_config(config: &Value) -> Result<()> {
     ensure!(config.is_object(), "config must be a JSON object");
+    ensure!(
+        config.get("descriptionsEnabled").is_none(),
+        "descriptionsEnabled has been removed; remove it from config and run `slopdex generate descriptions` to generate descriptions explicitly"
+    );
     for (key, allowed) in [
         ("provider", &["openai", "jina"][..]),
         (
@@ -126,7 +130,7 @@ fn validate_config(config: &Value) -> Result<()> {
             );
         }
     }
-    for key in ["descriptionsEnabled", "rerankingEnabled", "verbose"] {
+    for key in ["rerankingEnabled", "verbose"] {
         if let Some(value) = config.get(key) {
             ensure!(value.is_boolean(), "{key} must be a boolean");
         }
@@ -283,7 +287,6 @@ pub(super) fn run_config(
     write_config(path, &config)?;
     if interactive {
         let summary = [
-            "descriptionsEnabled",
             "descriptionProvider",
             "descriptionModel",
             "descriptionFallbackModel",

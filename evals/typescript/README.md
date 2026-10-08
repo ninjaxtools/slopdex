@@ -324,9 +324,10 @@ Semantic-cache preparation runs an offline, no-reindex `cross-search` with an
 impossible source regex to load and persist the native indexes without querying a provider. Cache
 metadata records the ANN generation, embedding profile, artifact sizes and SHA-256
 hashes. Older embedding-only caches are warmed in place; missing, stale or corrupt
-sidecars are repaired during preparation. Code and Markdown indexes are always
-included, and description/combined indexes are included when descriptions are
-enabled.
+sidecars are repaired during preparation. Code, Markdown, and independent
+description indexes are included; the description index contains any available
+source or generated prose and can be empty. There is no combined/fusion index,
+and preparing the cache does not generate descriptions.
 
 Before timing each search/combined trial, the runner copies all matching binaries and
 manifests and opens them through the writable native loader using the same offline

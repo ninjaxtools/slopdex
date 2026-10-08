@@ -103,26 +103,33 @@ impl Prompts for ScriptedPrompts {
 }
 
 #[test]
-fn wizard_can_skip_llms_and_preserves_extensions() {
+fn wizard_configures_description_models_without_enablement_and_preserves_extensions() {
     let mut config = json!({"custom": "keep"});
-    let mut prompts = ScriptedPrompts::new("no\nno\n\n\n\n\n\n\n\n\n\n\n");
+    let mut prompts = ScriptedPrompts::new(&format!("openai\n\nno\nno\n{}", "\n".repeat(10)));
     configure_interactively(&mut config, &mut prompts).unwrap();
-    assert_eq!(config["descriptionsEnabled"], false);
+    assert_eq!(config["descriptionProvider"], "openai");
+    assert_eq!(config["descriptionModel"], "gpt-5.6-luna");
     assert_eq!(config["model"], "text-embedding-3-large");
     assert_eq!(config["dimensions"], 3072);
     assert_eq!(config["custom"], "keep");
     assert!(prompts.fetches.is_empty());
     let output = String::from_utf8(prompts.output).unwrap();
-    assert!(!output.contains("Description provider"));
-    assert!(!output.contains("Description model"));
+    assert!(output.contains("Description provider"));
+    assert!(output.contains("Description model"));
+    assert!(!output.contains("Generate file and function descriptions"));
 }
 
 #[test]
 fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
     for (answers, provider, model, dimensions) in [
-        ("no\nno\n\n\n\n\n\n\n\n\n\n\n", "jina", "custom-jina", 16),
         (
-            "no\nno\nopenai\ntext-embedding-3-small\n8\n\n\n\n\n\n\n\n",
+            "openai\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n",
+            "jina",
+            "custom-jina",
+            16,
+        ),
+        (
+            "openai\n\nno\nno\nopenai\ntext-embedding-3-small\n8\n\n\n\n\n\n\n\n",
             "openai",
             "text-embedding-3-small",
             8,
@@ -153,7 +160,7 @@ fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
 fn wizard_removes_fallback_alias_when_fallback_is_disabled() {
     let mut config = json!({"descriptionProvider": "openai", "descriptionModel": "primary",
         "fallbackModel": "backup"});
-    let mut prompts = ScriptedPrompts::new("yes\n\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n");
+    let mut prompts = ScriptedPrompts::new("\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n");
     configure_interactively(&mut config, &mut prompts).unwrap();
     assert!(config.get("fallbackModel").is_none());
     assert!(config.get("descriptionFallbackModel").is_none());
@@ -213,8 +220,8 @@ fn wizard_published_models_are_searchable_scoped_and_defaulted() {
 #[test]
 fn wizard_fetches_one_catalog_and_reuses_it_for_fallback() {
     let mut config = json!({"descriptionProvider": "opencode-go", "descriptionModel": "primary",
-        "descriptionFallbackModel": "backup", "descriptionsEnabled": true});
-    let mut prompts = ScriptedPrompts::new(&"\n".repeat(16));
+        "descriptionFallbackModel": "backup"});
+    let mut prompts = ScriptedPrompts::new(&"\n".repeat(15));
     prompts.catalog = json!([
         {"provider": "opencode-go", "model": "primary"},
         {"provider": "opencode-go", "model": "backup"}
@@ -230,7 +237,6 @@ fn wizard_cancellation_at_every_prompt_discards_all_changes() {
     let original = json!({"embeddingProvider": "jina", "embeddingModel": "custom",
         "embeddingDimensions": 16, "custom": "keep"});
     let answers = [
-        "yes",
         "openai",
         "primary",
         "yes",
@@ -274,7 +280,7 @@ fn wizard_cancellation_at_every_prompt_discards_all_changes() {
 
 #[test]
 fn wizard_catalog_and_validation_errors_discard_changes() {
-    for answers in ["yes\nopencode-go\n", "no\nno\n\n\n\n\n[\n\n\n\n\n\n"] {
+    for answers in ["opencode-go\n", "openai\n\nno\nno\n\n\n\n\n[\n\n\n\n\n\n"] {
         let original = json!({"embeddingProvider": "jina", "custom": "keep"});
         let mut config = original.clone();
         assert!(configure_interactively(&mut config, &mut ScriptedPrompts::new(answers)).is_err());

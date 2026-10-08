@@ -56,6 +56,8 @@ pub(in crate::cli) fn print_search(
                         &row["chunk"]
                     } else if row["type"] == "symbol" {
                         &row["symbol"]
+                    } else if row["type"] == "file" {
+                        &row["file"]
                     } else {
                         &row["function"]
                     },

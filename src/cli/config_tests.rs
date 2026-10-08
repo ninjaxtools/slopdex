@@ -150,8 +150,8 @@ fn config_set_keeps_json_stdout_machine_readable() {
         vec![
             "config",
             "set",
-            "descriptionsEnabled",
-            "true",
+            "descriptionProvider",
+            "openai",
             "--format",
             "json",
         ],
@@ -197,6 +197,28 @@ fn config_set_supports_nested_values_and_rejects_invalid_values_without_writing(
 }
 
 #[test]
+fn removed_description_setting_is_rejected_without_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    write_config(&path, &json!({"custom": "keep"})).unwrap();
+    let original = fs::read(&path).unwrap();
+    for value in ["true", "false", "null"] {
+        let cli = parse(&["config", "set", "descriptionsEnabled", value]);
+        let Command::Config { args } = cli.command else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        let error = run_config(&cli.global, &path, &args, &mut out).unwrap_err();
+        assert!(error.to_string().contains("has been removed"));
+        assert!(out.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    fs::write(&path, r#"{"descriptionsEnabled": false}"#).unwrap();
+    let error = effective_config(&parse(&["status"]).global, &path).unwrap_err();
+    assert!(error.to_string().contains("slopdex generate descriptions"));
+}
+
+#[test]
 fn config_read_distinguishes_missing_files_from_invalid_or_unreadable_files() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.json");
@@ -228,7 +250,7 @@ fn invalid_config_settings_cannot_partially_persist_a_config_action() {
     let cli = parse(&[
         "config",
         "set",
-        "descriptionsEnabled",
+        "custom.updated",
         "true",
         "--format",
         "json",

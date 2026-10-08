@@ -9,7 +9,7 @@ mod workspace;
 pub(crate) use output::describe_search_context;
 
 use self::{
-    args::{Cli, Command, Format, HelpTopic, IndexAction},
+    args::{Cli, Command, Format, GenerateAction, HelpTopic, IndexAction},
     config::{effective_config, run_config},
     io::{print_json, with_stdout},
     output::{CrossOutput, Presentation, print_cross, print_errors, print_map, print_search},
@@ -397,11 +397,11 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             &mut out,
             &refreshed.unwrap_or(json!({"refreshed": false, "noReindex": true})),
         )?,
-        Command::Index {
-            action: IndexAction::ReindexFiles { callables },
+        Command::Generate {
+            action: GenerateAction::Descriptions,
         } => {
-            let result = ui::spin("Regenerating file descriptions", || {
-                engine.reindex_files(*callables)
+            let result = ui::spin("Generating file and callable descriptions", || {
+                engine.generate_descriptions()
             })?;
             print_json(&mut out, &result)?
         }

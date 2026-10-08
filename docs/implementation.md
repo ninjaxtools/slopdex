@@ -17,14 +17,15 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/main.rs`, `src/lib.rs` | Native entry point/error exit handling, public core modules, shared SHA-256 helper. |
 | `src/cli.rs` | Clap commands/validation, root-selected JSON configuration, interactive prompts, summary/JSON/JSONL output, connected-component clusters. |
 | `src/ui.rs` | Shared cliclack progress and diagnostic rendering on terminal stderr, plain redirected diagnostics, synchronized provider notices. |
-| `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, search/filtering/fusion/reranking, cross-search, and task explanation context. |
-| `src/filter.rs` | Shared ordered path globs, qualified-name regexes, resolved normalized semantic names, and map kind selection with ancestor context. |
+| `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, independent-index search/filtering/reranking, cross-search, and task explanation context. |
+| `src/filter.rs` | Shared ordered path globs, qualified-name regexes, resolved semantic selection, and map kind selection with ancestor context. |
 | `src/symbols.rs` | Stable normalization of bare names and queries for name-only symbol embeddings. |
 | `src/map.rs` | Compact structure summaries from canonical metadata; display-only truncation. |
 | `src/parse/mod.rs` | Shared parsing result types, file-language detection, and dispatch to code or Markdown parsing. |
 | `src/parse/code.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery. |
 | `src/parse/structure.rs`, `src/parse/imports.rs` | Canonical declarations, signatures, hierarchy, source ranges, and imported bindings/aliases. |
 | `src/parse/markdown.rs` | Structural heading hierarchy and separate bounded Markdown search chunks, fence and comment handling. |
+| `src/parse/descriptions.rs` | Shared source-comment attachment, Python function/class docstrings, and file/symbol description extraction. |
 | `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits and hosted implementations, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
 | `src/storage.rs` | Authoritative SQLite records, artifact/result caches, transactional live-state reconciliation, schema validation. |
 | `src/vectors.rs` | Persistent incremental filtered F32 cosine USearch HNSW indexes and validated sidecar publication/recovery. |
@@ -66,8 +67,8 @@ cross-search root loads its own config plus the same global overrides. The CLI
 recognizes identical source/target database paths (including
 symlinks and Unix hard links) and reuses the source engine rather than taking a
 second lock. Provider construction validates configuration without making network
-requests; credentials are resolved only on a request. Saved description state
-and, when neither provider nor model is explicit, the saved description profile
+requests; credentials are resolved only on a request. When neither description
+provider nor model is explicit, the saved description profile
 can supply engine defaults.
 
 If the resolved index is missing, `map` directly parses eligible files and renders
@@ -84,26 +85,37 @@ the discovered universe. Semantic refresh subsequently prepares any missing
 embeddings, including for files unchanged since an indexed map refresh.
 
 With an existing index, `map -q` opens through `Engine::open_symbol_map`.
-It still calls only `refresh_structure`, then lazily resolves semantic name
-selection from saved structures. It may prepare name/query embeddings through
+It still calls only `refresh_structure`, then lazily resolves semantic selection
+over symbols, available descriptions, and heading titles from saved snapshots.
+It may prepare name, description, and query embeddings through
 providers or caches and build the separate `<index>.symbols.usearch` sidecar.
 If a read-only engine reports `NeedsWrite` during refresh, map, or selection,
 the CLI reopens a writable symbol-map engine and retries; `--no-reindex` keeps
-the saved snapshot while allowing symbol cache population. Ordinary map does
+the saved snapshot while allowing selector cache population. Ordinary map does
 not initialize a model. `StructureSource::selection` defaults to compiling local
-filters, while the engine override resolves semantic names; both map querying
+filters, while the engine override resolves semantic selection; both map querying
 and expanded heading-body rendering use the resolved selection.
 
 The CLI's `Command::SearchSymbols(QueryArgs)` forwards `search-symbols` to the
 engine. `SearchArgs` adds `symbols` to the explicit `code`/`descriptions`/`md`
-selector family: any true stream flag serializes all four booleans. Plain search
-keeps its existing content streams, with symbols opt-in. `CommandMode` centralizes
+selector family: any true index flag serializes all four booleans. Plain search
+includes all indexes, including symbols and available descriptions.
+`CommandMode` centralizes
 opening and refresh: pure `search-symbols` and `search --symbols` use
 `Engine::open_symbol_map(root, index, config, readonly)` and `refresh_structure`,
 as semantic map does; mixed content/symbol searches use normal engine refresh.
 All search commands require an existing index. Read-only `NeedsWrite` retries
 reopen the same mode writable, retaining structural-only refresh for pure symbols.
 `--no-reindex` skips refresh but allows lazy name/query cache writes.
+
+`Command::Generate { action: GenerateAction::Descriptions }` uses normal content
+open/refresh mode and opens writable. After the usual refresh (unless
+`--no-reindex`), dispatch calls only `Engine::generate_descriptions()` and prints
+its JSON statistics. Indexed description generation is explicit; ordinary refresh,
+search, map, and status do not generate descriptions. Source-described files and
+callables, and all Markdown files, are excluded from generation. Description text
+is optional, but any available source or generated prose is indexed without an
+enablement setting. CLI config validation rejects the removed setting.
 
 Shared selectors compile ordered `ignore::overrides` path rules and an ORed Rust
 `RegexSet`; `-i` affects regexes only. Positive globs require a match, `!` excludes,
@@ -118,14 +130,18 @@ Shared `SelectionArgs` serializes `symbolQuery` only for supplied `-q` values an
 `symbolThreshold` only when supplied. Queries are ORed with default minimum
 similarity `0.5`, independently of content `--threshold`. `Selection::compile`
 validates string queries and a finite scalar threshold in `[-1,1]`; a semantic
-selector starts with an empty resolved-name set, so unresolved selection cannot
-silently select everything. The engine fills the union through `with_symbol_names`.
+selector starts with empty resolved match sets, so unresolved selection cannot
+silently select everything. The engine fills name, path-qualified symbol, and file
+match sets through `with_semantic_matches`.
 Regex matching remains qualified-name/alias based, while semantic matching uses
-normalized `node.name` or `node.names`. The two active families are ORed; an absent
+normalized `node.name` or `node.names` and available descriptions.
+The two active families are ORed; an absent
 family contributes no matches, and with neither supplied all names are eligible.
-`names_match` shares this composition across callable, Markdown, and cross-search
-filters; `symbol_matches` also accounts for declaration aliases. Bare heading titles carry no parent
-semantics; ancestors are context and receive body text only if directly selected.
+Path-aware matching shares this composition across callable, Markdown, and
+cross-search filters; `symbol_matches_at` also accounts for declaration aliases.
+Description matches select a particular symbol or, for a file description, the
+file's declarations. Bare heading titles carry no parent semantics; ancestors are
+context and receive body text only if directly selected.
 `name_matches` stays regex-only and `-i` affects regexes only.
 
 Normalization splits camelCase/PascalCase, acronyms, letter/digit boundaries, and
@@ -134,7 +150,21 @@ vectors. Embedding inputs contain names only, without bodies, signatures,
 descriptions, or parent scopes. Symbol vectors use 256 native dimensions by
 default, capped at configured embedding dimensions, with optional
 `symbolDimensions`; OpenAI ada requires its full dimensions. They are derived
-lazily from saved structures rather than from content search units.
+lazily from saved structures rather than from content search units. `-q` also
+embeds available source/generated descriptions in this selector space, independently
+of content embeddings and without invoking description generation.
+
+Source descriptions use one attachment policy across parser backends: a standalone
+contiguous comment group immediately before a declaration attaches to it when the
+gap contains only whitespace and no blank line. Declaration wrappers such as
+attributes, decorators, exports, and variable bindings are taken into account.
+Trailing comments do not attach forward. A first comment group preceded only by
+whitespace is the file description, even after leading blank lines; it can also
+describe an adjacent first declaration. Delimiters and block-comment stars are
+stripped while internal prose line breaks remain. Python functions/classes also
+use a leading constant docstring; comments and docstrings combine with a paragraph
+break. Source descriptions override generated prose and publish with structure,
+even before semantic embeddings are prepared.
 
 ### SQLite schema and artifacts
 
@@ -145,13 +175,13 @@ search units, and diagnostics; the layout does not fully deduplicate payloads.
 
 | Table | Contents |
 | --- | --- |
-| `metadata` | Identity (canonical root and schema), generation, Git checkpoint, active embedding profile, description enabled/profile settings. |
+| `metadata` | Identity (canonical root and schema), generation, Git checkpoint, active embedding profile, description profile settings. |
 | `files` | Path-keyed source/hash/language, provenance, parser version/structure hash, and compatibility snapshot. |
 | `symbols` | File-local declaration IDs/parents, order, kinds, qualified names, complete signatures, source ranges, and metadata. |
 | `symbol_names` | Ordered declared/imported names and aliases linked to symbols. |
 | `search_units` | Callable/Markdown records with stable integer IDs, unique logical identities, optional symbol links, compatibility data, and embedding-input hashes. |
 | `unit_embeddings` | Search-unit vector associations by role, profile, and input hash. |
-| `descriptions` | Live file/callable descriptions, source hashes, and optional vector references. |
+| `descriptions` | Available source/generated descriptions, source hashes, and optional vector references. |
 | `diagnostics` | Per-file read/parse/extraction diagnostics with structured columns and compatibility data. |
 | `embeddings` | Content-addressed document/query embeddings stored as little-endian F32 blobs. |
 | `cache` | Durable parse and model-generated artifacts, keyed by kind and content-addressed cache key. |
@@ -183,27 +213,30 @@ and vector associations to the embedding table. Structure publication can create
 search units with no embeddings; canonical records do not depend on a model.
 
 Parse keys contain parser version, path, and source hash. Embedding keys contain
-the embedding profile, query/document operation, and full input. A file description
-key hashes only its content hash and system instruction; a callable description
-key hashes its qualified symbol name, source hash, file-description text, and
-system instruction. Cached answers carry their original path and hashes referencing
-the prompt (including source), system instruction, configured generator profile,
-and relevant settings as inspectable provenance outside the key. Those inputs are
-stored once per content hash. Renames and model changes can therefore
-reuse a matching description, including during explicit regeneration. Completed
-artifacts are persisted independently of the final live update and result cache,
-remaining reusable across generation changes and failed-refresh retries. The
-engine persists each successful embedding batch as it completes, so later
-failures do not discard earlier paid batches. Unchanged callable descriptions
-and stale file descriptions can survive profile changes until work explicitly
-requires their regeneration; a profile change is not a blanket regeneration.
+the embedding profile, query/document operation, and full input. Generated file
+description keys include source-content hash and the generation profile; callable
+keys include qualified symbol name, callable source hash, file-description text,
+and that generation profile. The generation profile includes the configured LLM
+profile, generation settings, and system instruction. Settings cover provider/model,
+fallback, endpoint, timeout, retry count, and retry delay. Relevant source,
+profile/settings, or system-instruction changes invalidate generated reuse; a
+path-only rename can still reuse a matching artifact. Cached answers retain their
+original path and content-addressed prompt/settings/profile provenance. Source
+descriptions bypass generation and cannot be replaced by it.
+
+Completed artifacts are persisted independently of final live publication and
+result caches, remaining reusable across index generation changes and retries.
+Each successful embedding batch is persisted immediately. Ordinary refresh
+extracts source descriptions, preserves reusable generated prose, and prepares
+its embeddings. Only `generate_descriptions` regenerates missing/stale generated
+descriptions or reacts to changed generation settings/profile/system instructions.
 
 Rerankings and task explanations also have durable artifact caches, independent
 of the generation-keyed search-result cache. Their keys include the model
 configuration and complete query/documents or explanation prompt. An unrelated
 structural change can invalidate result rows without repeating those paid calls.
 
-Query-result keys include generation, enabled state, effective config, query,
+Query-result keys include generation, effective config, query,
 kind, and options. Cross-search keys include source/target generations, canonical
 target database path, scoring kind, resolved changed-since commit, saved checkpoint,
 and options. A moving Git branch is resolved before cache lookup and its ancestry
@@ -243,15 +276,16 @@ Refresh proceeds as follows:
    diagnostics, checkpoint, generation, and result-cache invalidation.
    Generation advances for live-record changes; checkpoint-only updates do not
    increment it. Ordinary map reads this structure without opening sidecars.
-5. Semantic refresh prepares missing active-profile embeddings and enabled
-   descriptions, including for files unchanged since a map refresh. Each completed
+5. Semantic refresh prepares missing active-profile embeddings, including available
+   source or generated descriptions without generating prose, even for files
+   unchanged since a map refresh. Missing descriptions are allowed. Each completed
    model artifact is saved immediately. After rechecking HEAD and prepared source
    hashes, a second transaction publishes semantic associations and descriptions.
    Provider or publication failure leaves the committed structure available and
    paid artifacts reusable. Incomplete configured semantic projections cannot be
    searched with `--no-reindex`; refresh finishes their preparation first.
 6. Load the committed semantic snapshot and reconcile USearch indexes. Description
-   enabled/profile settings are saved separately from live-record publication.
+   profile settings are saved separately from live-record publication.
 
 Git records provenance and a checkpoint, while all indexed source comes from the
 working tree. `update --target` supports HEAD only. Changed-since selection
@@ -266,7 +300,7 @@ work; unindexed map still parses current files. Search/cross-search require an e
 database even with `--no-reindex`.
 Offline status/cross-search use the saved native snapshot, while uncached query
 embedding/reranking and task descriptions still call providers. The CLI sets
-`noReindex` from `--no-reindex`, overriding a JSON value. `index reindex-files` is an
+`noReindex` from `--no-reindex`, overriding a JSON value. `generate descriptions` is an
 explicit operation on saved source snapshots, not a new filesystem scan after
 the automatic refresh.
 
@@ -283,15 +317,21 @@ ancestry.
 
 ### Persistent vector snapshots and search
 
-The engine supplies a complete authoritative `(item ID, vector)` snapshot to
-each `VectorIndex::open`. There are code and Markdown indexes at embedding
-dimension `D`; complete enabled descriptions additionally produce description
-fusion at `2D` and combined fusion at `3D`. Each component is unit-normalized
-before concatenation, so cosine of the concatenation is exactly the arithmetic
-mean of component cosines, up to F32 rounding. Query fusion repeats the query
-unit vector; cross-search compares corresponding code/description/file vectors.
-Cross-search falls back to code for the whole comparison unless both sides have
-complete descriptions and identical configured description profiles.
+The engine supplies authoritative `(item ID, vector)` snapshots to
+`VectorIndex::open`. Code, Markdown/document content, and available callable/symbol
+descriptions use independent indexes at embedding dimension `D`; there is no
+concatenated or combined index. Description text is optional. A semantic projection
+is description-complete when existing descriptions have active-profile embeddings,
+not when every callable has a description. File descriptions are independently
+compared against the query vector and emitted as `type:"file"` rows.
+
+Code and description retrieval apply thresholds independently. Hits for the same
+search-unit ID merge by maximum similarity, with optional `codeSimilarity`,
+`descriptionSimilarity`, `functionDescriptionSimilarity`, and
+`fileDescriptionSimilarity` reporting components rather than averaged weights.
+Cross-search always retrieves, thresholds, and ranks by code. Available callable
+and file description similarities are supplementary pairwise scores; they require
+neither universal description coverage nor identical generator profiles.
 
 USearch uses cosine HNSW, F32 storage, connectivity 16, insertion expansion 128,
 and search expansion 64. Data is copied into owned indexes, not memory-mapped.
@@ -304,8 +344,8 @@ Symbol hits are scored from normalized bare names/aliases, taking the maximum
 similarity per structural node. They include all structural kinds and headings
 without content units. The ordinary ranking threshold and limit apply; optional
 `symbolQuery` is an additional selector with independent `symbolThreshold`.
-Mixed searches retain separate function, Markdown/document, and symbol rows,
-then apply global ranking and limit rather than fusing symbol and content scores.
+Mixed searches retain merged function hits plus file, Markdown/document, and
+symbol rows, then apply global ranking and limit rather than fusing symbol and content scores.
 The result contract is `{type:"symbol", symbol:{...StructureNode,path,sourceMode},
 similarity, symbolSimilarity}`. Node IDs are file-local; vocabulary/vector IDs
 must never reach presentation.
@@ -320,8 +360,15 @@ No body is used to rank pure symbols. Call-graph key lookup excludes noncallable
 nodes before expansion; callable symbol JSON rows receive related callable and
 callee metadata as function rows do.
 
-Exact fusion does not make HNSW exhaustive: neighbor membership/recall remain
-approximate, with no all-pairs/exact-scan fallback. Reranking consumes the
+File-description JSON rows carry `{type:"file", file:{path,description,sourceMode,
+language}, similarity, fileDescriptionSimilarity}`. CLI presentation groups them
+with declaration hits, prints their scores on the file header, and shows their
+prose at standard/expanded detail or for explicit description search at compact
+detail. File hits have no synthetic declaration and do not seed call expansion.
+
+Independent-index merging does not make HNSW exhaustive: neighbor membership/recall
+remain approximate, with no all-pairs/exact-scan fallback for ANN retrieval.
+File descriptions use direct cosine comparisons. Reranking consumes the
 retrieved query candidates; cross-search is never sent to a reranker.
 
 Each `<index>.<kind>.usearch` has a `.manifest.json` containing format/USearch

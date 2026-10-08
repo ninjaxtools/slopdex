@@ -15,6 +15,8 @@ pub struct Selection {
     globs: Override,
     names: Option<RegexSet>,
     semantic_names: Option<HashSet<String>>,
+    semantic_symbols: HashSet<(String, usize)>,
+    semantic_paths: HashSet<String>,
     kinds: HashSet<&'static str>,
     private: bool,
 }
@@ -81,6 +83,8 @@ impl Selection {
             globs: globs.build().context("compile selection globs")?,
             names,
             semantic_names: (!queries.is_empty()).then(HashSet::new),
+            semantic_symbols: HashSet::new(),
+            semantic_paths: HashSet::new(),
             kinds,
             private,
         })
@@ -102,6 +106,69 @@ impl Selection {
     pub(crate) fn with_symbol_names(mut self, names: HashSet<String>) -> Self {
         self.semantic_names = Some(names);
         self
+    }
+
+    /// Description matches retain their declaration identity instead of expanding
+    /// to every declaration with the same name. File prose selects its own path.
+    pub(crate) fn with_semantic_matches(
+        mut self,
+        names: HashSet<String>,
+        symbols: HashSet<(String, usize)>,
+        paths: HashSet<String>,
+    ) -> Self {
+        self = self.with_symbol_names(names);
+        self.semantic_symbols = symbols;
+        self.semantic_paths = paths;
+        self
+    }
+
+    pub(crate) fn file_matches(&self, path: &str) -> bool {
+        self.path_matches(path)
+            && self
+                .combine_name_matches(self.name_matches(path), self.semantic_paths.contains(path))
+    }
+
+    /// Search units and structure maps resolve the same file-local declaration.
+    pub(crate) fn unit_matches(
+        &self,
+        path: &str,
+        data: &Value,
+        structure: Option<&FileStructure>,
+    ) -> bool {
+        if !self.path_matches(path) {
+            return false;
+        }
+        if let Some(node) = structure.and_then(|structure| {
+            crate::map::matching_node(structure, data).or_else(|| {
+                let title = data["headingPath"].as_array()?.last()?.as_str()?;
+                let start = data["startLine"].as_u64()? as usize;
+                structure
+                    .nodes
+                    .iter()
+                    .filter(|node| {
+                        node.kind == "heading" && node.name == title && node.start_line <= start
+                    })
+                    .max_by_key(|node| node.start_line)
+            })
+        }) {
+            return self.symbol_matches_at(path, node);
+        }
+        let heading = data["headingPath"].as_array().map(|parts| {
+            parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(".")
+        });
+        let qualified = data["qualifiedName"]
+            .as_str()
+            .or(heading.as_deref())
+            .unwrap_or("");
+        let bare = data["name"]
+            .as_str()
+            .or_else(|| data["headingPath"].as_array()?.last()?.as_str())
+            .unwrap_or("");
+        self.names_match(qualified, bare) || self.semantic_paths.contains(path)
     }
 
     pub(crate) fn semantic_name_matches(&self, name: &str) -> bool {
@@ -132,6 +199,10 @@ impl Selection {
     /// are qualified in the declaration's enclosing scope. Semantic selection
     /// independently matches bare names/aliases, then unions with the regex family.
     pub fn symbol_matches(&self, node: &StructureNode) -> bool {
+        self.symbol_matches_at("", node)
+    }
+
+    pub fn symbol_matches_at(&self, path: &str, node: &StructureNode) -> bool {
         let prefix = if node.kind == "import" {
             ""
         } else {
@@ -142,7 +213,9 @@ impl Selection {
                 .names
                 .iter()
                 .any(|name| self.name_matches(&format!("{prefix}{name}")));
-        let semantic_matches = self.semantic_name_matches(&node.name)
+        let semantic_matches = self.semantic_paths.contains(path)
+            || self.semantic_symbols.contains(&(path.to_owned(), node.id))
+            || self.semantic_name_matches(&node.name)
             || node
                 .names
                 .iter()
@@ -158,6 +231,10 @@ impl Selection {
     /// expand a matched parent to its unmatched children. IDs and source order
     /// remain unchanged, even if IDs are sparse or parents follow their children.
     pub fn select_structure(&self, structure: &FileStructure) -> Vec<StructureNode> {
+        self.select_structure_at("", structure)
+    }
+
+    pub fn select_structure_at(&self, path: &str, structure: &FileStructure) -> Vec<StructureNode> {
         let parents: HashMap<_, _> = structure
             .nodes
             .iter()
@@ -170,7 +247,7 @@ impl Selection {
             if (!self.private
                 && symbol_is_private(node.id, &nodes, &mut visibility, &mut HashSet::new()))
                 || !self.kind_matches(&node.kind)
-                || !self.symbol_matches(node)
+                || !self.symbol_matches_at(path, node)
             {
                 continue;
             }
@@ -665,6 +742,61 @@ mod tests {
             .unwrap()
             .with_symbol_names(HashSet::from(["guide".into()]));
         assert_eq!(parent.select_structure(&parsed.structure).len(), 1);
+    }
+
+    #[test]
+    fn description_matches_keep_path_and_declaration_identity_and_union_regex() {
+        let structure = crate::parse::parse(
+            "same.rs",
+            "pub struct Service; impl Service { pub fn run() {} } pub fn run() {} pub fn other() {}",
+        ).unwrap().structure;
+        let method = structure
+            .nodes
+            .iter()
+            .find(|node| node.qualified_name == "Service.run")
+            .unwrap();
+        let selection = Selection::compile(&json!({
+            "symbolQuery":"description", "regexp":"^other$", "private":true
+        }))
+        .unwrap()
+        .with_semantic_matches(
+            HashSet::new(),
+            HashSet::from([("a.rs".into(), method.id)]),
+            HashSet::new(),
+        );
+        assert!(selection.symbol_matches_at("a.rs", method));
+        assert!(!selection.symbol_matches_at("b.rs", method));
+        let selected = selection.select_structure_at("a.rs", &structure);
+        assert!(
+            selected
+                .iter()
+                .any(|node| node.qualified_name == "Service.run")
+        );
+        assert!(selected.iter().any(|node| node.name == "other"));
+        assert!(!selected.iter().any(|node| node.qualified_name == "run"));
+        assert_eq!(selection.select_structure_at("b.rs", &structure).len(), 1);
+        let data = serde_json::to_value(method).unwrap();
+        assert!(selection.unit_matches("a.rs", &data, Some(&structure)));
+        assert!(!selection.unit_matches("b.rs", &data, Some(&structure)));
+    }
+
+    #[test]
+    fn file_description_matches_select_only_the_matched_path_with_glob_intersection() {
+        let structure = crate::parse::parse("file.rs", "pub fn run() {}")
+            .unwrap()
+            .structure;
+        let selection = Selection::compile(&json!({"symbolQuery":"description", "glob":"*.rs"}))
+            .unwrap()
+            .with_semantic_matches(
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::from(["a.rs".into(), "guide.md".into()]),
+            );
+        assert!(selection.file_matches("a.rs"));
+        assert!(!selection.file_matches("b.rs"));
+        assert!(!selection.file_matches("guide.md"));
+        assert_eq!(selection.select_structure_at("a.rs", &structure).len(), 1);
+        assert!(selection.select_structure_at("b.rs", &structure).is_empty());
     }
 
     #[test]

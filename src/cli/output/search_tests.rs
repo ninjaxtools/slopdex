@@ -104,3 +104,167 @@ fn search_uses_indexed_declaration_instead_of_callable_source() -> Result<()> {
     assert!(!output.contains("secret") && !output.contains('{'));
     Ok(())
 }
+
+#[test]
+fn file_only_search_renders_header_scores_and_prose_without_callable_hunks() -> Result<()> {
+    let rows = vec![json!({"type":"file", "file":{
+        "path":"guide.md", "description":"Explains setup.\nLists credentials.",
+        "sourceMode":"working-tree", "language":"markdown"
+    }, "similarity":0.82, "fileDescriptionSimilarity":0.82, "rerankScore":0.93})];
+    for detail in [Detail::Compact, Detail::Standard, Detail::Expanded] {
+        for descriptions in [false, true] {
+            let mut out = Vec::new();
+            print_search(
+                &mut out,
+                &rows,
+                Format::Json,
+                detail,
+                descriptions,
+                &mut Presentation::empty(),
+            )?;
+            assert_eq!(serde_json::from_slice::<Value>(&out)?, json!(rows));
+            out.clear();
+            print_search(
+                &mut out,
+                &rows,
+                Format::Summary,
+                detail,
+                descriptions,
+                &mut Presentation::empty(),
+            )?;
+            let output = String::from_utf8(out)?;
+            let scores = if detail == Detail::Expanded {
+                " [file 0.82]"
+            } else {
+                ""
+            };
+            let prose = if detail != Detail::Compact || descriptions {
+                "<!-- Explains setup. -->\n<!-- Lists credentials. -->\n"
+            } else {
+                ""
+            };
+            assert_eq!(
+                output,
+                format!("*** guide.md  <!-- score=0.93 similarity=0.82{scores} -->\n{prose}")
+            );
+            assert!(!output.contains("@@") && !output.contains("null"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn file_hits_group_with_callable_and_symbol_hits_and_preserve_json_with_calls() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("api.rs"),
+        "pub const TIMEOUT: u64 = 30;\npub fn run() { check(); }\nfn check() {}\n",
+    )?;
+    fs::write(dir.path().join("other.rs"), "pub fn other() {}\n")?;
+    let index = dir.path().join("index.sqlite");
+    let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+    engine.refresh_structure()?;
+    let structure = engine.presentation_structure("api.rs")?.unwrap();
+    let mut symbol = serde_json::to_value(
+        structure
+            .nodes
+            .iter()
+            .find(|node| node.name == "run")
+            .unwrap(),
+    )?;
+    symbol["path"] = json!("api.rs");
+    let rows = vec![
+        json!({"type":"function", "similarity":0.9, "function":{
+            "path":"other.rs", "qualifiedName":"other", "name":"other", "startLine":1, "endLine":1}}),
+        json!({"type":"symbol", "symbol":symbol, "similarity":0.6, "symbolSimilarity":0.6}),
+        json!({"type":"file", "file":{
+            "path":"api.rs", "description":"Handles requests.\nChecks permissions.",
+            "sourceMode":"working-tree", "language":"rust"
+        }, "similarity":0.98, "fileDescriptionSimilarity":0.98}),
+        json!({"type":"function", "function":symbol, "similarity":0.5}),
+    ];
+    let calls = crate::cli::args::CallDepths {
+        callees: 1,
+        ..Default::default()
+    };
+    for detail in [Detail::Compact, Detail::Standard, Detail::Expanded] {
+        let mut out = Vec::new();
+        print_search(
+            &mut out,
+            &rows,
+            Format::Json,
+            detail,
+            false,
+            &mut Presentation::with_calls(&engine, calls, 0.9)?,
+        )?;
+        let enriched: Value = serde_json::from_slice(&out)?;
+        assert_eq!(enriched[2], rows[2]);
+        assert_eq!(enriched[1]["symbol"], rows[1]["symbol"]);
+        assert_eq!(enriched[3]["function"], rows[3]["function"]);
+        assert_eq!(
+            enriched[1]["relatedCallables"],
+            enriched[3]["relatedCallables"]
+        );
+        assert_eq!(enriched[1]["callees"], json!(["api.rs:3:check"]));
+        out.clear();
+        print_search(
+            &mut out,
+            &rows,
+            Format::Summary,
+            detail,
+            false,
+            &mut Presentation::with_calls(&engine, calls, 0.9)?,
+        )?;
+        let output = String::from_utf8(out)?;
+        assert!(output.starts_with("*** api.rs  // score=0.98"), "{output}");
+        assert_eq!(output.matches("*** api.rs").count(), 1, "{output}");
+        assert_eq!(output.matches("pub fn run()").count(), 1, "{output}");
+        assert!(
+            output.contains("symbol score=0.60") && output.contains("score=0.50"),
+            "{output}"
+        );
+        assert_eq!(
+            output.contains("// Handles requests."),
+            detail != Detail::Compact,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("Handles requests.").count(),
+            usize::from(detail != Detail::Compact)
+        );
+        assert!(output.contains("callees: api.rs:3:check"), "{output}");
+        assert!(!output.contains("pub const TIMEOUT"), "{output}");
+    }
+    let context = super::describe_search_context(&engine, &rows, 0, 0, 0, 0, 0.9)?;
+    assert!(context.contains("*** api.rs  // score=0.98"));
+    assert!(context.contains("// Handles requests.\n// Checks permissions."));
+    Ok(())
+}
+
+#[test]
+fn explicit_file_descriptions_share_one_header_with_unmatched_callable_hits() -> Result<()> {
+    let rows = vec![
+        json!({"type":"function", "function":{
+            "path":"api.py", "name":"run", "startLine":4, "endLine":5,
+            "description":"Handles a request."
+        }, "similarity":0.7}),
+        json!({"type":"file", "file":{
+            "path":"api.py", "description":"Request routing.",
+            "sourceMode":"working-tree", "language":"python"
+        }, "similarity":0.8, "fileDescriptionSimilarity":0.8}),
+    ];
+    let mut out = Vec::new();
+    print_search(
+        &mut out,
+        &rows,
+        Format::Summary,
+        Detail::Compact,
+        true,
+        &mut Presentation::empty(),
+    )?;
+    assert_eq!(
+        String::from_utf8(out)?,
+        "*** api.py  # score=0.80\n# Request routing.\n\n@@ 4-5 @@\nrun  # score=0.70 | Handles a request.\n"
+    );
+    Ok(())
+}
