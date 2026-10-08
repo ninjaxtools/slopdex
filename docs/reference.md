@@ -185,10 +185,18 @@ cross-search clusters. Map JSON and related callable JSON nodes include indexed
 
 Callees are the functions a symbol calls; callers are the functions that call it.
 In text output, each function's displayed callees appear immediately below its
-declaration under a standalone `callees:` header. The header is indented two spaces
-deeper than the declaration. Callees are grouped under one repository-relative
-`path:` header per file, with paths sorted lexically and symbols in numeric source
-order within each file. After each comment marker, file-header text is indented
+declaration, indented two spaces deeper than the declaration. A single callee
+appears on the same line as `callees:`, separated by one space:
+
+```text
+def outer():
+  # callees: b.py:1-2:middle
+```
+
+Multiple callees appear under a standalone `callees:` header, grouped under one
+repository-relative `path:` header per file. Paths are sorted lexically, with
+symbols in numeric source order within each file. After each comment marker,
+file-header text is indented
 two spaces deeper than `callees:`; symbol text is indented another two spaces and
 uses `start-end:qualifiedName`, or `line:qualifiedName` for single-line functions.
 When a file has only one displayed symbol, its location follows the file's colon
