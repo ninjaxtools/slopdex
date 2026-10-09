@@ -303,6 +303,7 @@ pub(crate) fn render_callees<'a>(
     if files.is_empty() {
         return None;
     }
+    let symbol_name = |symbol: &str| symbol.split_once(':').unwrap().1.to_owned();
     let indent = "  ".repeat(depth + 1);
     if files.len() == 1
         && let Some((path, symbols)) = files.first_key_value()
@@ -310,7 +311,10 @@ pub(crate) fn render_callees<'a>(
     {
         return Some(format!(
             "{indent}{}\n",
-            comment(language, &format!("callees: {path}:{symbol}"))
+            comment(
+                language,
+                &format!("callees: {path}:{}", symbol_name(symbol))
+            )
         ));
     }
     let mut output = format!("{indent}{}\n", comment(language, "callees:"));
@@ -318,7 +322,7 @@ pub(crate) fn render_callees<'a>(
         if let [symbol] = symbols.as_slice() {
             output.push_str(&format!(
                 "{indent}{}\n",
-                comment_with_indent(language, &format!("{path}:{symbol}"), "  ")
+                comment_with_indent(language, &format!("{path}:{}", symbol_name(symbol)), "  ")
             ));
             continue;
         }
@@ -329,7 +333,7 @@ pub(crate) fn render_callees<'a>(
         for symbol in symbols {
             output.push_str(&format!(
                 "{indent}{}\n",
-                comment_with_indent(language, symbol, "    ")
+                comment_with_indent(language, &symbol_name(symbol), "    ")
             ));
         }
     }
@@ -888,6 +892,33 @@ pub fn matching_node<'a>(structure: &'a FileStructure, unit: &Value) -> Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callee_comments_omit_line_numbers() {
+        assert_eq!(
+            render_callees("rust", ["src/api.rs:12-24:Api::run"], 0).unwrap(),
+            "  // callees: src/api.rs:Api::run\n"
+        );
+        assert_eq!(
+            render_callees(
+                "python",
+                [
+                    "src/api.rs:12-24:Api::run",
+                    "src/api.rs:3:check",
+                    "src:other.rs:8-10:Other::go",
+                ],
+                1,
+            )
+            .unwrap(),
+            concat!(
+                "    # callees:\n",
+                "    #   src/api.rs:\n",
+                "    #     check\n",
+                "    #     Api::run\n",
+                "    #   src:other.rs:Other::go\n",
+            )
+        );
+    }
 
     #[test]
     fn query_uses_source_resolved_semantic_selection() -> Result<()> {

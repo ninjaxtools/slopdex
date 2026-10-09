@@ -4512,7 +4512,7 @@ fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_art
         );
     }
     assert!(
-        expanded_text.contains("\ndef middle():\n  # callees: c.py:3-4:leaf\n"),
+        expanded_text.contains("\ndef middle():\n  # callees: c.py:leaf\n"),
         "{expanded_text}"
     );
     for name in ["outermost", "middle", "deepest"] {
@@ -5290,8 +5290,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     );
     let text = String::from_utf8(output.stdout)?;
     assert!(
-        text.contains("*** a.py")
-            && text.contains("\ndef outer():\n  # callees: b.py:1-2:middle\n"),
+        text.contains("*** a.py") && text.contains("\ndef outer():\n  # callees: b.py:middle\n"),
         "{text}"
     );
     assert!(
@@ -5323,7 +5322,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     );
     let map_text = String::from_utf8(map_text.stdout)?;
     assert!(
-        map_text.contains("\ndef outer():\n  # callees: b.py:1-2:middle\n"),
+        map_text.contains("\ndef outer():\n  # callees: b.py:middle\n"),
         "{map_text}"
     );
     let describe = repo.cli_json(&[
@@ -5503,7 +5502,7 @@ fn expanded_detail_defaults_to_one_edge_and_includes_high_similarity_code() -> R
         "{with_code}"
     );
     assert!(
-        with_code.contains("\ndef outer():\n  # callees: b.py:1-2:middle\n"),
+        with_code.contains("\ndef outer():\n  # callees: b.py:middle\n"),
         "{with_code}"
     );
     let without_code = run("1")?;

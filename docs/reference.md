@@ -200,7 +200,7 @@ appears on the same line as `callees:`, separated by one space:
 
 ```text
 def outer():
-  # callees: b.py:1-2:middle
+  # callees: b.py:middle
 ```
 
 Multiple callees appear under a standalone `callees:` header, grouped under one
@@ -208,9 +208,9 @@ repository-relative `path:` header per file. Paths are sorted lexically, with
 symbols in numeric source order within each file. After each comment marker,
 file-header text is indented
 two spaces deeper than `callees:`; symbol text is indented another two spaces and
-uses `start-end:qualifiedName`, or `line:qualifiedName` for single-line functions.
-When a file has only one displayed symbol, its location follows the file's colon
-on the same line with no intervening space, for example `c.py:7:leaf`.
+uses just `qualifiedName`, without line numbers or ranges.
+When a file has only one displayed symbol, its name follows the file's colon
+on the same line with no intervening space, for example `c.py:leaf`.
 All comment markers align with the `callees:` marker; only the nested contents
 after the markers are indented. The whole block follows the owning function's
 indentation, including for nested declarations. These lines use language-specific
@@ -223,9 +223,9 @@ on line 7 in `c.py`, renders:
 def outer():
   # callees:
   #   b.py:
-  #     1-2:middle
-  #     5:helper
-  #   c.py:7:leaf
+  #     middle
+  #     helper
+  #   c.py:leaf
 ```
 
 JSON `callees` string arrays remain flat locations in `path:start-end:qualifiedName`
