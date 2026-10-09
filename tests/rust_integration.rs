@@ -8199,18 +8199,20 @@ fn concurrent_workspaces_share_provider_requests_and_snapshot_artifacts() -> Res
             let config = config.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || -> Result<Value> {
-                let mut engine = Engine::open(&root, &index, config)?;
                 barrier.wait();
+                let mut engine = Engine::open(&root, &index, config)?;
                 engine.refresh()?;
                 engine.generate_descriptions()?;
                 engine.status()
             })
         })
         .collect();
+    // Join every worker before propagating any open/refresh failure.
     let statuses: Vec<_> = workers
         .into_iter()
         .map(|worker| worker.join().expect("workspace worker"))
-        .collect::<Result<_>>()?;
+        .collect();
+    let statuses: Vec<_> = statuses.into_iter().collect::<Result<_>>()?;
     assert_eq!(statuses[0]["snapshot"], statuses[1]["snapshot"]);
     assert_ne!(statuses[0]["indexPath"], statuses[1]["indexPath"]);
     assert_eq!(

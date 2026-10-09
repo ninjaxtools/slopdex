@@ -18,7 +18,7 @@ use s3::{Bucket, creds::Credentials, region::Region};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{hash, storage::Database, ui};
+use crate::{hash, registry, storage::Database, ui};
 
 const MAX_S3_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -228,6 +228,18 @@ pub(crate) fn open_store(path: &Path, readonly: bool) -> Result<Connection> {
         Connection::open(path)?
     };
     conn.busy_timeout(Duration::from_secs(30))?;
+    // WAL activation needs a lock that SQLite's busy handler cannot always
+    // wait for. Serialize cold starts across processes, before reading schema
+    // state, using the canonical file so path aliases share the same lock.
+    let _initialization = if readonly {
+        None
+    } else {
+        Some(registry::lock_path(
+            &std::fs::canonicalize(path)?,
+            "store",
+            "initialize",
+        )?)
+    };
     let (version, populated): (i64, bool) = conn.query_row(
         "SELECT user_version,EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%') FROM pragma_user_version",
         [], |r| Ok((r.get(0)?, r.get(1)?)),
@@ -238,15 +250,20 @@ pub(crate) fn open_store(path: &Path, readonly: bool) -> Result<Connection> {
         path.display()
     );
     if !readonly {
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        // Concurrent initializers recheck after acquiring the short schema lock.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if current == 0 {
-            tx.execute_batch(GLOBAL_SCHEMA)?;
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        if journal != "wal" {
+            conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         }
-        tx.commit()?;
+        // Reopening a valid WAL store is read-only setup: do not compete with
+        // live artifact writers for a schema transaction that has no work.
+        if version == 0 {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            tx.execute_batch(GLOBAL_SCHEMA)?;
+            tx.commit()?;
+        }
     }
     conn.prepare("SELECT hash,source FROM sources LIMIT 0")?;
     conn.prepare("SELECT key,vector FROM embeddings LIMIT 0")?;
@@ -824,6 +841,94 @@ mod tests {
                 "{error}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_cold_store_opens_share_initialization_through_path_aliases() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("store");
+        std::fs::create_dir(&root)?;
+        let mut roots = vec![root.clone()];
+        roots.push(root.canonicalize()?);
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias)?;
+            roots.push(alias);
+        }
+        for round in 0..8 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let workers: Vec<_> = (0..8)
+                .map(|worker| {
+                    let path = roots[worker % roots.len()].join(format!("global-{round}.sqlite"));
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        open_store(&path, false)
+                    })
+                })
+                .collect();
+            // Join everyone before propagating an error; successful connections
+            // stay open while peers finish opening the same cold store.
+            let results: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("store opener"))
+                .collect();
+            let connections = results.into_iter().collect::<Result<Vec<_>>>()?;
+            for (worker, conn) in connections.iter().enumerate() {
+                assert_eq!(
+                    conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                assert_eq!(
+                    conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
+                    "wal"
+                );
+                conn.execute(
+                    "INSERT INTO sources(hash,source) VALUES(?,?)",
+                    params![worker.to_string(), "shared source"],
+                )?;
+            }
+            assert_eq!(
+                connections[0]
+                    .query_row("SELECT count(*) FROM sources", [], |r| r.get::<_, i64>(0))?,
+                8
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn initialized_store_reopens_without_waiting_for_an_artifact_writer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("global.sqlite");
+        let conn = open_store(&path, false)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO sources VALUES('pending','not committed')", [])?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                for readonly in [false, true] {
+                    let reopened = open_store(&path, readonly)?;
+                    assert_eq!(
+                        reopened.query_row("SELECT count(*) FROM sources", [], |r| r
+                            .get::<_, i64>(0))?,
+                        0,
+                        "uncommitted artifacts must remain invisible"
+                    );
+                }
+                Ok(())
+            })();
+            sender.send(result).expect("opener result receiver");
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        // Release the writer and join even on timeout, so a regression fails
+        // without stranding a worker or waiting for SQLite's full busy timeout.
+        drop(tx);
+        worker.join().expect("store opener");
+        result.context("Opening an initialized WAL store waited for the artifact writer")??;
         Ok(())
     }
 
