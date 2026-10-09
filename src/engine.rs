@@ -2476,12 +2476,9 @@ fn source_paths_subset(
                 });
             }
             candidates.as_ref().is_none_or(|paths| {
-                entry
-                    .path()
-                    .strip_prefix(&filter_root)
+                relative(&filter_root, entry.path())
                     .ok()
-                    .and_then(Path::to_str)
-                    .is_some_and(|path| paths.contains(path))
+                    .is_some_and(|path| paths.contains(&path))
             })
         });
     let mut paths = Vec::new();
@@ -2844,6 +2841,35 @@ mod tests {
             json!({"artifactCachePath":temp.path().join("global.sqlite")}),
         )?;
         Ok((temp, engine))
+    }
+
+    #[test]
+    fn source_paths_subset_normalizes_nested_git_candidates() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        for path in [
+            "nested/new.rs",
+            "nested/deeper/source.rs",
+            "nested/unselected.rs",
+            "other/unselected.rs",
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(path, "fn example() {}")?;
+        }
+        let candidates = HashSet::from([
+            "nested/new.rs".to_owned(),
+            "nested/deeper/source.rs".to_owned(),
+        ]);
+        let paths = source_paths_subset(
+            &root,
+            &temp.path().join("index.sqlite"),
+            &json!({"artifactCachePath":temp.path().join("global.sqlite")}),
+            Some(&candidates),
+            None,
+        )?;
+        assert_eq!(paths, ["nested/deeper/source.rs", "nested/new.rs"]);
+        Ok(())
     }
 
     #[test]

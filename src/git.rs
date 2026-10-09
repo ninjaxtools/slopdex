@@ -1108,10 +1108,15 @@ mod tests {
         repo.commit()?;
         fs::remove_file(repo.root().join("pkg/tracked.rs"))?;
         repo.write("pkg/untracked.rs", "untracked")?;
+        repo.write("pkg/nested/untracked.rs", "nested untracked")?;
         repo.write("pkg/ignored/skip.rs", "ignored")?;
         assert_eq!(
             tracked_untracked_paths(&repo.root().join("pkg"))?.unwrap(),
-            HashSet::from(["tracked.rs".into(), "untracked.rs".into()])
+            HashSet::from([
+                "tracked.rs".into(),
+                "untracked.rs".into(),
+                "nested/untracked.rs".into()
+            ])
         );
         Ok(())
     }
