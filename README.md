@@ -124,35 +124,7 @@ $ slopdex search 'validate session' --code --symbols
 $ slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
 ```
 
-Descriptions refer to source comments found above symbols or at the start of a file. Since not all symbols have descriptions, missing descriptions can optionally be generated with `generate descriptions`, but required an LLM to be configured.
-
-I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low-cost models. If you
-sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
-$5 in credit.
-
-```console
-$ export OPENAI_API_KEY="your-api-key"
-# Or
-# export OPENCODE_API_KEY="your-api-key" # for OpenCode Zen/Go descriptions
-# Or
-# opencode auth login                    # use stored credentials instead of env variables
-
-$ slopdex generate descriptions
-$ slopdex search-descriptions "keep the repository index synchronized"
-```
-
-You can list and configure one of OpenCode's models like this (or use the interactive config):
-
-```console
-$ slopdex help models opencode-go
-$ slopdex config set descriptionProvider opencode-go
-$ slopdex config set descriptionModel gpt-5.6-luna
-$ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
-```
-
-The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
-
-Generated descriptions are cached by the full effective request: configured profile, settings, system instruction, and ordered conversation messages. Paths, source, line ranges, and earlier answers can affect reuse.
+Descriptions refer to source comments found above symbols or at the start of a file. Missing descriptions/comments can optionally be generated with `generate descriptions`, but required an LLM to be configured (see below).
 
 > [!NOTE]
 > Add this to your `AGENTS.md` to use semantic code search with your agent:
@@ -227,11 +199,41 @@ $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 
 The intention of the `describe` command is to use a low-cost model to summarise vector search findings to provide more relevant pre-processed results to a more powerful calling agent. It first performs a vector search and then uses the results to provide a tailored summary/description of relevant code.
 
+The `describe` command requires an LLM to be configured (see below).
+
 ```console
 $ slopdex describe "I want to implement a new rpc endpoint"
 ```
 
 First a `search` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation which generates an explanation which will be emitted along with the `compact` search references. This provides a tailored explanation for the query based on the `expanded` search result along with the `compact` search result and thereby acts as a compaction of the `expanded` result.
+
+### Configure an LLM
+
+I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low-cost models. If you
+sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
+$5 in credit.
+
+```console
+$ export OPENAI_API_KEY="your-api-key"
+# Or
+# export OPENCODE_API_KEY="your-api-key" # for OpenCode Zen/Go descriptions
+# Or
+# opencode auth login                    # use stored credentials instead of env variables
+
+$ slopdex generate descriptions
+$ slopdex search-descriptions "keep the repository index synchronized"
+```
+
+You can list and configure one of OpenCode's models like this (or use the interactive config):
+
+```console
+$ slopdex help models opencode-go
+$ slopdex config set descriptionProvider opencode-go
+$ slopdex config set descriptionModel gpt-5.6-luna
+$ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
+```
+
+The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
 
 ### Interactive Config
 
