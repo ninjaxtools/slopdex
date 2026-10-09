@@ -317,8 +317,9 @@ Symbol embeddings default to 256 native dimensions, capped at the configured
 content embedding dimensions. Optional JSON `symbolDimensions` sets a separate
 symbol embedding dimension; OpenAI `text-embedding-ada-002` uses its full
 dimensions. `-q` embeds available descriptions in the same selector space. A
-separate `<index>.symbols.usearch` index is created lazily from normalized names
-in saved structures. Ordinary map initializes no model.
+separate symbol search channel is opened lazily from normalized names in saved
+structures, using a shared base and a worktree `<index>.symbols.shared.json`
+pointer. Ordinary map initializes no model.
 
 Path and name selection intersect and apply before query result limits, including
 to Markdown results. Cross-search applies these selectors **only to sources**,
@@ -467,11 +468,12 @@ description coverage nor matching description-generator profiles. JSON
 `scoring` reports `similarityMode: "code"` and weights of code `1`, description
 `0`, and file description `0`.
 
-**Neighbor retrieval remains approximate.** Filters run inside USearch graph
-traversal, not on an unfiltered top-k list. Threshold ranges can trigger wider
+**Neighbor retrieval remains approximate.** Base membership masks and selectors
+filter inside USearch graph traversal, not on an unfiltered top-k list. Worktree
+deltas are searched exactly and merged with base hits. Threshold ranges can trigger wider
 retrieval, but neither independent-index merging nor an unlimited output limit
 guarantees exhaustive recall or exact top-k membership. There is no exhaustive
-scan fallback for ANN retrieval; file descriptions are scored directly.
+scan fallback over the full base for ANN retrieval; file descriptions are scored directly.
 Similarity is model-dependent, not a probability of duplication.
 
 ### Reranking, clusters, and output
@@ -662,22 +664,34 @@ source engine. Missing-index failures create no index/cache artifacts and make
 no provider calls.
 
 Existing indexes continue to refresh automatically unless `--no-reindex` is
-given. A compatible legacy default index can still migrate to the XDG location
-before use. Git is optional: indexing reads the working tree and records HEAD
-when available. An unindexed `map` is direct, local inspection; it does not
-initialize an index for a subsequent search.
+given. Git is optional: indexing reads the working tree and records HEAD
+when available. There is no legacy index migration, import, or seeding fallback.
+An unindexed `map` is direct, local inspection; it does not initialize an index
+for a subsequent search.
+
+After an initial scan, Git refresh combines current status, the tree diff from
+the saved checkpoint to HEAD, and previously dirty paths. Revisiting the latter
+detects restored edits even when they no longer appear in status. Branch switches
+do not require an ancestry relationship. Unchanged repeated queries do not read
+and hash every indexed file. Missing checkpoints, non-Git/unborn roots, and
+discovery-policy changes can require a full scan. Candidate files are still
+content-hashed and checked before publication; Git metadata is not content-cache
+validity. There is no filesystem watcher.
 
 ### SQLite authority and USearch sidecars
 
-The default database is `$XDG_CACHE_HOME/slopdex/workspaces/<root-hash>/index.sqlite`
+The default database is `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite`
 (normally `~/.cache/slopdex/...`; `<root-hash>` is SHA-256 of the canonical
-workspace path). Distinct worktrees have independent indexes. SQLite is authoritative
-for file snapshots, callable/chunk records, provenance, diagnostics, descriptions,
-document/query vectors, reusable artifacts, metadata, and cached search results.
-Native schema **3** has normalized `files`, `symbols`, `symbol_names`,
+workspace path). Distinct worktrees have independent live bindings and search-result
+caches. Native schema **4** has normalized `files`, `symbols`, `symbol_names`,
 `search_units`, `unit_embeddings`, `descriptions`, and `diagnostics` tables, plus
-`cache`, `description_content`, `embeddings`, `metadata`, and `search_cache`. Compatibility JSON snapshots
-remain alongside columns; this is not a fully deduplicated representation.
+`metadata` and `search_cache`. File records bind paths to source hashes; embedding
+and description records bind live occurrences to global artifact keys. Source
+text, parse artifacts, document/query vectors, provider artifacts, description
+content, and immutable snapshot manifests are authoritative in the attached global
+SQLite store, not duplicated paid-artifact caches in each worktree. Both databases
+are needed to read the saved snapshot; a workspace database alone is not a portable
+index. Structural metadata retains JSON where appropriate.
 Canonical structure and search units exist independently of semantic embeddings.
 After a map-only refresh, a semantic command's normal refresh prepares missing
 vectors for its active profile.
@@ -686,27 +700,40 @@ Content-addressed parse and model-generated artifacts are durable independently
 of live generations and search-result caches. Completed description/embedding
 work is persisted before final live publication, so retries after an interrupted
 refresh can reuse it. Live changes update the generation and invalidate search
-results without discarding those reusable artifacts.
+results without discarding those reusable artifacts. Published content has an
+immutable snapshot digest covering bindings and relevant parser/profile/policy
+contracts. Automatic garbage collection is not implemented.
+
+Repository relatedness is tracked separately. Linked worktrees are related through
+their canonical common Git directory; observed history roots and full commit IDs
+provide discovery evidence for related clones. Remote URLs are only sanitized
+hints, not merge keys. Registry family membership, roots, commits, and remotes
+never establish cache validity: reuse still depends on exact content and contracts.
 
 ### Shared provider artifacts
 
-An additional per-user SQLite cache at `$XDG_CACHE_HOME/slopdex/artifacts-v2.sqlite`
-shares provider artifacts across local workspaces, even when their workspace indexes
-are different. An optional S3-compatible bucket shares embeddings, file/callable
-descriptions, rerankings, and generated explanations between machines. A lookup
-checks the workspace index, then the per-user cache, then S3 (if configured),
-before calling a provider. Hits are validated and copied into the workspace index.
+The per-user store at `$XDG_CACHE_HOME/slopdex/global-v1.sqlite` is the one
+authoritative local artifact store shared across worktrees and repositories. It
+holds source and parse artifacts, embeddings, description content and generation
+records, rerankings, explanations, and immutable snapshot manifests. A provider
+artifact lookup checks this store, then S3 (if configured), before calling a
+provider. Remote hits are validated and written to the same global store; live
+worktree records reference their keys rather than copying their payloads. A failed
+or incompatible global store is an error, not a workspace-cache fallback.
+An optional S3-compatible bucket shares embeddings, file/callable descriptions,
+rerankings, and generated explanations between machines.
 The bucket stores global content-addressed objects, independent of repository
 identity. A description answer records hashes for its original system instruction,
-generation prompt, configured model profile, settings, and file-description context.
-Each distinct input is stored once by content hash in the per-user SQLite cache
+generation prompt, configured model profile, settings, file-description context,
+and ordered conversation messages.
+Each distinct input is stored once by content hash in the global SQLite store
 and as an S3 content object. A remote hit fetches missing referenced objects
 before using the answer; a missing object is a cache miss. S3 content objects
 are created conditionally, so repeated uploads do not create new versions of
 an existing prompt. The prompt contains
 source text (a whole file for file descriptions), so anyone with bucket access
-can read these content objects and vectors. Git metadata, search results, and USearch files are
-not uploaded.
+can read these content objects and vectors. Source/parse storage and snapshot
+manifests are local; Git metadata, search results, and USearch files are not uploaded.
 
 S3 is best effort: missing objects, outages, and failed uploads cannot prevent
 provider work. Missing keys are fetched with bounded concurrency (up to 10), one
@@ -715,21 +742,27 @@ local write. All S3 objects under `<prefix>/v3/<kind>/<first-two-key-characters>
 are zstd-compressed frames containing the SHA-256 checksum of the uncompressed
 payload, a newline, and the payload. This includes embeddings, description
 records and their referenced content, rerankings, and explanations; the local
-SQLite caches remain uncompressed. Earlier `v2` S3 objects are not read, and
-existing workspace artifacts can be republished under `v3` on refresh. Embedding identities distinguish
+SQLite store remains uncompressed. Earlier `v2` S3 objects are not read. Existing
+global provider artifacts can be published under `v3` on refresh. Embedding
+identities distinguish
 query/document inputs, provider/model/dimensions, and custom endpoints. Generated
-description keys include relevant source hashes and a generation profile covering
-the configured LLM profile, generation settings, and system instruction. Callable
-keys also include qualified symbol name and file-description context. Paths are
-kept as provenance rather than key inputs, so a rename can reuse a matching answer;
-source, profile/settings, or system-instruction changes invalidate reuse. Source
+description keys cover the configured LLM profile, generation settings, system
+instruction, and every ordered message role/content in the effective request.
+The file prompt includes path and complete source; callable turns include symbol,
+line range, and preceding conversation. Renames, line shifts, surrounding-file
+changes, or earlier answers can change the key; reuse requires an identical
+effective request, not merely matching callable source. Source
 descriptions are extracted locally and never sent to a generator for replacement.
 Map without `-q` never contacts S3. An uncached
 semantic query with `--no-reindex` may consult S3 before its provider call.
-Opening an existing workspace index also imports its valid provider artifacts into
-the per-user cache. When S3 is enabled later, the next successful semantic refresh
-uploads existing paid artifacts best effort. Legacy description keys do not match
-the current keys; there is no legacy description-cache import policy.
+When S3 is enabled later, the next successful semantic refresh uploads existing
+global paid artifacts best effort. There is no import or migration from old
+workspace indexes, `artifacts-v2.sqlite`, or legacy description caches.
+
+Parse, embedding, and description misses use per-artifact locks and recheck the
+global store after acquiring them, preventing duplicate work across concurrent
+worktrees. Locks remain held through local persistence, with a bounded 30-second
+wait; unrelated artifact keys can proceed independently.
 
 Example `.slopdex/config.json` fields (credentials come from standard AWS
 environment variables or credentials files, not this JSON):
@@ -748,25 +781,36 @@ environment variables or credentials files, not this JSON):
 
 `endpoint` is optional for AWS S3. S3-compatible services such as MinIO
 typically need `pathStyle: true` (the default when `endpoint` is provided).
-`artifactCachePath` optionally overrides the per-user shared SQLite cache path.
+`artifactCachePath` optionally selects the authoritative global SQLite store.
+Relative paths resolve from the process working directory. Each workspace index
+persists its canonical global-store binding and keeps using it when the override
+is omitted. An explicit override that conflicts with an existing binding requires
+a new index path; `--force-reindex` does not change the binding. The workspace and
+global SQLite paths must differ. An unavailable or incompatible store is not
+silently replaced, migrated, or seeded from a workspace index.
 To run the MinIO integration test against a local server with
 `minioadmin`/`minioadmin` credentials, set `SLOPDEX_MINIO_ENDPOINT` (for example,
 `SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 cargo test --test rust_integration minio_shares_artifacts`).
 
-Persistent derived indexes sit beside the database:
-`<index>.code.usearch`, `<index>.markdown.usearch`, and the independent
-`<index>.descriptions.usearch`, which can be empty when no descriptions exist.
-There is no combined/fusion index. Semantic
-symbol selection adds a lazy `<index>.symbols.usearch` built from name-only
-embeddings derived from saved structures, independently of content indexes. Each has
-a `.manifest.json` sidecar. Valid caches are reconciled incrementally by stable
-item ID and vector hash; unchanged vectors retain their graph entries. Missing,
-corrupt, or incompatible sidecars are rebuilt from SQLite without model calls.
-F32 vectors are loaded into owned memory, not memory-mapped.
+Derived vector indexes are opened lazily per channel: code, Markdown,
+descriptions, and name-only symbols. Worktree pointers sit beside the database as
+`<index>.code.shared.json`, `<index>.markdown.shared.json`,
+`<index>.descriptions.shared.json`, and `<index>.symbols.shared.json`.
+There is no combined/fusion index. Compatible worktrees reuse immutable global
+USearch bases under `<global-store>.indexes/<contract>/`, keyed by embedding
+profile and native index contract. Each pointer
+records exact worktree membership and delta hashes. Membership masks exclude
+deleted or foreign occurrences; vectors absent from the base are searched as an
+exact worktree delta. Large deltas or insufficient active overlap compact into a
+new immutable base. Unchanged membership does not rewrite the pointer or base.
+Missing, corrupt, or incompatible derived caches can be rebuilt from authoritative
+SQLite vectors without model calls; missing embeddings are a separate provider
+operation. F32 vectors use bounds-checked copies into owned memory, not mmap.
 
-An exclusive `<index>.lock` is held for the engine's lifetime. A competing command
-fails promptly with an index-in-use error; retry after it finishes. SQLite uses
-WAL and a 30-second busy timeout. See [architecture](implementation.md#architecture-and-code-map)
+An engine holds `<index>.lock` for its lifetime: shared for read-only opens,
+exclusive for writers. Contention waits up to 10 seconds before an index-in-use
+error; retry after it finishes. Operations needing writes can reopen writable and
+retry. SQLite uses WAL and a 30-second busy timeout. See [architecture](implementation.md#architecture-and-code-map)
 for transaction and sidecar publication details.
 
 ### Descriptions
@@ -798,13 +842,13 @@ file/callable prose. It skips source-described files and callables and all Markd
 files. A source-described file may still have undescribed callables generated,
 using its source description as context. The command opens writable, refreshes
 normally unless `--no-reindex`, then calls `Engine::generate_descriptions()` on
-indexed source. With `--no-reindex`, it uses the saved snapshot but still validates
-Git HEAD and source hashes before publication. Updates, searches, maps, and status
+indexed source. With `--no-reindex`, it skips refresh, but generation still verifies
+live HEAD and affected source before publishing descriptions. Updates, searches, maps, and status
 never generate indexed descriptions automatically. There is no enable/disable control.
 
-Matching generated artifacts are reused. Relevant source hashes, configured
-description profile, generation settings, and system instruction determine reuse;
-changes invalidate it. Generation settings include provider/model, fallback model,
+Matching generated artifacts are reused by the full effective request, including
+the configured description profile, settings, system instruction, and ordered
+conversation messages. Generation settings include provider/model, fallback model,
 endpoint, timeout, retry count, and retry delay. Run `generate descriptions` after
 such changes to regenerate applicable missing/stale generated prose. Source
 descriptions are retained and never replaced by generation.
@@ -816,26 +860,29 @@ symbol and line range. The system instructions and conversation history remain
 an identical prefix across turns so providers can reuse cached input tokens;
 different files can run in parallel up to `parallelism`. Cached or saved file
 descriptions seed the conversation without another generation request. Previously
-saved callable descriptions are reused until regenerated, and multi-line callable
+saved callable descriptions are retained only while their file context remains
+unchanged or a matching request is reused, and multi-line callable
 descriptions are flattened for inline display. `status` reports
 profiles, description counts, and stale-file-description count.
 
 ### Native offline reuse and recovery
 
-`--no-reindex` (engine config `noReindex`) skips refresh completely, with or
-without Git, even for an empty index. It supports offline inspection and
-cross-search of an existing native index; missing derived USearch files can still
-be reconstructed locally. It does not make the database read-only or disable all
-network operations: uncached query vectors/reranking, `describe`, and explicit
-description regeneration still require their providers. Cached queries can run
-offline when the matching artifacts/results exist. Catalog commands still fetch
+`--no-reindex` (engine config `noReindex`) skips refresh and live freshness checks,
+with or without Git, even for an empty index. It uses the saved snapshot and its
+bound global store, regardless of later working-tree changes. It supports offline
+inspection and cross-search of an existing native index; missing derived USearch
+files can still be reconstructed locally. It does not make the database read-only or disable all
+network operations: uncached query/selector vectors, reranking, `describe`, and
+explicit description regeneration may consult artifact caches/S3 or call their
+providers. Cached queries can run offline when the matching artifacts/results
+exist. Catalog commands still fetch
 their catalogs. Use the CLI flag: the CLI overwrites a JSON `noReindex` value with
 the flag's value on every invocation.
 
 `map --no-reindex` without `-q` needs neither providers nor sidecar repair. With no
 index it parses current files directly; with an existing index it uses saved structure.
 With an existing index, adding `-q` may populate name/description/query vectors and repair
-the separate symbol sidecar, using a provider when cache entries are missing.
+the separate symbol channel pointer/base, using a provider when artifacts are missing.
 Without an index, map warns on stdout that `-q` is ignored and parses current
 files directly, including with `--no-reindex`.
 A structure-only index can have search units without vectors; `--no-reindex`
@@ -845,9 +892,10 @@ refresh to prepare them.
 Native index identity includes canonical root and schema. Embedding profiles
 (provider/model/dimensions/strategy) are separate projections: changing a model
 does not reset structural data, and cached vectors from older profiles remain
-available for reuse. Within schema 3, changing the root requires
+available for reuse. Within schema 4, changing the root requires
 `--force-reindex --yes-really-rebuild-the-index`. This clears native live records,
-non-identity metadata, and search results while retaining artifact/vector caches.
+non-identity metadata, and search results while retaining the global-store binding
+and global artifacts/vectors/snapshots.
 A compatible index follows normal refresh even with that flag. It conflicts with
 `--no-reindex`. `--rebuild-on-divergence` is accepted with the same confirmation,
 but the current engine refreshes the working tree without a divergence gate;
@@ -855,41 +903,35 @@ the flag adds no engine behavior.
 
 ### Rebuilding an old index
 
-Native schema **3** is a hard cutoff: **all schema-2 indexes**, old
+Native schema **4** is a hard cutoff: **all earlier native indexes**, old
 `rust_`-prefixed native tables, and TypeScript layouts (including schema 11) are
 rejected with instructions to remove the existing SQLite index and rebuild, or
 choose a new index path. These incompatible layouts are not imported or migrated;
 neither `--force-reindex` nor `--no-reindex` bypasses old-layout rejection.
 
-For an old explicit database, stop any Slopdex process using it, then remove
-that database and its `-wal`/`-shm` companions. A schema-3 index at the former
-default `.slopdex/index.sqlite` is copied automatically to the new XDG default
-location on first use; older incompatible layouts are skipped. Run
-`slopdex update` to create the new index. To rebuild at a fresh default location,
-remove the current index path reported by `slopdex status --format json` and its
-WAL/SHM companions.
-Alternatively, select a new path:
-
-```bash
-slopdex --index /path/to/new-index.sqlite update
-```
-
-For a custom database, remove that SQLite file and its `-wal`/`-shm` companions,
-then run `slopdex --index /path/to/index.sqlite update`. To rebuild at a new,
-unused path instead:
+The `worktrees-v1` default is a fresh namespace. Former `.slopdex/index.sqlite`
+and `workspaces/...` indexes and `artifacts-v2.sqlite` are never copied, imported,
+or used as fallback seeds. Run `slopdex update` to create the new default index.
+For an old explicit database, stop any Slopdex process using it before removing
+that SQLite file and its `-wal`/`-shm` companions, then run update with the same
+`--index` path. Prefer selecting a new, unused path instead:
 
 ```bash
 slopdex --index /path/to/new-index.sqlite update
 ```
 
 Use that same `--index` path on subsequent commands, or save it as `indexPath` in
-config. Rebuilding scans current files and regenerates embeddings using the
-configured providers, including available source descriptions. Run
-`generate descriptions` separately to prepare generated prose where source
-descriptions are absent;
-old database artifacts and saved description settings are not imported.
-Derived USearch sidecars are reconciled
-or rebuilt from the new SQLite snapshot.
+config. Rebuilding scans current files and obtains embeddings from matching
+global/S3 artifacts or the configured providers, including available source
+descriptions. Run `generate descriptions` separately to prepare generated prose
+where source descriptions are absent; old database artifacts and saved
+description settings are not imported.
+Shared derived indexes are opened lazily from the new SQLite snapshot.
+
+Global store schema **1** likewise has no compatibility/import path. To select
+a fresh `artifactCachePath` for an incompatible global store, also select a new
+workspace index path so its binding points to that store. Do not delete a global
+store merely to rebuild one worktree: other indexes can depend on it.
 
 Use `slopdex map` to inspect local structure before creating an index. Run
 `slopdex update` when ready to prepare an index for search.
@@ -924,10 +966,11 @@ Index-using commands warn about saved errors, including with `--no-reindex` and
 for separate cross-search targets. `--ignore-errors` silences warnings without
 clearing records. Help/version do not inspect diagnostics.
 
-Provider failures abort refresh before live publication; completed artifacts
-remain reusable. Refresh checks that HEAD and prepared file hashes have not
-changed before committing. Rerun after edits settle or provider problems are
-resolved. This check is not an atomic filesystem snapshot.
+Provider failures abort semantic publication; the structural snapshot and completed
+global artifacts remain reusable. Normal refresh rechecks HEAD, dirty provenance,
+file selection, ignore policy, candidate metadata, and prepared file hashes before
+committing. Rerun after edits settle or provider problems are resolved. This check
+is not an atomic filesystem snapshot.
 
 ## Root configuration and provider overrides
 
@@ -974,13 +1017,13 @@ Example `.slopdex/config.json`:
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel` | Disabled by default; models default to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, OpenAI `gpt-5.6-luna`. |
 | `rerankerCandidates` | OpenAI candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
-| `artifactCachePath`, `artifactS3` | Shared local cache override and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
+| `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`; larger configured values are capped. Interactive setup defaults to `32`. |
 | `embeddingBaseUrl`, `descriptionBaseUrl`, `rerankerBaseUrl` | Operation-specific HTTP(S) endpoint overrides; JSON only. Include the API version, e.g. `http://localhost:8080/v1`. |
 | `providerTimeoutMs` | Positive request timeout, default `60000`, capped at `300000`; connect timeout is 10 seconds. |
 | `providerMaxRetries` | Integer `0..5`, default `2`, for ordinary retryable HTTP failures. |
 | `retryDelayMs` | Nonnegative exponential-backoff base, default `250`; delays and numeric `Retry-After` are capped at 5 seconds. |
-| `parallelism` | Defaults to `10`; bounds concurrent embedding batches and callable descriptions within each file (also `config set parallelism`). File descriptions run first, files are processed serially, and each successful HTTP result is cached immediately. |
+| `parallelism` | Defaults to `10`; bounds concurrent embedding batches and file conversations (also `config set parallelism`). Each file's description precedes its sequential callable turns; different files can proceed in parallel. Successful artifacts are persisted immediately. |
 | `verbose` | External model-call notices go to stderr once per kind/provider/model per process by default; `true` (also `--verbose`) reports every outgoing attempt, including retries. Kinds are `vectors`, `descriptions`, and `reranking`; notices identify the actual model, including fallback, without credentials, URLs, or input. Construction and cache hits produce no model-call notices. |
 
 Aliases `embeddingProvider`, `embeddingModel`, `embeddingDimensions`, and
@@ -988,7 +1031,8 @@ Aliases `embeddingProvider`, `embeddingModel`, `embeddingDimensions`, and
 Embedding profiles include `strategyVersion: "rust-v1"`. Description profiles
 identify the configured primary with `strategyVersion: "file-conversation-v3"`,
 even while fallback serves requests, and include configured endpoint/fallback
-information. Generation reuse also includes settings and system instruction.
+information. Generation reuse includes settings, system instruction, and the
+complete ordered effective conversation.
 Credentials are not profile inputs. Content embedding profiles are independent
 of the description-generator profile.
 

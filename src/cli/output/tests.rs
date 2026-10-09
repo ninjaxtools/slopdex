@@ -29,10 +29,24 @@ fn indexed_file_and_callable_descriptions_are_comments_at_the_requested_detail()
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let data: Value = serde_json::from_str(&data)?;
-    db.execute("INSERT INTO descriptions(scope,path,identity,source_hash,text,embedding_key) VALUES('file','api.rs','',?,?,NULL)",
-        rusqlite::params![crate::hash(source), "Handles API requests.\nIncludes validation."])?;
-    db.execute("INSERT INTO descriptions(scope,path,identity,source_hash,text,embedding_key) VALUES('callable','api.rs',?,?,?,NULL)",
-        rusqlite::params![identity, data["sourceHash"].as_str(), "Runs work.\nReturns a result."])?;
+    let global_path: String = db.query_row(
+        "SELECT value FROM metadata WHERE key='global_path'",
+        [],
+        |row| row.get(0),
+    )?;
+    db.execute("ATTACH DATABASE ? AS global", [global_path])?;
+    let file_description = "Handles API requests.\nIncludes validation.";
+    let callable_description = "Runs work.\nReturns a result.";
+    for text in [file_description, callable_description] {
+        db.execute(
+            "INSERT OR IGNORE INTO global.description_content(hash,content) VALUES(?,?)",
+            rusqlite::params![crate::hash(text), text],
+        )?;
+    }
+    db.execute("INSERT INTO descriptions(scope,path,identity,source_hash,content_hash,embedding_key) VALUES('file','api.rs','',?,?,NULL)",
+        rusqlite::params![crate::hash(source), crate::hash(file_description)])?;
+    db.execute("INSERT INTO descriptions(scope,path,identity,source_hash,content_hash,embedding_key) VALUES('callable','api.rs',?,?,?,NULL)",
+        rusqlite::params![identity, data["sourceHash"].as_str(), crate::hash(callable_description)])?;
     drop(db);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let engine = loop {

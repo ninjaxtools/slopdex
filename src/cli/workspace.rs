@@ -1,10 +1,8 @@
-//! Workspace paths and index identity and migration.
+//! Workspace paths and index identity.
 
 use crate::cache;
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
-use rusqlite::{Connection, OpenFlags};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     fs, io,
     path::{Component, Path, PathBuf},
@@ -36,7 +34,7 @@ pub(super) fn index_path(root: &Path, explicit: Option<&Path>, config: &Value) -
         .canonicalize()
         .context("Repository root does not exist")?;
     Ok(cache::directory()?
-        .join("workspaces")
+        .join("worktrees-v1")
         .join(crate::hash(root.as_os_str().as_encoded_bytes()))
         .join("index.sqlite"))
 }
@@ -48,55 +46,6 @@ pub(super) fn require_index(index: &Path) -> Result<()> {
         index.display()
     );
     Ok(())
-}
-
-/// Migrate a compatible snapshot with SQLite backup so committed WAL data is included.
-pub(super) fn migrate_legacy_index(root: &Path, index: &Path) -> Result<()> {
-    let old = root.join(".slopdex/index.sqlite");
-    if index.exists() || !old.exists() || same_path(&old, index)? {
-        return Ok(());
-    }
-    let parent = index.parent().context("Index path has no parent")?;
-    fs::create_dir_all(parent)?;
-    let mut lock_path = index.as_os_str().to_os_string();
-    lock_path.push(".lock");
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(PathBuf::from(lock_path))?;
-    lock.lock_exclusive()?;
-    if index.exists() {
-        return Ok(());
-    }
-    let source = Connection::open_with_flags(&old, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let identity: String = match source.query_row(
-        "SELECT value FROM metadata WHERE key='identity'",
-        [],
-        |row| row.get(0),
-    ) {
-        Ok(value) => value,
-        Err(_) => return Ok(()),
-    };
-    if serde_json::from_str::<Value>(&identity)? != json!({"schema":3,"root":root.canonicalize()?})
-    {
-        return Ok(());
-    }
-    let temporary = parent.join(format!(".index.sqlite.migrate-{}", std::process::id()));
-    let copied = (|| -> Result<()> {
-        let mut target = Connection::open(&temporary)?;
-        let backup = rusqlite::backup::Backup::new(&source, &mut target)?;
-        backup.run_to_completion(256, std::time::Duration::from_millis(20), None)?;
-        drop(backup);
-        drop(target);
-        fs::rename(&temporary, index)?;
-        Ok(())
-    })();
-    if copied.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    copied
 }
 
 fn canonical_identity(path: &Path) -> Result<PathBuf> {

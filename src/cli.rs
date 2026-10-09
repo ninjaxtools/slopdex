@@ -13,9 +13,7 @@ use self::{
     config::{effective_config, run_config},
     io::{print_json, with_stdout},
     output::{CrossOutput, Presentation, print_cross, print_errors, print_map, print_search},
-    workspace::{
-        absolute, config_path, index_path, migrate_legacy_index, require_index, same_path,
-    },
+    workspace::{absolute, config_path, index_path, require_index, same_path},
 };
 use crate::{engine::Engine, filter, map, providers::Providers, ui};
 use anyhow::{Context, Result, ensure};
@@ -115,9 +113,6 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
         && let Some(target_index) = &args.target_index
     {
         require_index(&absolute(target_index)?)?;
-    }
-    if cli.global.index.is_none() && config["indexPath"].is_null() {
-        migrate_legacy_index(&root, &index)?;
     }
     if matches!(
         &cli.command,

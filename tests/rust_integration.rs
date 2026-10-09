@@ -359,9 +359,9 @@ impl ConcurrentWork {
 
     fn paid_count(self, db: &Connection) -> Result<usize> {
         let sql = match self {
-            Self::Embeddings => "SELECT count(*) FROM embeddings",
+            Self::Embeddings => "SELECT count(*) FROM global.embeddings",
             Self::Callables => {
-                "SELECT count(*) FROM cache WHERE kind='description' AND json_extract(value,'$.text') LIKE 'callable-summary:%'"
+                "SELECT count(*) FROM global.cache WHERE kind='description' AND json_extract(value,'$.text') LIKE 'callable-summary:%'"
             }
         };
         let count: i64 = db.query_row(sql, [], |row| row.get(0))?;
@@ -434,7 +434,7 @@ impl ConcurrentRequests {
             // Keep one paid request outstanding until an earlier success is
             // visible through a separate SQLite connection. This also catches
             // collecting the whole window before persisting any of its results.
-            let db = Connection::open(&self.index)?;
+            let db = workspace_connection(&self.index)?;
             let deadline = Instant::now() + Duration::from_secs(3);
             while self.work.paid_count(&db)? == 0 {
                 ensure!(
@@ -531,10 +531,14 @@ impl Repo {
     }
 
     fn db(&self) -> Result<Connection> {
-        Ok(Connection::open(&self.index)?)
+        workspace_connection(&self.index)
     }
 
     fn open_map(&self, config: &Value) -> Result<Engine> {
+        let mut config = config.clone();
+        if !self.index.exists() && config.get("artifactCachePath").is_none_or(Value::is_null) {
+            config["artifactCachePath"] = json!(self.home.join("cache/slopdex/global-v1.sqlite"));
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match Engine::open_map(&self.root, &self.index, config.clone()) {
@@ -557,6 +561,7 @@ impl Repo {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.home)
+            .env("XDG_CACHE_HOME", self.home.join("cache"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("NO_PROXY", "*");
@@ -686,22 +691,345 @@ fn near(actual: &Value, expected: f64) {
     );
 }
 
+fn workspace_connection(index: &Path) -> Result<Connection> {
+    let db = Connection::open(index)?;
+    db.busy_timeout(Duration::from_secs(30))?;
+    let global: String = db.query_row(
+        "SELECT value FROM metadata WHERE key='global_path'",
+        [],
+        |row| row.get(0),
+    )?;
+    db.execute("ATTACH DATABASE ? AS global", [global])?;
+    Ok(db)
+}
+
+// Linux inotify observes actual reads, independent of permissions, timestamps,
+// root privileges, or whether an unchanged refresh happens to return zero work.
+#[cfg(target_os = "linux")]
+struct AccessWatch(fs::File);
+
+#[cfg(target_os = "linux")]
+impl AccessWatch {
+    fn new(paths: &[PathBuf]) -> Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn inotify_init1(flags: std::ffi::c_int) -> std::ffi::c_int;
+            fn inotify_add_watch(
+                fd: std::ffi::c_int,
+                path: *const std::ffi::c_char,
+                mask: u32,
+            ) -> std::ffi::c_int;
+        }
+        // O_NONBLOCK | O_CLOEXEC. File owns and closes the returned descriptor.
+        let fd = unsafe { inotify_init1(0x800 | 0x80000) };
+        ensure!(
+            fd >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        for path in paths {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+            let watch = unsafe { inotify_add_watch(file.as_raw_fd(), path.as_ptr(), 1) }; // IN_ACCESS
+            ensure!(
+                watch >= 0,
+                "inotify_add_watch: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(Self(file))
+    }
+
+    fn accessed(&mut self) -> Result<bool> {
+        let mut bytes = [0; 4096];
+        let mut accessed = false;
+        loop {
+            match self.0.read(&mut bytes) {
+                Ok(0) => return Ok(accessed),
+                Ok(_) => accessed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(accessed);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn git_clean_repeated_refresh_and_cached_reopen_do_not_read_sources_or_shared_bases() -> Result<()>
+{
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.git(&["init", "-q"])?;
+    repo.write("api.rs", &function("saved", "VECTOR_EAST"))?;
+    // Avoid Git's racy-clean timestamp check reading freshly written content:
+    // the index records an mtime that is unambiguously older than its own write.
+    fs::File::options()
+        .write(true)
+        .open(repo.root.join("api.rs"))?
+        .set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(946_684_800)),
+        )?;
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "-qm", "initial"])?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let expected = engine.search("east", "search-code", &all())?;
+    let pointer = shared_pointer(&repo, "code")?;
+    let base = shared_base_directory(&repo, &pointer)?
+        .join(format!("{}.usearch", pointer["base_id"].as_str().unwrap()));
+    let mut watch = AccessWatch::new(&[repo.root.join("api.rs"), base.clone()])?;
+    fs::read(repo.root.join("api.rs"))?;
+    assert!(
+        watch.accessed()?,
+        "positive control must observe source reads"
+    );
+    fs::read(&base)?;
+    assert!(
+        watch.accessed()?,
+        "positive control must observe shared base reads"
+    );
+    let calls = mock.count();
+    let generation = engine.status()?["generation"].clone();
+    for _ in 0..3 {
+        let refreshed = engine.refresh()?;
+        assert_eq!(refreshed["filesUpdated"], 0);
+        assert_eq!(refreshed["filesPrepared"], 0);
+        assert_eq!(refreshed["generation"], generation);
+        assert_eq!(engine.search("east", "search-code", &all())?, expected);
+        assert!(
+            !watch.accessed()?,
+            "clean refresh/cache hit must not read source or ANN base"
+        );
+    }
+    drop(engine);
+    let reader = Engine::open_readonly(&repo.root, &repo.index, config.clone())?;
+    assert_eq!(reader.search("east", "search-code", &all())?, expected);
+    assert!(
+        !watch.accessed()?,
+        "cached readonly reopen must not load the shared base"
+    );
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn git_branch_switches_and_dirty_restores_reuse_paid_artifacts_and_shared_base() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.git(&["init", "-q"])?;
+    for (path, name, marker) in [
+        ("keep.rs", "keep", "VECTOR_EAST"),
+        ("other.rs", "other", "VECTOR_MID"),
+        ("edit.rs", "original", "VECTOR_NORTH"),
+    ] {
+        repo.write(path, &function(name, marker))?;
+    }
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "-qm", "initial"])?;
+    repo.git(&["branch", "original"])?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    let original = engine.search("east", "search-code", &all())?;
+    let pointer = shared_pointer(&repo, "code")?;
+    assert!(pointer["delta"].as_object().unwrap().is_empty());
+    let immutable_base = filesystem_snapshot(&shared_base_directory(&repo, &pointer)?)?;
+    repo.git(&["checkout", "-qb", "changed"])?;
+    repo.write("edit.rs", &function("changed", "VECTOR_WEST"))?;
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "-qm", "changed"])?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    let changed = engine.search("east", "search-code", &all())?;
+    assert_eq!(names(&changed), strings(&["keep", "other", "changed"]));
+    let delta = shared_pointer(&repo, "code")?;
+    assert_eq!(delta["base_id"], pointer["base_id"]);
+    assert_ne!(delta["fingerprint"], pointer["fingerprint"]);
+    assert_eq!(delta["delta"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        filesystem_snapshot(&shared_base_directory(&repo, &pointer)?)?,
+        immutable_base,
+        "a small edit publishes a workspace delta without mutating the global base"
+    );
+    let paid = mock.count();
+    for (branch, expected) in [
+        ("original", &original),
+        ("changed", &changed),
+        ("original", &original),
+    ] {
+        repo.git(&["checkout", "-q", branch])?;
+        engine.refresh()?;
+        engine.generate_descriptions()?;
+        let rows = engine.search("east", "search-code", &all())?;
+        assert_eq!(names(&rows), names(expected));
+        for expected in expected {
+            let actual = row(
+                &rows,
+                expected["function"]["qualifiedName"].as_str().unwrap(),
+            );
+            assert_eq!(
+                actual["function"]["description"],
+                expected["function"]["description"]
+            );
+            near(
+                &actual["similarity"],
+                expected["similarity"].as_f64().unwrap(),
+            );
+        }
+        assert_eq!(
+            mock.count(),
+            paid,
+            "restoring a paid branch must reuse descriptions and embeddings"
+        );
+        assert_eq!(
+            shared_pointer(&repo, "code")?["base_id"],
+            pointer["base_id"]
+        );
+    }
+    // The restored path is clean now and absent from current Git status. The
+    // previous dirty set must still bring it into the next refresh's candidates.
+    repo.write("edit.rs", &function("changed", "VECTOR_WEST"))?;
+    engine.refresh()?;
+    assert!(names(&engine.search("east", "search-code", &all())?).contains("changed"));
+    repo.git(&["restore", "edit.rs"])?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        names(&original)
+    );
+    assert_eq!(mock.count(), paid);
+    assert_eq!(engine.refresh()?["filesUpdated"], 0);
+    Ok(())
+}
+
+#[test]
+fn git_policy_changes_force_rescan_and_restoration_reuses_global_artifacts() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    repo.git(&["init", "-q"])?;
+    repo.write("keep.rs", &function("keep", "VECTOR_EAST"))?;
+    repo.write("skip.rs", &function("skip", "VECTOR_MID"))?;
+    repo.write(".ignore", "")?;
+    repo.git(&["add", "."])?;
+    repo.git(&["commit", "-qm", "initial"])?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["keep", "skip"])
+    );
+    let paid = mock.count();
+    repo.write(".ignore", "skip.rs\n")?;
+    assert_eq!(engine.refresh()?["filesDeleted"], 1);
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["keep"])
+    );
+    repo.git(&["restore", ".ignore"])?;
+    engine.refresh()?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["keep", "skip"]),
+        "restoring a now-clean ignore policy must not take the clean fast path"
+    );
+    assert_eq!(mock.count(), paid);
+    drop(engine);
+    config["exclude"] = json!(["skip.rs"]);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.refresh()?["filesDeleted"], 1);
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["keep"]),
+        "unchanged Git HEAD cannot hide a changed effective indexing policy"
+    );
+    assert_eq!(mock.count(), paid);
+    Ok(())
+}
+
+#[test]
+fn global_parses_reuse_renamed_same_dialect_paths_and_isolate_languages() -> Result<()> {
+    let mock = Mock::start()?;
+    let first = Repo::new()?;
+    let second = Repo::new()?;
+    let config = mock.config();
+    let source = "export function shared() { return 42; }\n";
+    first.write("src/original.ts", source)?;
+    let mut engine = first.open(&config)?;
+    engine.refresh()?;
+    let parses = artifact_counts(&first)?.1;
+    assert_eq!(parses, 1);
+    let calls = mock.count();
+    second.write("nested/renamed.ts", source)?;
+    let mut other = second.open(&config)?;
+    other.refresh()?;
+    assert_eq!(artifact_counts(&second)?.1, parses);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "same-dialect rename must reuse its content vector"
+    );
+    let mapped = other.map(&json!({"private":true}))?;
+    assert_eq!(map_names(&mapped), strings(&["shared"]));
+    assert_eq!(mapped[0]["path"], "nested/renamed.ts");
+    fs::rename(
+        second.root.join("nested/renamed.ts"),
+        second.root.join("nested/restored.ts"),
+    )?;
+    other.refresh()?;
+    assert_eq!(artifact_counts(&second)?.1, parses);
+    assert_eq!(
+        other.map(&json!({"private":true}))?[0]["path"],
+        "nested/restored.ts"
+    );
+    second.write("same.js", source)?;
+    other.refresh()?;
+    assert_eq!(
+        artifact_counts(&second)?.1,
+        parses + 1,
+        "identical bytes need a separate JavaScript parse contract"
+    );
+    let versions: BTreeSet<String> = second
+        .db()?
+        .prepare("SELECT DISTINCT parser_version FROM files")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(
+        versions,
+        strings(&[slopdex::storage::STRUCTURE_PARSER_VERSION])
+    );
+    Ok(())
+}
+
 fn file_record(repo: &Repo, path: &str) -> Result<Value> {
-    let text: String =
-        repo.db()?
-            .query_row("SELECT data FROM files WHERE path=?", [path], |r| r.get(0))?;
-    Ok(serde_json::from_str(&text)?)
+    let db = slopdex::storage::Database::open_readonly(&repo.index, &repo.root.canonicalize()?)?;
+    let file = db
+        .files()?
+        .into_iter()
+        .find(|file| file.path == path)
+        .with_context(|| format!("missing file {path}"))?;
+    Ok(serde_json::to_value(file)?)
 }
 
 fn artifact_counts(repo: &Repo) -> Result<(i64, i64, i64)> {
     let db = repo.db()?;
     Ok((
-        db.query_row("SELECT count(*) FROM embeddings", [], |r| r.get(0))?,
-        db.query_row("SELECT count(*) FROM cache WHERE kind='parse'", [], |r| {
-            r.get(0)
-        })?,
+        db.query_row("SELECT count(*) FROM global.embeddings", [], |r| r.get(0))?,
         db.query_row(
-            "SELECT count(*) FROM cache WHERE kind='description'",
+            "SELECT count(*) FROM global.cache WHERE kind='parse'",
+            [],
+            |r| r.get(0),
+        )?,
+        db.query_row(
+            "SELECT count(*) FROM global.cache WHERE kind='description'",
             [],
             |r| r.get(0),
         )?,
@@ -1969,20 +2297,27 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
     engine.refresh()?;
     engine.generate_descriptions()?;
     let expected = engine.search("east", "search", &all())?;
+    assert_eq!(
+        engine.search("east", "search-descriptions", &all())?.len(),
+        4
+    );
     let expected_status = engine.status()?;
     let calls = mock.count();
     drop(engine);
-    let sidecars: Vec<PathBuf> = ["code", "markdown", "descriptions"]
-        .iter()
-        .flat_map(|kind| {
-            let path = format!("{}.{kind}.usearch", repo.index.display());
-            [
-                PathBuf::from(&path),
-                PathBuf::from(format!("{path}.manifest.json")),
-            ]
-        })
-        .collect();
-    for round in 0..3 {
+    for round in 0..4 {
+        let mut sidecars = BTreeSet::new();
+        for kind in ["code", "markdown", "descriptions"] {
+            let pointer = shared_pointer(&repo, kind)?;
+            let directory = shared_base_directory(&repo, &pointer)?;
+            let id = pointer["base_id"].as_str().unwrap();
+            sidecars.insert(PathBuf::from(format!(
+                "{}.{kind}.shared.json",
+                repo.index.display()
+            )));
+            sidecars.insert(directory.join(format!("{id}.usearch")));
+            sidecars.insert(directory.join(format!("{id}.usearch.manifest.json")));
+            sidecars.insert(directory.join(format!("{id}.base.json")));
+        }
         for path in &sidecars {
             assert!(path.is_file());
             match round {
@@ -1992,12 +2327,32 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
                     // reject the corrupt binary before USearch tries to load it.
                     fs::write(path, b"not a valid binary")?;
                 }
-                2 if path.extension().is_some_and(|e| e == "json") => {
+                2 if path.to_string_lossy().ends_with(".base.json") => {
                     fs::write(path, b"not a valid manifest")?;
+                }
+                3 if path.to_string_lossy().ends_with(".shared.json") => {
+                    fs::write(path, b"not a valid pointer")?;
                 }
                 _ => {}
             }
         }
+        let global_indexes = PathBuf::from(format!(
+            "{}.indexes",
+            config["artifactCachePath"].as_str().unwrap()
+        ));
+        let damaged = filesystem_snapshot(&global_indexes)?;
+        let damaged_pointers: Vec<_> = ["code", "markdown", "descriptions"]
+            .into_iter()
+            .map(|kind| fs::read(format!("{}.{kind}.shared.json", repo.index.display())).ok())
+            .collect();
+        #[cfg(target_os = "linux")]
+        let mut watch = AccessWatch::new(
+            &sidecars
+                .iter()
+                .filter(|path| path.is_file() && !path.to_string_lossy().ends_with(".shared.json"))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )?;
         let engine = repo.open(&config)?;
         assert_eq!(engine.status()?, expected_status);
         assert_eq!(
@@ -2005,6 +2360,26 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
             expected,
             "persisted result cache survives restart"
         );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !watch.accessed()?,
+            "cached queries must not read corrupt shared bases or manifests"
+        );
+        assert_eq!(
+            filesystem_snapshot(&global_indexes)?,
+            damaged,
+            "cache hits must not rebuild or publish shared bases"
+        );
+        for (kind, bytes) in ["code", "markdown", "descriptions"]
+            .into_iter()
+            .zip(damaged_pointers)
+        {
+            assert_eq!(
+                fs::read(format!("{}.{kind}.shared.json", repo.index.display())).ok(),
+                bytes,
+                "cache hits must not rewrite shared pointers"
+            );
+        }
         // Different options bypass the result cache, proving rebuilt ANN indexes work.
         let options = json!({"minSimilarity": -1, "limit": 20 + round, "code": true, "md": true});
         assert_eq!(engine.search("east", "search", &options)?, expected);
@@ -2120,16 +2495,28 @@ fn description_lifecycle_indexes_independent_scores_and_generates_only_missing_o
     )?;
     engine.refresh()?;
     assert_eq!(mock.requests("/responses").len(), 6);
+    let stale = engine.search("east", "search", &all())?;
+    assert_eq!(row(&stale, "alpha")["function"]["description"], Value::Null);
+    let embedding_count = mock.embedding_inputs().len();
     assert_eq!(engine.generate_descriptions()?["filesPrepared"], 1);
     assert_eq!(
         mock.requests("/responses").len(),
-        7,
-        "only the stale file description is regenerated for a file-only edit"
+        8,
+        "a file-only edit invalidates file and callable generation context"
     );
     let regenerated = engine.search("east", "search", &all())?;
-    assert_eq!(
+    assert_ne!(
         row(&regenerated, "alpha")["function"]["description"],
         callable
+    );
+    assert_eq!(mock.embedding_inputs().len(), embedding_count + 2);
+    assert!(
+        mock.embedding_inputs().contains(
+            &row(&regenerated, "alpha")["function"]["description"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        )
     );
     let calls = mock.count();
     assert_eq!(engine.generate_descriptions()?["filesPrepared"], 0);
@@ -2678,7 +3065,7 @@ fn cli_missing_resolved_source_indexes_fail_without_artifacts_or_provider_calls(
                 repo.index.clone()
             } else {
                 repo.home
-                    .join("cache/slopdex/workspaces")
+                    .join("cache/slopdex/worktrees-v1")
                     .join(slopdex::hash(
                         repo.root.canonicalize()?.as_os_str().as_encoded_bytes(),
                     ))
@@ -3024,7 +3411,7 @@ fn open_waits_for_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot
 fn current_map_reads_share_the_lock_and_stale_maps_wait_for_writers() -> Result<()> {
     let repo = Repo::new()?;
     repo.write("source.rs", "pub fn first() {}\n")?;
-    let mut writer = Engine::open_map(&repo.root, &repo.index, json!({}))?;
+    let mut writer = repo.open_map(&json!({}))?;
     writer.refresh_structure()?;
     drop(writer);
 
@@ -3068,7 +3455,8 @@ fn current_map_reads_share_the_lock_and_stale_maps_wait_for_writers() -> Result<
 }
 
 #[test]
-fn refresh_invalidates_only_changed_callable_descriptions_without_generating() -> Result<()> {
+fn refresh_invalidates_all_callable_descriptions_in_changed_file_context_without_generating()
+-> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     repo.write(
@@ -3093,14 +3481,14 @@ fn refresh_invalidates_only_changed_callable_descriptions_without_generating() -
     );
     assert_eq!(
         row(&disabled, "untouched")["function"]["description"],
-        row(&before, "untouched")["function"]["description"]
+        Value::Null
     );
-    assert_eq!(engine.status()?["descriptionCount"], 1);
+    assert_eq!(engine.status()?["descriptionCount"], 0);
     assert_eq!(engine.status()?["staleFileDescriptionCount"], 1);
     assert_eq!(mock.requests("/responses").len(), 3);
     engine.generate_descriptions()?;
     assert_eq!(engine.status()?["descriptionCount"], 2);
-    assert_eq!(mock.requests("/responses").len(), 5);
+    assert_eq!(mock.requests("/responses").len(), 6);
     assert_ne!(
         file_record(&repo, "code.rs")?["description"],
         saved_file["description"]
@@ -3109,6 +3497,10 @@ fn refresh_invalidates_only_changed_callable_descriptions_without_generating() -
     assert_ne!(
         row(&enabled, "edited")["function"]["description"],
         row(&before, "edited")["function"]["description"]
+    );
+    assert_ne!(
+        row(&enabled, "untouched")["function"]["description"],
+        row(&before, "untouched")["function"]["description"]
     );
     near(&row(&enabled, "edited")["similarity"], 0.0);
     Ok(())
@@ -3512,6 +3904,10 @@ fn regression_failed_generation_reuses_completed_descriptions_after_generation_c
     engine.refresh()?;
     let status = engine.status()?;
     let stale_file = file_record(&repo, "code.rs")?;
+    let stale = engine.search("east", "search", &all())?;
+    for name in ["alpha", "beta"] {
+        assert_eq!(row(&stale, name)["function"]["description"], Value::Null);
+    }
     assert_eq!(status["staleFileDescriptionCount"], 1);
     assert_eq!(mock.requests("/responses").len(), 3);
     repo.db()?.execute_batch(
@@ -3528,13 +3924,13 @@ fn regression_failed_generation_reuses_completed_descriptions_after_generation_c
     );
     assert_eq!(
         mock.requests("/responses").len(),
-        4,
-        "stale file generation completed before publication failed"
+        6,
+        "stale file and callable generation completed before publication failed"
     );
     let mut engine = repo.open(&config)?;
     assert_eq!(engine.status()?, status);
     assert_eq!(file_record(&repo, "code.rs")?, stale_file);
-    assert_eq!(engine.search("east", "search", &all())?, before);
+    assert_eq!(engine.search("east", "search", &all())?, stale);
     repo.db()?
         .execute_batch("DROP TRIGGER regression_reindex_abort")?;
     // Move generation independently of the failed file's source. A cache key
@@ -3563,7 +3959,7 @@ fn regression_failed_generation_reuses_completed_descriptions_after_generation_c
     assert_ne!(file["description"], stale_file["description"]);
     let after = engine.search("east", "search", &all())?;
     for name in ["alpha", "beta"] {
-        assert_eq!(
+        assert_ne!(
             row(&after, name)["function"]["description"],
             row(&before, name)["function"]["description"]
         );
@@ -3920,7 +4316,7 @@ fn cli_unindexed_map_requires_update_before_search_and_existing_indexes_refresh(
 }
 
 #[test]
-fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens_offline()
+fn map_publishes_schema4_structure_without_models_or_vector_sidecars_and_reopens_offline()
 -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
@@ -3960,7 +4356,7 @@ fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens
     let db = repo.db()?;
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
-        3
+        4
     );
     let identity: String =
         db.query_row("SELECT value FROM metadata WHERE key='identity'", [], |r| {
@@ -3968,7 +4364,25 @@ fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens
         })?;
     assert_eq!(
         serde_json::from_str::<Value>(&identity)?,
-        json!({"schema":3,"root":repo.root.canonicalize()?})
+        json!({"schema":4,"root":repo.root.canonicalize()?})
+    );
+    let columns: BTreeSet<String> = db
+        .prepare("PRAGMA main.table_info(files)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert!(!columns.contains("source") && !columns.contains("data"));
+    let paid_tables: i64 = db.query_row(
+        "SELECT count(*) FROM main.sqlite_master WHERE name IN ('embeddings','cache','description_content','sources')",
+        [], |row| row.get(0),
+    )?;
+    assert_eq!(
+        paid_tables, 0,
+        "workspace state must not duplicate global artifacts"
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM global.sources", [], |row| row
+            .get::<_, i64>(0))?,
+        2
     );
     assert!(db.query_row("SELECT count(*) FROM symbols", [], |r| r.get::<_, i64>(0))? >= 4);
     assert!(
@@ -3977,7 +4391,7 @@ fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens
             > 0
     );
     assert_eq!(
-        db.query_row("SELECT count(*) FROM embeddings", [], |r| r
+        db.query_row("SELECT count(*) FROM global.embeddings", [], |r| r
             .get::<_, i64>(0))?,
         0
     );
@@ -3996,8 +4410,8 @@ fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens
 
     repo.write("src/api.ts", "export function not_indexed() {}\n")?;
     fs::remove_file(repo.root.join("guide.md"))?;
-    // Neither the parse cache nor compatibility JSON is an authoritative map source.
-    db.execute_batch("DELETE FROM cache WHERE kind='parse'; UPDATE files SET data='{}';")?;
+    // The normalized local structure remains authoritative without cached parses.
+    db.execute("DELETE FROM global.cache WHERE kind='parse'", [])?;
     config["noReindex"] = json!(true);
     let mut engine = repo.open_map(&config)?;
     assert_eq!(engine.refresh_structure()?["skipped"], true);
@@ -4015,13 +4429,13 @@ fn map_publishes_schema3_structure_without_models_or_vector_sidecars_and_reopens
     );
     assert_eq!(mock.count(), 0);
     for kind in ["code", "markdown", "descriptions", "combined"] {
-        let path = PathBuf::from(format!("{}.{kind}.usearch", repo.index.display()));
+        let path = PathBuf::from(format!("{}.{kind}.shared.json", repo.index.display()));
         assert!(
             !path.exists(),
             "map created a vector sidecar: {}",
             path.display()
         );
-        assert!(!PathBuf::from(format!("{}.manifest.json", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}.{kind}.usearch", repo.index.display())).exists());
     }
     Ok(())
 }
@@ -4096,7 +4510,8 @@ fn map_call_graph_expands_cross_file_chains_and_rebuilds_after_edits() -> Result
 fn expanded_call_depths_force_code_only_within_their_own_levels() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
     repo.write("a.py", "from b import middle\n\ndef outer():\n    return middle()\n\ndef outermost():\n    return outer()\n")?;
     repo.write(
         "b.py",
@@ -4107,7 +4522,7 @@ fn expanded_call_depths_force_code_only_within_their_own_levels() -> Result<()> 
         "from d import deepest\n\ndef leaf():\n    return deepest()\n",
     )?;
     repo.write("d.py", "def deepest():\n    return 1\n")?;
-    let mut engine = repo.open_map(&json!({}))?;
+    let mut engine = repo.open_map(&config)?;
     engine.refresh_structure()?;
     let just_expanded = engine
         .map(&json!({"kinds":["fns"],"regexp":["^middle$"],"expandCallers":2,"expandCallees":1}))?;
@@ -5325,7 +5740,7 @@ fn symbol_map_normalizes_bare_names_and_indexes_noncallables_without_content() -
     let ordinary = engine.map(&json!({}))?;
     assert!(map_names(&ordinary).contains("Ordinary"));
     assert_eq!(mock.count(), 0);
-    assert!(!PathBuf::from(format!("{}.symbols.usearch", repo.index.display())).exists());
+    assert!(!PathBuf::from(format!("{}.symbols.shared.json", repo.index.display())).exists());
 
     let options = json!({"symbolQuery":"VECTOR_NORTH"});
     let selected = engine.map(&options)?;
@@ -5626,7 +6041,7 @@ fn symbol_map_cli_no_reindex_populates_lazy_cache_and_expands_only_direct_select
     assert_eq!((after.1, after.2), (before.1, before.2));
     assert!(mock.requests("/responses").is_empty());
     for kind in ["code", "markdown", "descriptions", "combined"] {
-        assert!(!PathBuf::from(format!("{}.{kind}.usearch", repo.index.display())).exists());
+        assert!(!PathBuf::from(format!("{}.{kind}.shared.json", repo.index.display())).exists());
     }
     Ok(())
 }
@@ -6145,7 +6560,7 @@ fn search_symbols_native_dimensions_share_map_vectors_and_support_cached_readonl
     let mapped = engine.map(&json!({"symbolQuery":"HTTP2VectorNorth"}))?;
     assert_eq!(map_names(&mapped), strings(&["HTTP2VectorNorth"]));
     let manifest = symbol_manifest(&first)?;
-    assert_eq!(manifest["dimensions"], 2);
+    assert_eq!(shared_base(&first, &manifest)?["dimensions"], 2);
     let calls = mock.count();
     assert_eq!(calls, 2, "one symbol vocabulary batch and one query");
     let rows = engine.search("http_2_vector_north", "search-symbols", &all())?;
@@ -6154,7 +6569,7 @@ fn search_symbols_native_dimensions_share_map_vectors_and_support_cached_readonl
     assert_eq!(
         symbol_manifest(&first)?,
         manifest,
-        "reuse the existing .symbols.usearch vocabulary"
+        "reuse the existing shared symbol vocabulary pointer"
     );
     let selector = json!({"symbols":true, "minSimilarity":-1});
     assert_eq!(
@@ -6172,7 +6587,7 @@ fn search_symbols_native_dimensions_share_map_vectors_and_support_cached_readonl
     for query in [false, true] {
         let key = slopdex::storage::Database::embedding_key(&profile, query, "http 2 vector north");
         let bytes: i64 = first.db()?.query_row(
-            "SELECT length(vector) FROM embeddings WHERE key=?",
+            "SELECT length(vector) FROM global.embeddings WHERE key=?",
             [key],
             |row| row.get(0),
         )?;
@@ -6207,7 +6622,10 @@ fn search_symbols_native_dimensions_share_map_vectors_and_support_cached_readonl
         calls,
         "a different index hydrates shared symbol document/query artifacts"
     );
-    assert_eq!(symbol_manifest(&second)?["dimensions"], 2);
+    assert_eq!(
+        shared_base(&second, &symbol_manifest(&second)?)?["dimensions"],
+        2
+    );
     assert_name_only_work(&first, &mock)?;
     assert_name_only_work(&second, &mock)?;
     Ok(())
@@ -6237,7 +6655,7 @@ fn search_symbols_mixed_modes_rank_separate_streams_with_global_limits_and_expli
     assert!(plain.iter().all(|row| row["type"] != "symbol"));
     assert!(plain.iter().any(|row| row["type"] == "document"));
     assert!(
-        !PathBuf::from(format!("{}.symbols.usearch", repo.index.display())).exists(),
+        !PathBuf::from(format!("{}.symbols.shared.json", repo.index.display())).exists(),
         "explicit content search does not initialize symbols"
     );
     let options = json!({"glob":["*.rs", "*.md"], "minSimilarity":-1});
@@ -6566,7 +6984,7 @@ fn search_symbols_cli_saved_snapshot_json_summary_and_expanded_callable_heading_
     assert!(after.0 > before.0);
     assert_eq!((after.1, after.2), (before.1, before.2));
     for kind in ["code", "markdown", "descriptions", "combined"] {
-        assert!(!PathBuf::from(format!("{}.{kind}.usearch", repo.index.display())).exists());
+        assert!(!PathBuf::from(format!("{}.{kind}.shared.json", repo.index.display())).exists());
     }
     assert_name_only_work(&repo, &mock)?;
     Ok(())
@@ -6607,7 +7025,7 @@ fn search_symbols_cli_refreshes_only_structure_without_generating_descriptions()
     );
     assert_eq!(mock.count(), calls);
     for kind in ["code", "markdown", "descriptions", "combined"] {
-        assert!(!PathBuf::from(format!("{}.{kind}.usearch", repo.index.display())).exists());
+        assert!(!PathBuf::from(format!("{}.{kind}.shared.json", repo.index.display())).exists());
     }
     assert_name_only_work(&repo, &mock)?;
     Ok(())
@@ -6638,10 +7056,43 @@ fn search_symbols_cli_missing_index_fails_before_providers_or_filesystem_writes(
 }
 
 fn symbol_manifest(repo: &Repo) -> Result<Value> {
-    Ok(serde_json::from_slice(&fs::read(format!(
-        "{}.symbols.usearch.manifest.json",
+    shared_pointer(repo, "symbols")
+}
+
+fn shared_pointer(repo: &Repo, kind: &str) -> Result<Value> {
+    let pointer: Value = serde_json::from_slice(&fs::read(format!(
+        "{}.{kind}.shared.json",
         repo.index.display()
-    ))?)?)
+    ))?)?;
+    assert_eq!(pointer["version"], 1);
+    for field in ["contract", "base_id", "fingerprint"] {
+        let hash = pointer[field]
+            .as_str()
+            .context("missing shared pointer hash")?;
+        assert_eq!(hash.len(), 64, "{field}: {pointer}");
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+    assert!(pointer["membership"].is_object());
+    assert!(pointer["delta"].is_object());
+    Ok(pointer)
+}
+
+fn shared_base_directory(repo: &Repo, pointer: &Value) -> Result<PathBuf> {
+    let global: String = repo.db()?.query_row(
+        "SELECT value FROM metadata WHERE key='global_path'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(PathBuf::from(format!("{global}.indexes")).join(pointer["contract"].as_str().unwrap()))
+}
+
+fn shared_base(repo: &Repo, pointer: &Value) -> Result<Value> {
+    Ok(serde_json::from_slice(&fs::read(
+        shared_base_directory(repo, pointer)?.join(format!(
+            "{}.base.json",
+            pointer["base_id"].as_str().unwrap()
+        )),
+    )?)?)
 }
 
 #[test]
@@ -6660,7 +7111,8 @@ fn symbol_map_refresh_reconciles_new_deleted_and_renamed_names_without_reembeddi
         strings(&["VectorNorthKeep", "VectorNorthRename"])
     );
     let manifest = symbol_manifest(&repo)?;
-    assert_eq!(manifest["vectors"].as_object().unwrap().len(), 3);
+    assert_eq!(manifest["membership"].as_object().unwrap().len(), 3);
+    assert!(manifest["delta"].as_object().unwrap().is_empty());
     let inputs = mock.embedding_inputs().len();
     repo.write("keep.ts", "export function VectorNorthKeep() { return 'changed VECTOR_WEST body'; }\nexport function VectorMidRenamed() {}\nexport const VECTOR_WEST_NEW = 2;\n")?;
     fs::remove_file(repo.root.join("deleted.ts"))?;
@@ -6684,9 +7136,11 @@ fn symbol_map_refresh_reconciles_new_deleted_and_renamed_names_without_reembeddi
         strings(&["vector mid renamed", "vector west new"])
     );
     let reconciled = symbol_manifest(&repo)?;
-    assert_eq!(reconciled["generation"], refreshed["generation"]);
     assert_ne!(reconciled["fingerprint"], manifest["fingerprint"]);
-    assert_eq!(reconciled["vectors"].as_object().unwrap().len(), 3);
+    assert_eq!(reconciled["membership"].as_object().unwrap().len(), 3);
+    // Only one of three base names remains, forcing a compacted shared base.
+    assert_ne!(reconciled["base_id"], manifest["base_id"]);
+    assert!(reconciled["delta"].as_object().unwrap().is_empty());
     assert_eq!(
         map_names(&engine.map(&json!({"symbolQuery":"VECTOR_WEST", "symbolThreshold":0.7}))?),
         strings(&["VECTOR_WEST_NEW"])
@@ -6701,7 +7155,7 @@ fn symbol_map_refresh_reconciles_new_deleted_and_renamed_names_without_reembeddi
     );
     assert_eq!(mock.count(), calls);
     assert_eq!(
-        symbol_manifest(&repo)?["vectors"]
+        symbol_manifest(&repo)?["membership"]
             .as_object()
             .unwrap()
             .len(),
@@ -6790,7 +7244,7 @@ fn symbol_native_dimensions_profiles_and_shared_cache_are_isolated_and_reusable(
         assert_eq!(request.body["input"], json!(["vector north"]));
     }
     let manifest = symbol_manifest(&first)?;
-    assert_eq!(manifest["dimensions"], 2);
+    assert_eq!(shared_base(&first, &manifest)?["dimensions"], 2);
     let content_profile = slopdex::providers::Providers::new(&small)?.embedding_profile();
     assert_eq!(content_profile["dimensions"], 4);
     assert!(content_profile.get("symbolNormalizationVersion").is_none());
@@ -6800,7 +7254,7 @@ fn symbol_native_dimensions_profiles_and_shared_cache_are_isolated_and_reusable(
     let bytes_for = |repo: &Repo, profile: &Value, query| -> Result<i64> {
         let key = slopdex::storage::Database::embedding_key(profile, query, "vector north");
         Ok(repo.db()?.query_row(
-            "SELECT length(vector) FROM embeddings WHERE key=?",
+            "SELECT length(vector) FROM global.embeddings WHERE key=?",
             [key],
             |r| r.get(0),
         )?)
@@ -6818,7 +7272,10 @@ fn symbol_native_dimensions_profiles_and_shared_cache_are_isolated_and_reusable(
     let mut other = second.open(&small)?;
     other.refresh_structure()?;
     assert_eq!(other.map(&options)?, selected);
-    assert_eq!(symbol_manifest(&second)?["dimensions"], 2);
+    assert_eq!(
+        shared_base(&second, &symbol_manifest(&second)?)?["dimensions"],
+        2
+    );
     assert_eq!(
         mock.count(),
         small_calls,
@@ -6829,7 +7286,7 @@ fn symbol_native_dimensions_profiles_and_shared_cache_are_isolated_and_reusable(
     let engine = first.open(&default)?;
     assert_eq!(engine.map(&options)?, selected);
     assert_eq!(
-        symbol_manifest(&first)?["dimensions"],
+        shared_base(&first, &symbol_manifest(&first)?)?["dimensions"],
         4,
         "default symbol dimensions are min(content, 256)"
     );
@@ -6943,7 +7400,7 @@ fn symbol_map_without_index_warns_on_stdout_and_ignores_queries_without_provider
     );
     assert_eq!(mock.count(), 0);
     assert_eq!(artifact_counts(&repo)?.0, 0);
-    assert!(!PathBuf::from(format!("{}.symbols.usearch", repo.index.display())).exists());
+    assert!(!PathBuf::from(format!("{}.symbols.shared.json", repo.index.display())).exists());
     Ok(())
 }
 
@@ -7221,7 +7678,7 @@ fn rerank_and_task_description_caches_survive_restart_and_unrelated_generation_c
 }
 
 #[test]
-fn schema3_file_columns_are_authoritative_for_saved_description_context() -> Result<()> {
+fn missing_global_source_artifacts_report_actionable_diagnostics() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let config = mock.config();
@@ -7229,22 +7686,32 @@ fn schema3_file_columns_are_authoritative_for_saved_description_context() -> Res
     repo.write("code.rs", &source)?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
-    let expected = engine.search("east", "search-code", &all())?;
     drop(engine);
-    repo.db()?.execute("UPDATE files SET data='{}'", [])?;
-    fs::remove_file(repo.root.join("code.rs"))?;
-    let engine = repo.open(&config)?;
-    assert_eq!(engine.search("east", "search-code", &all())?, expected);
-    engine.describe("east", &json!({"minSimilarity":0.9}))?;
-    let requests = mock.requests("/responses");
-    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(
-        prompt.contains(&format!("@ code:\n{}", source.trim_end())),
-        "{prompt}"
+    let calls = mock.count();
+    assert_eq!(
+        repo.db()?.execute(
+            "DELETE FROM global.sources WHERE hash=?",
+            [slopdex::hash(&source)]
+        )?,
+        1
     );
-    assert!(!prompt.contains("Full source code for best matching files"));
+    let error = match repo.open(&config) {
+        Ok(_) => anyhow::bail!("missing global source must not open as a complete index"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("source") && error.contains("code.rs"),
+        "{error}"
+    );
+    assert!(
+        error.contains("slopdex update") || error.contains("rebuild"),
+        "{error}"
+    );
+    assert_eq!(
+        mock.count(),
+        calls,
+        "a missing source artifact must not call providers"
+    );
     Ok(())
 }
 
@@ -7296,6 +7763,63 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
     );
     drop(engine);
 
+    let first_db = workspace_connection(&first)?;
+    let second_db = workspace_connection(&second)?;
+    assert_eq!(
+        first_db.query_row("SELECT count(*) FROM search_cache", [], |row| row
+            .get::<_, i64>(0))?,
+        0,
+        "result cache belongs only to the workspace that searched"
+    );
+    assert!(
+        second_db.query_row("SELECT count(*) FROM search_cache", [], |row| row
+            .get::<_, i64>(0))?
+            > 0
+    );
+    for db in [&first_db, &second_db] {
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM global.sources", [], |row| row
+                .get::<_, i64>(0))?,
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM global.cache WHERE kind='parse'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM global.cache WHERE kind='description'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            2
+        );
+        assert_eq!(db.query_row("SELECT count(*) FROM main.sqlite_master WHERE name IN ('sources','embeddings','cache','description_content')", [], |row| row.get::<_, i64>(0))?, 0);
+    }
+    let engine = Engine::open(&roots[0], &first, config.clone())?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        names(&results)
+    );
+    assert_eq!(
+        mock.count(),
+        calls + 1,
+        "a local result-cache miss still reuses the global query vector"
+    );
+    let pointer = |index: &Path| -> Result<Value> {
+        Ok(serde_json::from_slice(&fs::read(format!(
+            "{}.code.shared.json",
+            index.display()
+        ))?)?)
+    };
+    assert_eq!(pointer(&first)?["base_id"], pointer(&second)?["base_id"]);
+    assert_eq!(pointer(&first)?["contract"], pointer(&second)?["contract"]);
+    drop(engine);
+
     let other = Mock::start()?;
     let mut other_config = other.config();
     other_config["artifactCachePath"] = json!(cache);
@@ -7305,6 +7829,75 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
     assert!(
         !other.embedding_inputs().is_empty(),
         "different endpoint must not reuse vectors"
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_workspaces_share_provider_requests_and_snapshot_artifacts() -> Result<()> {
+    let mock = Mock::start()?;
+    let first = Repo::new()?;
+    let second = Repo::new()?;
+    let config = mock.config();
+    for repo in [&first, &second] {
+        repo.write("src/api.rs", &function("shared", "VECTOR_EAST"))?;
+    }
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = [&first, &second]
+        .into_iter()
+        .map(|repo| {
+            let root = repo.root.clone();
+            let index = repo.index.clone();
+            let config = config.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || -> Result<Value> {
+                let mut engine = Engine::open(&root, &index, config)?;
+                barrier.wait();
+                engine.refresh()?;
+                engine.generate_descriptions()?;
+                engine.status()
+            })
+        })
+        .collect();
+    let statuses: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("workspace worker"))
+        .collect::<Result<_>>()?;
+    assert_eq!(statuses[0]["snapshot"], statuses[1]["snapshot"]);
+    assert_ne!(statuses[0]["indexPath"], statuses[1]["indexPath"]);
+    assert_eq!(
+        mock.requests("/responses").len(),
+        2,
+        "one shared file request and one shared callable request"
+    );
+    let inputs = mock.embedding_inputs();
+    assert_eq!(
+        inputs.len(),
+        3,
+        "code, file prose and callable prose are each paid once"
+    );
+    assert_eq!(inputs.iter().collect::<BTreeSet<_>>().len(), inputs.len());
+    let db = first.db()?;
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM global.sources", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM global.cache WHERE kind='parse'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM global.cache WHERE kind='unit-content'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        1
     );
     Ok(())
 }
@@ -7338,12 +7931,9 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
     config["artifactS3"] =
         json!({"bucket": bucket, "endpoint": endpoint, "region": "us-east-1", "prefix":"tests"});
     let mut repos = Vec::new();
-    for ordinal in 0..3 {
+    for _ in 0..3 {
         let repo = Repo::new()?;
-        repo.write(
-            if ordinal == 1 { "renamed.rs" } else { "api.rs" },
-            &function("shared", "VECTOR_EAST"),
-        )?;
+        repo.write("api.rs", &function("shared", "VECTOR_EAST"))?;
         repo.write(".slopdex/config.json", &config.to_string())?;
         repos.push(repo);
     }
@@ -7378,14 +7968,14 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
     assert_eq!(mock.count(), paid, "second machine must reuse S3 artifacts");
     let first_index = repos[0]
         .home
-        .join("cache/slopdex/workspaces")
+        .join("cache/slopdex/worktrees-v1")
         .join(slopdex::hash(
             repos[0].root.canonicalize()?.as_os_str().as_encoded_bytes(),
         ))
         .join("index.sqlite");
-    let index = Connection::open(first_index)?;
+    let index = workspace_connection(&first_index)?;
     let (file_key, record): (String, String) = index.query_row(
-        "SELECT key,value FROM cache WHERE kind='description' AND json_extract(value,'$.generation.scope')='file'",
+        "SELECT key,value FROM global.cache WHERE kind='description' AND json_extract(value,'$.generation.scope')='file'",
         [], |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let metadata: Value = serde_json::from_str(&record)?;
@@ -7401,7 +7991,7 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
     let remote_content = created.bucket.get_object(&content_object)?;
     assert_eq!(remote_content.status_code(), 200);
     let stored_system: String = index.query_row(
-        "SELECT content FROM description_content WHERE hash=?",
+        "SELECT content FROM global.description_content WHERE hash=?",
         [system_hash],
         |row| row.get(0),
     )?;
@@ -7413,7 +8003,7 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
         "could not remove a remote context object"
     );
     let missing = Repo::new()?;
-    missing.write("moved.rs", &function("shared", "VECTOR_EAST"))?;
+    missing.write("api.rs", &function("shared", "VECTOR_EAST"))?;
     missing.write(".slopdex/config.json", &config.to_string())?;
     run(&missing, false)?;
     assert!(
@@ -7493,122 +8083,171 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
 }
 
 #[test]
-fn default_xdg_index_migrates_legacy_sqlite_without_discarding_wal_data() -> Result<()> {
+fn default_xdg_worktrees_use_v4_global_store_and_reuse_paid_embeddings() -> Result<()> {
     let mock = Mock::start()?;
-    let repo = Repo::new()?;
-    let config = mock.config();
-    repo.write(".slopdex/config.json", &config.to_string())?;
-    repo.write("api.rs", &function("saved", "VECTOR_EAST"))?;
-    let legacy = repo.root.join(".slopdex/index.sqlite");
-    let mut engine = Engine::open(&repo.root, &legacy, config)?;
-    engine.refresh()?;
-    let expected_rows = engine.search("east", "search-code", &all())?;
-    let generation = engine.status()?["generation"].clone();
-    drop(engine);
-    let calls = mock.count();
-    let xdg = repo.home.join("xdg-cache");
-    let searched = repo
-        .child(env!("CARGO_BIN_EXE_slopdex"))
-        .arg("--root")
-        .arg(&repo.root)
-        .args([
-            "--no-reindex",
-            "--format",
-            "json",
-            "search-code",
-            "east",
-            "--threshold",
-            "-1",
-        ])
-        .env("XDG_CACHE_HOME", &xdg)
-        .output()?;
-    ensure!(
-        searched.status.success(),
-        "{}",
-        String::from_utf8_lossy(&searched.stderr)
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&searched.stdout)?,
-        json!(expected_rows)
-    );
-    let output = repo
-        .child(env!("CARGO_BIN_EXE_slopdex"))
-        .arg("--root")
-        .arg(&repo.root)
-        .arg("--no-reindex")
-        .args(["--format", "json", "status"])
-        .env("XDG_CACHE_HOME", &xdg)
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let status: Value = serde_json::from_slice(&output.stdout)?;
-    let expected = xdg
-        .join("slopdex/workspaces")
-        .join(slopdex::hash(
-            repo.root.canonicalize()?.as_os_str().as_encoded_bytes(),
-        ))
-        .join("index.sqlite")
-        .canonicalize()?;
-    assert_eq!(status["indexPath"], json!(expected));
-    assert_eq!(status["generation"], generation);
-    assert_eq!(status["fileCount"], 1);
-    assert!(legacy.exists() && expected.exists());
-    assert_eq!(mock.count(), calls);
-    Ok(())
-}
-
-#[test]
-fn existing_workspace_vectors_seed_new_shared_cache_without_provider_calls() -> Result<()> {
-    let mock = Mock::start()?;
-    let temp = tempfile::tempdir()?;
-    let source = function("saved", "VECTOR_EAST");
-    let roots: Vec<_> = ["original", "other"]
-        .into_iter()
-        .map(|name| temp.path().join(name))
-        .collect();
-    for root in &roots {
-        fs::create_dir(root)?;
-        fs::write(root.join("api.rs"), &source)?;
-    }
+    let first = Repo::new()?;
+    let second = Repo::new()?;
     let mut config = mock.config();
-    let original = roots[0].join("index.sqlite");
-    // Like Repo::open, tolerate brief flock inheritance by concurrent test children.
-    let open = |root: &PathBuf, index: &PathBuf, config: Value| {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match Engine::open(root, index, config.clone()) {
-                Err(error)
-                    if error.to_string().starts_with("Index is in use")
-                        && Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(10))
-                }
-                result => break result,
-            }
+    config.as_object_mut().unwrap().remove("artifactCachePath");
+    for repo in [&first, &second] {
+        repo.write(".slopdex/config.json", &config.to_string())?;
+        repo.write("api.rs", &function("saved", "VECTOR_EAST"))?;
+    }
+    let xdg = first.home.join("shared-cache");
+    let mut calls = None;
+    let mut pointers = Vec::new();
+    for repo in [&first, &second] {
+        let output = isolated_cli(repo, None)
+            .env("XDG_CACHE_HOME", &xdg)
+            .args(["--format", "json", "update"])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = isolated_cli(repo, None)
+            .env("XDG_CACHE_HOME", &xdg)
+            .args([
+                "--no-reindex",
+                "--format",
+                "json",
+                "search-code",
+                "east",
+                "--threshold",
+                "-1",
+            ])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<Value> = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(names(&rows), strings(&["saved"]));
+        let index = xdg
+            .join("slopdex/worktrees-v1")
+            .join(slopdex::hash(
+                repo.root.canonicalize()?.as_os_str().as_encoded_bytes(),
+            ))
+            .join("index.sqlite");
+        let db = workspace_connection(&index)?;
+        assert_eq!(
+            db.query_row("PRAGMA main.user_version", [], |row| row.get::<_, i64>(0))?,
+            4
+        );
+        let global: String = db.query_row(
+            "SELECT value FROM metadata WHERE key='global_path'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            PathBuf::from(global),
+            xdg.join("slopdex/global-v1.sqlite").canonicalize()?
+        );
+        let pointer: Value =
+            serde_json::from_slice(&fs::read(format!("{}.code.shared.json", index.display()))?)?;
+        pointers.push(pointer);
+        if let Some(paid) = calls {
+            assert_eq!(
+                mock.count(),
+                paid,
+                "a new default worktree reuses the global document and query embeddings"
+            );
+        } else {
+            calls = Some(mock.count());
         }
-    };
-    let mut engine = open(&roots[0], &original, config.clone())?;
-    engine.refresh()?;
-    drop(engine);
-    let calls = mock.count();
-    config["artifactCachePath"] = json!(temp.path().join("fresh-shared.sqlite"));
-    drop(open(&roots[0], &original, config.clone())?);
-    let mut other = open(&roots[1], &roots[1].join("index.sqlite"), config)?;
-    other.refresh()?;
+    }
+    assert_eq!(pointers[0]["contract"], pointers[1]["contract"]);
+    assert_eq!(pointers[0]["base_id"], pointers[1]["base_id"]);
+    assert_eq!(pointers[0]["delta"], json!({}));
+    assert_eq!(pointers[1]["delta"], json!({}));
+    Ok(())
+}
+
+#[test]
+fn description_keys_distinguish_full_file_context_and_earlier_assistant_turns() -> Result<()> {
+    let mock = Mock::start()?;
+    let config = mock.config();
+    let first = Repo::new()?;
+    let second = Repo::new()?;
+    let third = Repo::new()?;
+    let target = "pub fn target() -> i32 { 42 }\n";
+    let before = "pub fn before() -> i32 { 1 }\n";
+    let changed_before = "pub fn before() -> i32 { 2 }\n";
+    for (repo, source) in [
+        (
+            &first,
+            format!("//! Fixed source description\n\n{before}{target}"),
+        ),
+        (
+            &second,
+            format!("//! Fixed source description\n\n{changed_before}{target}"),
+        ),
+        (
+            &third,
+            format!("//! Fixed source description\n\n\n{before}{target}"),
+        ),
+    ] {
+        repo.write("api.rs", &source)?;
+    }
+    let mut texts = Vec::new();
+    for (ordinal, repo) in [&first, &second, &third].into_iter().enumerate() {
+        let mut engine = repo.open(&config)?;
+        engine.refresh()?;
+        engine.generate_descriptions()?;
+        assert_eq!(
+            mock.requests("/responses").len(),
+            (ordinal + 1) * 2,
+            "same target source and file prose cannot satisfy changed full-file context or line prompts"
+        );
+        let text: String = repo.db()?.query_row(
+            "SELECT c.content FROM descriptions d JOIN global.description_content c ON c.hash=d.content_hash
+             JOIN search_units u ON u.path=d.path AND u.identity=d.identity
+             WHERE d.scope='callable' AND json_extract(u.data,'$.qualifiedName')='target'",
+            [], |row| row.get(0),
+        )?;
+        texts.push(text);
+        let paid = mock.count();
+        engine.generate_descriptions()?;
+        assert_eq!(
+            mock.count(),
+            paid,
+            "identical effective transcript stays warm"
+        );
+    }
+    assert_eq!(texts.iter().collect::<BTreeSet<_>>().len(), 3);
+    let target_requests: Vec<_> = mock
+        .requests("/responses")
+        .into_iter()
+        .filter(|request| description_prompt(&request.body).contains("Symbol: target\n"))
+        .collect();
+    assert_eq!(target_requests.len(), 3);
+    let messages = target_requests[0].body["input"].as_array().unwrap();
     assert_eq!(
-        mock.count(),
-        calls,
-        "existing paid vectors must seed the shared cache"
+        messages.len(),
+        5,
+        "target follows the file and first callable turns"
+    );
+    assert_eq!(
+        messages[1]["content"][0]["text"],
+        "Fixed source description"
+    );
+    assert_ne!(
+        messages[3], target_requests[1].body["input"][3],
+        "earlier assistant output differs"
+    );
+    assert_ne!(
+        description_prompt(&target_requests[0].body),
+        description_prompt(&target_requests[2].body),
+        "moving unchanged source changes the final line-range prompt"
     );
     Ok(())
 }
 
 #[test]
-fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retain_context()
--> Result<()> {
+fn description_keys_include_path_context_profiles_settings_and_effective_transcript() -> Result<()>
+{
     let mock = Mock::start()?;
     let first = Repo::new()?;
     let second = Repo::new()?;
@@ -7622,13 +8261,13 @@ fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retai
     engine.generate_descriptions()?;
     let description = file_record(&first, "src/old.rs")?["description"].clone();
     let callable: String = first.db()?.query_row(
-        "SELECT text FROM descriptions WHERE scope='callable' AND path='src/old.rs'",
+        "SELECT c.content FROM descriptions d JOIN global.description_content c ON c.hash=d.content_hash WHERE d.scope='callable' AND d.path='src/old.rs'",
         [],
         |row| row.get(0),
     )?;
     let rows: Vec<(String, Value)> = first
         .db()?
-        .prepare("SELECT key,value FROM cache WHERE kind='description'")?
+        .prepare("SELECT key,value FROM global.cache WHERE kind='description'")?
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
@@ -7639,12 +8278,13 @@ fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retai
         .collect::<Result<_>>()?;
     assert_eq!(rows.len(), 2);
     let db = first.db()?;
+    let requests = mock.requests("/responses");
     for (key, artifact) in &rows {
         let generation = &artifact["generation"];
         let content = |field: &str| -> Result<String> {
             let content_hash = generation[field].as_str().context("missing content hash")?;
             let text: String = db.query_row(
-                "SELECT content FROM description_content WHERE hash=?",
+                "SELECT content FROM global.description_content WHERE hash=?",
                 [content_hash],
                 |row| row.get(0),
             )?;
@@ -7660,13 +8300,57 @@ fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retai
         let prompt = content("prompt_hash")?;
         let first_message = &generation["messages"][0];
         let context: String = db.query_row(
-            "SELECT content FROM description_content WHERE hash=?",
+            "SELECT content FROM global.description_content WHERE hash=?",
             [first_message["content_hash"].as_str().unwrap()],
             |row| row.get(0),
         )?;
         assert!(context.contains("File: src/old.rs"));
         assert!(context.contains("VECTOR_EAST"));
         assert!(prompt.starts_with("Describe"));
+        let transcript: Vec<Value> = generation["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                let text: String = db.query_row(
+                    "SELECT content FROM global.description_content WHERE hash=?",
+                    [message["content_hash"].as_str().unwrap()],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    slopdex::hash(&text),
+                    message["content_hash"].as_str().unwrap()
+                );
+                Ok(json!({"role":message["role"], "text":text}))
+            })
+            .collect::<Result<_>>()?;
+        let request = requests
+            .iter()
+            .find(|request| {
+                format!(
+                    "{}: {}",
+                    if generation["scope"] == "file" {
+                        "file-summary"
+                    } else {
+                        "callable-summary"
+                    },
+                    slopdex::hash(request.body["input"].to_string())
+                ) == artifact["text"]
+            })
+            .context("artifact must correspond to a paid effective request")?;
+        let wire: Vec<_> = request.body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| json!({"role":message["role"], "text":message["content"][0]["text"]}))
+            .collect();
+        assert_eq!(
+            transcript, wire,
+            "every effective user/assistant turn must be retained"
+        );
+        assert_eq!(system, request.body["instructions"]);
+        assert_eq!(prompt, description_prompt(&request.body));
+        assert_eq!(profile["model"], request.body["model"]);
         assert!(artifact["generation"].get("prompt").is_none());
         assert!(artifact["generation"].get("system").is_none());
         assert!(
@@ -7679,18 +8363,35 @@ fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retai
     fs::rename(first.root.join("src/old.rs"), first.root.join("src/new.rs"))?;
     engine.refresh()?;
     engine.generate_descriptions()?;
-    assert_eq!(mock.requests("/responses").len(), calls);
     assert_eq!(
+        mock.requests("/responses").len(),
+        calls + 2,
+        "renaming changes the path in the effective request context"
+    );
+    assert_ne!(
         file_record(&first, "src/new.rs")?["description"],
         description
     );
-    assert_eq!(
+    assert_ne!(
         first.db()?.query_row::<String, _, _>(
-            "SELECT text FROM descriptions WHERE scope='callable' AND path='src/new.rs'",
+            "SELECT c.content FROM descriptions d JOIN global.description_content c ON c.hash=d.content_hash WHERE d.scope='callable' AND d.path='src/new.rs'",
             [],
             |row| row.get(0)
         )?,
         callable
+    );
+    let calls = mock.requests("/responses").len();
+    fs::rename(first.root.join("src/new.rs"), first.root.join("src/old.rs"))?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    assert_eq!(
+        mock.requests("/responses").len(),
+        calls,
+        "restoring the identical path and full transcript reuses the original artifacts"
+    );
+    assert_eq!(
+        file_record(&first, "src/old.rs")?["description"],
+        description
     );
     drop(engine);
 
@@ -7713,7 +8414,7 @@ fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retai
     );
     assert_ne!(
         second.db()?.query_row::<String, _, _>(
-            "SELECT text FROM descriptions WHERE scope='callable' AND path='src/another.rs'",
+            "SELECT c.content FROM descriptions d JOIN global.description_content c ON c.hash=d.content_hash WHERE d.scope='callable' AND d.path='src/another.rs'",
             [],
             |row| row.get(0)
         )?,
@@ -7721,7 +8422,7 @@ fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retai
     );
     let profile_keys: BTreeSet<String> = second
         .db()?
-        .prepare("SELECT key FROM cache WHERE kind='description'")?
+        .prepare("SELECT key FROM global.cache WHERE kind='description' AND json_extract(value,'$.generation.path')='src/another.rs'")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     assert!(profile_keys.is_disjoint(&rows.iter().map(|(key, _)| key.clone()).collect()));
@@ -7739,7 +8440,7 @@ fn description_keys_reuse_renames_but_invalidate_profiles_and_settings_and_retai
     );
     let setting_keys: BTreeSet<String> = second
         .db()?
-        .prepare("SELECT key FROM cache WHERE kind='description'")?
+        .prepare("SELECT key FROM global.cache WHERE kind='description' AND json_extract(value,'$.generation.path')='src/another.rs'")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     assert_eq!(setting_keys.difference(&profile_keys).count(), 2);
@@ -7767,7 +8468,7 @@ fn description_context_is_stored_once_by_hash_across_callable_artifacts() -> Res
     engine.generate_descriptions()?;
     let db = repo.db()?;
     let rows: Vec<Value> = db
-        .prepare("SELECT value FROM cache WHERE kind='description'")?
+        .prepare("SELECT value FROM global.cache WHERE kind='description'")?
         .query_map([], |row| row.get::<_, String>(0))?
         .map(|row| Ok(serde_json::from_str(&row?)?))
         .collect::<Result<_>>()?;
@@ -7799,6 +8500,12 @@ fn description_context_is_stored_once_by_hash_across_callable_artifacts() -> Res
             .iter()
             .map(|message| message["content_hash"].as_str().unwrap().to_owned())
     }))
+    // Live description bindings also reference interned response text. The last
+    // callable answer is not part of a later generation's message transcript.
+    .chain(
+        rows.iter()
+            .map(|row| slopdex::hash(row["text"].as_str().unwrap())),
+    )
     .collect();
     let source_messages: BTreeSet<_> = refs
         .iter()
@@ -7809,13 +8516,15 @@ fn description_context_is_stored_once_by_hash_across_callable_artifacts() -> Res
         1,
         "full-file context is stored once across every turn"
     );
-    let count: i64 = db.query_row("SELECT count(*) FROM description_content", [], |row| {
-        row.get(0)
-    })?;
+    let count: i64 = db.query_row(
+        "SELECT count(*) FROM global.description_content",
+        [],
+        |row| row.get(0),
+    )?;
     assert_eq!(count as usize, all_hashes.len());
     for content_hash in &all_hashes {
         let text: String = db.query_row(
-            "SELECT content FROM description_content WHERE hash=?",
+            "SELECT content FROM global.description_content WHERE hash=?",
             [content_hash],
             |row| row.get(0),
         )?;
@@ -7828,11 +8537,10 @@ fn description_context_is_stored_once_by_hash_across_callable_artifacts() -> Res
                 .contains("Describe existing source code accurately")
     }));
     let local = Connection::open(mock.cache.path().join("artifacts.sqlite"))?;
-    let local_count: i64 = local.query_row(
-        "SELECT count(*) FROM artifacts WHERE kind='content'",
-        [],
-        |row| row.get(0),
-    )?;
+    let local_count: i64 =
+        local.query_row("SELECT count(*) FROM description_content", [], |row| {
+            row.get(0)
+        })?;
     assert_eq!(local_count, count);
     Ok(())
 }

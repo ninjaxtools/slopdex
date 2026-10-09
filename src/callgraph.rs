@@ -31,10 +31,36 @@ pub struct Expansion {
     pub comments: BTreeMap<Key, Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct CallGraph {
     pub files: BTreeMap<String, FileStructure>,
+    #[serde(with = "edge_map")]
     edges: BTreeMap<Key, BTreeSet<Key>>,
+    #[serde(with = "edge_map")]
     reverse: BTreeMap<Key, BTreeSet<Key>>,
+}
+
+mod edge_map {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        edges: &BTreeMap<Key, BTreeSet<Key>>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        edges.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<BTreeMap<Key, BTreeSet<Key>>, D::Error> {
+        let entries = Vec::<(Key, BTreeSet<Key>)>::deserialize(deserializer)?;
+        let count = entries.len();
+        let edges: BTreeMap<_, _> = entries.into_iter().collect();
+        if edges.len() != count {
+            return Err(serde::de::Error::custom("Duplicate call graph key"));
+        }
+        Ok(edges)
+    }
 }
 
 fn callable(node: &StructureNode) -> bool {

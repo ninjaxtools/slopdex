@@ -8,6 +8,7 @@ pub mod map;
 pub mod models;
 pub mod parse;
 pub mod providers;
+mod registry;
 pub mod storage;
 mod symbols;
 mod ui;

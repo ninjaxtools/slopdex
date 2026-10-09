@@ -60,7 +60,7 @@ fn config_round_trip_preserves_unknown_fields_and_resolves_cwd_paths() {
         index_path(&root, None, &config).unwrap(),
         cache::directory()
             .unwrap()
-            .join("workspaces")
+            .join("worktrees-v1")
             .join(crate::hash(
                 root.canonicalize().unwrap().as_os_str().as_encoded_bytes()
             ))

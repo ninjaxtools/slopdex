@@ -2,7 +2,6 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use slopdex::{
-    cache::Artifacts,
     engine::Engine,
     hash, parse,
     providers::Providers,
@@ -58,7 +57,7 @@ impl Fixture {
         let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
         let index = temp.path().join("index.sqlite");
         let config = test_config(&temp);
-        let mut db = Database::open(&index, temp.path(), &Value::Null, false)?;
+        let mut db = Database::open_with_config(&index, temp.path(), &config, false)?;
         let mut records = Vec::new();
         for &(path, source) in sources {
             fs::write(temp.path().join(path), source)?;
@@ -126,7 +125,7 @@ impl Fixture {
         config["dimensions"] = json!(dimensions);
         let mut profile = Providers::new(&config)?.embedding_profile();
         profile["symbolNormalizationVersion"] = json!("symbols-v1");
-        let db = Database::open(&self.index, self.temp.path(), &Value::Null, false)?;
+        let db = Database::open_with_config(&self.index, self.temp.path(), &self.config, false)?;
         for (input, query, axis) in [
             ("run", false, 1),
             ("limit", false, 1),
@@ -205,10 +204,26 @@ fn default_search_unions_all_indexes_and_explicit_selectors_agree() -> Result<()
             .any(|row| row["type"] == "function" && row["function"]["path"] == "b.rs")
     );
     assert!(all.iter().any(|row| row["type"] == "markdown"));
+    for kind in ["code", "markdown", "descriptions", "symbols"] {
+        let pointer: Value = serde_json::from_slice(&fs::read(
+            fixture
+                .index
+                .with_extension(format!("sqlite.{kind}.shared.json")),
+        )?)?;
+        assert_eq!(pointer["version"], 1);
+        assert!(!pointer["membership"].as_object().unwrap().is_empty());
+        assert_eq!(pointer["fingerprint"].as_str().unwrap().len(), 64);
+        assert!(
+            !fixture
+                .index
+                .with_extension(format!("sqlite.{kind}.usearch"))
+                .exists()
+        );
+    }
     assert!(
         !fixture
             .index
-            .with_extension("sqlite.combined.usearch")
+            .with_extension("sqlite.combined.shared.json")
             .exists()
     );
     Ok(())
@@ -217,21 +232,14 @@ fn default_search_unions_all_indexes_and_explicit_selectors_agree() -> Result<()
 #[test]
 fn description_similarity_is_independent_of_code_and_file_prose() -> Result<()> {
     let fixture = Fixture::new(true)?;
-    let db = Database::open_readonly(&fixture.index, fixture.temp.path())?;
-    let item = db
-        .items()?
-        .into_iter()
-        .find(|item| item.kind == "function")
-        .unwrap();
-    let description_index = fixture.index.with_extension("sqlite.descriptions.usearch");
-    // A disposable index from the old callable+file concatenation is rebuilt.
-    slopdex::vectors::VectorIndex::open(
+    let description_index = fixture
+        .index
+        .with_extension("sqlite.descriptions.shared.json");
+    // An incompatible shared pointer must be replaced using durable vectors.
+    fs::write(
         &description_index,
-        4,
-        db.generation()?,
-        &[(item.id, vec![1.0, 0.0, 0.0, 1.0])],
+        br#"{"version":0,"contract":"old-concatenated-descriptions"}"#,
     )?;
-    drop(db);
     let engine = fixture.engine()?;
     let rows = engine.search(
         "copper token",
@@ -247,10 +255,34 @@ fn description_similarity_is_independent_of_code_and_file_prose() -> Result<()> 
     let symbol = rows.iter().find(|row| row["type"] == "symbol").unwrap();
     assert_eq!(symbol["symbol"]["name"], "LIMIT");
     assert!(symbol.get("codeSimilarity").is_none());
-    let manifest: Value = serde_json::from_str(&fs::read_to_string(
-        description_index.with_extension("usearch.manifest.json"),
+    // File descriptions are scored independently without synthetic item IDs.
+    let all = engine.search(
+        "copper token",
+        "search-descriptions",
+        &json!({"minSimilarity":-1}),
+    )?;
+    assert_eq!(all.len(), 4);
+    assert_eq!(all.iter().filter(|row| row["type"] == "file").count(), 2);
+    let manifest: Value = serde_json::from_str(&fs::read_to_string(&description_index)?)?;
+    assert_eq!(manifest["membership"].as_object().unwrap().len(), 2);
+    assert!(manifest["delta"].as_object().unwrap().is_empty());
+    let base: Value = serde_json::from_slice(&fs::read(
+        PathBuf::from(format!(
+            "{}.indexes",
+            fixture.config["artifactCachePath"].as_str().unwrap()
+        ))
+        .join(manifest["contract"].as_str().unwrap())
+        .join(format!(
+            "{}.base.json",
+            manifest["base_id"].as_str().unwrap()
+        )),
     )?)?;
-    assert_eq!(manifest["dimensions"], 2);
+    assert_eq!(base["dimensions"], 2);
+    assert_eq!(
+        base["embeddings"].as_object().unwrap().len(),
+        1,
+        "identical callable and symbol prose is stored once despite two live occurrences"
+    );
     Ok(())
 }
 
@@ -277,9 +309,10 @@ fn cross_search_description_scores_do_not_affect_ranking_limits_or_thresholds() 
             ),
         ],
     )?;
-    let db = Database::open(&fixture.index, fixture.temp.path(), &Value::Null, false)?;
+    let db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
     // Embeddings are immutable; replace the fixture's uniform vectors before opening.
-    db.conn.execute("DELETE FROM embeddings", [])?;
+    db.conn.execute("DELETE FROM global.embeddings", [])?;
     let profile = Providers::new(&fixture.config)?.embedding_profile();
     let files = db.files()?;
     for item in db.items()? {
@@ -411,7 +444,8 @@ fn structural_map_description_queries_select_precise_declarations() -> Result<()
     assert_eq!(rows[0]["path"], "a.rs");
     assert_eq!(rows[0]["nodes"].as_array().unwrap().len(), 2);
     assert_eq!(rows, engine.map(&options)?);
-    let db = Database::open(&fixture.index, fixture.temp.path(), &Value::Null, false)?;
+    let db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
     assert!(
         db.items()?
             .iter()
@@ -419,9 +453,13 @@ fn structural_map_description_queries_select_precise_declarations() -> Result<()
     );
     let generation = db.generation()?;
     db.conn.execute(
-        "UPDATE descriptions SET text='silver token' WHERE scope='callable' AND path='a.rs'
+        "INSERT OR IGNORE INTO global.description_content(hash,content) VALUES(?,'silver token')",
+        [hash("silver token")],
+    )?;
+    db.conn.execute(
+        "UPDATE descriptions SET content_hash=? WHERE scope='callable' AND path='a.rs'
          AND identity=(SELECT identity FROM search_units WHERE path='a.rs' AND kind='function')",
-        [],
+        [hash("silver token")],
     )?;
     assert_eq!(db.generation()?, generation);
     let changed = engine.map(&options)?;
@@ -438,10 +476,8 @@ fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Resul
     let index = temp.path().join(".slopdex/index.sqlite");
     let config = test_config(&temp);
     let profile = Providers::new(&config)?.embedding_profile();
-    let db = Database::open(&index, temp.path(), &Value::Null, false)?;
-    // Keep vectors out of the workspace DB so refresh must prepare the new
-    // records and hydrate their content-addressed vectors from the local cache.
-    let artifacts = Artifacts::open(&config);
+    let db = Database::open_with_config(&index, temp.path(), &config, false)?;
+    // Seed the configured global store before publishing workspace bindings.
     for (path, source) in [
         (
             "source.rs",
@@ -469,11 +505,10 @@ fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Resul
             .map(|callable| &callable.embedding_input)
             .chain(parsed.chunks.iter().map(|chunk| &chunk.embedding_input))
         {
-            artifacts.put_embedding(
-                &db,
+            db.put_embedding(
                 &Database::embedding_key(&profile, false, input),
                 &[0.0, 1.0],
-            );
+            )?;
         }
         for text in parsed
             .structure
@@ -493,18 +528,13 @@ fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Resul
             } else {
                 [0.0, 1.0]
             };
-            artifacts.put_embedding(
-                &db,
-                &Database::embedding_key(&profile, false, text),
-                &vector,
-            );
+            db.put_embedding(&Database::embedding_key(&profile, false, text), &vector)?;
         }
     }
-    artifacts.put_embedding(
-        &db,
+    db.put_embedding(
         &Database::embedding_key(&profile, true, "copper token"),
         &[1.0, 0.0],
-    );
+    )?;
     drop(db);
     let fixture = Fixture {
         temp,
@@ -515,7 +545,10 @@ fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Resul
     let mut engine = fixture.engine()?;
     let refreshed = engine.refresh().context("Refresh source-only fixture")?;
     assert_eq!(refreshed["filesUpdated"], 3);
-    assert_eq!(refreshed["filesPrepared"], 3);
+    assert_eq!(
+        refreshed["filesPrepared"], 0,
+        "all vectors were seeded globally"
+    );
     assert!(engine.errors()?.is_empty());
     let options = json!({"minSimilarity":0.9});
     let before = engine

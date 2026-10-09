@@ -16,6 +16,10 @@ use std::{
 };
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
+#[path = "vectors/shared.rs"]
+mod shared;
+pub use shared::SharedIndex;
+
 const VERSION: u32 = 1;
 const CONNECTIVITY: usize = 16;
 const EXPANSION_ADD: usize = 128;

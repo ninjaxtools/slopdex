@@ -1,4 +1,49 @@
 use super::*;
+use serde_json::json;
+
+#[test]
+fn default_index_uses_fresh_canonical_root_namespace() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("repo");
+    fs::create_dir(&root)?;
+    let canonical = root.canonicalize()?;
+    let expected = cache::directory()?
+        .join("worktrees-v1")
+        .join(crate::hash(canonical.as_os_str().as_encoded_bytes()))
+        .join("index.sqlite");
+    assert_eq!(index_path(&root, None, &json!({}))?, expected);
+    assert_eq!(index_path(&root.join("."), None, &json!({}))?, expected);
+    #[cfg(unix)]
+    {
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias)?;
+        assert_eq!(index_path(&alias, None, &json!({}))?, expected);
+    }
+    let other = temp.path().join("other");
+    fs::create_dir(&other)?;
+    assert_ne!(index_path(&other, None, &json!({}))?, expected);
+    Ok(())
+}
+
+#[test]
+fn explicit_index_paths_keep_cwd_resolution_and_precedence() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    // Explicit paths do not require the selected root to exist.
+    let root = temp.path().join("missing");
+    let config = json!({"indexPath": "saved/index.sqlite"});
+    let cwd = std::env::current_dir()?;
+    assert_eq!(
+        index_path(&root, None, &config)?,
+        cwd.join("saved/index.sqlite")
+    );
+    assert_eq!(
+        index_path(&root, Some(Path::new("explicit.sqlite")), &config)?,
+        cwd.join("explicit.sqlite")
+    );
+    let explicit = temp.path().join("absolute.sqlite");
+    assert_eq!(index_path(&root, Some(&explicit), &config)?, explicit);
+    Ok(())
+}
 
 #[test]
 fn identical_target_detection_handles_missing_paths_and_symlinks() {

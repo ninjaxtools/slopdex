@@ -57,7 +57,9 @@ $ slopdex search "validate an authenticated session"
 ...
 ```
 
-The index is created with the `update` command and tracks the current Git commit and is refreshed with the latest changes before it is used. Index data is stored in the current user's global cache folder and project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
+The index is created with the `update` command and refreshed before use. Git checkouts use status, commit-tree differences, and previously dirty paths to refresh incrementally, without hashing every unchanged file on repeated queries. `--no-reindex` uses the saved snapshot without checking freshness; missing query artifacts can still require provider calls.
+
+Each worktree has its own bindings in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). Source, parse, embedding, and provider artifacts and immutable snapshots live in the authoritative `global-v1.sqlite` store and are reused across worktrees. Vector search lazily shares immutable index bases with worktree-specific deltas and membership masks. Older indexes/caches are not migrated or imported; run `slopdex update` to create the new index. Project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
 
 ### Code map/skeleton
 
@@ -152,7 +154,7 @@ $ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
 
 The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
 
-Generated descriptions are cached by source and generation context, including the configured profile, settings, and system instruction.
+Generated descriptions are cached by the full effective request: configured profile, settings, system instruction, and ordered conversation messages. Paths, source, line ranges, and earlier answers can affect reuse.
 
 > [!NOTE]
 > Add this to your `AGENTS.md` to use semantic code search with your agent:

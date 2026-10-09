@@ -27,8 +27,10 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/parse/markdown.rs` | Structural heading hierarchy and separate bounded Markdown search chunks, fence and comment handling. |
 | `src/parse/descriptions.rs` | Shared source-comment attachment, Python function/class docstrings, and file/symbol description extraction. |
 | `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits and hosted implementations, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
-| `src/storage.rs` | Authoritative SQLite records, artifact/result caches, transactional live-state reconciliation, schema validation. |
-| `src/vectors.rs` | Persistent incremental filtered F32 cosine USearch HNSW indexes and validated sidecar publication/recovery. |
+| `src/storage.rs` | Worktree SQLite bindings, attached global artifacts, immutable snapshot manifests, transactional live-state reconciliation, schema validation. |
+| `src/cache.rs` | Authoritative global SQLite store and validated, best-effort S3 provider artifacts. |
+| `src/git.rs`, `src/registry.rs` | Git candidate discovery/checkpoints, repository relatedness evidence, and per-artifact single-flight locks. |
+| `src/vectors.rs`, `src/vectors/shared.rs` | Checked F32 cosine USearch primitives and immutable shared bases with exact worktree deltas/membership masks. |
 | `tests/rust_integration.rs` | Engine/CLI integration coverage using temporary repositories, real SQLite/USearch, and local mock HTTP providers. |
 | `target/release/slopdex` | Locally built executable (`slopdex.exe` on Windows). |
 | `.github/workflows/rust.yml` | `cargo verify` on Linux, macOS and Windows for main/master pushes, pull requests and manual runs; no Node setup. |
@@ -51,9 +53,11 @@ workspace. CLI options and output are implemented in Rust.
 exit through Clap, model listing fetches public catalogs, and configuration
 actions read/write JSON without opening SQLite. The root defaults to the process
 working directory, with no upward Git-root discovery. Default paths are
-`<root>/.slopdex/config.json` and a per-workspace index under the user's XDG
-cache (canonical root SHA-256). A compatible old default index is copied with
-SQLite backup on first use, including committed WAL changes. Explicit relative
+`<root>/.slopdex/config.json` and
+`$XDG_CACHE_HOME/slopdex/worktrees-v1/<canonical-root-sha256>/index.sqlite`.
+The global store defaults to `$XDG_CACHE_HOME/slopdex/global-v1.sqlite`.
+No former default index or cache is copied, migrated, imported, or used as a seed.
+Explicit relative
 config/index paths, including JSON `indexPath`, resolve against the working
 directory. CLI overrides are applied after canonicalizing supported config aliases.
 Config saves use a same-directory temporary file, `sync_all`, and rename.
@@ -88,7 +92,7 @@ With an existing index, `map -q` opens through `Engine::open_symbol_map`.
 It still calls only `refresh_structure`, then lazily resolves semantic selection
 over symbols, available descriptions, and heading titles from saved snapshots.
 It may prepare name, description, and query embeddings through
-providers or caches and build the separate `<index>.symbols.usearch` sidecar.
+providers or caches and open the separate `<index>.symbols.shared.json` channel.
 If a read-only engine reports `NeedsWrite` during refresh, map, or selection,
 the CLI reopens a writable symbol-map engine and retries; `--no-reindex` keeps
 the saved snapshot while allowing selector cache population. Ordinary map does
@@ -166,232 +170,170 @@ use a leading constant docstring; comments and docstrings combine with a paragra
 break. Source descriptions override generated prose and publish with structure,
 even before semantic embeddings are prepared.
 
-### SQLite schema and artifacts
+### SQLite bindings and global artifacts
 
-SQLite is the authority. Native schema **3** separates canonical structure,
-search units, and model-specific embedding associations into normalized tables.
-Compatibility JSON `data` snapshots remain alongside explicit columns in files,
-search units, and diagnostics; the layout does not fully deduplicate payloads.
+SQLite is authoritative: worktree schema **4** stores live bindings and local
+query results; global schema **1** stores reusable content. These are hard cutoffs,
+not migration entry points. Older native/TypeScript layouts and former default
+paths are never imported or used as compatibility seeds. See the
+[rebuild instructions](reference.md#rebuilding-an-old-index).
 
-| Table | Contents |
+| Store | Contents |
 | --- | --- |
-| `metadata` | Identity (canonical root and schema), generation, Git checkpoint, active embedding profile, description profile settings. |
-| `files` | Path-keyed source/hash/language, provenance, parser version/structure hash, and compatibility snapshot. |
-| `symbols` | File-local declaration IDs/parents, order, kinds, qualified names, complete signatures, source ranges, and metadata. |
-| `symbol_names` | Ordered declared/imported names and aliases linked to symbols. |
-| `search_units` | Callable/Markdown records with stable integer IDs, unique logical identities, optional symbol links, compatibility data, and embedding-input hashes. |
-| `unit_embeddings` | Search-unit vector associations by role, profile, and input hash. |
-| `descriptions` | Available source/generated descriptions, source hashes, and optional vector references. |
-| `diagnostics` | Per-file read/parse/extraction diagnostics with structured columns and compatibility data. |
-| `embeddings` | Content-addressed document/query embeddings stored as little-endian F32 blobs. |
-| `cache` | Durable parse and model-generated artifacts, keyed by kind and content-addressed cache key. |
-| `description_content` | Unique description generation inputs (system instructions, prompts, settings, profiles, and file-description context) keyed by their content hash; cached answer records reference these hashes. |
-| `search_cache` | Serialized query and cross-search result rows, separate from reusable model/parse artifacts. |
+| Worktree `files` | Path, source hash, language, provenance, parser version, and structure hash; source text lives globally. |
+| Worktree `symbols`, `symbol_names`, `search_units` | Canonical declarations/names, file-local hierarchy, stable live occurrence IDs, and search-unit metadata/input/content hashes. |
+| Worktree `unit_embeddings`, `descriptions` | Profile/input associations and content/vector references, not duplicated artifact payloads. |
+| Worktree `diagnostics`, `metadata`, `search_cache` | Saved failures, root/store binding, checkpoint/generation/policies, profiles, snapshot digest, and derived query results. |
+| Global `sources`, `embeddings` | Content-addressed source text and little-endian F32 document/query vectors. |
+| Global `cache`, `description_content` | Parse, resolved call-graph, search-unit source/input, and provider artifacts; interned description text, prompts, settings, profiles, and conversation messages. |
+| Global `snapshots` | Immutable content-addressed manifests of published bindings and parser/profile/policy contracts. |
+| Global registry/upload tables | Repository relatedness evidence and best-effort remote upload bookkeeping. |
 
-`src/cache.rs` adds a second SQLite database under the per-user cache for
-content-addressed provider artifacts. On a workspace miss, it reads this shared
-cache and optionally S3 before a provider request, then hydrates the workspace
-SQLite database. Completed provider work is saved to the workspace first, then
-written to the shared local cache and S3 best effort. Remote lookups issue up to
-10 concurrent GETs at a time. Description records contain only the answer and
-content hashes; distinct generation inputs are stored once in the shared cache's
-`artifacts(kind='content')` rows and as S3 content-addressed objects. A remote
-hit fetches any missing content objects before publishing the answer locally.
-S3 uploads of content objects use conditional creation, avoiding duplicate object
-versions when another index has already uploaded the same input. All remote object
-values are zstd-compressed in the `v3` namespace; reads bound decompressed size
-before checking the uncompressed payload checksum. Workspace and shared SQLite
-values retain their existing representation.
-No remote object contains workspace item IDs or Git snapshot state. Ordinary map does not
-fetch remote artifacts.
+The worktree connection attaches the global store as `global`. Both databases are
+needed to read a saved snapshot. `artifactCachePath` selects the global store when
+creating an index; its canonical path is persisted in the worktree binding.
+Omitting the override subsequently retains that binding. A conflicting explicit
+override requires a new worktree index path, even with `--force-reindex`.
+Unavailable/incompatible global stores are errors, not workspace-cache fallbacks.
 
-Callable identity hashes path, qualified name, kind, and same-name occurrence;
-Markdown identity hashes path and chunk ordinal. Reconciliation preserves item
-IDs across source edits/line shifts when identity is unchanged. Deleting a file
-cascades to its structure and search units. Foreign keys link units to symbols
-and vector associations to the embedding table. Structure publication can create
-search units with no embeddings; canonical records do not depend on a model.
+Callable occurrence identity includes path, qualified name, kind, and same-name
+ordinal; Markdown identity includes path and chunk ordinal. Reconciliation retains
+live integer IDs when occurrence identity is unchanged. Source, description, and
+embedding payloads are globally referenced; structural JSON metadata remains where
+appropriate. Canonical structure can publish without semantic vectors.
 
-Parse keys contain parser version, path, and source hash. Embedding keys contain
-the embedding profile, query/document operation, and full input. Generated file
-description keys include source-content hash and the generation profile; callable
-keys include qualified symbol name, callable source hash, file-description text,
-and that generation profile. The generation profile includes the configured LLM
-profile, generation settings, and system instruction. Settings cover provider/model,
-fallback, endpoint, timeout, retry count, and retry delay. Relevant source,
-profile/settings, or system-instruction changes invalidate generated reuse; a
-path-only rename can still reuse a matching artifact. Cached answers retain their
-original path and content-addressed prompt/settings/profile provenance. Source
-descriptions bypass generation and cannot be replaced by it.
+Artifact validity follows exact inputs and contracts:
 
-Completed artifacts are persisted independently of final live publication and
-result caches, remaining reusable across index generation changes and retries.
-Each successful embedding batch is persisted immediately. Ordinary refresh
-extracts source descriptions, preserves reusable generated prose, and prepares
-its embeddings. Only `generate_descriptions` regenerates missing/stale generated
-descriptions or reacts to changed generation settings/profile/system instructions.
+- Parse keys contain parser version, detected language, and source hash, not path.
+- Embedding keys contain the embedding profile, query/document role, and full input.
+- Description keys hash `description-request-v1`, the configured LLM profile,
+  generation settings, system instruction, and every ordered message role/content
+  in the effective request. File prompts include path and complete source; callable
+  turns include symbol/line range and the complete preceding conversation. Renames,
+  line shifts, surrounding-file changes, or earlier answers can therefore change
+  the request key. Saved artifacts retain content-hash references to these inputs.
+- Rerankings and explanations use model configuration and complete request context,
+  independently of generation-keyed worktree result caches.
 
-Rerankings and task explanations also have durable artifact caches, independent
-of the generation-keyed search-result cache. Their keys include the model
-configuration and complete query/documents or explanation prompt. An unrelated
-structural change can invalidate result rows without repeating those paid calls.
+Only explicit description generation invokes a generator. Source descriptions take
+precedence. Each file's turns are sequential, while a window of files can proceed
+in parallel. Identical effective requests are grouped before provider work. Parse,
+embedding, description, reranking, and explanation misses acquire per-artifact locks under
+`<global-store>.locks`, recheck the global cache, and retain the locks through local
+persistence. Embedding batches acquire keys in sorted order. Unrelated keys and
+worktrees can proceed concurrently; these are not repository-lifetime locks.
+Lock waits are bounded to 30 seconds. Completed artifacts survive failed live
+publication and can be reused on retry.
 
-Query-result keys include generation, effective config, query,
-kind, and options. Cross-search keys include source/target generations, canonical
-target database path, scoring kind, resolved changed-since commit, saved checkpoint,
-and options. A moving Git branch is resolved before cache lookup and its ancestry
-is checked again. Dirty live publication clears the local search-result cache.
-
-This is a hard schema cutoff: all schema-2 databases, old `rust_`-prefixed tables,
-and TypeScript layouts are rejected. These incompatible layouts are not imported
-or migrated, and `--force-reindex` cannot bypass old-layout rejection. Remove the
-existing SQLite index and rebuild with `slopdex update`, or select a new database with
-`slopdex --index /path/to/new-index.sqlite update`. See the
-[rebuild instructions](reference.md#rebuilding-an-old-index) for the default path.
+Optional S3 is consulted after a global provider-artifact miss. Remote hits are
+validated and written to that same store, never imported into duplicate worktree
+artifact tables. Missing referenced description content makes a remote answer a
+miss. GET concurrency is bounded to 10; uploads are best effort, with conditional
+creation for content objects. The `v3` zstd frames contain a checksum and payload;
+decompressed size is bounded before checksum validation. Older remote namespaces
+are not read. Source/parse storage, snapshot manifests, registry/Git metadata,
+query results, and USearch files are not uploaded. Ordinary map does not fetch S3.
+Backfill exports only artifacts belonging to the requesting worktree, not unrelated
+repositories' entries in the global store.
+Automatic garbage collection is not implemented.
 
 ### Refresh snapshots and locking
 
-The engine acquires a nonblocking exclusive filesystem lock at `<index>.lock`
-before opening SQLite and holds it for its entire lifetime, including provider
-requests, live publication, vector reconciliation, and searches. Contention fails
-with a retry-after-completion message; there is no engine lock-wait/retry loop.
-SQLite uses WAL, foreign keys, and a 30-second busy timeout. Config-only actions
-do not acquire this index lock.
+Engine lifetime locks at `<index>.lock` are shared for read-only opens and exclusive
+for writers, with a bounded 10-second contention wait. `NeedsWrite` allows CLI
+operations to reopen writable and retry in the same command mode. SQLite uses WAL,
+foreign keys for worktree bindings, and a 30-second busy timeout; read-only opens
+also attach the global store read-only. Config-only actions acquire no index lock.
 
-Refresh proceeds as follows:
+1. Git refresh combines current status, the checkpoint-to-HEAD tree diff, previous
+   dirty paths (including restored edits), missing parser structures, and saved
+   failures. Candidate-subset walking prunes unrelated directories while retaining
+   ignore/glob/extension policy. Missing checkpoints, non-Git/unborn roots, or
+   discovery-policy changes require a full scan; branch switches need no ancestry.
+2. Saved metadata fingerprints skip unchanged candidates; changed candidates are
+   read, content-hashed, and parsed through global artifacts. Unchanged repeated
+   queries do not hash every indexed file. Ignore/config/sparse-checkout policy is
+   tracked separately, including Git-ignored policy files in remembered directories;
+   there is no filesystem watcher.
+3. Normal refresh rechecks HEAD, dirty-path provenance, file selection, policy,
+   candidate metadata, and prepared file hashes before publication. This is
+   optimistic validation, not an atomic filesystem snapshot. It reconciles structure,
+   search units, diagnostics, checkpoint, snapshot digest, and result-cache changes
+   transactionally in the worktree database. Global artifacts and snapshot manifests
+   commit first on an independent connection: attached WAL databases do not provide
+   cross-database crash atomicity. Rejected publication can leave reusable artifacts,
+   never workspace references to uncommitted content. Dirty-path state is conservatively saved before publication so
+   an interruption does not lose restore detection. Checkpoint-only updates retain
+   the live generation and query results.
+4. Semantic refresh prepares missing active-profile associations from saved source,
+   including existing descriptions, without generating prose. Completed provider
+   artifacts persist before the semantic publication transaction. Loading committed
+   records clears in-memory derived indexes; channels open only when queried.
 
-1. Read current Git HEAD if available and collect dirty/untracked paths. Walk the
-   current filesystem with ignore rules, built-in exclusions, include/exclude
-   globs, supported extensions, and the size limit.
-2. Compare source hashes, parser versions, and provenance to saved files. Parse
-   changed/failed files and remove paths no longer eligible. Save reusable parse
-   artifacts as they complete. Read/size failures become
-   diagnostic file records, and parser errors can coexist with healthy callables.
-3. Before structural publication, verify HEAD is unchanged and re-read every
-   successfully parsed file to verify its hash. Failures abort publication but leave
-   completed parse artifacts available for retry. This is optimistic validation, not an
-   atomic filesystem snapshot; unchanged files and discovery are not revalidated
-   as a full filesystem transaction.
-4. In one SQLite transaction, reconcile files, symbols, pending search units,
-   diagnostics, checkpoint, generation, and result-cache invalidation.
-   Generation advances for live-record changes; checkpoint-only updates do not
-   increment it. Ordinary map reads this structure without opening sidecars.
-5. Semantic refresh prepares missing active-profile embeddings, including available
-   source or generated descriptions without generating prose, even for files
-   unchanged since a map refresh. Missing descriptions are allowed. Each completed
-   model artifact is saved immediately. After rechecking HEAD and prepared source
-   hashes, a second transaction publishes semantic associations and descriptions.
-   Provider or publication failure leaves the committed structure available and
-   paid artifacts reusable. Incomplete configured semantic projections cannot be
-   searched with `--no-reindex`; refresh finishes their preparation first.
-6. Load the committed semantic snapshot and reconcile USearch indexes. Description
-   profile settings are saved separately from live-record publication.
+Repository relatedness is separate from validity. `registry.rs` relates linked
+worktrees through canonical common Git directory identity and records observed
+history roots/full commits as family discovery evidence. Sanitized remote URLs are
+hints, never merge keys. Family membership and Git history never substitute for
+content hashes, profiles, parser contracts, or exact snapshot membership.
 
-Git records provenance and a checkpoint, while all indexed source comes from the
-working tree. `update --target` supports HEAD only. Changed-since selection
-parses base-commit files and compares qualified-name/source-hash pairs;
-uncommitted selection uses saved file provenance, including unchanged callables
-inside dirty files. Without HEAD, files are working-tree records.
+`--no-reindex` skips refresh/live freshness checks and uses the saved snapshot and
+bound global store, even after working-tree edits. It is not a read-only/network-off
+flag: missing query/selector artifacts, reranking, explanations, and explicit
+description generation can consult caches/S3 or call providers. A structure-only
+snapshot still needs normal semantic refresh to prepare missing content vectors.
+Explicit description generation still verifies HEAD and affected source before
+publishing descriptions, even when refresh was skipped.
+The CLI overwrites JSON `noReindex` with the flag's value. Unindexed map remains
+direct local parsing; search/cross-search require an existing index.
 
-Native `noReindex` skips refresh entirely, even for an empty database. Opening can
-still write metadata or, for semantic operations, repair sidecars; it is not
-read-only. Ordinary indexed map reads saved structure without provider or sidecar
-work; unindexed map still parses current files. Search/cross-search require an existing
-database even with `--no-reindex`.
-Offline status/cross-search use the saved native snapshot, while uncached query
-embedding/reranking and task descriptions still call providers. The CLI sets
-`noReindex` from `--no-reindex`, overriding a JSON value. `generate descriptions` is an
-explicit operation on saved source snapshots, not a new filesystem scan after
-the automatic refresh.
+Changing embedding profiles prepares another projection without resetting
+structure. A schema-4 root mismatch can be explicitly rebuilt with
+`--force-reindex --yes-really-rebuild-the-index`, retaining the global binding and
+artifacts/snapshots. The flag does not reset a compatible root, bypass schema
+rejection, or change the store binding. Refresh has no divergence/ancestry gate.
 
-Embedding profiles are separate from structural identity. Changing provider,
-model, or dimensions selects/prepares a new semantic projection without resetting
-structure; older cached profile artifacts remain reusable.
+### Shared vector bases and search
 
-Within schema 3, an incompatible root can be reset with
-`--force-reindex --yes-really-rebuild-the-index`: live records, non-identity
-metadata, and result caches are cleared while reusable artifacts/vectors remain.
-A compatible identity is not reset just because the flag is present. The accepted rebuild-on-divergence
-option currently adds no engine behavior; refresh does not enforce checkpoint
-ancestry.
+The engine lazily supplies `(occurrence ID, embedding key, vector)` snapshots to
+`SharedIndex::open` for code, Markdown/document content, descriptions, and symbols.
+Worktree channel pointers are `<index>.<kind>.shared.json`; global bases live under
+`<global-store>.indexes/<contract>/`. The contract includes the embedding profile,
+dimensions, native/USearch versions, metric/scoring, and graph settings. There is
+no concatenated/fusion index. File descriptions are scored directly.
 
-### Persistent vector snapshots and search
+Bases are immutable and deduplicate embedding keys, mapping them to checked native
+IDs rather than worktree occurrence IDs. A pointer records base identity, exact
+occurrence-to-embedding membership, delta hashes, and a fingerprint. Membership
+masks exclude deleted/foreign base entries; repeated embeddings fan out to eligible
+live occurrences. New vectors use an exact worktree delta. A missing/stale pointer
+chooses the suitable base with greatest overlap; ties prefer smaller bases, then
+base ID. Less than 50% active base overlap or a delta exceeding
+`max(64, base-size / 4)` compacts into a new base. Unchanged membership causes no
+pointer or base rewrite.
 
-The engine supplies authoritative `(item ID, vector)` snapshots to
-`VectorIndex::open`. Code, Markdown/document content, and available callable/symbol
-descriptions use independent indexes at embedding dimension `D`; there is no
-concatenated or combined index. Description text is optional. A semantic projection
-is description-complete when existing descriptions have active-profile embeddings,
-not when every callable has a description. File descriptions are independently
-compared against the query vector and emitted as `type:"file"` rows.
+Base publication holds only a per-base lock, rechecks for an existing valid base,
+and writes the `.base.json` publication marker last. Native binaries/manifests
+retain full checksum, configuration/count/key validation and bounds-checked copied
+loads into owned memory, not mmap. Missing/corrupt derived files rebuild from SQLite
+vectors without provider calls. Read-only shared-index opens publish no files and
+can build an in-memory fallback; missing embedding artifacts are a separate issue.
 
-Code and description retrieval apply thresholds independently. Hits for the same
-search-unit ID merge by maximum similarity, with optional `codeSimilarity`,
-`descriptionSimilarity`, `functionDescriptionSimilarity`, and
-`fileDescriptionSimilarity` reporting components rather than averaged weights.
-Cross-search always retrieves, thresholds, and ranks by code. Available callable
-and file description similarities are supplementary pairwise scores; they require
-neither universal description coverage nor identical generator profiles.
-
-USearch uses cosine HNSW, F32 storage, connectivity 16, insertion expansion 128,
-and search expansion 64. Data is copied into owned indexes, not memory-mapped.
-Eligibility predicates run inside graph traversal. Returned candidates are rescored
-with F64 cosine arithmetic over the stored F32 vectors before threshold filtering,
-avoiding CPU-specific SIMD approximation errors at score boundaries. The engine
-widens retrieval as needed for threshold ranges, then applies score bounds and
-result limits.
-Symbol hits are scored from normalized bare names/aliases, taking the maximum
-similarity per structural node. They include all structural kinds and headings
-without content units. The ordinary ranking threshold and limit apply; optional
-`symbolQuery` is an additional selector with independent `symbolThreshold`.
-Mixed searches retain merged function hits plus file, Markdown/document, and
-symbol rows, then apply global ranking and limit rather than fusing symbol and content scores.
-The result contract is `{type:"symbol", symbol:{...StructureNode,path,sourceMode},
-similarity, symbolSimilarity}`. Node IDs are file-local; vocabulary/vector IDs
-must never reach presentation.
-
-CLI ranked-hit construction reads symbol rows from `symbol`, matching their saved
-node by qualified name and range rather than Markdown chunk context. Text combines
-annotations when content and symbol rows match one declaration; expanded score
-details include `symbolSimilarity`. Expanded direct heading hits obtain their
-saved body through `markdown_map_bodies`, leaving ancestors heading-only. Other
-symbol kinds use ordinary structure rendering and optional indexed source display.
-No body is used to rank pure symbols. Call-graph key lookup excludes noncallable
-nodes before expansion; callable symbol JSON rows receive related callable and
-callee metadata as function rows do.
-
-File-description JSON rows carry `{type:"file", file:{path,description,sourceMode,
-language}, similarity, fileDescriptionSimilarity}`. CLI presentation groups them
-with declaration hits, prints their scores on the file header, and shows their
-prose at standard/expanded detail or for explicit description search at compact
-detail. File hits have no synthetic declaration and do not seed call expansion.
-
-Independent-index merging does not make HNSW exhaustive: neighbor membership/recall
-remain approximate, with no all-pairs/exact-scan fallback for ANN retrieval.
-File descriptions use direct cosine comparisons. Reranking consumes the
-retrieved query candidates; cross-search is never sent to a reranker.
-
-Each `<index>.<kind>.usearch` has a `.manifest.json` containing format/USearch
-versions, dimensions, generation, per-ID hashes of original F32 bits, a snapshot
-fingerprint, and binary hash. Opening validates the manifest, binary, native
-configuration, count, and keys. A valid changed snapshot removes deleted/replaced
-keys and adds new/replacement vectors, preserving unchanged graph entries and
-reusing deleted slots. Identical snapshots cause no sidecar writes; generation
-changes with identical vectors only replace the manifest. Failed reconciliation
-or missing/corrupt/incompatible sidecars trigger a rebuild from SQLite vectors.
-
-Publication writes/syncs temporary files and renames the binary first, manifest
-last, syncing parent directories on Unix. The pair is not one atomic filesystem
-operation: a crash between renames produces a hash mismatch and recovery rebuild
-on next open. SQLite has already committed, so it always supplies the authoritative
-snapshot for that repair; no model request is needed. The engine's lifetime lock
-prevents another Slopdex command from observing interleaved publication.
+USearch uses F32 cosine HNSW with connectivity 16, insertion expansion 128, and
+search expansion 64. Membership/eligibility filters run inside base traversal;
+candidates are rescored with F64 cosine arithmetic. Exact delta hits merge with
+base hits before thresholds/limits. Base recall remains approximate: there is no
+full-base exhaustive scan fallback. Code/description hits merge by maximum
+similarity; cross-search ranks by code, with description scores supplementary.
+Symbol search scores normalized names/aliases and returns structural IDs, never
+native vocabulary IDs. Reranking applies only to retrieved query candidates,
+not cross-search. Detailed result/rendering contracts are in the
+[reference](reference.md#reranking-clusters-and-output).
 
 ### Provider calls and retry boundaries
 
-The provider layer is blocking; the engine bounds concurrent embedding batches
-and callable descriptions within each file using `parallelism` (default `10`).
-File descriptions run first, files are processed serially, and each successful
+The provider layer is blocking; `parallelism` (default `10`) bounds embedding
+batches and concurrent file conversations. A file description precedes that file's
+sequential callable turns; different files can proceed in parallel. Each successful
 HTTP result is cached immediately. External model-call notices go to stderr
 once per kind/provider/model per process using thread-safe deduplication;
 `verbose: true` / `--verbose` reports every outgoing attempt, including retries.
