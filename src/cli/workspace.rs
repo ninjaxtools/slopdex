@@ -8,6 +8,88 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+pub(super) struct SourceWorkspace {
+    pub(super) root: PathBuf,
+    pub(super) paths: Vec<PathBuf>,
+    /// Effective cwd for relative paths saved in an external source's config.
+    pub(super) directory: Option<PathBuf>,
+}
+
+/// Interpret source arguments against the selected workspace, then discover an
+/// external source's own checkout (or directory for non-Git sources).
+pub(super) fn source_workspace(root: &Path, path: &Path) -> Result<SourceWorkspace> {
+    let selected = canonical_identity(root)?;
+    let source = canonical_identity(&root.join(path))?;
+    let (root, directory) = if source.starts_with(&selected) {
+        (root.to_owned(), None)
+    } else {
+        let mut directory = source.as_path();
+        while !directory.is_dir() {
+            directory = directory.parent().context("Source path has no directory")?;
+        }
+        (
+            crate::git::checkout_root(directory)?.unwrap_or_else(|| directory.to_owned()),
+            Some(directory.to_owned()),
+        )
+    };
+    Ok(SourceWorkspace {
+        root,
+        paths: vec![source],
+        directory,
+    })
+}
+
+pub(super) fn map_workspaces(root: &Path, paths: &[PathBuf]) -> Result<Vec<SourceWorkspace>> {
+    if paths.is_empty() {
+        return Ok(vec![SourceWorkspace {
+            root: root.to_owned(),
+            paths: Vec::new(),
+            directory: None,
+        }]);
+    }
+    let mut workspaces: Vec<SourceWorkspace> = Vec::new();
+    let mut missing = Vec::new();
+    for path in paths {
+        if !root
+            .join(path)
+            .try_exists()
+            .with_context(|| format!("Cannot inspect map path {}", path.display()))?
+        {
+            missing.push(path);
+            continue;
+        }
+        let workspace = source_workspace(root, path)?;
+        let mut existing = None;
+        for (index, group) in workspaces.iter().enumerate() {
+            if same_path(&group.root, &workspace.root)? && group.directory == workspace.directory {
+                existing = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = existing {
+            workspaces[index].paths.extend(workspace.paths);
+        } else {
+            workspaces.push(workspace);
+        }
+    }
+    if workspaces.is_empty() {
+        // Keep the normal empty-map lifecycle (including the missing-index -q
+        // warning). existing_options will warn about and discard these paths.
+        return Ok(vec![SourceWorkspace {
+            root: root.to_owned(),
+            paths: paths.to_vec(),
+            directory: None,
+        }]);
+    }
+    for path in missing {
+        crate::ui::warning(format!(
+            "slopdex: warning: map path does not exist; ignoring: {}",
+            path.display()
+        ));
+    }
+    Ok(workspaces)
+}
+
 pub(super) fn absolute(path: &Path) -> Result<PathBuf> {
     let path = if path.is_absolute() {
         path.to_owned()

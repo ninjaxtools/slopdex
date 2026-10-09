@@ -109,14 +109,20 @@ fn resolve_commit(root: &Path, reference: &str) -> Option<String> {
     )
 }
 
-fn checkout(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+pub(crate) fn checkout_root(root: &Path) -> Result<Option<PathBuf>> {
     let Some(top) = text(
         root,
         &["rev-parse", "--path-format=absolute", "--show-toplevel"],
     ) else {
         return Ok(None);
     };
-    let checkout = Path::new(&top).canonicalize()?;
+    Ok(Some(Path::new(&top).canonicalize()?))
+}
+
+fn checkout(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+    let Some(checkout) = checkout_root(root)? else {
+        return Ok(None);
+    };
     let selected = root.canonicalize()?;
     let scope = selected
         .strip_prefix(&checkout)

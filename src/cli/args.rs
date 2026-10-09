@@ -4,7 +4,7 @@ use crate::{filter, map, ui};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -237,7 +237,7 @@ impl SelectionArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct MapArgs {
-    /// Files or recursive directories, repository-relative or absolute within the root
+    /// Files or recursive directories; external paths use their own repository and index
     pub(super) paths: Vec<PathBuf>,
     #[command(flatten)]
     pub(super) selection: SelectionArgs,
@@ -335,18 +335,17 @@ impl MapArgs {
         value
     }
 
-    pub(super) fn existing_options(&self, root: &Path, detail: Detail) -> Result<Option<Value>> {
-        if self.paths.is_empty() {
+    pub(super) fn existing_options(
+        &self,
+        root: &Path,
+        paths: &[PathBuf],
+        detail: Detail,
+    ) -> Result<Option<Value>> {
+        if paths.is_empty() {
             return Ok(Some(self.options_for(detail)));
         }
-        let mut paths = Vec::new();
-        for path in &self.paths {
-            if !path.is_absolute() {
-                ensure!(
-                    !path.components().any(|c| matches!(c, Component::ParentDir)),
-                    "Source path must remain inside the repository"
-                );
-            }
+        let mut existing = Vec::new();
+        for path in paths {
             let source = if path.is_absolute() {
                 path.to_owned()
             } else {
@@ -356,7 +355,7 @@ impl MapArgs {
                 .try_exists()
                 .with_context(|| format!("Cannot inspect map path {}", path.display()))?
             {
-                paths.push(path);
+                existing.push(path);
             } else {
                 ui::warning(format!(
                     "slopdex: warning: map path does not exist; ignoring: {}",
@@ -364,11 +363,11 @@ impl MapArgs {
                 ));
             }
         }
-        if paths.is_empty() {
+        if existing.is_empty() {
             return Ok(None);
         }
         let mut options = self.options_for(detail);
-        options["paths"] = json!(paths);
+        options["paths"] = json!(existing);
         Ok(Some(options))
     }
 }
@@ -464,7 +463,7 @@ pub(super) struct CrossArgs {
         value_parser = line_range
     )]
     pub(super) lines: LineRange,
-    /// Source file or recursive directory, repo-relative or absolute within the repository
+    /// Source file or recursive directory; external paths use their own repository and index
     #[arg(long)]
     pub(super) source_path: Option<PathBuf>,
     /// Use changed functions since this Git ancestor as sources

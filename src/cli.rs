@@ -13,7 +13,10 @@ use self::{
     config::{effective_config, run_config},
     io::{print_json, with_stdout},
     output::{CrossOutput, Presentation, print_cross, print_errors, print_map, print_search},
-    workspace::{absolute, config_path, index_path, require_index, same_path},
+    workspace::{
+        SourceWorkspace, absolute, config_path, index_path, map_workspaces, require_index,
+        same_path, source_workspace,
+    },
 };
 use crate::{engine::Engine, filter, map, providers::Providers, ui};
 use anyhow::{Context, Result, ensure};
@@ -76,6 +79,56 @@ pub fn run() -> Result<()> {
 }
 
 fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
+    let root = absolute(cli.global.root.as_deref().unwrap_or(Path::new(".")))?;
+    let workspaces = match &cli.command {
+        Command::Map(args) => map_workspaces(&root, &args.paths)?,
+        Command::CrossSearch(args) if args.source_path.is_some() => {
+            vec![source_workspace(&root, args.source_path.as_ref().unwrap())?]
+        }
+        _ => vec![SourceWorkspace {
+            root,
+            paths: Vec::new(),
+            directory: None,
+        }],
+    };
+    let mut map_rows = Vec::new();
+    for workspace in workspaces {
+        run_workspace(cli, &workspace, &mut out, &mut map_rows)?;
+    }
+    if matches!(cli.command, Command::Map(_)) && cli.global.format == Some(Format::Json) {
+        print_json(&mut out, &map_rows)?;
+    }
+    Ok(())
+}
+
+fn emit_map(
+    cli: &Cli,
+    out: &mut impl Write,
+    rows: &[Value],
+    source: Option<&dyn map::StructureSource>,
+    selection: Option<&filter::Selection>,
+    collected: &mut Vec<Value>,
+) -> Result<()> {
+    if cli.global.format == Some(Format::Json) {
+        collected.extend_from_slice(rows);
+        return Ok(());
+    }
+    print_map(
+        out,
+        rows,
+        cli.global.format.unwrap_or(Format::Summary),
+        cli.global.detail,
+        source,
+        selection,
+    )
+}
+
+fn run_workspace(
+    cli: &Cli,
+    workspace: &SourceWorkspace,
+    mut out: &mut impl Write,
+    map_rows: &mut Vec<Value>,
+) -> Result<()> {
     if let Command::Help {
         topic: Some(HelpTopic::Models { provider }),
     } = &cli.command
@@ -101,14 +154,25 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
         Cli::command().write_long_help(&mut out)?;
         return Ok(());
     }
-    let root = absolute(cli.global.root.as_deref().unwrap_or(Path::new(".")))?;
-    let config_file = config_path(&root, cli.global.config.as_deref())?;
+    let root = &workspace.root;
+    let config_file = config_path(root, cli.global.config.as_deref())?;
     if let Command::Config { args } = &cli.command {
         return run_config(&cli.global, &config_file, args, &mut out);
     }
 
-    let config = effective_config(&cli.global, &config_file)?;
-    let index = index_path(&root, cli.global.index.as_deref(), &config)?;
+    let mut config = effective_config(&cli.global, &config_file)?;
+    if let Some(directory) = &workspace.directory {
+        for key in ["indexPath", "artifactCachePath"] {
+            if let Some(path) = config[key]
+                .as_str()
+                .map(Path::new)
+                .filter(|path| path.is_relative())
+            {
+                config[key] = json!(directory.join(path));
+            }
+        }
+    }
+    let index = index_path(root, cli.global.index.as_deref(), &config)?;
     if let Command::CrossSearch(args) = &cli.command
         && let Some(target_index) = &args.target_index
     {
@@ -132,12 +196,13 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             .canonicalize()
             .context("Repository root does not exist")?;
         ensure!(root.is_dir(), "Repository root is not a directory");
-        let format = cli.global.format.unwrap_or(Format::Summary);
         if !args.selection.symbol_query.is_empty() {
             writeln!(out, "slopdex: warning: no active index; -q is ignored.")?;
         }
-        let Some(mut options) = args.existing_options(&root, cli.global.detail)? else {
-            return print_map(&mut out, &[], format, cli.global.detail, None, None);
+        let Some(mut options) =
+            args.existing_options(&root, &workspace.paths, cli.global.detail)?
+        else {
+            return emit_map(cli, &mut out, &[], None, None, map_rows);
         };
         options.as_object_mut().unwrap().remove("symbolQuery");
         options.as_object_mut().unwrap().remove("symbolThreshold");
@@ -145,13 +210,13 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             map::Unindexed::parse(&root, &index, &config, &options)
         })?;
         let rows = map::query(&source, &root, &options)?;
-        return print_map(
+        return emit_map(
+            cli,
             &mut out,
             &rows,
-            format,
-            cli.global.detail,
             Some(&source),
             Some(&filter::Selection::compile(&options)?),
+            map_rows,
         );
     }
     let mode = CommandMode::for_command(&cli.command);
@@ -170,11 +235,9 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
     );
     let reader =
         read_only_command && index.exists() && config["forceReindex"].as_bool() != Some(true);
-    let mut engine = ui::spin("Opening index", || {
-        mode.open(&root, &index, &config, reader)
-    })?;
+    let mut engine = ui::spin("Opening index", || mode.open(root, &index, &config, reader))?;
     let map_options = if let Command::Map(args) = &cli.command {
-        args.existing_options(&root, cli.global.detail)?
+        args.existing_options(root, &workspace.paths, cli.global.detail)?
     } else {
         None
     };
@@ -185,7 +248,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             Err(error) if error.is::<crate::engine::NeedsWrite>() => {
                 drop(engine);
                 engine = ui::spin("Opening index for update", || {
-                    mode.open(&root, &index, &config, false)
+                    mode.open(root, &index, &config, false)
                 })?;
                 mode.refresh(&mut engine)?
             }
@@ -208,7 +271,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
                     Err(error) if error.is::<crate::engine::NeedsWrite>() => {
                         drop(engine);
                         engine = ui::spin("Opening index for update", || {
-                            mode.open(&root, &index, &config, false)
+                            mode.open(root, &index, &config, false)
                         })?;
                         if !cli.global.no_reindex {
                             mode.refresh(&mut engine)?;
@@ -223,13 +286,13 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             } else {
                 (Vec::new(), None)
             };
-            print_map(
+            emit_map(
+                cli,
                 &mut out,
                 &rows,
-                format,
-                cli.global.detail,
                 Some(&engine),
                 selection.as_ref(),
+                map_rows,
             )?;
         }
         Command::Search(_)
@@ -244,7 +307,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
                 Err(error) if error.is::<crate::engine::NeedsWrite>() => {
                     drop(engine);
                     engine = ui::spin("Opening index for update", || {
-                        mode.open(&root, &index, &config, false)
+                        mode.open(root, &index, &config, false)
                     })?;
                     if !cli.global.no_reindex {
                         mode.refresh(&mut engine)?;
@@ -327,7 +390,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
                 let target_index = absolute(target_index)?;
                 if same_path(&index, &target_index)? {
                     ensure!(
-                        same_path(&root, &target_root)?,
+                        same_path(root, &target_root)?,
                         "source and target use the same index but different repository roots"
                     );
                 } else {
@@ -348,8 +411,12 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
                     target = Some(opened);
                 }
             }
+            let mut options = args.options();
+            if let Some(path) = workspace.paths.first() {
+                options["sourcePath"] = json!(path);
+            }
             let rows = ui::spin("Comparing indexed functions", || {
-                engine.cross_search(target.as_ref(), &args.options())
+                engine.cross_search(target.as_ref(), &options)
             })?;
             let format = cli.global.format.unwrap_or(if args.cohesion {
                 Format::Summary

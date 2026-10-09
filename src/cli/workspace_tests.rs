@@ -2,6 +2,72 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn source_paths_select_external_directories_without_changing_cwd() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("current");
+    let other = temp.path().join("other");
+    fs::create_dir(&root)?;
+    fs::create_dir(&other)?;
+    fs::write(root.join("local.rs"), "pub fn local() {}")?;
+    fs::write(other.join("external.rs"), "pub fn external() {}")?;
+    let canonical_root = root.canonicalize()?;
+    let canonical_other = other.canonicalize()?;
+    let cwd = std::env::current_dir()?;
+
+    let local = source_workspace(&root, Path::new("../current/local.rs"))?;
+    assert_eq!(local.root, root);
+    assert_eq!(local.paths, [canonical_root.join("local.rs")]);
+    assert!(local.directory.is_none());
+
+    for path in [
+        PathBuf::from("../other/external.rs"),
+        other.join("external.rs"),
+        other.clone(),
+    ] {
+        let external = source_workspace(&root, &path)?;
+        assert_eq!(external.root, canonical_other);
+        assert_eq!(
+            external.directory.as_deref(),
+            Some(canonical_other.as_path())
+        );
+        assert!(external.paths[0].starts_with(&canonical_other));
+    }
+    assert_eq!(std::env::current_dir()?, cwd);
+    let groups = map_workspaces(
+        &root,
+        &[
+            PathBuf::from("local.rs"),
+            other.join("external.rs"),
+            other.clone(),
+        ],
+    )?;
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].paths.len(), 1);
+    assert_eq!(groups[1].paths.len(), 2);
+    let missing = map_workspaces(&root, &[other.join("missing.rs")])?;
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].root, root);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn external_source_symlinks_select_the_destination_workspace() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("current");
+    let other = temp.path().join("other");
+    fs::create_dir(&root)?;
+    fs::create_dir(&other)?;
+    fs::write(other.join("external.rs"), "pub fn external() {}")?;
+    std::os::unix::fs::symlink(&other, root.join("alias"))?;
+    let external = source_workspace(&root, Path::new("alias/external.rs"))?;
+    let other = other.canonicalize()?;
+    assert_eq!(external.root, other);
+    assert_eq!(external.paths, [other.join("external.rs")]);
+    Ok(())
+}
+
+#[test]
 fn default_index_uses_fresh_canonical_root_namespace() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("repo");

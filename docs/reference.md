@@ -119,9 +119,15 @@ slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--s
 
 With no paths, map selects the repository. Paths select files or recursive
 directories and are relative to `--root`, including when invoked from another
-working directory. Absolute paths within the root are accepted; paths outside it
-are rejected. Missing paths produce warnings on stderr and are ignored. Multiple
-paths form a union, intersected with the shared selectors.
+working directory. Absolute paths and `..` components are accepted. A path outside
+the selected root uses its own Git checkout root, configuration, and index, as if
+invoked from that source's directory. Without Git, that directory is the root.
+Explicit `--config` and `--index` overrides still apply and remain relative to the
+invocation directory; relative paths saved in an external source's configuration
+resolve from the source's directory. Missing paths produce warnings on stderr and
+are ignored. Multiple paths form a union, intersected with the shared selectors;
+paths in different workspaces are processed independently, with JSON results
+combined into one array. Returned paths remain relative to their respective roots.
 
 When the resolved index is missing, map parses eligible files directly
 and renders the same structure, selectors, call-graph expansion, and expanded source/Markdown
@@ -380,7 +386,7 @@ Cross-search options:
 | --- | --- |
 | `--matches <number>` | Maximum neighbors retrieved per source, default `5`. Symmetric-pair suppression can reduce the emitted count. |
 | `--lines <number|min-max>` | Line count for both sources and candidates, default `2`: the minimum is inclusive and the optional maximum is exclusive. A single number means at least that many lines. `--min-lines` is an alias. |
-| `--source-path <path>` | Source file or recursive directory, root-relative or absolute within the root. |
+| `--source-path <path>` | Source file or recursive directory, root-relative or absolute; external paths select their own root, configuration, and index, as for map. |
 | `--changed-since <commit>` | Source callables differing from this ancestor of the indexed Git checkpoint; details below. |
 | `--uncommitted` | Source callables whose indexed file has working-tree provenance. |
 | `--cross-file-only` | Exclude candidates with the same root-qualified file path as the source. |

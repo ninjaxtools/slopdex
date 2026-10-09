@@ -3969,6 +3969,355 @@ fn regression_failed_generation_reuses_completed_descriptions_after_generation_c
 }
 
 #[test]
+fn cli_external_map_uses_checkout_config_and_saved_snapshot() -> Result<()> {
+    let invoker = Repo::new()?;
+    let mut external = Repo::new()?;
+    external.root = invoker._temp.path().join("external-checkout");
+    fs::create_dir(&external.root)?;
+    external.git(&["init", "--quiet"])?;
+    invoker.write(".slopdex/config.json", "not valid JSON")?;
+    let config = json!({"indexPath": external.index});
+    external.write(".slopdex/config.json", &config.to_string())?;
+    external.write("nested/api.rs", &function("saved_external", "saved"))?;
+    external.write("other.rs", &function("outside_selection", "saved"))?;
+    external.open_map(&config)?.refresh_structure()?;
+    external.write("nested/api.rs", &function("live_external", "edited"))?;
+    let before = filesystem_snapshot(invoker._temp.path())?;
+    let saved_file = file_record(&external, "nested/api.rs")?;
+
+    for path in [
+        external.root.join("nested/api.rs"),
+        PathBuf::from("../external-checkout/nested/api.rs"),
+        PathBuf::from("../external-checkout/nested"),
+    ] {
+        // Do not use Repo::cli: its explicit invocation index would mask discovery.
+        let output = invoker
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .arg("--root")
+            .arg(&invoker.root)
+            .args(["--no-reindex", "--format", "json", "map", "--private"])
+            .arg(&path)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{path:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(
+            map_names(rows.as_array().unwrap()),
+            strings(&["saved_external"])
+        );
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["path"], "nested/api.rs");
+    }
+    assert_eq!(filesystem_snapshot(invoker._temp.path())?, before);
+    assert_eq!(file_record(&external, "nested/api.rs")?, saved_file);
+    assert!(!invoker.index.exists());
+    Ok(())
+}
+
+#[test]
+fn cli_external_map_uses_source_root_xdg_index_without_config() -> Result<()> {
+    let invoker = Repo::new()?;
+    let mut external = Repo::new()?;
+    external.git(&["init", "--quiet"])?;
+    external.home = invoker.home.clone();
+    external.index = invoker
+        .home
+        .join("cache/slopdex/worktrees-v1")
+        .join(slopdex::hash(
+            external.root.canonicalize()?.as_os_str().as_encoded_bytes(),
+        ))
+        .join("index.sqlite");
+    invoker.write(".slopdex/config.json", "not valid JSON")?;
+    external.write("nested/api.rs", &function("saved_default_index", "saved"))?;
+    external.open_map(&json!({}))?.refresh_structure()?;
+    external.write("nested/api.rs", &function("live_without_index", "edited"))?;
+
+    let output = invoker
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .args(["--no-reindex", "--format", "json", "map", "--private"])
+        .arg(external.root.join("nested/api.rs"))
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        map_names(rows.as_array().unwrap()),
+        strings(&["saved_default_index"])
+    );
+    assert_eq!(rows[0]["path"], "nested/api.rs");
+    assert!(!external.root.join(".slopdex").exists());
+    assert!(!invoker.index.exists());
+    Ok(())
+}
+
+#[test]
+fn cli_external_map_parses_unindexed_non_git_files_and_directories_without_artifacts() -> Result<()>
+{
+    let invoker = Repo::new()?;
+    let external = Repo::new()?;
+    invoker.write(".slopdex/config.json", "not valid JSON")?;
+    external.write("api.rs", &function("external_file", "live"))?;
+    external.write("nested/peer.rs", &function("external_peer", "live"))?;
+    assert!(!external.root.join(".git").exists());
+    let before = filesystem_snapshot(invoker._temp.path())?;
+    let external_before = filesystem_snapshot(external._temp.path())?;
+
+    for no_reindex in [false, true] {
+        for (path, expected) in [
+            (external.root.join("api.rs"), strings(&["external_file"])),
+            (
+                external.root.clone(),
+                strings(&["external_file", "external_peer"]),
+            ),
+        ] {
+            let mut command = invoker.child(env!("CARGO_BIN_EXE_slopdex"));
+            if no_reindex {
+                command.arg("--no-reindex");
+            }
+            let output = command
+                .args(["--format", "json", "map", "--private"])
+                .arg(&path)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rows: Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(map_names(rows.as_array().unwrap()), expected);
+            assert!(
+                rows.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["path"] == "api.rs")
+            );
+            assert_eq!(filesystem_snapshot(invoker._temp.path())?, before);
+            assert_eq!(filesystem_snapshot(external._temp.path())?, external_before);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_external_map_combines_independent_repositories_and_warns_for_missing_paths() -> Result<()> {
+    let invoker = Repo::new()?;
+    let first = Repo::new()?;
+    let second = Repo::new()?;
+    for (repo, name) in [
+        (&invoker, "local_saved"),
+        (&first, "first_saved"),
+        (&second, "second_saved"),
+    ] {
+        repo.git(&["init", "--quiet"])?;
+        let config = json!({"indexPath": repo.index});
+        repo.write(".slopdex/config.json", &config.to_string())?;
+        repo.write("src/api.rs", &function(name, "saved"))?;
+        repo.open_map(&config)?.refresh_structure()?;
+        repo.write("src/api.rs", &function("live_not_saved", "edited"))?;
+    }
+    let missing = second.root.join("missing.rs");
+    for include_local in [false, true] {
+        if !include_local {
+            invoker.write(".slopdex/config.json", "not valid JSON")?;
+        } else {
+            invoker.write(
+                ".slopdex/config.json",
+                &json!({"indexPath": invoker.index}).to_string(),
+            )?;
+        }
+        let mut command = invoker.child(env!("CARGO_BIN_EXE_slopdex"));
+        command.args(["--no-reindex", "--format", "json", "map", "--private"]);
+        if include_local {
+            command.arg("src/api.rs");
+        }
+        let output = command
+            .arg(first.root.join("src/api.rs"))
+            .arg(second.root.join("src/api.rs"))
+            .arg(&missing)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Parsing the entire stdout rejects concatenated per-workspace JSON arrays.
+        let rows: Value = serde_json::from_slice(&output.stdout)?;
+        let expected = if include_local {
+            strings(&["local_saved", "first_saved", "second_saved"])
+        } else {
+            strings(&["first_saved", "second_saved"])
+        };
+        assert_eq!(rows.as_array().unwrap().len(), expected.len());
+        assert_eq!(map_names(rows.as_array().unwrap()), expected);
+        assert!(
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["path"] == "src/api.rs")
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("map path does not exist"), "{stderr}");
+        assert!(stderr.contains(missing.to_str().unwrap()), "{stderr}");
+    }
+
+    let output = invoker
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .args(["--format", "json", "map"])
+        .arg(&missing)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(serde_json::from_slice::<Value>(&output.stdout)?, json!([]));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("map path does not exist"));
+    Ok(())
+}
+
+#[test]
+fn cli_external_map_explicit_config_and_index_override_source_defaults() -> Result<()> {
+    let invoker = Repo::new()?;
+    let external = Repo::new()?;
+    external.git(&["init", "--quiet"])?;
+    invoker.write(".slopdex/config.json", "not valid JSON")?;
+    let configured_index = external._temp.path().join("configured.sqlite");
+    let explicit_index = external._temp.path().join("explicit.sqlite");
+    let config = json!({
+        "indexPath": external.index,
+        "artifactCachePath": external.home.join("cache/slopdex/global-v1.sqlite")
+    });
+    external.write(".slopdex/config.json", &config.to_string())?;
+    for (index, name) in [
+        (&external.index, "automatic_snapshot"),
+        (&configured_index, "configured_snapshot"),
+        (&explicit_index, "explicit_snapshot"),
+    ] {
+        external.write("nested/api.rs", &function(name, "saved"))?;
+        Engine::open_map(&external.root, index, config.clone())?.refresh_structure()?;
+    }
+    external.write("nested/api.rs", &function("live_snapshot", "edited"))?;
+    let mut alternate = config.clone();
+    alternate["indexPath"] = json!(configured_index);
+    invoker.write("alternate.json", &alternate.to_string())?;
+
+    for (explicit_config, explicit_index, expected) in [
+        (false, Some(&explicit_index), "explicit_snapshot"),
+        (true, None, "configured_snapshot"),
+        (true, Some(&explicit_index), "explicit_snapshot"),
+    ] {
+        if explicit_config {
+            // Explicit --config must bypass even an invalid source-local config.
+            external.write(".slopdex/config.json", "not valid JSON")?;
+        }
+        let mut command = invoker.child(env!("CARGO_BIN_EXE_slopdex"));
+        if explicit_config {
+            command.args(["--config", "alternate.json"]);
+        }
+        if let Some(index) = explicit_index {
+            command.arg("--index").arg(index);
+        }
+        let output = command
+            .args(["--no-reindex", "--format", "json", "map", "--private"])
+            .arg(external.root.join("nested/api.rs"))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(map_names(rows.as_array().unwrap()), strings(&[expected]));
+        assert_eq!(rows[0]["path"], "nested/api.rs");
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_external_cross_source_uses_checkout_snapshot_and_preserves_target_options() -> Result<()> {
+    let mock = Mock::start()?;
+    let invoker = Repo::new()?;
+    let mut source = Repo::new()?;
+    let target = Repo::new()?;
+    source.root = invoker._temp.path().join("source-checkout");
+    fs::create_dir(&source.root)?;
+    source.git(&["init", "--quiet"])?;
+    invoker.write(".slopdex/config.json", "not valid JSON")?;
+    let mut config = mock.config();
+    config["indexPath"] = json!(source.index);
+    source.write(".slopdex/config.json", &config.to_string())?;
+    source.write("nested/same.rs", &function("source_saved", "VECTOR_EAST"))?;
+    source.write("other.rs", &function("source_not_selected", "VECTOR_EAST"))?;
+    target.write(".slopdex/config.json", "not valid JSON")?;
+    target.write("target-config.json", &mock.config().to_string())?;
+    target.write("nested/same.rs", &function("target_saved", "VECTOR_EAST"))?;
+    target.write(
+        "other.rs",
+        &function("target_below_threshold", "VECTOR_NORTH"),
+    )?;
+    source.open(&config)?.refresh()?;
+    target.open(&mock.config())?.refresh()?;
+    source.write("nested/same.rs", &function("source_live", "VECTOR_NORTH"))?;
+    target.write("nested/same.rs", &function("target_live", "VECTOR_NORTH"))?;
+    let calls = mock.count();
+
+    for path in [
+        source.root.join("nested/same.rs"),
+        PathBuf::from("../source-checkout/nested"),
+    ] {
+        let output = invoker
+            .child(env!("CARGO_BIN_EXE_slopdex"))
+            .args([
+                "--no-reindex",
+                "--format",
+                "json",
+                "cross-search",
+                "--source-path",
+            ])
+            .arg(&path)
+            .arg("--target-root")
+            .arg(&target.root)
+            .arg("--target-index")
+            .arg(&target.index)
+            .arg("--target-config")
+            .arg(target.root.join("target-config.json"))
+            .args(["--threshold", "0.9", "--matches", "1", "--cross-file-only"])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<Value> = String::from_utf8(output.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<serde_json::Result<_>>()?;
+        assert_eq!(sources(&rows), strings(&["source_saved"]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source"]["path"], "nested/same.rs");
+        assert_eq!(rows[0]["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            rows[0]["matches"][0]["function"]["qualifiedName"],
+            "target_saved"
+        );
+        near(&rows[0]["matches"][0]["similarity"], 1.0);
+        assert_eq!(
+            mock.count(),
+            calls,
+            "saved cross-search must not call providers"
+        );
+    }
+    assert!(!invoker.index.exists());
+    Ok(())
+}
+
+#[test]
 fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_artifacts()
 -> Result<()> {
     let mock = Mock::start()?;
