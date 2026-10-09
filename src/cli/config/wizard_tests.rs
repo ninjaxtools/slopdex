@@ -105,7 +105,7 @@ impl Prompts for ScriptedPrompts {
 #[test]
 fn wizard_configures_description_models_without_enablement_and_preserves_extensions() {
     let mut config = json!({"custom": "keep"});
-    let mut prompts = ScriptedPrompts::new(&format!("openai\n\nno\nno\n{}", "\n".repeat(10)));
+    let mut prompts = ScriptedPrompts::new(&format!("openai\n\nno\nno\n{}", "\n".repeat(11)));
     configure_interactively(&mut config, &mut prompts).unwrap();
     assert_eq!(config["descriptionProvider"], "openai");
     assert_eq!(config["descriptionModel"], "gpt-5.6-luna");
@@ -137,7 +137,7 @@ fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
     ] {
         let mut config = json!({"embeddingProvider": "jina", "embeddingModel": "custom-jina",
             "embeddingDimensions": 16, "custom": "keep"});
-        let mut prompts = ScriptedPrompts::new(answers);
+        let mut prompts = ScriptedPrompts::new(&(answers.to_owned() + "\n"));
         configure_interactively(&mut config, &mut prompts).unwrap();
         for alias in ["embeddingProvider", "embeddingModel", "embeddingDimensions"] {
             assert!(config.get(alias).is_none());
@@ -160,7 +160,7 @@ fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
 fn wizard_removes_fallback_alias_when_fallback_is_disabled() {
     let mut config = json!({"descriptionProvider": "openai", "descriptionModel": "primary",
         "fallbackModel": "backup"});
-    let mut prompts = ScriptedPrompts::new("\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n");
+    let mut prompts = ScriptedPrompts::new("\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n\n");
     configure_interactively(&mut config, &mut prompts).unwrap();
     assert!(config.get("fallbackModel").is_none());
     assert!(config.get("descriptionFallbackModel").is_none());
@@ -221,7 +221,7 @@ fn wizard_published_models_are_searchable_scoped_and_defaulted() {
 fn wizard_fetches_one_catalog_and_reuses_it_for_fallback() {
     let mut config = json!({"descriptionProvider": "opencode-go", "descriptionModel": "primary",
         "descriptionFallbackModel": "backup"});
-    let mut prompts = ScriptedPrompts::new(&"\n".repeat(15));
+    let mut prompts = ScriptedPrompts::new(&"\n".repeat(16));
     prompts.catalog = json!([
         {"provider": "opencode-go", "model": "primary"},
         {"provider": "opencode-go", "model": "backup"}
@@ -255,6 +255,7 @@ fn wizard_cancellation_at_every_prompt_discards_all_changes() {
         "16",
         "4",
         "yes",
+        "none",
     ];
     for end in 0..answers.len() {
         let input = answers[..end]
@@ -275,6 +276,7 @@ fn wizard_cancellation_at_every_prompt_discards_all_changes() {
     configure_interactively(&mut config, &mut prompts).unwrap();
     assert_eq!(config["rerankerCandidates"], 100);
     assert_eq!(config["verbose"], true);
+    assert_eq!(config["defaultLimit"], "none");
     assert!(prompts.fetches.is_empty());
 }
 
@@ -300,4 +302,31 @@ fn filtered_config_prompts_only_matching_keys() {
     let mut prompts = ScriptedPrompts::new("7\n");
     configure_interactively_filtered(&mut config, &mut prompts, Some("parallel")).unwrap();
     assert_eq!(config["parallelism"], 7);
+}
+
+#[test]
+fn wizard_default_limit_is_configurable_and_validation_is_staged() {
+    for (answer, expected) in [
+        ("\n", json!(4096)),
+        ("23\n", json!(23)),
+        ("none\n", json!("none")),
+    ] {
+        let mut config = json!({"custom": "keep"});
+        let mut prompts = ScriptedPrompts::new(answer);
+        configure_interactively_filtered(&mut config, &mut prompts, Some("defaultLimit")).unwrap();
+        assert_eq!(config, json!({"custom": "keep", "defaultLimit": expected}));
+    }
+    for answer in ["0\n", "all\n"] {
+        let original = json!({"defaultLimit": "none", "custom": "keep"});
+        let mut config = original.clone();
+        assert!(
+            configure_interactively_filtered(
+                &mut config,
+                &mut ScriptedPrompts::new(answer),
+                Some("defaultLimit")
+            )
+            .is_err()
+        );
+        assert_eq!(config, original);
+    }
 }

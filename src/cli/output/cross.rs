@@ -45,7 +45,7 @@ pub(in crate::cli) fn print_cross(
     options: CrossOutput,
     source_presentation: &mut Presentation<'_>,
     mut target_presentation: Option<&mut Presentation<'_>>,
-) -> Result<()> {
+) -> Result<bool> {
     let CrossOutput {
         format,
         same_index,
@@ -54,6 +54,7 @@ pub(in crate::cli) fn print_cross(
         detail,
     } = options;
     rows.retain(|row| !array(&row["matches"]).is_empty());
+    let omitted = limit.is_some_and(|limit| rows.len() > limit);
     if format == Format::Json && source_presentation.calls_enabled() {
         for row in &mut rows {
             row["relatedCallables"] = json!(source_presentation.related_json(&row["source"]));
@@ -125,7 +126,8 @@ pub(in crate::cli) fn print_cross(
                 });
             }
         }
-        return print_ranked_files(out, hits, detail, source_presentation, target_presentation);
+        print_ranked_files(out, hits, detail, source_presentation, target_presentation)?;
+        return Ok(omitted);
     }
     for (index, row) in rows.iter().take(limit.unwrap_or(usize::MAX)).enumerate() {
         if format == Format::Json {
@@ -195,7 +197,7 @@ pub(in crate::cli) fn print_cross(
             }
         }
     }
-    Ok(())
+    Ok(omitted)
 }
 
 #[cfg(test)]

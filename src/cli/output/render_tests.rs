@@ -11,6 +11,22 @@ use serde_json::{Value, json};
 use std::fs;
 
 #[test]
+fn documented_symbols_render_attached_code_but_keep_heading_bodies_separate() {
+    let code = "/// Run.\nfn run() {}\n";
+    let parsed = crate::parse::parse("api.rs", code).unwrap();
+    assert_eq!(
+        super::source_code(code, &parsed.structure.nodes[0]).as_deref(),
+        Some("@ code:\n/// Run.\nfn run() {}\n")
+    );
+
+    let source = "<!-- Guide. -->\n# Guide\nParent body.\n<!-- Setup. -->\n## Setup\nChild body.\n";
+    let parsed = crate::parse::parse("guide.md", source).unwrap();
+    let bodies = super::markdown_map_bodies(source, &parsed.structure);
+    assert_eq!(bodies[&0], "Parent body.\n");
+    assert_eq!(bodies[&1], "Child body.\n");
+}
+
+#[test]
 fn symbol_search_renders_saved_nodes_heading_bodies_and_independent_scores() -> Result<()> {
     let dir = tempfile::tempdir()?;
     fs::write(

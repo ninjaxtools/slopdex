@@ -39,7 +39,7 @@ SEMANTIC_OR_INDEX = {"search", "search-code", "search-descriptions", "search-md"
                      "reindex-files", "models"}
 VALUE_OPTIONS = {"--root", "--config", "--index", "--provider", "--model",
                  "--dimensions", "--description-provider", "--description-model",
-                 "--description-fallback-model", "--reranker-candidates", "--format",
+                 "--description-fallback-model", "--reranker-candidates", "--output",
                  "--detail", "--expand-code-threshold"}
 COMMANDS = SEMANTIC_OR_INDEX | {"map", "status", "index-errors", "config", "help"}
 BASE_INSTRUCTIONS = ("# Evaluation workspace\n\nInvestigate this checkout using local tools and cite source evidence. Do not modify\n"

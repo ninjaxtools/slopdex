@@ -23,6 +23,12 @@ pub struct Selection {
     formats: BTreeSet<FormatGroup>,
 }
 
+pub(crate) struct SelectedStructure {
+    pub(crate) nodes: Vec<StructureNode>,
+    pub(crate) direct_count: usize,
+    pub(crate) omitted: bool,
+}
+
 impl Selection {
     /// Compile shared path, regex, and semantic selectors, plus map kinds/visibility.
     /// String lists accept either a string (including legacy `regexp`) or an array.
@@ -251,6 +257,18 @@ impl Selection {
     }
 
     pub fn select_structure_at(&self, path: &str, structure: &FileStructure) -> Vec<StructureNode> {
+        self.select_structure_limited_at(path, structure, None)
+            .nodes
+    }
+
+    /// Cap direct matches in original source order before adding ancestor context.
+    /// A zero remaining budget still checks for one more eligible match.
+    pub(crate) fn select_structure_limited_at(
+        &self,
+        path: &str,
+        structure: &FileStructure,
+        limit: Option<usize>,
+    ) -> SelectedStructure {
         let parents: HashMap<_, _> = structure
             .nodes
             .iter()
@@ -258,8 +276,11 @@ impl Selection {
             .collect();
         let nodes: HashMap<_, _> = structure.nodes.iter().map(|node| (node.id, node)).collect();
         let mut visibility = HashMap::new();
-        let mut selected = HashSet::new();
-        for node in &structure.nodes {
+        let mut ordered: Vec<_> = structure.nodes.iter().collect();
+        ordered.sort_by_key(|node| node.source_order_key());
+        let mut direct = Vec::new();
+        let mut omitted = false;
+        for node in &ordered {
             if (!self.private
                 && symbol_is_private(node.id, &nodes, &mut visibility, &mut HashSet::new()))
                 || !self.kind_matches(&node.kind)
@@ -267,6 +288,15 @@ impl Selection {
             {
                 continue;
             }
+            if limit.is_some_and(|limit| direct.len() == limit) {
+                omitted = true;
+                break;
+            }
+            direct.push(*node);
+        }
+        let direct_count = direct.len();
+        let mut selected = HashSet::new();
+        for node in direct {
             let mut current = Some(node.id);
             while let Some(id) = current {
                 if !selected.insert(id) {
@@ -275,12 +305,15 @@ impl Selection {
                 current = parents.get(&id).copied().flatten();
             }
         }
-        structure
-            .nodes
-            .iter()
-            .filter(|node| selected.contains(&node.id))
-            .cloned()
-            .collect()
+        SelectedStructure {
+            nodes: ordered
+                .into_iter()
+                .filter(|node| selected.contains(&node.id))
+                .cloned()
+                .collect(),
+            direct_count,
+            omitted,
+        }
     }
 }
 
@@ -955,6 +988,97 @@ mod tests {
     }
 
     #[test]
+    fn limited_structure_counts_only_direct_matches_and_keeps_ancestors() {
+        let mut structure = crate::parse::parse(
+            "example.ts",
+            "export namespace API { export class Service { private hidden() {} run() {} stop() {} } }",
+        )
+        .unwrap()
+        .structure;
+        structure.nodes.reverse();
+        let selection = Selection::compile(&json!({"kinds": "methods"})).unwrap();
+        let limited = selection.select_structure_limited_at("example.ts", &structure, Some(1));
+        assert_eq!(limited.direct_count, 1);
+        assert!(limited.omitted);
+        assert_eq!(
+            limited
+                .nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["API", "Service", "run"]
+        );
+        let exact = selection.select_structure_limited_at("example.ts", &structure, Some(2));
+        assert_eq!(exact.direct_count, 2);
+        assert!(!exact.omitted);
+        assert_eq!(exact.nodes.len(), 4);
+        let exhausted = selection.select_structure_limited_at("example.ts", &structure, Some(0));
+        assert_eq!(exhausted.direct_count, 0);
+        assert!(exhausted.nodes.is_empty());
+        assert!(exhausted.omitted);
+        let parent = Selection::compile(&json!({"regexp": "^API\\.Service", "private": true}))
+            .unwrap()
+            .select_structure_limited_at("example.ts", &structure, Some(1));
+        assert_eq!(parent.direct_count, 1);
+        assert!(parent.omitted);
+        assert_eq!(
+            parent
+                .nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["API", "Service"]
+        );
+    }
+
+    #[test]
+    fn limited_structure_uses_original_declaration_bytes_with_shared_comments() {
+        let mut structure = crate::parse::parse(
+            "example.js",
+            "// API.\nconst First = class { first() {} }, Second = class { second() {} };\n",
+        )
+        .unwrap()
+        .structure;
+        structure.nodes.reverse();
+        let selection =
+            Selection::compile(&json!({"regexp": "first|^Second$", "private": true})).unwrap();
+        let limited = selection.select_structure_limited_at("example.js", &structure, Some(1));
+        assert_eq!(limited.direct_count, 1);
+        assert!(limited.omitted);
+        assert_eq!(
+            limited
+                .nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["First", "first"]
+        );
+    }
+
+    #[test]
+    fn limited_structure_semantics_fail_closed_and_preserve_kind_visibility() {
+        let structure = crate::parse::parse(
+            "example.rs",
+            "pub struct Run; fn hidden() {} pub fn run() {} pub fn other() {}",
+        )
+        .unwrap()
+        .structure;
+        let unresolved = Selection::compile(&json!({
+            "symbolQuery": "run", "kinds": "functions"
+        }))
+        .unwrap();
+        let empty = unresolved.select_structure_limited_at("example.rs", &structure, Some(0));
+        assert_eq!(empty.direct_count, 0);
+        assert!(!empty.omitted);
+        assert!(empty.nodes.is_empty());
+        let resolved = unresolved.with_symbol_names(HashSet::from(["run".into(), "hidden".into()]));
+        let exact = resolved.select_structure_limited_at("example.rs", &structure, Some(1));
+        assert_eq!(exact.direct_count, 1);
+        assert!(!exact.omitted);
+        assert_eq!(exact.nodes[0].name, "run");
+    }
+
+    #[test]
     fn structure_selection_excludes_private_symbols_by_default() {
         for (path, source, public, private) in [
             (
@@ -1123,7 +1247,7 @@ mod tests {
                 .iter()
                 .map(|node| node.id)
                 .collect::<Vec<_>>(),
-            [30, 10]
+            [10, 30]
         );
     }
 }

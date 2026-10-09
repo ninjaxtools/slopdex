@@ -5,6 +5,7 @@ use crate::{
     callgraph::{CallGraph, Key},
     engine,
     filter::Selection,
+    limits::{self, LimitedResults},
     parse::{self, FileStructure, ParsedFile, StructureNode},
     ui,
 };
@@ -50,9 +51,12 @@ impl Unindexed {
         let selection = Selection::compile(options)?;
         let paths = selected_paths(root, options)?;
         let (callers, callees) = call_depths(options);
+        let mut remaining = limits::resolve(&Value::Null, options)?.count();
         let max_size = config["maxFileSize"].as_u64().unwrap_or(1_048_576);
         let mut result = Self::default();
-        for path in engine::source_paths(root, index, config)? {
+        let mut source_paths = engine::source_paths(root, index, config)?;
+        source_paths.sort();
+        for path in source_paths {
             // Call resolution needs the whole workspace; otherwise parse only
             // files that can contribute to the requested map.
             if callers == 0 && callees == 0 && !path_matches(&selection, &paths, &path) {
@@ -76,7 +80,20 @@ impl Unindexed {
                     ));
                 }
             }
+            // Retain the file proving omission so query_limited can report it,
+            // but do not parse any later files unless call resolution needs them.
+            let omitted = if callers == 0 && callees == 0 && remaining.is_some() {
+                let selected =
+                    selection.select_structure_limited_at(&path, &parsed.structure, remaining);
+                remaining = remaining.map(|remaining| remaining - selected.direct_count);
+                selected.omitted
+            } else {
+                false
+            };
             result.files.insert(path, (source, parsed));
+            if omitted {
+                break;
+            }
         }
         Ok(result)
     }
@@ -148,18 +165,38 @@ pub(crate) fn query(
     root: &Path,
     options: &Value,
 ) -> Result<Vec<Value>> {
+    Ok(query_limited(source, root, options)?.rows)
+}
+
+pub(crate) fn query_limited(
+    source: &dyn StructureSource,
+    root: &Path,
+    options: &Value,
+) -> Result<LimitedResults<Value>> {
+    let limit = limits::resolve(&Value::Null, options)?.count();
+    let mut remaining = limit;
+    let mut omitted = false;
+    let mut direct_count = 0;
     let selection = source.selection(options)?;
     let paths = selected_paths(root, options)?;
     let (callers, callees) = call_depths(options);
     let mut selected = BTreeMap::<String, Vec<StructureNode>>::new();
-    for path in source.paths()? {
+    let mut source_paths = source.paths()?;
+    source_paths.sort();
+    for path in source_paths {
         if !path_matches(&selection, &paths, &path) {
             continue;
         }
         if let Some(structure) = source.structure(&path)? {
-            let nodes = selection.select_structure_at(&path, &structure);
-            if !nodes.is_empty() {
-                selected.insert(path, nodes);
+            let matches = selection.select_structure_limited_at(&path, &structure, remaining);
+            direct_count += matches.direct_count;
+            remaining = remaining.map(|remaining| remaining - matches.direct_count);
+            if !matches.nodes.is_empty() {
+                selected.insert(path, matches.nodes);
+            }
+            if matches.omitted {
+                omitted = true;
+                break;
             }
         }
     }
@@ -201,7 +238,7 @@ pub(crate) fn query(
     };
     let mut result = Vec::new();
     for (path, mut nodes) in selected {
-        nodes.sort_by_key(|node| (node.start_byte, node.id));
+        nodes.sort_by_key(StructureNode::source_order_key);
         let mut values = Vec::new();
         for node in nodes {
             let key = Key {
@@ -231,7 +268,12 @@ pub(crate) fn query(
         }
         result.push(json!({"path":path,"nodes":values}));
     }
-    Ok(result)
+    Ok(LimitedResults {
+        rows: result,
+        omitted,
+        limit,
+        count: direct_count,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,11 +499,11 @@ pub fn render_with_hits(
 ) -> String {
     let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let mut ordered: Vec<_> = nodes.iter().collect();
-    ordered.sort_by_key(|node| (node.start_byte, node.id));
+    ordered.sort_by_key(|node| node.source_order_key());
     let mut full_children: HashMap<Option<usize>, Vec<&StructureNode>> = HashMap::new();
     if let Some(structure) = full_structure {
         let mut full: Vec<_> = structure.nodes.iter().collect();
-        full.sort_by_key(|node| (node.start_byte, node.id));
+        full.sort_by_key(|node| node.source_order_key());
         for node in full {
             full_children.entry(node.parent_id).or_default().push(node);
         }
@@ -502,7 +544,8 @@ pub fn render_with_hits(
                 display_end(previous)
             };
             let nearby = (child && end == node.start_line)
-                || blank_gap(end, node.start_line, source_lines.as_deref());
+                || blank_gap(end, node.start_line, source_lines.as_deref())
+                || shared_comment_gap(previous, node, end, source_lines.as_deref());
             parent_present
                 && previous_parent_present
                 && nearby
@@ -599,17 +642,18 @@ fn append_group(
 /// Compare against a declaration rather than its enclosing body: the last line
 /// of a Markdown heading, or the first declaration line after Rust attributes.
 fn declaration_line(node: &StructureNode) -> usize {
+    let start = node.declaration_start_line.unwrap_or(node.start_line);
     if node.kind == "heading" {
-        node.start_line + node.signature.lines().count().saturating_sub(1)
+        start + node.signature.lines().count().saturating_sub(1)
     } else if node.language == "rust" {
-        node.start_line
+        start
             + node
                 .attributes
                 .iter()
                 .map(|attr| attr.lines().count())
                 .sum::<usize>()
     } else {
-        node.start_line
+        start
     }
 }
 
@@ -621,6 +665,27 @@ fn blank_gap(end: usize, start: usize, source_lines: Option<&[&str]>) -> bool {
                     .get(end..start - 1)
                     .is_some_and(|gap| gap.iter().all(|line| line.trim().is_empty()))
             }))
+}
+
+/// Multibindings share a leading comment, but their original declarations still
+/// have independent gaps. Do not treat other overlapping ranges as adjacent.
+fn shared_comment_gap(
+    previous: &StructureNode,
+    node: &StructureNode,
+    end: usize,
+    source_lines: Option<&[&str]>,
+) -> bool {
+    previous.parent_id == node.parent_id
+        && previous.kind != "heading"
+        && node.kind != "heading"
+        && previous.declaration_start_byte.is_some()
+        && previous.start_byte == node.start_byte
+        && node
+            .declaration_start_byte
+            .is_some_and(|start| previous.end_byte <= start)
+        && node
+            .declaration_start_line
+            .is_some_and(|start| blank_gap(end, start, source_lines))
 }
 
 fn depth(node: &StructureNode, by_id: &HashMap<usize, &StructureNode>) -> usize {
@@ -893,6 +958,221 @@ pub fn matching_node<'a>(structure: &'a FileStructure, unit: &Value) -> Option<&
 mod tests {
     use super::*;
 
+    fn unindexed(files: &[(&str, &str)]) -> Result<Unindexed> {
+        Ok(Unindexed {
+            files: files
+                .iter()
+                .map(|(path, source)| {
+                    Ok((
+                        (*path).to_owned(),
+                        ((*source).to_owned(), parse::parse(path, source)?),
+                    ))
+                })
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    fn query_names(rows: &[Value]) -> Vec<&str> {
+        rows.iter()
+            .flat_map(|row| row["nodes"].as_array().unwrap())
+            .map(|node| node["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn query_limits_direct_matches_globally_and_keeps_ancestor_context() -> Result<()> {
+        let source = unindexed(&[
+            ("b.ts", "export class Later { third() {} fourth() {} }"),
+            ("a.ts", "export class First { first() {} second() {} }"),
+        ])?;
+        let options = json!({"kinds": "methods", "limit": 3});
+        let limited = query_limited(&source, Path::new("."), &options)?;
+        assert_eq!(limited.limit, Some(3));
+        assert!(limited.omitted);
+        assert_eq!(limited.rows[0]["path"], "a.ts");
+        assert_eq!(limited.rows[1]["path"], "b.ts");
+        assert_eq!(
+            query_names(&limited.rows),
+            ["First", "first", "second", "Later", "third"]
+        );
+        assert_eq!(query(&source, Path::new("."), &options)?, limited.rows);
+        for limit in [json!(4), json!("none")] {
+            let complete = query_limited(
+                &source,
+                Path::new("."),
+                &json!({"kinds": "methods", "limit": limit}),
+            )?;
+            assert!(!complete.omitted);
+            assert_eq!(query_names(&complete.rows).len(), 6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn query_checks_later_eligible_paths_for_omission_then_stops() -> Result<()> {
+        struct Observed {
+            source: Unindexed,
+            reads: std::cell::RefCell<Vec<String>>,
+        }
+        impl StructureSource for Observed {
+            fn paths(&self) -> Result<Vec<String>> {
+                let mut paths = self.source.paths()?;
+                paths.reverse();
+                Ok(paths)
+            }
+            fn structure(&self, path: &str) -> Result<Option<FileStructure>> {
+                self.reads.borrow_mut().push(path.to_owned());
+                self.source.structure(path)
+            }
+            fn source(&self, path: &str) -> Option<&str> {
+                self.source.source(path)
+            }
+            fn call_graph(&self) -> Result<CallGraph> {
+                self.source.call_graph()
+            }
+        }
+        let source = Observed {
+            source: unindexed(&[
+                ("a.rs", "pub fn keep() {}"),
+                ("b.rs", "fn keep_private() {} pub struct keep_type;"),
+                ("c.rs", "pub fn other() {}"),
+                ("d.rs", "pub fn keep_more() {}"),
+                ("e.rs", "pub fn keep_last() {}"),
+                ("excluded.rs", "pub fn keep_excluded() {}"),
+            ])?,
+            reads: Default::default(),
+        };
+        let options = json!({
+            "kinds": "functions", "regexp": "keep", "limit": 1,
+            "glob": ["*.rs", "!excluded.rs"]
+        });
+        let limited = query_limited(&source, Path::new("."), &options)?;
+        assert!(limited.omitted);
+        assert_eq!(query_names(&limited.rows), ["keep"]);
+        assert_eq!(*source.reads.borrow(), ["a.rs", "b.rs", "c.rs", "d.rs"]);
+        source.reads.borrow_mut().clear();
+        let exact = query_limited(
+            &source,
+            Path::new("."),
+            &json!({"kinds": "functions", "regexp": "^keep$", "limit": 1}),
+        )?;
+        assert!(!exact.omitted);
+        assert_eq!(query_names(&exact.rows), ["keep"]);
+        assert_eq!(source.reads.borrow().len(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn query_builtin_limit_and_none_are_valid_for_empty_and_large_inputs() -> Result<()> {
+        let empty = Unindexed::default();
+        for (options, limit) in [
+            (json!({}), Some(4096)),
+            (json!({"limit": 1}), Some(1)),
+            (json!({"limit": "none"}), None),
+        ] {
+            let result = query_limited(&empty, Path::new("."), &options)?;
+            assert!(result.rows.is_empty());
+            assert!(!result.omitted);
+            assert_eq!(result.limit, limit);
+        }
+        for limit in [json!(0), json!(-1), json!(true), json!("all"), Value::Null] {
+            assert!(query_limited(&empty, Path::new("."), &json!({"limit": limit})).is_err());
+        }
+        // Synthetic declarations keep the default-boundary test parser-independent.
+        let mut parsed = parse::parse("many.rs", "")?;
+        parsed.structure.nodes = (0..4097)
+            .rev()
+            .map(|id| StructureNode {
+                id,
+                name: format!("item{id}"),
+                qualified_name: format!("item{id}"),
+                kind: "function".into(),
+                start_byte: id,
+                ..StructureNode::default()
+            })
+            .collect();
+        let mut source = Unindexed {
+            files: BTreeMap::from([("many.rs".into(), (String::new(), parsed))]),
+        };
+        let limited = query_limited(&source, Path::new("."), &json!({}))?;
+        assert_eq!(limited.limit, Some(4096));
+        assert!(limited.omitted);
+        assert_eq!(query_names(&limited.rows).len(), 4096);
+        assert_eq!(query_names(&limited.rows)[0], "item0");
+        assert_eq!(query_names(&limited.rows)[4095], "item4095");
+        let all = query_limited(&source, Path::new("."), &json!({"limit": "none"}))?;
+        assert_eq!(all.limit, None);
+        assert!(!all.omitted);
+        assert_eq!(query_names(&all.rows).len(), 4097);
+        source
+            .files
+            .get_mut("many.rs")
+            .unwrap()
+            .1
+            .structure
+            .nodes
+            .remove(0);
+        let exact = query_limited(&source, Path::new("."), &json!({}))?;
+        assert!(!exact.omitted);
+        assert_eq!(query_names(&exact.rows).len(), 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn query_limit_preserves_callgraph_context_outside_the_budget() -> Result<()> {
+        let source = unindexed(&[(
+            "calls.rs",
+            "pub fn first() { helper(); } pub fn helper() {} pub fn caller() { first(); } pub fn other() {}",
+        )])?;
+        let limited = query_limited(
+            &source,
+            Path::new("."),
+            &json!({"limit": 1, "expandCallers": 1, "expandCallees": 1}),
+        )?;
+        assert!(limited.omitted);
+        assert_eq!(query_names(&limited.rows), ["first", "helper", "caller"]);
+        let nodes = limited.rows[0]["nodes"].as_array().unwrap();
+        assert_eq!(nodes[1]["callDepth"]["callee"], 1);
+        assert_eq!(nodes[2]["callDepth"]["caller"], 1);
+        assert_eq!(nodes[1]["expandedCode"], true);
+        assert_eq!(nodes[2]["expandedCode"], true);
+        let exact = query_limited(
+            &source,
+            Path::new("."),
+            &json!({"limit": 1, "regexp": "^first$", "callers": 1, "callees": 1}),
+        )?;
+        assert!(!exact.omitted);
+        assert_eq!(query_names(&exact.rows), ["first", "helper", "caller"]);
+        Ok(())
+    }
+
+    #[test]
+    fn unindexed_parse_stops_after_proving_omission_unless_callgraph_is_needed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        for (path, source) in [
+            ("a.rs", "pub fn first() {}"),
+            ("b.rs", "fn hidden() {}"),
+            ("c.rs", "pub fn second() {}"),
+            ("d.rs", "pub fn third() {}"),
+        ] {
+            std::fs::write(root.join(path), source)?;
+        }
+        let options = json!({"limit": 1});
+        let config = json!({"artifactCachePath": root.join("artifacts")});
+        let source = Unindexed::parse(root, &root.join("index.sqlite"), &config, &options)?;
+        assert_eq!(source.paths()?, ["a.rs", "b.rs", "c.rs"]);
+        assert!(query_limited(&source, root, &options)?.omitted);
+        let graph = Unindexed::parse(
+            root,
+            &root.join("index.sqlite"),
+            &config,
+            &json!({"limit": 1, "callees": 1}),
+        )?;
+        assert_eq!(graph.paths()?.len(), 4);
+        Ok(())
+    }
+
     #[test]
     fn callee_comments_omit_line_numbers() {
         assert_eq!(
@@ -1055,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn up_to_four_blank_lines_join_siblings_but_five_or_a_comment_do_not() {
+    fn up_to_four_blank_lines_join_siblings_including_attached_comments_but_not_five() {
         let source = "fn first() {}\n  \nfn second() {}\n\n\nfn third() {}\n\n\n  \n\nfn fourth() {}\n\n\n\n\n\nfn fifth() {}\n// separator\nfn sixth() {}\n";
         let structure = crate::parse::parse("api.rs", source).unwrap().structure;
         let output = render_with_structure(
@@ -1069,14 +1349,172 @@ mod tests {
             output.contains("@@ 1-11 @@\nfn first()\nfn second()\nfn third()\nfn fourth()\n"),
             "{output}"
         );
-        assert!(output.contains("@@ 17 @@\nfn fifth()\n"), "{output}");
-        assert!(output.contains("@@ 19 @@\nfn sixth()\n"), "{output}");
-        assert_eq!(output.matches("@@").count(), 6, "{output}");
+        assert!(
+            output.contains("@@ 17-19 @@\nfn fifth()\nfn sixth()\n"),
+            "{output}"
+        );
+        assert_eq!(output.matches("@@").count(), 4, "{output}");
 
         // Without the indexed source, the skipped line cannot be assumed blank.
         let without_source = render_nodes(&structure.nodes, None);
         assert!(without_source.contains("@@ 1 @@\nfn first()\n"));
         assert!(without_source.contains("@@ 3 @@\nfn second()\n"));
+    }
+
+    #[test]
+    fn attached_comment_blocks_do_not_count_toward_the_blank_gap_limit() {
+        for (blanks, shared) in [(0, true), (4, true), (5, false)] {
+            let source = format!(
+                "fn first() {{}}\n{}/// One.\n/// Two.\n/// Three.\n/// Four.\n/// Five.\n/// Six.\nfn second() {{}}\n",
+                "\n".repeat(blanks)
+            );
+            let structure = crate::parse::parse("api.rs", &source).unwrap().structure;
+            let output = render_with_structure(
+                &structure.nodes,
+                None,
+                Detail::Compact,
+                Some(&source),
+                Some(&structure),
+            );
+            assert_eq!(
+                output.matches("@@").count(),
+                if shared { 2 } else { 4 },
+                "{output}"
+            );
+            assert_eq!(structure.nodes[1].start_line, blanks + 2);
+        }
+    }
+
+    #[test]
+    fn detached_comments_still_break_adjacency() {
+        let source = "fn first() {}\n// Detached.\n\nfn second() {}\n";
+        let structure = crate::parse::parse("api.rs", source).unwrap().structure;
+        let output = render_with_structure(
+            &structure.nodes,
+            None,
+            Detail::Compact,
+            Some(source),
+            Some(&structure),
+        );
+        assert_eq!(output.matches("@@").count(), 4, "{output}");
+    }
+
+    #[test]
+    fn documented_containers_join_their_children_after_attributes() {
+        let source = "/// Container.\n/// More detail.\n#[derive(Debug)]\nstruct Fields {\n    /// Field.\n    first: i32,\n}\n";
+        let structure = crate::parse::parse("fields.rs", source).unwrap().structure;
+        let output = render_nodes(&structure.nodes, None);
+        assert_eq!(output, "@@ 1-7 @@\nstruct Fields\n  first: i32\n");
+    }
+
+    #[test]
+    fn documented_multibinding_classes_keep_source_order() {
+        let source = "// API.\nconst First = class {\n  first() {}\n}, Second = class {\n  second() {}\n};\n";
+        let structure = crate::parse::parse("api.js", source).unwrap().structure;
+        let mut nodes = structure.nodes.clone();
+        nodes.reverse();
+        nodes.sort_by_key(StructureNode::source_order_key);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            ["First", "First.first", "Second", "Second.second"]
+        );
+        for name in ["First", "Second"] {
+            let node = nodes.iter().find(|node| node.name == name).unwrap();
+            assert_eq!(node.start_byte, 0);
+            assert_eq!(node.declaration_start_byte, source.find(name));
+            assert_eq!(node.description.as_deref(), Some("API."));
+        }
+        let output = render_with_structure(
+            &nodes,
+            None,
+            Detail::Compact,
+            Some(source),
+            Some(&structure),
+        );
+        let positions =
+            ["First", "first()", "Second", "second()"].map(|name| output.find(name).unwrap());
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn documented_callable_multibindings_keep_the_existing_blank_gap_rule() {
+        for (blanks, shared) in [(0, true), (4, true), (5, false)] {
+            let source = format!(
+                "// API.\nconst first = () => 1,\n{}      second = () => 2;\n",
+                "\n".repeat(blanks)
+            );
+            let parsed = crate::parse::parse("api.js", &source).unwrap();
+            for indexed_source in [None, Some(source.as_str())] {
+                let output = render_with_structure(
+                    &parsed.structure.nodes,
+                    None,
+                    Detail::Compact,
+                    indexed_source,
+                    Some(&parsed.structure),
+                );
+                assert_eq!(
+                    output.matches("@@").count(),
+                    if shared && (blanks == 0 || indexed_source.is_some()) {
+                        2
+                    } else {
+                        4
+                    },
+                    "{output}"
+                );
+            }
+            for callable in &parsed.callables {
+                assert!(callable.source.starts_with("// API.\n"));
+                assert_eq!(callable.source_hash, crate::hash(&callable.source));
+                assert!(callable.embedding_input.ends_with(&callable.source));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_comments_do_not_join_across_omitted_symbols_or_scopes() {
+        for source in [
+            "// API.\nconst first = () => 1,\n      omitted = 0, second = () => 2;\n",
+            "function host() {\n// API.\nconst first = () => 1,\n      second = () => 2;\n}\n",
+        ] {
+            let structure = crate::parse::parse("api.js", source).unwrap().structure;
+            let nodes: Vec<_> = structure
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.name.as_str(), "first" | "second"))
+                .cloned()
+                .collect();
+            let output = render_with_structure(
+                &nodes,
+                None,
+                Detail::Compact,
+                Some(source),
+                Some(&structure),
+            );
+            assert_eq!(output.matches("@@").count(), 4, "{output}");
+        }
+    }
+
+    #[test]
+    fn shared_comment_adjacency_requires_nonoverlapping_original_ranges() {
+        let source = "// API.\nconst first = () => 1,\n      second = () => 2;\n";
+        let mut structure = crate::parse::parse("api.js", source).unwrap().structure;
+        // Even with shared comments and adjacent declaration lines, containment
+        // or overlapping declaration ranges must not gain a new adjacency rule.
+        structure.nodes[0].end_byte = structure.nodes[1].end_byte;
+        let output = render_with_structure(
+            &structure.nodes,
+            None,
+            Detail::Compact,
+            Some(source),
+            Some(&structure),
+        );
+        assert_eq!(output.matches("@@").count(), 4, "{output}");
     }
 
     #[test]

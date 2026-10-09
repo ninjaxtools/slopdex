@@ -1,5 +1,6 @@
 use super::{
-    CrossOutput, Presentation, print_cross, print_errors, print_map, print_search,
+    CrossOutput, Presentation, print_cross, print_errors, print_limit_notice, print_map,
+    print_search,
     test_support::{edge, function, map_config},
 };
 use crate::{
@@ -12,6 +13,25 @@ use std::{
     fs,
     io::{self, Write},
 };
+
+#[test]
+fn limit_notices_require_actual_omission_and_keep_json_stdout_clean() -> Result<()> {
+    for format in [Format::Summary, Format::Clusters, Format::Json] {
+        let mut out = Vec::new();
+        print_limit_notice(&mut out, format, false, Some(1))?;
+        print_limit_notice(&mut out, format, false, None)?;
+        assert!(out.is_empty());
+        print_limit_notice(&mut out, format, true, Some(1))?;
+        if format == Format::Json {
+            assert!(out.is_empty());
+        } else {
+            let output = String::from_utf8(out)?;
+            assert!(output.contains("results omitted by limit 1"));
+            assert!(output.contains("--limit none"));
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn indexed_file_and_callable_descriptions_are_comments_at_the_requested_detail() -> Result<()> {

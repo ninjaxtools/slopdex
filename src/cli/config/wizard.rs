@@ -2,6 +2,7 @@
 
 use super::{normalize_config_aliases, validate_config};
 use crate::cli::args::positive;
+use crate::limits::{self, ResultLimit};
 use crate::providers::Providers;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
@@ -157,6 +158,7 @@ pub(super) const CONFIG_KEYS: &[&str] = &[
     "maxFileSize",
     "embeddingBatchSize",
     "parallelism",
+    "defaultLimit",
     "verbose",
 ];
 
@@ -414,6 +416,21 @@ fn configure_interactively_filtered(
             "Log every external model request?",
             existing["verbose"].as_bool().unwrap_or(false)
         )?);
+    }
+    if selected(prefix, "defaultLimit") {
+        let default = limits::resolve(&existing, &json!({}))?.value();
+        let default = default
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| default.to_string());
+        let limit = prompts.required(
+            "Default result limit (positive integer or 'none')",
+            &default,
+        )?;
+        config["defaultLimit"] = limit
+            .parse::<ResultLimit>()
+            .map_err(anyhow::Error::msg)?
+            .value();
     }
     validate_config(&config)?;
     *saved = config;

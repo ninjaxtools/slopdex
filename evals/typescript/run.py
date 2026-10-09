@@ -312,7 +312,7 @@ def offline_ann_command(binary: str, workspace: Path, config_path: Path, index: 
     # search-symbols always opens the graph, bypassing map's selector-result cache.
     navigation = ["search-symbols", "slopdex eval warmup", "-e", "a^"] if symbol_only else ["cross-search", "-e", "a^"]
     return [binary, "--root", str(workspace), "--config", str(config_path), "--index", str(index),
-            "--no-reindex", "--format", "json", *navigation]
+            "--no-reindex", "--output", "json", *navigation]
 
 
 def warm_native_ann(directory: Path, metadata: dict, binary: str, workspace: Path, timeout: int, *, symbol_only=False):
@@ -528,7 +528,7 @@ def verify_native_ann_reuse(binary: str, workspace: Path, config_path: Path, ind
         # may advance generation while retaining the identical vocabulary/graph;
         # that only updates manifest generation/fingerprint, not the binary.
         argv = [binary, "--root", str(workspace), "--config", str(offline_config), "--index", str(index),
-                "--force-reindex", "--yes-really-rebuild-the-index", "--ignore-errors", "--format", "json", "map", "--private", "-k", "fns",
+                "--force-reindex", "--yes-really-rebuild-the-index", "--ignore-errors", "--output", "json", "map", "--private", "-k", "fns",
                 "-q", "slopdex eval warmup", "--symbol-threshold", "0", "-g", "*", "-g", "!*"]
         symbol_query = {"command": "map -q", "provider_credentials_removed": True,
                         "selector_cache_cleared": True, "embedding_count": embedding_count}
@@ -659,7 +659,7 @@ def slopdex_command(argv: list[str]) -> str:
     value_options = {
         "--root", "--config", "--index", "--provider", "--model", "--dimensions",
         "--description-provider", "--description-model", "--description-fallback-model",
-        "--reranker-candidates", "--format", "--detail", "--expand-code-threshold",
+        "--reranker-candidates", "--output", "--detail", "--expand-code-threshold",
     }
     flag_options = {"--no-reindex", "--force-reindex", "--rebuild-on-divergence",
                     "--yes-really-rebuild-the-index", "--ignore-errors", "--verbose"}

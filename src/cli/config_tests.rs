@@ -152,16 +152,16 @@ fn config_set_keeps_json_stdout_machine_readable() {
             "set",
             "descriptionProvider",
             "openai",
-            "--format",
+            "--output",
             "json",
         ],
-        vec!["config", "set", "parallelism", "4", "--format", "json"],
+        vec!["config", "set", "parallelism", "4", "--output", "json"],
         vec![
             "config",
             "set",
             "rerankerProvider",
             "openai",
-            "--format",
+            "--output",
             "json",
         ],
     ] {
@@ -174,6 +174,33 @@ fn config_set_keeps_json_stdout_machine_readable() {
         let result: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(result["configPath"], json!(path));
         assert_eq!(read_config(&path).unwrap()["custom"], "keep");
+    }
+}
+
+#[test]
+fn config_default_limit_accepts_counts_and_none_and_rejects_invalid_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    for (input, expected) in [("17", json!(17)), ("none", json!("none"))] {
+        let result = config_action_json(&path, &["config", "set", "defaultLimit", input]);
+        assert_eq!(result["defaultLimit"], expected);
+        let config = effective_config(&parse(&["map"]).global, &path).unwrap();
+        assert_eq!(config["defaultLimit"], expected);
+    }
+    let original = fs::read(&path).unwrap();
+    for invalid in ["0", "-1", "1.5", "null", "true", "\"17\"", "all"] {
+        let cli = parse(&["config", "set", "defaultLimit", "--", invalid]);
+        let Command::Config { args } = cli.command else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        let error = run_config(&cli.global, &path, &args, &mut out).unwrap_err();
+        assert!(error.to_string().contains("defaultLimit"), "{error}");
+        assert!(out.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::write(&path, json!({"defaultLimit": serde_json::from_str::<Value>(invalid).unwrap_or(json!(invalid))}).to_string()).unwrap();
+        assert!(effective_config(&parse(&["map"]).global, &path).is_err());
+        fs::write(&path, &original).unwrap();
     }
 }
 
@@ -252,7 +279,7 @@ fn invalid_config_settings_cannot_partially_persist_a_config_action() {
         "set",
         "custom.updated",
         "true",
-        "--format",
+        "--output",
         "json",
     ]);
     let Command::Config { args } = cli.command else {
@@ -338,7 +365,7 @@ fn failed_config_replacement_preserves_destination_and_allows_retry() {
 }
 
 fn config_action_json(path: &Path, args: &[&str]) -> Value {
-    let cli = parse(&[args, &["--format", "json"]].concat());
+    let cli = parse(&[args, &["--output", "json"]].concat());
     let Command::Config { args } = cli.command else {
         panic!()
     };
@@ -545,7 +572,7 @@ fn config_exclusion_dispatch_creates_config_without_an_index() {
         "sample.rs:run",
         "--root",
         temp.path().to_str().unwrap(),
-        "--format",
+        "--output",
         "json",
     ]);
     let mut out = Vec::new();

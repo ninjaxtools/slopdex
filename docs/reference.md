@@ -74,7 +74,7 @@ about descriptions, reranking, embeddings, paths, filters, and common settings.
 Use arrow keys and Enter to select providers and models; typing in an OpenCode
 model menu filters the published catalog. Saved values are preselected, numeric
 inputs validate inline, and Esc/Ctrl-C cancels without saving partial changes.
-The wizard and its saved-settings summary render on stderr, so `--format json`
+The wizard and its saved-settings summary render on stderr, so `--output json`
 can write the resulting configuration to redirected stdout.
 Advanced endpoint/HTTP settings can be set with `config set`.
 
@@ -114,7 +114,7 @@ use plain diagnostics without animations; result data on stdout retains its
 ## Structure map
 
 ```text
-slopdex map [PATH]... [--formats GROUPS]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--symbol-threshold NUMBER] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--format text|json]
+slopdex map [PATH]... [--formats GROUPS]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--symbol-threshold NUMBER] [--limit N|none] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--output text|json]
 ```
 
 With no paths, map selects the repository. Paths select files or recursive
@@ -135,7 +135,7 @@ output. It creates no database, lock files, cache directories, or sidecars, even
 with `--no-reindex`, and works without Git. Ignore/include/exclude rules and
 `maxFileSize` still apply.
 If `-q` is supplied, map prints `slopdex: warning: no active index; -q is ignored.`
-to stdout before the map output, including with `--format json`. All symbol
+to stdout before the map output, including with `--output json`. All symbol
 queries are ignored; other selectors, paths, and detail settings still apply.
 
 With an existing index, map normally refreshes local file snapshots, declarations,
@@ -253,7 +253,10 @@ them, including parent and child headings. Prose or code between declarations
 starts a new hunk. In file order, each ancestor is printed once. Code hunks contain
 declaration signatures: no executable body, body braces, per-line number prefix,
 or omission marker is printed unless explicitly expanded. Nested declarations are
-indented. Code ranges cover original declarations; Markdown map ranges cover full
+indented. Code ranges include attached leading comment blocks, which are also
+included in callable code embeddings and indexed separately as descriptions.
+Adjacency measures the whitespace before the attached block, not its comment
+lines; detached comments still break a hunk. Markdown map ranges cover full
 sections, including subsections. With `--detail expanded`, Markdown maps also print
 the full body beneath each selected heading, without repeating nested sections.
 Headings included only as ancestor context remain heading-only, and filters omit
@@ -271,7 +274,7 @@ half-open; lines and UTF-8 byte columns are one-based with exclusive ends.
 slopdex map src docs -g '*.rs' -g '*.md'
 slopdex map src -k fns,types -e '^Engine\.'
 slopdex map src --private
-slopdex map -k imports -e 'HashMap|MapAlias' --format json
+slopdex map -k imports -e 'HashMap|MapAlias' --output json
 slopdex map docs -k headings -e '^Guide\.Setup' -i --no-reindex
 slopdex map src -q 'validate session' -q 'authenticate user' -g '*.rs' -k fns
 slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
@@ -371,10 +374,16 @@ Common query/cross-search filters:
 - `--threshold <number|min-max>`: default `0.8` for cross-search and `0.3` for
   query commands (including `describe`); finite endpoints in `[-1,1]`,
   inclusive minimum and exclusive maximum. A range requires minimum < maximum.
-- `--limit <positive integer>`: default unlimited. Caps query results (including
-  Markdown), or the context matches for `describe`. For cross-search it caps
+- `--limit <positive integer|none>`: default `4096`, configurable with
+  `defaultLimit` in `.slopdex/config.json`. `--limit none` disables the output
+  limit, overriding the config. Caps query results (including Markdown), or the
+  context matches for `describe`. For `map`, it caps direct declaration matches
+  across files and mapped workspaces; ancestor and call-graph context do not count.
+  When mapping multiple workspaces, the first workspace supplies the configured
+  default unless `--limit` is explicit. For cross-search it caps
   emitted clusters or matched-source rows **after all selected sources are
-  searched**.
+  searched**. When a limit actually omits results, text output includes a notice
+  suggesting `--limit none`; JSON/JSONL send that notice to stderr.
 - `--formats`, `-g`, `-e`, `-i`, `-q`, and `--symbol-threshold`: the [shared selectors](#shared-selectors).
 
 `search` accepts the explicit index selectors `--code`, `--descriptions`, `--docs`
@@ -551,7 +560,8 @@ impl SessionService
 Rust, JavaScript/TypeScript, Go, and Java use `//` comments; C uses `/* */`,
 Python uses `#`, and Markdown uses HTML comments. Description prose may come from
 source comments/docstrings or explicit generation. It is displayed as an annotation;
-its lines are not added to declaration hunk ranges.
+annotation lines do not extend declaration hunk ranges. Attached source comments
+are already part of the symbol's source range.
 This setting affects text presentation, not which symbols are selected or the
 contents of JSON. Map's `-k` and `--private` remain selection filters.
 
@@ -641,15 +651,15 @@ lines to keep their identities distinct. Identical paths share one file header
 even when the symbols come from different indexes. The similarity range belongs
 to observed edges, not individual members. File grouping is a text presentation;
 JSON `callees` arrays keep flat `path:start-end:qualifiedName` locations. With
-`--cohesion` or `--format text`, cross-search can instead print source/match groups
+`--cohesion` or `--output text`, cross-search can instead print source/match groups
 with per-match scores and optional filesystem distance.
 
 Reranking applies to query commands, including the search inside `describe`, not
 cross-search. Embedding thresholds are applied first. Cohere/Jina receive up to
-five times an explicit result limit, or all retrieved threshold-passing candidates
+five times the effective result limit, or all retrieved threshold-passing candidates
 without a limit. OpenAI receives up to
 `min(100, max(limit or 100, rerankerCandidates))`; the configured candidate count
-defaults to `10`. Without an explicit limit the OpenAI retrieval cap is **100**.
+defaults to `10`. With `--limit none` the OpenAI retrieval cap is still **100**.
 Query JSON retains `similarity` and adds `rerankScore`.
 
 Clusters are connected components of observed callable matches, sorted by highest
@@ -674,10 +684,10 @@ Cohesion changes the order of each source's selected semantic matches. Distance
 is `0` in one file, `1` between files in one directory, and `1` plus directory-tree
 hops otherwise. It does not alter similarity or the neighbor selection score.
 
-`--format json` produces map/query/diagnostic/model arrays, configuration/status
+`--output json` produces map/query/diagnostic/model arrays, configuration/status
 objects, and **JSONL for cross-search** (one object per matched source).
-`--format text` (legacy alias `summary`) selects the text view;
-`--format clusters` is valid only for cross-search without cohesion. Results go
+`--output text` (legacy alias `summary`) selects the text view;
+`--output clusters` is valid only for cross-search without cohesion. Results go
 to stdout and warnings/errors to stderr. Clap argument errors exit with `2`;
 runtime/configuration/domain failures exit with `1`; success/help/version exit
 with `0`.
@@ -1081,6 +1091,7 @@ Example `.slopdex/config.json`:
   "rerankerProvider": "openai",
   "rerankerModel": "gpt-5.6-luna",
   "rerankerCandidates": 10,
+  "defaultLimit": 4096,
   "exclude": ["**/fixtures/**"]
 }
 ```
@@ -1093,6 +1104,7 @@ Example `.slopdex/config.json`:
 | `descriptionFallbackModel` | Optional same-provider fallback; CLI `--description-fallback-model`. Successful fallback stays active within that provider instance until it fails. |
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel` | Disabled by default; models default to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, OpenAI `gpt-5.6-luna`. |
 | `rerankerCandidates` | OpenAI candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
+| `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, describe, map direct matches, and cross-search output. `--limit` overrides it. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
 | `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`; larger configured values are capped. Interactive setup defaults to `32`. |

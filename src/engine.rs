@@ -17,6 +17,7 @@ use crate::{
     filter::Selection,
     formats::FormatGroup,
     git, hash,
+    limits::{self, LimitedResults},
     models::{Message, Vector},
     parse,
     providers::Providers,
@@ -265,6 +266,7 @@ impl Engine {
         structural_only: bool,
         readonly: bool,
     ) -> Result<Self> {
+        limits::validate_config(&config)?;
         let root = root
             .canonicalize()
             .context("Repository root does not exist")?;
@@ -759,7 +761,15 @@ impl Engine {
     }
 
     pub fn map(&self, options: &Value) -> Result<Vec<Value>> {
-        crate::map::query(self, &self.root, options)
+        let mut options = options.clone();
+        options["limit"] = limits::resolve(&self.config, &options)?.value();
+        crate::map::query(self, &self.root, &options)
+    }
+
+    pub(crate) fn map_limited(&self, options: &Value) -> Result<LimitedResults<Value>> {
+        let mut options = options.clone();
+        options["limit"] = limits::resolve(&self.config, &options)?.value();
+        crate::map::query_limited(self, &self.root, &options)
     }
 
     /// Resolve name and description selectors against the current structural snapshot.
@@ -1710,6 +1720,32 @@ impl Engine {
     }
 
     pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>> {
+        Ok(self.search_limited(query, kind, options)?.rows)
+    }
+
+    pub(crate) fn search_limited(
+        &self,
+        query: &str,
+        kind: &str,
+        options: &Value,
+    ) -> Result<LimitedResults<Value>> {
+        let mut options = options.clone();
+        let limit = limits::resolve(&self.config, &options)?;
+        options["limit"] = limit.value();
+        let mut rows = self.search_rows(query, kind, &options)?;
+        let omitted = limit.count().is_some_and(|count| rows.len() > count);
+        if let Some(count) = limit.count() {
+            rows.truncate(count);
+        }
+        Ok(LimitedResults {
+            count: rows.len(),
+            rows,
+            omitted,
+            limit: limit.count(),
+        })
+    }
+
+    fn search_rows(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>> {
         let formats = Selection::compile(options)?;
         let SearchPlan {
             groups,
@@ -1771,7 +1807,9 @@ impl Engine {
                 limit.map(|l| l.saturating_mul(5))
             }
         } else {
-            limit
+            // Retrieve one extra threshold-passing hit to distinguish actual
+            // omission from exactly filling the requested output limit.
+            limit.map(|count| count.saturating_add(1))
         };
         let mut results = Vec::new();
         let structures = if content {
@@ -1934,7 +1972,7 @@ impl Engine {
             reranking.finish();
         }
         if let Some(limit) = limit {
-            results.truncate(limit);
+            results.truncate(limit.saturating_add(1));
         }
         self.db
             .put_search_cache(&self.query_key(query, kind, options)?, &results)?;
@@ -1958,7 +1996,7 @@ impl Engine {
             .collect();
         Ok(hash(
             json!([
-                "query-v7-format-groups",
+                "query-v8-output-limit-probe",
                 crate::formats::VERSION,
                 self.db.meta("snapshot")?,
                 self.db.generation()?,

@@ -195,6 +195,103 @@ fn hit_keys(rows: &[Value]) -> BTreeSet<String> {
         .collect()
 }
 
+#[test]
+fn default_result_limits_apply_to_search_and_map_and_can_be_disabled() -> Result<()> {
+    // Repeated callable inputs share one vector with distinct occurrences, so
+    // this checks output limits without depending on approximate-search recall.
+    let source = "pub fn item() {}\n".repeat(4097);
+    let mut fixture = Fixture::with_sources(false, &[("many.rs", &source)])?;
+    let options = json!({"minSimilarity":-1});
+    let engine = fixture.engine()?;
+    assert_eq!(
+        engine
+            .search("copper token", "search-code", &options)?
+            .len(),
+        4096
+    );
+    assert_eq!(
+        engine.map(&json!({}))?[0]["nodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4096
+    );
+    let unlimited = json!({"minSimilarity":-1, "limit":"none"});
+    assert_eq!(
+        engine
+            .search("copper token", "search-code", &unlimited)?
+            .len(),
+        4097
+    );
+    assert_eq!(
+        engine.map(&json!({"limit":"none"}))?[0]["nodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4097
+    );
+    drop(engine);
+
+    fixture.config["defaultLimit"] = json!(2);
+    let engine = fixture.engine()?;
+    let selected = engine.search("copper token", "search-code", &options)?;
+    assert_eq!(selected.len(), 2);
+    assert_eq!(
+        engine.search("copper token", "search-code", &options)?,
+        selected
+    );
+    assert_eq!(
+        engine.map(&json!({}))?[0]["nodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    for count in [1, 5] {
+        assert_eq!(
+            engine
+                .search(
+                    "copper token",
+                    "search-code",
+                    &json!({"minSimilarity":-1, "limit":count})
+                )?
+                .len(),
+            count
+        );
+        assert_eq!(
+            engine.map(&json!({"limit":count}))?[0]["nodes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            count
+        );
+    }
+    assert_eq!(
+        engine
+            .search("copper token", "search-code", &unlimited)?
+            .len(),
+        4097
+    );
+    drop(engine);
+
+    fixture.config["defaultLimit"] = json!("none");
+    let engine = fixture.engine()?;
+    assert_eq!(
+        engine
+            .search("copper token", "search-code", &options)?
+            .len(),
+        4097
+    );
+    assert_eq!(
+        engine.map(&json!({}))?[0]["nodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4097
+    );
+    Ok(())
+}
+
 fn configuration_fixture() -> Result<Fixture> {
     let fixture = Fixture::with_sources(
         false,

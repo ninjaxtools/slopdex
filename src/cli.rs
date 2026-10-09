@@ -12,13 +12,23 @@ use self::{
     args::{Cli, Command, Format, GenerateAction, HelpTopic, IndexAction},
     config::{effective_config, run_config},
     io::{print_json, with_stdout},
-    output::{CrossOutput, Presentation, print_cross, print_errors, print_map, print_search},
+    output::{
+        CrossOutput, Presentation, print_cross, print_errors, print_limit_notice, print_map,
+        print_search,
+    },
     workspace::{
         SourceWorkspace, absolute, config_path, index_path, map_workspaces, require_index,
         same_path, source_workspace,
     },
 };
-use crate::{engine::Engine, filter, map, providers::Providers, ui};
+use crate::{
+    engine::Engine,
+    filter,
+    limits::{self, LimitedResults, ResultLimit},
+    map,
+    providers::Providers,
+    ui,
+};
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use serde_json::{Value, json};
@@ -32,6 +42,45 @@ enum CommandMode {
     Content,
     Structure,
     Symbols,
+}
+
+#[derive(Default)]
+struct MapOutput {
+    rows: Vec<Value>,
+    limit: Option<ResultLimit>,
+    remaining: Option<usize>,
+    omitted: bool,
+}
+
+impl MapOutput {
+    fn initialize(&mut self, config: &Value, options: &Value) -> Result<()> {
+        if self.limit.is_none() {
+            let limit = limits::resolve(config, options)?;
+            self.limit = Some(limit);
+            self.remaining = limit.count();
+        }
+        Ok(())
+    }
+
+    fn apply_limit(&self, options: &mut Value) {
+        // A one-declaration probe after exhaustion distinguishes actual omission
+        // from later workspaces with no matches, without permitting --limit 0.
+        options["limit"] = self
+            .remaining
+            .map(|remaining| ResultLimit::Count(remaining.max(1)))
+            .unwrap_or(ResultLimit::None)
+            .value();
+    }
+
+    fn include(&mut self, results: &LimitedResults<Value>) -> bool {
+        if self.remaining == Some(0) {
+            self.omitted |= results.count > 0;
+            return false;
+        }
+        self.remaining = self.remaining.map(|remaining| remaining - results.count);
+        self.omitted |= results.omitted;
+        true
+    }
 }
 
 impl CommandMode {
@@ -91,12 +140,21 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             directory: None,
         }],
     };
-    let mut map_rows = Vec::new();
+    let mut map_output = MapOutput::default();
     for workspace in workspaces {
-        run_workspace(cli, &workspace, &mut out, &mut map_rows)?;
+        run_workspace(cli, &workspace, &mut out, &mut map_output)?;
     }
-    if matches!(cli.command, Command::Map(_)) && cli.global.format == Some(Format::Json) {
-        print_json(&mut out, &map_rows)?;
+    if matches!(cli.command, Command::Map(_)) {
+        let format = cli.global.format.unwrap_or(Format::Summary);
+        if format == Format::Json {
+            print_json(&mut out, &map_output.rows)?;
+        }
+        print_limit_notice(
+            &mut out,
+            format,
+            map_output.omitted,
+            map_output.limit.and_then(ResultLimit::count),
+        )?;
     }
     Ok(())
 }
@@ -104,30 +162,35 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
 fn emit_map(
     cli: &Cli,
     out: &mut impl Write,
-    rows: &[Value],
+    results: &LimitedResults<Value>,
     source: Option<&dyn map::StructureSource>,
     selection: Option<&filter::Selection>,
-    collected: &mut Vec<Value>,
+    collected: &mut MapOutput,
 ) -> Result<()> {
-    if cli.global.format == Some(Format::Json) {
-        collected.extend_from_slice(rows);
+    if !collected.include(results) {
         return Ok(());
     }
-    print_map(
-        out,
-        rows,
-        cli.global.format.unwrap_or(Format::Summary),
-        cli.global.detail,
-        source,
-        selection,
-    )
+    let format = cli.global.format.unwrap_or(Format::Summary);
+    if cli.global.format == Some(Format::Json) {
+        collected.rows.extend_from_slice(&results.rows);
+    } else {
+        print_map(
+            out,
+            &results.rows,
+            format,
+            cli.global.detail,
+            source,
+            selection,
+        )?;
+    }
+    Ok(())
 }
 
 fn run_workspace(
     cli: &Cli,
     workspace: &SourceWorkspace,
     mut out: &mut impl Write,
-    map_rows: &mut Vec<Value>,
+    map_output: &mut MapOutput,
 ) -> Result<()> {
     if let Command::Help {
         topic: Some(HelpTopic::Models { provider }),
@@ -161,6 +224,11 @@ fn run_workspace(
     }
 
     let mut config = effective_config(&cli.global, &config_file)?;
+    if let Command::Map(args) = &cli.command {
+        // The first selected workspace supplies the default for this command;
+        // later workspace defaults cannot reset the shared declaration budget.
+        map_output.initialize(&config, &args.options_for(cli.global.detail))?;
+    }
     if let Some(directory) = &workspace.directory {
         for key in ["indexPath", "artifactCachePath"] {
             if let Some(path) = config[key]
@@ -202,21 +270,22 @@ fn run_workspace(
         let Some(mut options) =
             args.existing_options(&root, &workspace.paths, cli.global.detail)?
         else {
-            return emit_map(cli, &mut out, &[], None, None, map_rows);
+            return Ok(());
         };
         options.as_object_mut().unwrap().remove("symbolQuery");
         options.as_object_mut().unwrap().remove("symbolThreshold");
+        map_output.apply_limit(&mut options);
         let source = ui::spin("Parsing structure", || {
             map::Unindexed::parse(&root, &index, &config, &options)
         })?;
-        let rows = map::query(&source, &root, &options)?;
+        let results = map::query_limited(&source, &root, &options)?;
         return emit_map(
             cli,
             &mut out,
-            &rows,
+            &results,
             Some(&source),
             Some(&filter::Selection::compile(&options)?),
-            map_rows,
+            map_output,
         );
     }
     let mode = CommandMode::for_command(&cli.command);
@@ -237,7 +306,11 @@ fn run_workspace(
         read_only_command && index.exists() && config["forceReindex"].as_bool() != Some(true);
     let mut engine = ui::spin("Opening index", || mode.open(root, &index, &config, reader))?;
     let map_options = if let Command::Map(args) = &cli.command {
-        args.existing_options(root, &workspace.paths, cli.global.detail)?
+        let mut options = args.existing_options(root, &workspace.paths, cli.global.detail)?;
+        if let Some(options) = &mut options {
+            map_output.apply_limit(options);
+        }
+        options
     } else {
         None
     };
@@ -263,9 +336,9 @@ fn run_workspace(
     let format = cli.global.format.unwrap_or(Format::Summary);
     match &cli.command {
         Command::Map(_) => {
-            let (rows, selection) = if let Some(options) = map_options.as_ref() {
+            if let Some(options) = map_options.as_ref() {
                 let mapped = ui::spin("Mapping repository structure", || {
-                    Ok((engine.map(options)?, engine.selection(options)?))
+                    Ok((engine.map_limited(options)?, engine.selection(options)?))
                 });
                 let (rows, selection) = match mapped {
                     Err(error) if error.is::<crate::engine::NeedsWrite>() => {
@@ -277,23 +350,20 @@ fn run_workspace(
                             mode.refresh(&mut engine)?;
                         }
                         ui::spin("Mapping repository structure", || {
-                            Ok((engine.map(options)?, engine.selection(options)?))
+                            Ok((engine.map_limited(options)?, engine.selection(options)?))
                         })?
                     }
                     result => result?,
                 };
-                (rows, Some(selection))
-            } else {
-                (Vec::new(), None)
-            };
-            emit_map(
-                cli,
-                &mut out,
-                &rows,
-                Some(&engine),
-                selection.as_ref(),
-                map_rows,
-            )?;
+                emit_map(
+                    cli,
+                    &mut out,
+                    &rows,
+                    Some(&engine),
+                    Some(&selection),
+                    map_output,
+                )?;
+            }
         }
         Command::Search(_)
         | Command::SearchCode(_)
@@ -302,7 +372,7 @@ fn run_workspace(
         | Command::SearchSymbols(_) => {
             let (args, kind, options, descriptions) = cli.command.search_request().unwrap();
             let rows = match ui::spin("Searching index", || {
-                engine.search(&args.query, kind, &options)
+                engine.search_limited(&args.query, kind, &options)
             }) {
                 Err(error) if error.is::<crate::engine::NeedsWrite>() => {
                     drop(engine);
@@ -313,14 +383,14 @@ fn run_workspace(
                         mode.refresh(&mut engine)?;
                     }
                     ui::spin("Searching index", || {
-                        engine.search(&args.query, kind, &options)
+                        engine.search_limited(&args.query, kind, &options)
                     })?
                 }
                 result => result?,
             };
             print_search(
                 &mut out,
-                &rows,
+                &rows.rows,
                 format,
                 cli.global.detail,
                 descriptions,
@@ -330,6 +400,7 @@ fn run_workspace(
                     cli.global.expand_code_threshold,
                 )?,
             )?;
+            print_limit_notice(&mut out, format, rows.omitted, rows.limit)?;
         }
         Command::Describe(args) => {
             let mut options = args.query.filters.options();
@@ -343,6 +414,8 @@ fn run_workspace(
             let mut result = ui::spin("Generating explanation", || {
                 engine.describe(&args.query.query, &options)
             })?;
+            // Reuse the cached query results used as explanation context, including omission metadata.
+            let references = engine.search_limited(&args.query.query, "search", &options)?;
             if format == Format::Json {
                 if calls.enabled() {
                     let presentation =
@@ -363,13 +436,11 @@ fn run_workspace(
                     "Explanation\n{}",
                     result["description"].as_str().unwrap_or("")
                 )?;
-                // Describe uses the same cached query results it used as LLM context.
-                let references = engine.search(&args.query.query, "search", &options)?;
-                if !references.is_empty() {
+                if !references.rows.is_empty() {
                     writeln!(out, "\nReferences")?;
                     print_search(
                         &mut out,
-                        &references,
+                        &references.rows,
                         format,
                         cli.global.detail,
                         false,
@@ -381,6 +452,7 @@ fn run_workspace(
                     )?;
                 }
             }
+            print_limit_notice(&mut out, format, references.omitted, references.limit)?;
         }
         Command::CrossSearch(args) => {
             let mut target = None;
@@ -423,14 +495,15 @@ fn run_workspace(
             } else {
                 Format::Clusters
             });
-            print_cross(
+            let limit = limits::resolve(&config, &args.filters.options())?.count();
+            let omitted = print_cross(
                 &mut out,
                 rows,
                 CrossOutput::new(
                     format,
                     target.is_none(),
                     args.cohesion,
-                    args.filters.limit,
+                    limit,
                     cli.global.detail,
                 ),
                 &mut Presentation::with_calls(
@@ -450,6 +523,7 @@ fn run_workspace(
                     .transpose()?
                     .as_mut(),
             )?;
+            print_limit_notice(&mut out, format, omitted, limit)?;
         }
         Command::Status => print_json(&mut out, &engine.status()?)?,
         Command::Index {

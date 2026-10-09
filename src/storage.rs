@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
-pub const STRUCTURE_PARSER_VERSION: &str = "structure-v9-description-identities";
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v11-leading-comment-source-order";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -1116,7 +1116,7 @@ fn write_structure(conn: &Connection, path: &str, structure: &FileStructure) -> 
             .as_deref()
             .map(|text| description_reference(conn, text))
             .transpose()?;
-        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level,"calls":node.calls,"descriptionHash":description_hash});
+        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level,"calls":node.calls,"descriptionHash":description_hash,"declarationStartLine":node.declaration_start_line,"declarationStartByte":node.declaration_start_byte});
         conn.execute("INSERT INTO symbols(path,id,parent_id,ordinal,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![path, i64::try_from(node.id)?, node.parent_id.map(i64::try_from).transpose()?, i64::try_from(ordinal)?, node.language, node.kind, node.name, node.qualified_name,
                 node.signature, i64::try_from(node.start_byte)?, i64::try_from(node.end_byte)?, i64::try_from(node.start_line)?, i64::try_from(node.start_column)?, i64::try_from(node.end_line)?, i64::try_from(node.end_column)?, metadata.to_string()])?;
@@ -1176,6 +1176,10 @@ fn read_structure(conn: &Connection, path: &str) -> Result<FileStructure> {
             node.attributes = serde_json::from_value(metadata["attributes"].clone())?;
             node.imports = serde_json::from_value(metadata["imports"].clone())?;
             node.heading_level = serde_json::from_value(metadata["headingLevel"].clone())?;
+            node.declaration_start_line =
+                serde_json::from_value(metadata["declarationStartLine"].clone())?;
+            node.declaration_start_byte =
+                serde_json::from_value(metadata["declarationStartByte"].clone())?;
             node.calls =
                 serde_json::from_value(metadata.get("calls").cloned().unwrap_or(json!([])))?;
             node.description = metadata["descriptionHash"]
@@ -2577,7 +2581,7 @@ mod tests {
         let (_dir, mut db) = fixture()?;
         let mut record = parsed_record(
             "code.rs",
-            "use std::collections::HashMap as Map;\nstruct Café { value: i32 }\nimpl Café { fn run(&self) -> i32 { self.value } }\n",
+            "use std::collections::HashMap as Map;\nstruct Café { value: i32 }\nimpl Café {\n    /// Run the service.\n    fn run(&self) -> i32 { self.value }\n}\n",
         )?;
         // Storage preserves the extraction in full; presentation limits belong
         // to the renderer, never to the normalized source of truth.
@@ -2586,6 +2590,22 @@ mod tests {
         record.1.structure.nodes[0]
             .attributes
             .push("#[cfg(feature = \"test\")]".into());
+        assert!(
+            record
+                .1
+                .structure
+                .nodes
+                .iter()
+                .any(|node| node.declaration_start_line == Some(5))
+        );
+        assert!(
+            record
+                .1
+                .structure
+                .nodes
+                .iter()
+                .any(|node| { node.declaration_start_byte == record.0.source.find("fn run") })
+        );
         db.apply_structure(std::slice::from_ref(&record), &[], Some("commit"))?;
         assert_eq!(db.structure("code.rs")?, record.1.structure);
         assert!(db.structure_current("code.rs", &record.0.hash, STRUCTURE_PARSER_VERSION)?);
@@ -2633,6 +2653,22 @@ mod tests {
         db.apply_structure(std::slice::from_ref(&other), &[], Some("commit"))?;
         assert_eq!(db.structure("code.rs")?, record.1.structure);
         assert_eq!(db.structure("other.rs")?, other.1.structure);
+        Ok(())
+    }
+
+    #[test]
+    fn structure_reads_metadata_without_declaration_start_byte() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let mut record = parsed_record("code.rs", "/// API.\nfn run() {}\n")?;
+        db.apply_structure(std::slice::from_ref(&record), &[], None)?;
+        db.conn.execute(
+            "UPDATE symbols SET metadata=json_remove(metadata,'$.declarationStartByte') WHERE path=?",
+            [&record.0.path],
+        )?;
+        for node in &mut record.1.structure.nodes {
+            node.declaration_start_byte = None;
+        }
+        assert_eq!(db.structure("code.rs")?, record.1.structure);
         Ok(())
     }
 

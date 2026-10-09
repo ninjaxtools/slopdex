@@ -17,6 +17,27 @@ use anyhow::Result;
 use serde_json::Value;
 use std::io::Write;
 
+pub(in crate::cli) fn print_limit_notice(
+    out: &mut impl Write,
+    format: Format,
+    omitted: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    if !omitted {
+        return Ok(());
+    }
+    let message = format!(
+        "slopdex: notice: results omitted by limit {}; use --limit none to show all results.",
+        limit.expect("omitted results have a finite limit")
+    );
+    if format == Format::Json {
+        writeln!(std::io::stderr().lock(), "{message}")?;
+    } else {
+        writeln!(out, "{message}")?;
+    }
+    Ok(())
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }

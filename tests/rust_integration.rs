@@ -607,7 +607,7 @@ impl Repo {
             .arg(&self.root)
             .arg("--index")
             .arg(&self.index)
-            .args(["--format", format])
+            .args(["--output", format])
             .args(args)
             .output()?;
         assert!(
@@ -1525,7 +1525,7 @@ fn cross_search_default_separates_strong_groups_and_explicit_thresholds_can_brid
         (vec!["--threshold", "0.3-0.8"], 1),
     ] {
         let args = [
-            vec!["--no-reindex", "--format", "clusters", "cross-search"],
+            vec!["--no-reindex", "--output", "clusters", "cross-search"],
             threshold_args,
         ]
         .concat();
@@ -1588,6 +1588,93 @@ fn cross_search_threshold_endpoints_exclude_self_and_use_only_indexed_vectors() 
         assert_eq!(engine.cross_search(None, &options)?, rows);
     }
     assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn cli_result_limits_honor_config_and_only_notice_actual_omissions() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let mut config = mock.config();
+    config["defaultLimit"] = json!(2);
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    for name in ["first", "second", "third"] {
+        repo.write(&format!("{name}.rs"), &function(name, "VECTOR_EAST"))?;
+    }
+    repo.open(&config)?.refresh()?;
+    let result_rows = |output: &Output, jsonl: bool| -> Result<Value> {
+        if jsonl {
+            Ok(Value::Array(
+                std::str::from_utf8(&output.stdout)?
+                    .lines()
+                    .map(serde_json::from_str)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            ))
+        } else {
+            Ok(serde_json::from_slice(&output.stdout)?)
+        }
+    };
+    for args in [
+        vec!["--no-reindex", "map", "--private"],
+        vec!["--no-reindex", "search-code", "east", "--threshold", "-1"],
+        vec![
+            "--no-reindex",
+            "cross-search",
+            "--include-symmetric-duplicates",
+        ],
+    ] {
+        let output = repo.cli(&args)?;
+        ensure!(output.status.success(), "{:?}", output);
+        let rows = result_rows(&output, args.contains(&"cross-search"))?;
+        assert_eq!(rows.as_array().unwrap().len(), 2, "{args:?}: {rows}");
+        let notice = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            notice.contains("omitted") && notice.contains("--limit none"),
+            "{notice}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("omitted"));
+        for limit in ["3", "none"] {
+            let mut unlimited = args.clone();
+            unlimited.extend(["--limit", limit]);
+            let output = repo.cli(&unlimited)?;
+            ensure!(output.status.success(), "{:?}", output);
+            let rows = result_rows(&output, args.contains(&"cross-search"))?;
+            assert_eq!(rows.as_array().unwrap().len(), 3, "{unlimited:?}: {rows}");
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("omitted"));
+        }
+    }
+    let output = repo.cli_format(&["--no-reindex", "map", "--private"], "summary")?;
+    ensure!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("omitted") && stdout.contains("--limit none"));
+    Ok(())
+}
+
+#[test]
+fn map_limit_is_global_across_workspaces_and_keeps_ancestor_context() -> Result<()> {
+    let invoker = Repo::new()?;
+    let first = Repo::new()?;
+    let second = Repo::new()?;
+    first.write("api.ts", "export class First { run() {} }\n")?;
+    second.write("api.ts", "export class Second { run() {} }\n")?;
+    let paths = [first.root.to_str().unwrap(), second.root.to_str().unwrap()];
+    let args = ["map", paths[0], paths[1], "-k", "methods", "--limit", "1"];
+    let output = invoker.cli(&args)?;
+    ensure!(output.status.success(), "{:?}", output);
+    let rows: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["nodes"].as_array().unwrap().len(), 2, "{rows}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("omitted"));
+    let unlimited = invoker.cli_json(&[
+        "map", paths[0], paths[1], "-k", "methods", "--limit", "none",
+    ])?;
+    assert_eq!(unlimited.as_array().unwrap().len(), 2);
+
+    second.write("api.ts", "export function no_method() {}\n")?;
+    let output = invoker.cli(&args)?;
+    ensure!(output.status.success(), "{:?}", output);
+    serde_json::from_slice::<Value>(&output.stdout)?;
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("omitted"));
     Ok(())
 }
 
@@ -2568,6 +2655,19 @@ fn refresh_indexes_source_descriptions_and_generation_excludes_source_provided()
         "Supplied callable VECTOR_NORTH."
     );
     near(&row(&supplied, "documented")["similarity"], 0.0);
+    let code_before = engine.search("east", "search", &all())?;
+    let documented_before = row(&code_before, "documented")["function"].clone();
+    assert!(
+        documented_before["source"]
+            .as_str()
+            .unwrap()
+            .starts_with("/// Supplied callable VECTOR_NORTH.\n")
+    );
+    assert!(
+        mock.embedding_inputs()
+            .iter()
+            .any(|input| { input.contains("source:\n/// Supplied callable VECTOR_NORTH.\n") })
+    );
     engine.generate_descriptions()?;
     assert_eq!(mock.requests("/responses").len(), 1);
     assert!(description_prompt(&mock.requests("/responses")[0].body).contains("Symbol: missing\n"));
@@ -2606,6 +2706,23 @@ fn refresh_indexes_source_descriptions_and_generation_excludes_source_provided()
         "Updated callable VECTOR_EAST."
     );
     near(&row(&edited, "documented")["similarity"], 1.0);
+    let code_after = engine.search("east", "search", &all())?;
+    let documented_after = &row(&code_after, "documented")["function"];
+    assert_ne!(
+        documented_before["sourceHash"],
+        documented_after["sourceHash"]
+    );
+    assert!(
+        documented_after["source"]
+            .as_str()
+            .unwrap()
+            .starts_with("/// Updated callable VECTOR_EAST.\n")
+    );
+    assert!(
+        mock.embedding_inputs()
+            .iter()
+            .any(|input| { input.contains("source:\n/// Updated callable VECTOR_EAST.\n") })
+    );
     Ok(())
 }
 
@@ -2630,9 +2747,9 @@ fn refresh_keeps_commented_overloads_distinct_from_their_implementation() -> Res
     let descriptions = engine.search("east", "search-descriptions", &all())?;
     assert_eq!(descriptions.len(), 3);
     for (line, kind, prose) in [
-        (4, "symbol", "Accept text VECTOR_EAST."),
-        (6, "symbol", "Accept a number VECTOR_NORTH."),
-        (8, "function", "Encode the boundary VECTOR_WEST."),
+        (3, "symbol", "Accept text VECTOR_EAST."),
+        (5, "symbol", "Accept a number VECTOR_NORTH."),
+        (7, "function", "Encode the boundary VECTOR_WEST."),
     ] {
         let result = descriptions
             .iter()
@@ -3092,7 +3209,7 @@ fn cli_missing_resolved_source_indexes_fail_without_artifacts_or_provider_calls(
                 "cross-search",
             ] {
                 let mut command = isolated_cli(&repo, index);
-                command.args(["--format", "json"]);
+                command.args(["--output", "json"]);
                 if no_reindex {
                     command.arg("--no-reindex");
                 }
@@ -3997,7 +4114,7 @@ fn cli_external_map_uses_checkout_config_and_saved_snapshot() -> Result<()> {
             .child(env!("CARGO_BIN_EXE_slopdex"))
             .arg("--root")
             .arg(&invoker.root)
-            .args(["--no-reindex", "--format", "json", "map", "--private"])
+            .args(["--no-reindex", "--output", "json", "map", "--private"])
             .arg(&path)
             .output()?;
         ensure!(
@@ -4039,7 +4156,7 @@ fn cli_external_map_uses_source_root_xdg_index_without_config() -> Result<()> {
 
     let output = invoker
         .child(env!("CARGO_BIN_EXE_slopdex"))
-        .args(["--no-reindex", "--format", "json", "map", "--private"])
+        .args(["--no-reindex", "--output", "json", "map", "--private"])
         .arg(external.root.join("nested/api.rs"))
         .output()?;
     ensure!(
@@ -4083,7 +4200,7 @@ fn cli_external_map_parses_unindexed_non_git_files_and_directories_without_artif
                 command.arg("--no-reindex");
             }
             let output = command
-                .args(["--format", "json", "map", "--private"])
+                .args(["--output", "json", "map", "--private"])
                 .arg(&path)
                 .output()?;
             ensure!(
@@ -4134,7 +4251,7 @@ fn cli_external_map_combines_independent_repositories_and_warns_for_missing_path
             )?;
         }
         let mut command = invoker.child(env!("CARGO_BIN_EXE_slopdex"));
-        command.args(["--no-reindex", "--format", "json", "map", "--private"]);
+        command.args(["--no-reindex", "--output", "json", "map", "--private"]);
         if include_local {
             command.arg("src/api.rs");
         }
@@ -4170,7 +4287,7 @@ fn cli_external_map_combines_independent_repositories_and_warns_for_missing_path
 
     let output = invoker
         .child(env!("CARGO_BIN_EXE_slopdex"))
-        .args(["--format", "json", "map"])
+        .args(["--output", "json", "map"])
         .arg(&missing)
         .output()?;
     ensure!(
@@ -4226,7 +4343,7 @@ fn cli_external_map_explicit_config_and_index_override_source_defaults() -> Resu
             command.arg("--index").arg(index);
         }
         let output = command
-            .args(["--no-reindex", "--format", "json", "map", "--private"])
+            .args(["--no-reindex", "--output", "json", "map", "--private"])
             .arg(external.root.join("nested/api.rs"))
             .output()?;
         ensure!(
@@ -4277,7 +4394,7 @@ fn cli_external_cross_source_uses_checkout_snapshot_and_preserves_target_options
             .child(env!("CARGO_BIN_EXE_slopdex"))
             .args([
                 "--no-reindex",
-                "--format",
+                "--output",
                 "json",
                 "cross-search",
                 "--source-path",
@@ -4447,7 +4564,7 @@ fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_art
         for no_reindex in [false, true] {
             for (i, (format, args)) in cases.iter().enumerate() {
                 let mut command = isolated_cli(&repo, index);
-                command.args(["--format", *format]);
+                command.args(["--output", *format]);
                 if no_reindex {
                     command.arg("--no-reindex");
                 }
@@ -4559,7 +4676,7 @@ fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_art
     for no_reindex in [false, true] {
         for (i, (format, args)) in cases.iter().enumerate() {
             let mut command = isolated_cli(&repo, Some(&repo.index));
-            command.args(["--format", *format]);
+            command.args(["--output", *format]);
             if no_reindex {
                 command.arg("--no-reindex");
             }
@@ -4734,7 +4851,7 @@ fn cli_unindexed_map_requires_update_before_search_and_existing_indexes_refresh(
     let before = filesystem_snapshot(repo._temp.path())?;
     for no_reindex in [false, true] {
         let mut command = isolated_cli(&repo, None);
-        command.args(["--format", "json"]);
+        command.args(["--output", "json"]);
         if no_reindex {
             command.arg("--no-reindex");
         }
@@ -4771,7 +4888,7 @@ fn cli_unindexed_map_requires_update_before_search_and_existing_indexes_refresh(
     let search = || -> Result<Value> {
         let output = isolated_cli(&repo, None)
             .args([
-                "--format",
+                "--output",
                 "json",
                 "search-code",
                 "east",
@@ -4790,13 +4907,13 @@ fn cli_unindexed_map_requires_update_before_search_and_existing_indexes_refresh(
     let calls = mock.count();
     repo.write("new.rs", "pub fn beta() -> i32 { 7 }\n")?;
     let output = isolated_cli(&repo, None)
-        .args(["--no-reindex", "--format", "json", "map"])
+        .args(["--no-reindex", "--output", "json", "map"])
         .output()?;
     ensure!(output.status.success());
     let rows: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(map_names(rows.as_array().unwrap()), strings(&["alpha"]));
     let output = isolated_cli(&repo, None)
-        .args(["--format", "json", "map"])
+        .args(["--output", "json", "map"])
         .output()?;
     ensure!(output.status.success());
     let rows: Value = serde_json::from_slice(&output.stdout)?;
@@ -5674,7 +5791,7 @@ fn expanded_detail_defaults_to_one_edge_and_includes_high_similarity_code() -> R
                 "expanded",
                 "--expand-code-threshold",
                 threshold,
-                "--format",
+                "--output",
                 "text",
                 "cross-search",
                 "--cohesion",
@@ -5804,7 +5921,7 @@ fn map_cli_closed_stdout_succeeds_for_text_and_json() -> Result<()> {
             .arg(&repo.root)
             .arg("--index")
             .arg(&repo.index)
-            .args(["--no-reindex", "--format", format, "map"]);
+            .args(["--no-reindex", "--output", format, "map"]);
         let complete = command.output()?;
         ensure!(complete.status.success());
         assert!(complete.stdout.len() > 256 * 1024);
@@ -5840,7 +5957,7 @@ fn map_cli_stdout_full_still_fails_for_text_and_json() -> Result<()> {
             .arg(&repo.root)
             .arg("--index")
             .arg(&repo.index)
-            .args(["--no-reindex", "--format", format, "map"])
+            .args(["--no-reindex", "--output", format, "map"])
             .stdout(fs::OpenOptions::new().write(true).open("/dev/full")?)
             .output()?;
         assert_eq!(output.status.code(), Some(1), "{format}");
@@ -6225,6 +6342,77 @@ fn partially_prepared_profile_rejects_search_and_reuses_successful_batches_on_re
 }
 
 #[test]
+fn symbol_map_queries_union_names_and_attached_descriptions() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    let source = "export function VectorNorthName() {}\n\
+        // Handles VECTOR_NORTH requests.\n\
+        export function ordinary() {}\n\
+        export function untouched() {}\n\
+        export class Container {\n\
+        // Handles VECTOR_NORTH requests.\n\
+        run() {}\n\
+        other() {}\n\
+        }\n";
+    repo.write("api.ts", source)?;
+    repo.write("other.ts", "export function ordinary() {}\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    assert_eq!(mock.count(), 0);
+    let options = json!({"symbolQuery":"VECTOR_NORTH", "symbolThreshold":0.9});
+    let selected = engine.map(&options)?;
+    assert_eq!(selected.len(), 1, "{selected:?}");
+    assert_eq!(selected[0]["path"], "api.ts");
+    assert_eq!(
+        map_names(&selected),
+        strings(&["VectorNorthName", "ordinary", "Container", "run"])
+    );
+    assert_eq!(engine.map(&options)?, selected);
+    assert!(mock.requests("/responses").is_empty());
+    assert!(
+        mock.embedding_inputs()
+            .contains(&"handles vector north requests".into()),
+        "{:?}",
+        mock.embedding_inputs()
+    );
+    assert!(
+        !mock
+            .embedding_inputs()
+            .iter()
+            .any(|input| input.contains("source:\n"))
+    );
+
+    repo.write(
+        "api.ts",
+        &source.replace("VECTOR_NORTH requests", "VECTOR_WEST requests"),
+    )?;
+    engine.refresh_structure()?;
+    assert_eq!(
+        map_names(&engine.map(&options)?),
+        strings(&["VectorNorthName"])
+    );
+    assert_eq!(
+        map_names(&engine.map(&json!({"symbolQuery":"VECTOR_WEST", "symbolThreshold":0.9}))?),
+        strings(&["ordinary", "Container", "run"])
+    );
+    drop(engine);
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    let cli = repo.cli_json(&[
+        "--no-reindex",
+        "map",
+        "-q",
+        "VECTOR_NORTH",
+        "-q",
+        "VECTOR_WEST",
+        "--symbol-threshold",
+        "0.9",
+    ])?;
+    assert_eq!(map_names(cli.as_array().unwrap()), map_names(&selected));
+    Ok(())
+}
+
+#[test]
 fn symbol_map_normalizes_bare_names_and_indexes_noncallables_without_content() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
@@ -6496,7 +6684,7 @@ fn symbol_map_cli_no_reindex_populates_lazy_cache_and_expands_only_direct_select
         .arg(&repo.index)
         .args([
             "--no-reindex",
-            "--format",
+            "--output",
             "summary",
             "--detail",
             "expanded",
@@ -7417,7 +7605,7 @@ fn search_symbols_cli_saved_snapshot_json_summary_and_expanded_callable_heading_
             .arg(&repo.root)
             .arg("--index")
             .arg(&repo.index)
-            .args(["--format", "summary", "--detail", detail])
+            .args(["--output", "summary", "--detail", detail])
             .args(args)
             .output()?;
         ensure!(
@@ -8534,7 +8722,7 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
         command
             .arg("--root")
             .arg(&repo.root)
-            .arg("--format")
+            .arg("--output")
             .arg("json")
             .args(["generate", "descriptions"])
             .env("XDG_CACHE_HOME", repo.home.join("cache"))
@@ -8622,7 +8810,7 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
         .arg(&repos[1].root)
         .args([
             "--no-reindex",
-            "--format",
+            "--output",
             "json",
             "search-code",
             "uncached-query",
@@ -8691,7 +8879,7 @@ fn default_xdg_worktrees_use_v4_global_store_and_reuse_paid_embeddings() -> Resu
     for repo in [&first, &second] {
         let output = isolated_cli(repo, None)
             .env("XDG_CACHE_HOME", &xdg)
-            .args(["--format", "json", "update"])
+            .args(["--output", "json", "update"])
             .output()?;
         ensure!(
             output.status.success(),
@@ -8702,7 +8890,7 @@ fn default_xdg_worktrees_use_v4_global_store_and_reuse_paid_embeddings() -> Resu
             .env("XDG_CACHE_HOME", &xdg)
             .args([
                 "--no-reindex",
-                "--format",
+                "--output",
                 "json",
                 "search-code",
                 "east",

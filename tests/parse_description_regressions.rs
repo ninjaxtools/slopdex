@@ -422,7 +422,7 @@ fn literal_comment_text_and_shebangs_are_not_descriptions() {
 }
 
 #[test]
-fn description_changes_preserve_callable_sources_hashes_and_embedding_inputs() {
+fn description_changes_update_callable_sources_hashes_and_embedding_inputs() {
     let before = clean("source.ts", "// Before.\nexport const run = () => 1;\n");
     let after = clean(
         "source.ts",
@@ -432,9 +432,20 @@ fn description_changes_preserve_callable_sources_hashes_and_embedding_inputs() {
     let before = &before.callables[0];
     let after = &after.callables[0];
     assert_ne!(before.description, after.description);
-    assert_eq!(before.source, after.source);
-    assert_eq!(before.source_hash, after.source_hash);
-    assert_eq!(before.embedding_input, after.embedding_input);
+    assert_ne!(before.source, after.source);
+    assert_ne!(before.source_hash, after.source_hash);
+    assert_ne!(before.embedding_input, after.embedding_input);
+    assert_eq!(before.source, "// Before.\nexport const run = () => 1");
+    assert_eq!(
+        after.source,
+        "// Longer after description.\nexport const run = () => 1"
+    );
+    for callable in [before, after] {
+        assert_eq!(callable.source_hash, slopdex::hash(&callable.source));
+        assert!(callable.embedding_input.ends_with(&callable.source));
+        assert_eq!(callable.start_line, 1);
+        assert_eq!(callable.line_count, 2);
+    }
     assert_eq!(
         (
             before.start_line,
@@ -449,6 +460,96 @@ fn description_changes_preserve_callable_sources_hashes_and_embedding_inputs() {
             after.end_column
         )
     );
+}
+
+#[test]
+fn leading_comments_extend_code_ranges_without_changing_signatures() {
+    for (path, comment, declaration, name) in [
+        (
+            "source.ts",
+            "// First.\n// Second.",
+            "export function run() {}",
+            "run",
+        ),
+        (
+            "source.tsx",
+            "/** First.\n * Second. */",
+            "const run = () => <div />;",
+            "run",
+        ),
+        (
+            "source.js",
+            "// First.\n// Second.",
+            "function run() {}",
+            "run",
+        ),
+        (
+            "source.jsx",
+            "/** First.\n * Second. */",
+            "const run = () => <div />;",
+            "run",
+        ),
+        (
+            "source.py",
+            "# First.\n# Second.",
+            "@decorate\ndef run(): pass",
+            "run",
+        ),
+        (
+            "source.rs",
+            "/// First.\n/// Second.",
+            "#[inline]\npub fn run() {}",
+            "run",
+        ),
+        ("source.go", "// First.\n// Second.", "func run() {}", "run"),
+        (
+            "source.java",
+            "/** First.\n * Second. */",
+            "class Run {}",
+            "Run",
+        ),
+        (
+            "source.c",
+            "/* First.\n * Second. */",
+            "int run(void) { return 0; }",
+            "run",
+        ),
+        ("source.sh", "# First.\n# Second.", "run() { :; }", "run"),
+    ] {
+        let bare = clean(path, &format!("{declaration}\n"));
+        let source = format!("\n{comment}\n{declaration}\n");
+        let parsed = clean(path, &source);
+        let node = named(&parsed, name);
+        assert_eq!(node.start_byte, 1, "{path}");
+        assert_eq!(node.start_line, 2, "{path}");
+        assert_eq!(node.declaration_start_line, Some(4), "{path}");
+        assert_eq!(node.signature, named(&bare, name).signature, "{path}");
+        assert_eq!(
+            node.description.as_deref(),
+            Some("First.\nSecond."),
+            "{path}"
+        );
+        for callable in &parsed.callables {
+            assert_eq!(callable.start_line, 2, "{path}");
+            assert!(callable.source.starts_with(comment), "{path}");
+            assert_eq!(callable.source_hash, slopdex::hash(&callable.source));
+            assert!(callable.embedding_input.ends_with(&callable.source));
+        }
+    }
+}
+
+#[test]
+fn detached_and_trailing_comments_stay_outside_following_code_ranges() {
+    let source = "// Detached.\n\nfunction bare() {} // Trailing.\nfunction following() {}\n//\nfunction empty() {}\n";
+    let parsed = clean("source.ts", source);
+    for (name, line) in [("bare", 3), ("following", 4), ("empty", 5)] {
+        let node = named(&parsed, name);
+        assert_eq!(node.start_line, line);
+        assert_eq!(node.description, None);
+        let callable = parsed.callables.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(callable.start_line, line);
+    }
+    assert!(parsed.callables[2].source.starts_with("//\n"));
 }
 
 #[test]

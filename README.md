@@ -54,7 +54,7 @@ cargo install --path . --locked
 $ slopdex map src docs
 $ slopdex map src -g '*.rs' -k fns -e 'refresh|search'
 $ slopdex map src --private
-$ slopdex map -g '*.md' -e '^Guide\.Setup' -i --format json
+$ slopdex map -g '*.md' -e '^Guide\.Setup' -i --output json
 $ slopdex map docs --detail expanded
 $ slopdex map --no-reindex
 $ slopdex map src -q 'validate session' -q 'authenticate user' -k fns
@@ -292,7 +292,7 @@ $ slopdex cross-search \
   --threshold 0.9
 ```
 
-Pass the target's `indexPath` from `slopdex --root /path/to/other/repo --format json status` (or a custom `--index` path) as `--target-index`.
+Pass the target's `indexPath` from `slopdex --root /path/to/other/repo --output json status` (or a custom `--index` path) as `--target-index`.
 
 ## Inspect index health
 
@@ -300,7 +300,7 @@ If some functions can't be indexed a warning is printed. Index errors can be inv
 
 ```console
 $ slopdex status
-$ slopdex index errors --format summary
+$ slopdex index errors --output summary
 $ slopdex --version
 ```
 

@@ -1109,8 +1109,8 @@ declare function external(): void;
             parsed.callables[0].signature.as_deref(),
             Some("async load<T>(id: T): Promise<T>")
         );
-        assert_eq!(parsed.callables[0].start_line, 2);
-        assert_eq!(parsed.callables[0].line_count, 4);
+        assert_eq!(parsed.callables[0].start_line, 1);
+        assert_eq!(parsed.callables[0].line_count, 5);
         assert_eq!(parsed.callables[7].signature.as_deref(), Some("*values()"));
     }
 
@@ -1207,13 +1207,13 @@ class Store:
             ]
         );
         let load = &parsed.callables[0];
-        assert_eq!(load.start_line, 2);
+        assert_eq!(load.start_line, 1);
         assert_eq!(load.end_line, 8);
         assert_eq!(
             load.signature.as_deref(),
             Some("async def load(value: str) -> str:")
         );
-        assert!(load.source.starts_with("@logged\nasync def"));
+        assert!(load.source.starts_with("# café 🚀\n@logged\nasync def"));
         assert!(
             load.embedding_input
                 .contains("documentation:\n\"\"\"Normalize a value for storage.\"\"\"\nsource:")

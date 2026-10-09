@@ -8,6 +8,57 @@ fn clap_definition_is_consistent() {
 }
 
 #[test]
+fn output_flag_is_canonical_and_format_flag_is_rejected() {
+    for (value, expected) in [
+        ("text", Format::Summary),
+        ("json", Format::Json),
+        ("clusters", Format::Clusters),
+    ] {
+        assert_eq!(
+            parse(&["cross-search", "--output", value]).global.format,
+            Some(expected)
+        );
+        assert_eq!(
+            parse(&["--output", value, "cross-search"]).global.format,
+            Some(expected)
+        );
+    }
+    for command in [
+        vec!["map"],
+        vec!["search", "query"],
+        vec!["cross-search"],
+        vec!["config"],
+    ] {
+        let mut old = vec!["slopdex"];
+        old.extend(command.iter().copied());
+        old.extend(["--format", "json"]);
+        assert!(Cli::try_parse_from(old).is_err());
+        let help = Cli::try_parse_from(
+            std::iter::once("slopdex")
+                .chain(command.iter().copied())
+                .chain(["--help"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(help.contains("--output"), "{help}");
+        assert!(
+            !help.split_whitespace().any(|word| word == "--format"),
+            "{help}"
+        );
+    }
+    let error = Cli::try_parse_from(["slopdex", "map", "--output", "invalid"])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("--output"), "{error}");
+    assert!(!error.contains("--format"), "{error}");
+    let cli = parse(&["map", "--formats", "code,docs", "--output", "json"]);
+    let Command::Map(args) = cli.command else {
+        panic!()
+    };
+    assert_eq!(args.selection.formats, ["code", "docs"]);
+}
+
+#[test]
 fn help_describes_all_indexes_semantic_selection_and_explicit_generation() {
     let help = |args: &[&str]| {
         Cli::try_parse_from(std::iter::once("slopdex").chain(args.iter().copied()))
@@ -55,7 +106,7 @@ fn description_generation_uses_content_mode_and_explicit_nested_action() {
             "generate",
             "descriptions",
             "--no-reindex",
-            "--format",
+            "--output",
             "json",
         ],
     ] {
@@ -388,7 +439,7 @@ fn map_paths_kinds_and_shared_selection_parse() {
         "--kinds",
         "imports",
         "--private",
-        "--format",
+        "--output",
         "json",
         "--no-reindex",
     ]);
@@ -508,7 +559,7 @@ fn readme_commands_parse() {
             "0.9",
         ],
         vec!["status"],
-        vec!["index", "errors", "--format", "summary"],
+        vec!["index", "errors", "--output", "summary"],
     ] {
         parse(&args);
     }
@@ -639,6 +690,72 @@ fn cross_search_has_a_selective_default_without_changing_query_defaults() {
 }
 
 #[test]
+fn limits_accept_none_preserve_unspecified_and_resolve_config_defaults() {
+    for command in [
+        "search",
+        "search-code",
+        "search-descriptions",
+        "search-docs",
+        "search-symbols",
+        "describe",
+        "map",
+        "cross-search",
+    ] {
+        for (limit, expected) in [
+            (None, None),
+            (Some("7"), Some(json!(7))),
+            (Some("none"), Some(json!("none"))),
+        ] {
+            let mut argv = vec![command];
+            if !matches!(command, "map" | "cross-search") {
+                argv.push("query");
+            }
+            if let Some(limit) = limit {
+                argv.extend(["--limit", limit]);
+            }
+            let cli = parse(&argv);
+            let options = match cli.command {
+                Command::Map(args) => {
+                    let options = args.options();
+                    assert!(options.get("minSimilarity").is_none());
+                    options
+                }
+                Command::CrossSearch(args) => {
+                    assert!(args.options().get("limit").is_none());
+                    args.filters.options()
+                }
+                Command::Describe(args) => args.query.filters.options(),
+                command => command.search_request().unwrap().2,
+            };
+            assert_eq!(options.get("limit"), expected.as_ref(), "{argv:?}");
+            for default in [json!(11), json!("none")] {
+                assert_eq!(
+                    crate::limits::resolve(&json!({"defaultLimit": default}), &options)
+                        .unwrap()
+                        .value(),
+                    expected.clone().unwrap_or(default),
+                    "{argv:?}"
+                );
+            }
+            assert_eq!(
+                crate::limits::resolve(&json!({}), &options)
+                    .unwrap()
+                    .value(),
+                expected.unwrap_or(json!(4096))
+            );
+        }
+        for invalid in ["0", "-1", "1.5", "NaN", "all"] {
+            let mut argv = vec!["slopdex", command];
+            if !matches!(command, "map" | "cross-search") {
+                argv.push("query");
+            }
+            argv.extend(["--limit", invalid]);
+            assert!(Cli::try_parse_from(argv).is_err(), "{command}: {invalid}");
+        }
+    }
+}
+
+#[test]
 fn options_defaults_and_limit_validation() {
     let cli = parse(&["cross-search"]);
     let Command::CrossSearch(args) = cli.command else {
@@ -682,9 +799,9 @@ fn validates_combinations_before_opening_an_index() {
         assert!(Cli::try_parse_from(std::iter::once("slopdex").chain(args)).is_err());
     }
     for args in [
-        vec!["search", "query", "--format", "clusters"],
-        vec!["map", "--format", "clusters"],
-        vec!["cross-search", "--cohesion", "--format", "clusters"],
+        vec!["search", "query", "--output", "clusters"],
+        vec!["map", "--output", "clusters"],
+        vec!["cross-search", "--cohesion", "--output", "clusters"],
         vec!["help", "models", "--description-provider", "openai"],
     ] {
         let cli = Cli::try_parse_from(std::iter::once("slopdex").chain(args)).unwrap();
@@ -696,7 +813,7 @@ fn validates_combinations_before_opening_an_index() {
         "search",
         "query",
         "--no-reindex",
-        "--format",
+        "--output",
         "json",
     ]);
     parse(&["config", "set", "descriptionModel", "model"]);

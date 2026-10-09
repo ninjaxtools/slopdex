@@ -296,7 +296,8 @@ fn markdown_ranges_hierarchy_setext_and_no_chunk_truncation() {
     assert_eq!(s.nodes.len(), 4);
     assert_eq!(s.nodes[1].name, long);
     assert_eq!(s.nodes[1].parent_id, Some(0));
-    assert_eq!(named(&s, "Root.Peer").start_line, 10);
+    assert_eq!(named(&s, "Root.Peer").start_line, 7);
+    assert_eq!(named(&s, "Root.Peer").declaration_start_line, Some(10));
     assert_eq!(named(&s, "Root").end_byte, source.find("# Next").unwrap());
     assert_eq!(named(&s, "Next").end_byte, source.len());
 }
@@ -310,14 +311,55 @@ fn complete_nodes_unicode_byte_ranges_and_backwards_serde() {
     let source = format!("// 項\r\nstruct Many {{\n{fields}\n}}\n");
     let s = structure("x.rs", &source);
     assert_eq!(s.nodes.len(), 101);
-    assert_eq!(s.nodes[0].start_byte, "// 項\r\n".len());
-    assert_eq!(s.nodes[0].start_line, 2);
+    assert_eq!(s.nodes[0].start_byte, 0);
+    assert_eq!(s.nodes[0].start_line, 1);
+    assert_eq!(s.nodes[0].declaration_start_line, Some(2));
+    assert_eq!(
+        s.nodes[0].declaration_start_byte,
+        source.find("struct Many")
+    );
     assert!(named(&s, "Many.field_99").signature.len() > 400);
     let encoded = serde_json::to_string(&s).unwrap();
     assert_eq!(s, serde_json::from_str(&encoded).unwrap());
+    let mut old_node = serde_json::to_value(&s.nodes[0]).unwrap();
+    old_node
+        .as_object_mut()
+        .unwrap()
+        .remove("declarationStartByte");
+    let old_node: super::StructureNode = serde_json::from_value(old_node).unwrap();
+    assert_eq!(old_node.declaration_start_byte, None);
+    assert_eq!(
+        old_node.source_order_key(),
+        (old_node.start_byte, old_node.id)
+    );
+    let bare = structure("bare.rs", "struct Bare;");
+    assert!(
+        serde_json::to_value(&bare.nodes[0])
+            .unwrap()
+            .get("declarationStartByte")
+            .is_none()
+    );
     let old: crate::parse::ParsedFile =
         serde_json::from_str(r#"{"callables":[],"chunks":[],"errors":[]}"#).unwrap();
     assert!(old.structure.nodes.is_empty());
+}
+
+#[test]
+fn source_order_uses_original_bytes_before_extraction_ids() {
+    let earlier = super::StructureNode {
+        id: 9,
+        start_byte: 0,
+        declaration_start_byte: Some(10),
+        start_line: 1,
+        declaration_start_line: Some(2),
+        ..Default::default()
+    };
+    let later = super::StructureNode {
+        id: 1,
+        declaration_start_byte: Some(20),
+        ..earlier.clone()
+    };
+    assert!(earlier.source_order_key() < later.source_order_key());
 }
 
 #[test]

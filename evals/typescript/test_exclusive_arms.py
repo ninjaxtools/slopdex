@@ -119,7 +119,7 @@ class ExclusiveArmTests(unittest.TestCase):
                    "reindex-files", "models", "config", "typo")
         for arm, opposite in (("map", "search"), ("search", "map")):
             allowed = ([arm, "target"], ["--no-reindex", arm, "target"],
-                       ["--format", "json", arm, "target"],
+                       ["--output", "json", arm, "target"], ["--output=json", arm, "target"],
                        ["--", arm, "target"], [], ["--help"], ["-h"], ["--version"], ["-V"],
                        ["help", opposite], [arm, "--help"], [opposite, "--help"],
                        [arm, "--version"])
@@ -130,7 +130,8 @@ class ExclusiveArmTests(unittest.TestCase):
                 for argv in ([command, "target"], ["--root", arm, "--no-reindex", command, "target"]):
                     with self.subTest(arm=arm, argv=argv):
                         self.assertFalse(runner.slopdex_call_allowed(arm, argv))
-            for argv in (["--unsupported", arm], ["--root"], [opposite, "--", "--help"]):
+            for argv in (["--unsupported", arm], ["--format", "json", arm],
+                         ["--format=json", arm], ["--root"], [opposite, "--", "--help"]):
                 with self.subTest(arm=arm, argv=argv):
                     self.assertFalse(runner.slopdex_call_allowed(arm, argv))
 
@@ -171,7 +172,7 @@ class ExclusiveArmTests(unittest.TestCase):
             self.assertEqual(runner.slopdex_command(argv), "help")
         self.assertEqual(runner.slopdex_command(["map", "-ehelper"]), "map")
         self.assertEqual(runner.slopdex_command(["map", "--", "-ih"]), "map")
-        for argv in (["help", "models"], ["help", "models", "opencode-go"], ["help", "--format=json", "models"]):
+        for argv in (["help", "models"], ["help", "models", "opencode-go"], ["help", "--output=json", "models"]):
             self.assertEqual(runner.slopdex_command(argv), "models")
             for arm in ("map", "search"):
                 self.assertFalse(runner.slopdex_call_allowed(arm, argv))
@@ -279,7 +280,7 @@ sys.exit(9 if '--fixture-fail' in sys.argv[1:] else 0)
         invoke(["help", "models"], "models", False, 126)
         for command in ("search-code", "search-md", "search-descriptions", "cross-search", "status", "update"):
             invoke([command, "target"], command, False, 126)
-        invoke(["--root", arm, "--format=json", opposite, "target"], opposite, False, 126)
+        invoke(["--root", arm, "--output=json", opposite, "target"], opposite, False, 126)
         for argv, command in ((["--help"], "help"), (["help", opposite], "help"),
                                ([opposite, "--help"], "help"), ([primary, "-ih"], "help"), (["--version"], "version")):
             invoke(argv, command, True, 0)

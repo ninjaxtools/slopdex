@@ -1,6 +1,6 @@
 //! Command-line declarations, parsing, and argument validation.
 
-use crate::{filter, formats::FormatGroup, map, ui};
+use crate::{filter, formats::FormatGroup, limits::ResultLimit, map, ui};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -53,7 +53,7 @@ pub(super) struct Global {
     #[arg(long, global = true, value_parser = candidates)]
     pub(super) reranker_candidates: Option<usize>,
     /// Text excerpts by default; cross-search uses clusters, cohesion uses source/match groups; cross JSON is JSONL
-    #[arg(long, global = true, value_enum)]
+    #[arg(long = "output", global = true, value_enum)]
     pub(super) format: Option<Format>,
     /// Compact by default; expanded includes descriptions and high-similarity callable code
     #[arg(long, global = true, value_enum, default_value = "compact")]
@@ -176,9 +176,9 @@ pub(super) struct Filters {
     /// Inclusive minimum, or inclusive-min/exclusive-max range; scores must be in [-1,1]
     #[arg(long, default_value = "0.3", allow_hyphen_values = true, value_parser = threshold)]
     pub(super) threshold: Threshold,
-    /// Positive output limit; default: unlimited. Cross-search limits clusters or matched sources
-    #[arg(long, value_parser = positive)]
-    pub(super) limit: Option<usize>,
+    /// Positive output limit or 'none'; default: config defaultLimit or 4096. Cross-search limits clusters or matched sources
+    #[arg(long)]
+    pub(super) limit: Option<ResultLimit>,
     #[command(flatten)]
     pub(super) selection: SelectionArgs,
 }
@@ -191,7 +191,7 @@ impl Filters {
             value["maxSimilarity"] = json!(max);
         }
         if let Some(limit) = self.limit {
-            value["limit"] = json!(limit);
+            value["limit"] = limit.value();
         }
         value
     }
@@ -256,6 +256,9 @@ pub(super) struct MapArgs {
     /// Include private and unexported symbols
     #[arg(long)]
     pub(super) private: bool,
+    /// Positive declaration limit or 'none'; default: config defaultLimit or 4096
+    #[arg(long)]
+    pub(super) limit: Option<ResultLimit>,
     #[command(flatten)]
     pub(super) calls: CallArgs,
 }
@@ -329,6 +332,9 @@ impl MapArgs {
         }
         if self.private {
             value["private"] = json!(true);
+        }
+        if let Some(limit) = self.limit {
+            value["limit"] = limit.value();
         }
         let calls = self.calls.resolve(detail);
         if calls.enabled() {
@@ -654,7 +660,7 @@ impl Cli {
         if self.global.format == Some(Format::Clusters) {
             ensure!(
                 matches!(&self.command, Command::CrossSearch(args) if !args.cohesion),
-                "clusters format is only available for cross-search without --cohesion; use summary or json"
+                "--output clusters is only available for cross-search without --cohesion; use --output text or --output json"
             );
         }
         if let Command::Help {

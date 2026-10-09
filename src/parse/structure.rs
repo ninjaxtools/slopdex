@@ -56,8 +56,14 @@ pub struct StructureNode {
     /// Complete declaration signature, without executable bodies/initializers.
     pub signature: String,
     pub start_byte: usize,
+    /// Original byte offset before attached leading comments (including attributes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_start_byte: Option<usize>,
     pub end_byte: usize,
     pub start_line: usize,
+    /// Original range start before attached leading comments (including attributes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_start_line: Option<usize>,
     pub start_column: usize,
     pub end_line: usize,
     pub end_column: usize,
@@ -66,6 +72,17 @@ pub struct StructureNode {
     pub heading_level: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<CallSite>,
+}
+
+impl StructureNode {
+    /// Attached comments can be shared by bindings; order their declarations,
+    /// not their expanded source ranges. IDs break ties in extraction order.
+    pub(crate) fn source_order_key(&self) -> (usize, usize) {
+        (
+            self.declaration_start_byte.unwrap_or(self.start_byte),
+            self.id,
+        )
+    }
 }
 
 pub(super) fn extract(language: &str, root: Node<'_>, source: &str) -> FileStructure {
@@ -307,8 +324,10 @@ impl Collector<'_> {
             names,
             signature,
             start_byte,
+            declaration_start_byte: None,
             end_byte: range.end_byte(),
             start_line: start.row + 1,
+            declaration_start_line: None,
             start_column: start.column + 1,
             end_line: range.end_position().row + 1,
             end_column: range.end_position().column + 1,

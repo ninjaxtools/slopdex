@@ -1,6 +1,7 @@
 //! Source descriptions share one association policy across all parser backends.
 //! Backends supply AST comment spans and declaration anchors; attachment happens
-//! after parsing, independently of callable source ranges and content hashes.
+//! after parsing. Attached leading comments also extend symbol source ranges,
+//! callable content hashes, and embedding inputs.
 //!
 //! Whitespace joins comments and declarations unless it contains a blank line.
 //! File headers ignore leading blank lines and may also describe an adjacent
@@ -139,6 +140,7 @@ impl SourceDescriptions {
             .filter(|group| source[..group.span.start].trim().is_empty())
             .and_then(|group| nonempty(group.prose.clone()));
 
+        let mut comment_starts = HashMap::new();
         for symbol in &mut parsed.structure.nodes {
             let anchor = self
                 .anchors
@@ -146,11 +148,14 @@ impl SourceDescriptions {
                 .copied()
                 .unwrap_or(symbol.start_byte);
             let comments = preceding(source, &groups, anchor);
+            if let Some(group) = comments {
+                comment_starts.insert(symbol.id, group.span.start);
+            }
             let docstring = self.docstrings.get(&symbol.start_byte).cloned();
-            symbol.description = combine(comments, docstring);
-        }
-        if parsed.callables.is_empty() {
-            return;
+            symbol.description = combine(
+                comments.and_then(|group| nonempty(group.prose.clone())),
+                docstring,
+            );
         }
         let positions = Positions::new(source);
         let mut declarations: HashMap<&str, Vec<&super::StructureNode>> = HashMap::new();
@@ -175,10 +180,37 @@ impl SourceDescriptions {
                 .and_then(|symbol| symbol.description.clone())
                 .or_else(|| {
                     combine(
-                        preceding(source, &groups, start),
+                        preceding(source, &groups, start)
+                            .and_then(|group| nonempty(group.prose.clone())),
                         self.docstrings.get(&start).cloned(),
                     )
                 });
+            let comment_start = declaration
+                .and_then(|symbol| comment_starts.get(&symbol.id).copied())
+                .or_else(|| preceding(source, &groups, start).map(|group| group.span.start));
+            if let Some(comment_start) = comment_start {
+                let point = positions.point(comment_start);
+                callable.start_line = point.row + 1;
+                callable.start_column = point.column + 1;
+                callable.line_count = callable.end_line - callable.start_line + 1;
+                // Callable embedding inputs end with their exact source text.
+                callable
+                    .embedding_input
+                    .truncate(callable.embedding_input.len() - callable.source.len());
+                callable.source = source[comment_start..end].to_owned();
+                callable.source_hash = crate::hash(&callable.source);
+                callable.embedding_input.push_str(&callable.source);
+            }
+        }
+        for symbol in &mut parsed.structure.nodes {
+            if let Some(&start) = comment_starts.get(&symbol.id) {
+                let point = positions.point(start);
+                symbol.declaration_start_line = Some(symbol.start_line);
+                symbol.declaration_start_byte = Some(symbol.start_byte);
+                symbol.start_byte = start;
+                symbol.start_line = point.row + 1;
+                symbol.start_column = point.column + 1;
+            }
         }
     }
 }
@@ -198,10 +230,14 @@ fn adjacent(source: &str, end: usize, start: usize) -> bool {
             <= 1
 }
 
-fn preceding(source: &str, groups: &[CommentGroup], start: usize) -> Option<String> {
+fn preceding<'a>(
+    source: &str,
+    groups: &'a [CommentGroup],
+    start: usize,
+) -> Option<&'a CommentGroup> {
     let index = groups.partition_point(|group| group.span.end <= start);
     let group = groups.get(index.checked_sub(1)?)?;
-    adjacent(source, group.span.end, start).then(|| nonempty(group.prose.clone()))?
+    adjacent(source, group.span.end, start).then_some(group)
 }
 
 fn nonempty(value: String) -> Option<String> {

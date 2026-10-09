@@ -35,7 +35,8 @@ pub(super) fn markdown_map_bodies(
         .iter()
         .enumerate()
         .filter_map(|(index, node)| {
-            let start = node.start_line - 1 + node.signature.lines().count();
+            let start = node.declaration_start_line.unwrap_or(node.start_line) - 1
+                + node.signature.lines().count();
             let end = headings
                 .get(index + 1)
                 .map_or(lines.len(), |next| next.start_line - 1);
@@ -694,7 +695,7 @@ fn print_ranked_file(
         }
     }
     let mut nodes: Vec<_> = selected.into_values().collect();
-    nodes.sort_by_key(|node| (node.start_byte, node.id));
+    nodes.sort_by_key(StructureNode::source_order_key);
     unmatched.sort_by_key(|hit| {
         (
             hit.item["startLine"].as_u64().unwrap_or(1),

@@ -85,6 +85,7 @@ pub(super) fn effective_config(global: &Global, path: &Path) -> Result<Value> {
 
 fn validate_config(config: &Value) -> Result<()> {
     ensure!(config.is_object(), "config must be a JSON object");
+    crate::limits::validate_config(config)?;
     cross_search_exclusions(config)?;
     ensure!(
         config.get("descriptionsEnabled").is_none(),
@@ -373,6 +374,7 @@ pub(super) fn run_config(
             "maxFileSize",
             "embeddingBatchSize",
             "parallelism",
+            "defaultLimit",
             "verbose",
         ]
         .iter()

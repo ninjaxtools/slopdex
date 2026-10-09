@@ -187,8 +187,9 @@ pub(super) fn print_clusters(
     rows: &[Value],
     same_index: bool,
     limit: Option<usize>,
-) -> Result<()> {
+) -> Result<bool> {
     let clusters = clusters(rows, same_index);
+    let omitted = limit.is_some_and(|limit| clusters.len() > limit);
     if clusters.is_empty() {
         writeln!(out, "No clusters.")?;
     }
@@ -236,7 +237,7 @@ pub(super) fn print_clusters(
             }
         }
     }
-    Ok(())
+    Ok(omitted)
 }
 
 #[cfg(test)]

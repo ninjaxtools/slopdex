@@ -89,7 +89,7 @@ fn cross_jsonl_limits_matched_sources_without_truncating_edges_or_metadata() {
         edge("x", "y", 0.7),
     ];
     let mut out = Vec::new();
-    print_cross(
+    let omitted = print_cross(
         &mut out,
         rows.clone(),
         CrossOutput::new(Format::Json, false, false, Some(1), Detail::Compact),
@@ -97,12 +97,13 @@ fn cross_jsonl_limits_matched_sources_without_truncating_edges_or_metadata() {
         None,
     )
     .unwrap();
+    assert!(omitted);
     let output = String::from_utf8(out).unwrap();
     assert_eq!(output.lines().count(), 1);
     assert!(output.ends_with('\n'));
     assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), first);
     let mut out = Vec::new();
-    print_cross(
+    let omitted = print_cross(
         &mut out,
         rows,
         CrossOutput::new(Format::Summary, false, false, Some(1), Detail::Compact),
@@ -110,6 +111,7 @@ fn cross_jsonl_limits_matched_sources_without_truncating_edges_or_metadata() {
         None,
     )
     .unwrap();
+    assert!(omitted);
     let output = String::from_utf8(out).unwrap();
     assert!(
         output.starts_with("*** src/a.rs\n@@ 1 @@\na  // source\n"),
@@ -122,4 +124,41 @@ fn cross_jsonl_limits_matched_sources_without_truncating_edges_or_metadata() {
     assert!(output.contains("*** src/b.rs\n@@ 1 @@\nb  // target score=0.80"));
     assert!(output.contains("*** src/c.rs\n@@ 1 @@\nc  // target score=0.90"));
     assert!(!output.contains("src/x.rs"));
+}
+
+#[test]
+fn cross_reports_omission_only_after_source_or_cluster_grouping() {
+    let connected = vec![edge("a", "b", 0.9), edge("b", "c", 0.8)];
+    for (format, rows, limit, expected) in [
+        (Format::Clusters, connected.clone(), Some(1), false),
+        (
+            Format::Clusters,
+            vec![edge("a", "b", 0.9), edge("x", "y", 0.8)],
+            Some(1),
+            true,
+        ),
+        (Format::Clusters, vec![edge("a", "a", 0.9)], Some(1), false),
+        (Format::Json, connected.clone(), Some(1), true),
+        (Format::Summary, connected.clone(), Some(2), false),
+        (Format::Json, connected, None, false),
+        (
+            Format::Json,
+            vec![
+                edge("a", "b", 0.9),
+                json!({"source": function("empty"), "matches": []}),
+            ],
+            Some(1),
+            false,
+        ),
+    ] {
+        let omitted = print_cross(
+            &mut Vec::new(),
+            rows,
+            CrossOutput::new(format, true, false, limit, Detail::Compact),
+            &mut Presentation::empty(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(omitted, expected, "{format:?}, {limit:?}");
+    }
 }
