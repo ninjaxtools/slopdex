@@ -1,6 +1,6 @@
 This repository employs the use of LLMs for [automatic programming](https://antirez.com/news/159).
 
-This readme is written by a human.
+This README is written by a human.
 
 # slopdex
 
@@ -9,7 +9,7 @@ This readme is written by a human.
   <img src="sloppy-dexter.png" width="280" align="right" alt="Dexter, the sloppy slime" />
 </picture>
 
-Slopdex helps with doing analysis on codebases that contain a lot of AI generated ~~slop~~ slime.
+Slopdex helps with doing analysis on codebases that contain a lot of AI-generated ~~slop~~ slime.
 
 The main supported functions are
 
@@ -46,7 +46,7 @@ Or you can build from source:
 cargo install --path . --locked
 ```
 
-### Code map/skeleton
+## Code map/skeleton
 
 `slopdex map` works locally without a provider or API key.
 
@@ -65,7 +65,7 @@ The `map` command can be used to generate a source code skeleton that strips mos
 
 Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). The `-q` filter uses vector search on symbol names and markdown heading titles.
 
-Use `--detail expanded` to to show full code or markdown of matched symbols.
+Use `--detail expanded` to show full code or markdown of matched symbols.
 
 See the [selector reference](docs/reference.md#shared-selectors).
 
@@ -76,7 +76,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > - Start discovery with one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" --private --callers 2 --callees 2 <paths...>`. Use known paths or `.`. Immediately read plausible implementation ranges and follow calls in source; grep for usages or missing links. Map again only for unknown declaration locations. Batch reads; skip repeated inventories and setup/help.
 > ```
 
-### Search
+## Search
 
 Vector search requires an embedding-provider API key from OpenAI or Jina.
 
@@ -87,7 +87,7 @@ $ slopdex search "validate an authenticated session"
 ...
 ```
 
-To create a vector index, the `update` command needs tobe run once in a git repository. Any subsequent attempts to use the index will determine what needs to be updated using git and update the index incrementally (use `--no-reindex` to skip this).
+To create a vector index, the `update` command needs to be run once in a Git repository. Any subsequent attempts to use the index will determine what needs to be updated using Git and update the index incrementally (use `--no-reindex` to skip this).
 
 Each worktree has its own index in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). There is also a `global-v1.sqlite` cache that is reused across worktrees, so hash-identical code will not cause unneeded model provider requests. Project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
 
@@ -124,7 +124,7 @@ $ slopdex search 'validate session' --code --symbols
 $ slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
 ```
 
-Descriptions refer to source comments found above symbols or at the start of a file. Missing descriptions/comments can optionally be generated with `generate descriptions`, but required an LLM to be configured (see below).
+Descriptions refer to source comments found above symbols or at the start of a file. Missing descriptions/comments can optionally be generated with `generate descriptions`, but require an LLM to be configured (see below).
 
 > [!NOTE]
 > Add this to your `AGENTS.md` to use semantic search with your agent:
@@ -135,7 +135,7 @@ Descriptions refer to source comments found above symbols or at the start of a f
 
 See the [attachment rules](docs/reference.md#descriptions).
 
-### Find duplicate code
+## Find duplicate code
 
 Compare functions across files, exclude short wrappers, and group matches into clusters.
 
@@ -164,7 +164,7 @@ $ slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 > Add this to your `AGENTS.md` to detect and refactor duplicate code before it is committed:
 >
 > ```text
-> - when reviewing uncommitted determine if similar code elsewhere warrants a refactor: `slopdex cross-search --uncommitted --cross-file-only --lines 4 --threshold 0.8`
+> - when reviewing uncommitted code, determine if similar code elsewhere warrants a refactor: `slopdex cross-search --uncommitted --cross-file-only --lines 4 --threshold 0.8`
 > ```
 
 ### Restrict functions used in the cross-search
@@ -203,7 +203,7 @@ When code is similar but not actually duplicated, then `--cohesion` can help fin
 $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 ```
 
-### Search and describe
+## Search and describe
 
 The intention of the `describe` command is to use a low-cost model to summarise vector search findings to provide more relevant pre-processed results to a more powerful calling agent. It first performs a vector search and then uses the results to provide a tailored summary/description of relevant code.
 
@@ -215,7 +215,7 @@ $ slopdex describe "I want to implement a new rpc endpoint"
 
 First a `search` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation which generates an explanation which will be emitted along with the `compact` search references. This provides a tailored explanation for the query based on the `expanded` search result along with the `compact` search result and thereby acts as a compaction of the `expanded` result.
 
-### Configure an LLM
+## Configure an LLM
 
 I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low-cost models. If you
 sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
@@ -241,9 +241,9 @@ $ slopdex config set descriptionModel gpt-5.6-luna
 $ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
 ```
 
-The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
+The fallback model is used if the main model reports an error, and if the fallback model reports an error the main model is tried again.
 
-### Other formats
+## Other formats
 
 All commands accept a `--formats` argument to select what file types should be considered:
 
@@ -263,7 +263,7 @@ $ slopdex map --formats code --formats config
 $ slopdex search "deployment settings" --formats config
 ```
 
-### Interactive Config
+## Interactive config
 
 To configure all configurable settings interactively run:
 
@@ -271,7 +271,7 @@ To configure all configurable settings interactively run:
 $ slopdex config
 ```
 
-### Reranking
+## Reranking
 
 Optionally a second-stage reranker can be enabled for all query-search commands:
 
@@ -283,7 +283,7 @@ $ slopdex config set rerankingEnabled true
 # Or use an LLM: export OPENAI_API_KEY="your-api-key" && slopdex config set rerankerProvider openai
 ```
 
-### Compare repositories
+## Compare repositories
 
 ```console
 $ slopdex cross-search \
@@ -294,7 +294,7 @@ $ slopdex cross-search \
 
 Pass the target's `indexPath` from `slopdex --root /path/to/other/repo --format json status` (or a custom `--index` path) as `--target-index`.
 
-### Inspect index health
+## Inspect index health
 
 If some functions can't be indexed a warning is printed. Index errors can be investigated and fixed with the `index errors` command to ensure the index is complete.
 
@@ -327,7 +327,7 @@ Semantic code search with vector embeddings:
 - [qmd](https://github.com/tobi/qmd)
 - [grepai](https://github.com/yoanbernabeu/grepai)
 - [cocoindex-code](https://github.com/cocoindex-io/cocoindex-code)
-- [codana](https://github.com/bartolli/codanna)
+- [codanna](https://github.com/bartolli/codanna)
 - [open-codebase-index](https://github.com/Helweg/open-codebase-index)
 
 ## Publishing
