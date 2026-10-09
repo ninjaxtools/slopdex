@@ -545,18 +545,19 @@ fn config_exclusion_dispatch_creates_config_without_an_index() {
         "sample.rs:run",
         "--root",
         temp.path().to_str().unwrap(),
+        "--format",
+        "json",
     ]);
     let mut out = Vec::new();
     super::super::run_cli(&cli, &mut out).unwrap();
-    assert!(
-        String::from_utf8(out)
-            .unwrap()
-            .contains("crossSearchExclusions=")
-    );
     let path = temp.path().join(".slopdex/config.json");
     let old_hash = crate::parse::parse("sample.rs", source).unwrap().callables[0]
         .source_hash
         .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap(),
+        json!({"configPath": path, "crossSearchExclusions": [old_hash]})
+    );
     assert_eq!(
         read_config(&path).unwrap()["crossSearchExclusions"],
         json!([old_hash])
