@@ -198,8 +198,7 @@ src/users/user-service.ts:27-48:UserService.authenticate
 
 Using `--cross-file-only` is useful to exclude similar code in the same file.
 
-Clusters are ranked by highest pair similarity × distinct covered source lines,
-descending. Overlapping symbols in the same file count their shared lines once.
+Clusters are ranked by highest pair similarity * lines, descending.
 
 You can use threshold and line-count ranges as well. Range starts are inclusive
 and ends are exclusive, so `--lines 4-20` selects functions with 4 through 19
