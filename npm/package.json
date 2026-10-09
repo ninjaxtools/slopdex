@@ -1,6 +1,6 @@
 {
   "name": "@ninjaxtools/slopdex",
-  "version": "0.34.0",
+  "version": "0.35.0",
   "description": "Semantic code and Markdown search with SQLite and USearch",
   "license": "MIT",
   "repository": {
