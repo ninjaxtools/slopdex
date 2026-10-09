@@ -46,21 +46,6 @@ Or you can build from source:
 cargo install --path . --locked
 ```
 
-## Getting started
-
-Vector search requires an embedding-provider API key from OpenAI or Jina.
-
-```console
-$ export OPENAI_API_KEY="your-api-key"
-$ slopdex update
-$ slopdex search "validate an authenticated session"
-...
-```
-
-The index is created with the `update` command and refreshed before use. Git checkouts use status, commit-tree differences, and previously dirty paths to refresh incrementally, without hashing every unchanged file on repeated queries. `--no-reindex` uses the saved snapshot without checking freshness; missing query artifacts can still require provider calls.
-
-Each worktree has its own bindings in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). Source, parse, embedding, and provider artifacts and immutable snapshots live in the authoritative `global-v1.sqlite` store and are reused across worktrees. Vector search lazily shares immutable index bases with worktree-specific deltas and membership masks. Older indexes/caches are not migrated or imported; run `slopdex update` to create the new index. Project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
-
 ### Code map/skeleton
 
 `slopdex map` works locally without a provider or API key.
@@ -92,6 +77,19 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > ```
 
 ### Search
+
+Vector search requires an embedding-provider API key from OpenAI or Jina.
+
+```console
+$ export OPENAI_API_KEY="your-api-key"
+$ slopdex update
+$ slopdex search "validate an authenticated session"
+...
+```
+
+To create a vector index, the `update` command needs tobe run once in a git repository. Any subsequent attempts to use the index will determine what needs to be updated using git and update the index incrementally (use `--no-reindex` to skip this).
+
+Each worktree has its own index in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). There is also a `global-v1.sqlite` cache that is reused across worktrees, so hash-identical code will not cause unneeded model provider requests. Project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
 
 By default all indexes are searched and ranked together.
 
@@ -165,24 +163,6 @@ Generated descriptions are cached by the full effective request: configured prof
 
 See the [attachment rules](docs/reference.md#descriptions).
 
-### Interactive Config
-
-To configure all configurable settings interactively run:
-
-```console
-$ slopdex config
-```
-
-### Search and describe
-
-The intention of the `describe` command is to use a low-cost model to summarise vector search findings to provide more relevant pre-processed results to a more powerful calling agent. It first performs a vector search and then uses the results to provide a tailored summary/description of relevant code.
-
-```console
-$ slopdex describe "I want to implement a new rpc endpoint"
-```
-
-First a `search` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation which generates an explanation which will be emitted along with the `compact` search references. This provides a tailored explanation for the query based on the `expanded` search result along with the `compact` search result and thereby acts as a compaction of the `expanded` result.
-
 ### Find duplicate code
 
 Compare functions across files, exclude short wrappers, and group matches into clusters.
@@ -241,6 +221,24 @@ When code is similar but not actually duplicated, then `--cohesion` can help fin
 
 ```console
 $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
+```
+
+### Search and describe
+
+The intention of the `describe` command is to use a low-cost model to summarise vector search findings to provide more relevant pre-processed results to a more powerful calling agent. It first performs a vector search and then uses the results to provide a tailored summary/description of relevant code.
+
+```console
+$ slopdex describe "I want to implement a new rpc endpoint"
+```
+
+First a `search` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation which generates an explanation which will be emitted along with the `compact` search references. This provides a tailored explanation for the query based on the `expanded` search result along with the `compact` search result and thereby acts as a compaction of the `expanded` result.
+
+### Interactive Config
+
+To configure all configurable settings interactively run:
+
+```console
+$ slopdex config
 ```
 
 ### Reranking
