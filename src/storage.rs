@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
-pub const STRUCTURE_PARSER_VERSION: &str = "structure-v8-source-descriptions";
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v9-description-identities";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -861,8 +861,18 @@ pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>
             continue;
         }
         let occurrence = occurrences.entry(&node.qualified_name).or_default();
-        let identity =
-            hash(json!([file.path, node.qualified_name, node.kind, *occurrence]).to_string());
+        // Description-only declarations (including overload signatures) have
+        // their own occurrence sequence, separate from callable implementations.
+        let identity = hash(
+            json!([
+                file.path,
+                "symbol-description",
+                node.qualified_name,
+                node.kind,
+                *occurrence
+            ])
+            .to_string(),
+        );
         *occurrence += 1;
         if node.description.is_none() {
             continue;
@@ -2121,7 +2131,16 @@ mod tests {
         let second_identity = items[1].identity.clone();
         assert_eq!(
             second_identity,
-            hash(json!(["code.ts", "A", record.1.structure.nodes[1].kind, 1]).to_string())
+            hash(
+                json!([
+                    "code.ts",
+                    "symbol-description",
+                    "A",
+                    record.1.structure.nodes[1].kind,
+                    1
+                ])
+                .to_string()
+            )
         );
         db.apply(&[(db.files()?.remove(0), items)], &[], None)?;
         record.1.structure.nodes[0].description = None;

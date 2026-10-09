@@ -2221,6 +2221,69 @@ fn refresh_indexes_source_descriptions_and_generation_excludes_source_provided()
 }
 
 #[test]
+fn refresh_keeps_commented_overloads_distinct_from_their_implementation() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    let source = "import { value } from './values.js';\n\n\
+        // Accept text VECTOR_EAST.\n\
+        export function boundaryKey(value: string): string;\n\
+        // Accept a number VECTOR_NORTH.\n\
+        export function boundaryKey(value: number): string;\n\
+        // Encode the boundary VECTOR_WEST.\n\
+        export function boundaryKey(value: string | number): string { return String(value); }\n";
+    repo.write("contracts.ts", source)?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    assert_eq!(engine.status()?["functionCount"], 1);
+    assert!(engine.errors()?.is_empty());
+
+    let descriptions = engine.search("east", "search-descriptions", &all())?;
+    assert_eq!(descriptions.len(), 3);
+    for (line, kind, prose) in [
+        (4, "symbol", "Accept text VECTOR_EAST."),
+        (6, "symbol", "Accept a number VECTOR_NORTH."),
+        (8, "function", "Encode the boundary VECTOR_WEST."),
+    ] {
+        let result = descriptions
+            .iter()
+            .find(|result| result[kind]["startLine"] == line)
+            .expect("each declaration must have its own searchable description");
+        assert_eq!(result["type"], kind);
+        assert_eq!(result[kind]["qualifiedName"], "boundaryKey");
+        assert_eq!(result[kind]["description"], prose);
+    }
+    assert!(mock.requests("/responses").is_empty());
+    drop(engine);
+
+    let mut engine = repo.open(&config)?;
+    assert_eq!(
+        engine.search("east", "search-descriptions", &all())?,
+        descriptions
+    );
+    repo.write(
+        "contracts.ts",
+        &source.replace("// Accept text VECTOR_EAST.", ""),
+    )?;
+    engine.refresh()?;
+    let descriptions = engine.search("east", "search-descriptions", &all())?;
+    assert_eq!(descriptions.len(), 2);
+    assert!(
+        descriptions
+            .iter()
+            .any(|result| { result["symbol"]["description"] == "Accept a number VECTOR_NORTH." })
+    );
+    assert!(
+        descriptions.iter().any(|result| {
+            result["function"]["description"] == "Encode the boundary VECTOR_WEST."
+        })
+    );
+    assert_eq!(engine.status()?["functionCount"], 1);
+    assert!(engine.errors()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn describe_uses_indexed_search_context_without_whole_files() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
