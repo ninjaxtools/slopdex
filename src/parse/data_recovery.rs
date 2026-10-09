@@ -1,7 +1,7 @@
 //! Bounded repairs of unexpected scalar tokens. Never blank an ERROR subtree:
 //! grammars can include healthy siblings, strings, or heredocs in that range.
 
-use super::document::text;
+use super::super::syntax::text;
 use tree_sitter::{Node, Parser, Tree};
 
 const MAX_REPAIRS: usize = 16;

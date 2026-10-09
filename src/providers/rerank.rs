@@ -1,4 +1,5 @@
-//! Reranker selection and shared configuration. Construct lazily on nonempty use.
+//! Reranker selection, shared configuration, and native ranking requests.
+//! Construct lazily on nonempty use.
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
@@ -6,7 +7,7 @@ use std::sync::Arc;
 
 use crate::models::Rerank;
 
-use super::{Context, string, unqualify};
+use super::{Context, Protocol, api_key, auth_headers, endpoint, parse_ranking, string, unqualify};
 
 pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Rerank>> {
     match string(&context.config, &["rerankerProvider"])?
@@ -41,5 +42,24 @@ impl Configuration {
             model: model.to_owned(),
             base: base.to_owned(),
         })
+    }
+
+    /// Cohere/Jina share the native rerank protocol; each builds its own request body.
+    pub(super) fn request_ranking(
+        &self,
+        context: &Context,
+        provider: &str,
+        body: &Value,
+        count: usize,
+    ) -> Result<Vec<(usize, f64)>> {
+        let key = api_key(&context.config, "rerankerApiKey", provider)?;
+        let headers = auth_headers(&key, Protocol::Responses)?;
+        let url = endpoint(&self.base, "rerank")?;
+        let response = context
+            .http
+            .request_with_notice(&url, Some(body), &headers, || {
+                context.report_call("reranking", provider, &self.model);
+            })?;
+        parse_ranking(&response["results"], count, false)
     }
 }

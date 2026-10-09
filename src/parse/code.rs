@@ -1,5 +1,6 @@
 //! Tree-sitter callable extraction and recoverable syntax diagnostics.
 
+use super::syntax::{children, text, unwrap_value as unwrap};
 use super::{CallSite, Callable, Diagnostic, ParsedFile};
 use crate::hash;
 use anyhow::{Context, Result};
@@ -158,17 +159,8 @@ fn collect_calls(
     }
 }
 
-fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
-    // Recovered trees keep byte offsets identical to the original source.
-    source.get(node.byte_range()).unwrap_or("")
-}
-
 fn field<'a>(source: &'a str, node: Node<'_>, name: &str) -> Option<&'a str> {
     node.child_by_field_name(name).map(|n| text(source, n))
-}
-
-fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    super::syntax::children(node)
 }
 
 fn scoped(scope: &[String], name: &str) -> Vec<String> {
@@ -267,10 +259,6 @@ fn object_scope(source: &str, node: Node<'_>) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn unwrap(node: Node<'_>) -> Node<'_> {
-    super::syntax::unwrap_value(node)
 }
 
 impl<'tree> Collector<'_, 'tree> {

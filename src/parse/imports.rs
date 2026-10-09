@@ -1,11 +1,8 @@
 //! Import paths and bindings, kept separate from display signatures.
 
 use super::ImportBinding;
+use super::syntax::text;
 use tree_sitter::Node;
-
-fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
-    source.get(node.byte_range()).unwrap_or("")
-}
 
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();

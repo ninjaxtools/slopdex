@@ -189,7 +189,7 @@ Compare functions across files, exclude short wrappers, and group matches into c
 
 ```console
 $ slopdex cross-search --cross-file-only --lines 4 --threshold 0.9
-*** Cluster 1 · 3 symbols · similarity 0.91-0.96
+*** Cluster 1 · 3 symbols · 50 lines · similarity 0.91-0.96
 src/auth/session.ts:18-29:validateSession
 src/http/middleware.ts:42-57:authenticate
 src/users/user-service.ts:27-48:UserService.authenticate
@@ -197,6 +197,9 @@ src/users/user-service.ts:27-48:UserService.authenticate
 ```
 
 Using `--cross-file-only` is useful to exclude similar code in the same file.
+
+Clusters are ranked by highest pair similarity × distinct covered source lines,
+descending. Overlapping symbols in the same file count their shared lines once.
 
 You can use threshold and line-count ranges as well. Range starts are inclusive
 and ends are exclusive, so `--lines 4-20` selects functions with 4 through 19
@@ -210,7 +213,7 @@ $ slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 > Add this to your `AGENTS.md` to detect and refactor duplicate code before it is committed:
 >
 > ```text
-> - when reviewing uncommitted determine if similar code elsewhere warrants a refactor: `slopdex cross-search --uncommitted --cross-file-only --threshold 0.8`
+> - when reviewing uncommitted determine if similar code elsewhere warrants a refactor: `slopdex cross-search --uncommitted --cross-file-only --lines 4 --threshold 0.8`
 > ```
 
 ### Restrict functions used in the cross-search

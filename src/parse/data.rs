@@ -1,5 +1,6 @@
 //! Tree-sitter structure for configuration and markup, with bounded text search units.
 
+use super::syntax::text;
 use super::{Diagnostic, FileStructure, ParsedFile, StructureNode};
 use anyhow::{Context, Result};
 use std::{
@@ -17,7 +18,7 @@ mod recovery;
 #[path = "data_strings.rs"]
 mod strings;
 
-use document::{Positions, children, text};
+use document::{Positions, children};
 
 pub(super) fn parse(
     language: &'static str,

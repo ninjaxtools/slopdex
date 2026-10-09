@@ -1,6 +1,7 @@
 //! Tree-sitter Markdown headings and heading-aware search chunks.
 
-use super::data::document::{self, Positions, children, text};
+use super::data::document::{self, Positions, children};
+use super::syntax::text;
 use super::{FileStructure, MarkdownChunk, ParsedFile, StructureNode};
 use crate::hash;
 use anyhow::{Context, Result};

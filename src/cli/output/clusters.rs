@@ -23,6 +23,13 @@ struct Cluster {
     members: Vec<ClusterMember>,
     min: f64,
     max: f64,
+    lines: u64,
+}
+
+impl Cluster {
+    fn rank(&self) -> f64 {
+        self.max * self.lines as f64
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +83,35 @@ fn node_key(function: &Value, role: &str) -> String {
     format!("{role}:{id}")
 }
 
+fn covered_lines(members: &[ClusterMember]) -> u64 {
+    let mut files = BTreeMap::<(&str, &str), Vec<(u64, u64)>>::new();
+    for member in members {
+        let function = &member.function;
+        let start = function["startLine"].as_u64().unwrap_or(1).max(1);
+        let mut end = function["endLine"].as_u64().unwrap_or(start).max(start);
+        // Tree-sitter ranges end exclusively; column 1 covers none of that line.
+        if end > start && function["endColumn"].as_u64() == Some(1) {
+            end -= 1;
+        }
+        files
+            .entry((member.role, text(function, "path")))
+            .or_default()
+            .push((start, end));
+    }
+    let mut lines = 0_u64;
+    for ranges in files.values_mut() {
+        ranges.sort_unstable();
+        let mut previous_end = 0;
+        for &(start, end) in ranges.iter() {
+            if end > previous_end {
+                lines = lines.saturating_add(end - start.max(previous_end + 1) + 1);
+                previous_end = end;
+            }
+        }
+    }
+    lines
+}
+
 fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
     let mut nodes = BTreeMap::<String, ClusterMember>::new();
     let mut neighbors = HashMap::<String, Vec<(String, f64)>>::new();
@@ -118,6 +154,7 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
             members: Vec::new(),
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
+            lines: 0,
         };
         while let Some(key) = pending.pop() {
             cluster.members.push(nodes[&key].clone());
@@ -132,12 +169,14 @@ fn clusters(rows: &[Value], same_index: bool) -> Vec<Cluster> {
         cluster
             .members
             .sort_by(|a, b| a.source_key().cmp(&b.source_key()));
+        cluster.lines = covered_lines(&cluster.members);
         result.push(cluster);
     }
     result.sort_by(|a, b| {
-        b.members
-            .len()
-            .cmp(&a.members.len())
+        b.rank()
+            .total_cmp(&a.rank())
+            .then_with(|| b.max.total_cmp(&a.max))
+            .then_with(|| b.lines.cmp(&a.lines))
             .then_with(|| a.members[0].label().cmp(&b.members[0].label()))
     });
     result
@@ -168,9 +207,10 @@ pub(super) fn print_clusters(
         };
         writeln!(
             out,
-            "*** Cluster {} · {} symbols · similarity {range}",
+            "*** Cluster {} · {} symbols · {} lines · similarity {range}",
             index + 1,
             cluster.members.len(),
+            cluster.lines,
         )?;
         let locations: Vec<_> = cluster
             .members

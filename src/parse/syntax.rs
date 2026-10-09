@@ -1,6 +1,11 @@
-//! Shared AST navigation: comments are layout, not expressions or bindings.
+//! Shared AST access: comments are layout, not expressions or bindings.
 
 use tree_sitter::Node;
+
+pub(super) fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
+    // Recovered trees keep byte offsets identical to the original source.
+    source.get(node.byte_range()).unwrap_or("")
+}
 
 pub(super) fn children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
@@ -135,4 +140,40 @@ pub(super) fn shell_owner(mut node: Node<'_>) -> Option<Node<'_>> {
         node = parent;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn text_reads_original_unicode_source_after_offset_preserving_repairs() {
+        let source = "const café = ???;";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("const café = 123;", None).unwrap();
+        let declaration = tree.root_node().named_child(0).unwrap();
+        let binding = declaration.named_child(0).unwrap();
+        let name = binding.child_by_field_name("name").unwrap();
+        let value = binding.child_by_field_name("value").unwrap();
+
+        assert_eq!(text(source, name), "café");
+        assert_eq!(text(source, value), "???");
+    }
+
+    #[test]
+    fn text_returns_empty_for_invalid_source_ranges() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("x", None).unwrap();
+        let node = tree.root_node();
+
+        assert_eq!(text("", node), "");
+        assert_eq!(text("é", node), "");
+    }
 }

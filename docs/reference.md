@@ -586,7 +586,7 @@ print it directly after the file's colon on the same line, with no intervening
 space. For example:
 
 ```text
-*** Cluster 1 · 3 symbols · similarity 0.91-0.95
+*** Cluster 1 · 3 symbols · 12 lines · similarity 0.91-0.95
 src/api/routes.ts:
   12:validateSession
   20-24:refreshSession
@@ -609,8 +609,15 @@ without a limit. OpenAI receives up to
 defaults to `10`. Without an explicit limit the OpenAI retrieval cap is **100**.
 Query JSON retains `similarity` and adds `rerankScore`.
 
-Clusters are connected components of observed callable matches, sorted by member
-count and then name. The displayed similarity range covers observed links;
+Clusters are connected components of observed callable matches, sorted by highest
+pair similarity × distinct covered source lines, descending. Line coverage is the
+union of member ranges per file; overlapping symbols count shared lines once,
+and source/target indexes count separately even for identical paths. Exclusive
+ends at column 1 do not count the ending line. Missing end lines default to the
+start line. Ties use highest pair similarity, then covered lines (both
+descending), then the first member's location/name. `--limit` applies after ranking.
+Cluster headers show the covered line count. The displayed similarity range
+covers observed links;
 members need not all match one another directly. Cross-search compares callables,
 not Markdown chunks. Sources with no surviving matches are omitted.
 

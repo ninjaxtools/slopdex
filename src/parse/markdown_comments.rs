@@ -1,7 +1,8 @@
 //! Comment spans from Markdown's block and inline ASTs. Code spans and fenced
 //! or indented examples are literal content, even when they look like HTML.
 
-use super::document::{self, Positions, children, text};
+use super::super::syntax::text;
+use super::document::{self, Positions, children};
 use anyhow::{Context, Result};
 use std::ops::Range;
 use tree_sitter::{Node, Parser};

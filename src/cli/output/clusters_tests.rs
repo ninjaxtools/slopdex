@@ -1,4 +1,4 @@
-use super::{ClusterMember, clusters};
+use super::{ClusterMember, clusters, covered_lines};
 use crate::cli::{
     args::{Detail, Format},
     output::{
@@ -7,7 +7,121 @@ use crate::cli::{
         test_support::edge,
     },
 };
-use serde_json::json;
+use serde_json::{Value, json};
+
+fn span(id: &str, path: &str, start: u64, end: u64) -> Value {
+    json!({"id": id, "path": path, "qualifiedName": id,
+        "startLine": start, "endLine": end, "endColumn": 2})
+}
+
+#[test]
+fn clusters_rank_by_similarity_times_coverage_before_limiting() {
+    let rows = vec![
+        edge("a", "b", 0.99),
+        edge("b", "c", 0.99),
+        json!({"source": span("x", "x.rs", 1, 10), "matches": [
+            {"function": span("y", "y.rs", 1, 10), "similarity": 0.8}]}),
+        json!({"source": span("m", "m.rs", 1, 10), "matches": [
+            {"function": span("n", "n.rs", 1, 10), "similarity": 0.9}]}),
+    ];
+    let grouped = clusters(&rows, true);
+    assert_eq!(grouped[0].rank(), 18.0);
+    assert_eq!(grouped[1].rank(), 16.0);
+    assert_eq!(grouped[2].members.len(), 3);
+    assert_eq!(grouped[2].lines, 3);
+    assert_eq!(grouped[2].max, 0.99);
+
+    let mut out = Vec::new();
+    print_cross(
+        &mut out,
+        rows,
+        CrossOutput::new(Format::Clusters, true, false, Some(1), Detail::Compact),
+        &mut Presentation::empty(),
+        None,
+    )
+    .unwrap();
+    let output = String::from_utf8(out).unwrap();
+    assert!(output.contains("*** Cluster 1 · 2 symbols · 20 lines · similarity 0.90"));
+    assert!(output.contains("m.rs:1-10:m\n"));
+    assert!(!output.contains("Cluster 2"));
+}
+
+#[test]
+fn equal_cluster_ranks_use_similarity_then_stable_location_order() {
+    let mut rows = vec![
+        json!({"source": span("y", "y.rs", 1, 2), "matches": [
+            {"function": span("z", "z.rs", 1, 2), "similarity": 0.75}]}),
+        json!({"source": span("h", "h.rs", 1, 2), "matches": [
+            {"function": span("i", "i.rs", 1, 1), "similarity": 1.0}]}),
+        json!({"source": span("a", "a.rs", 1, 2), "matches": [
+            {"function": span("b", "b.rs", 1, 2), "similarity": 0.75}]}),
+    ];
+    for _ in 0..2 {
+        let grouped = clusters(&rows, true);
+        assert!(grouped.iter().all(|cluster| cluster.rank() == 3.0));
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|cluster| cluster.members[0].function["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["h", "a", "y"]
+        );
+        rows.reverse();
+    }
+}
+
+#[test]
+fn coverage_merges_nested_and_overlapping_ranges_per_file_and_index() {
+    let members: Vec<_> = [
+        span("outer", "same.rs", 1, 10),
+        span("nested", "same.rs", 3, 5),
+        span("overlap", "same.rs", 8, 14),
+        span("disjoint", "same.rs", 20, 22),
+        span("other", "other.rs", 1, 10),
+    ]
+    .into_iter()
+    .map(|function| ClusterMember {
+        function,
+        role: "index",
+    })
+    .collect();
+    assert_eq!(covered_lines(&members), 27);
+
+    let source = ClusterMember {
+        function: span("same", "same.rs", 1, 10),
+        role: "source",
+    };
+    let target = ClusterMember {
+        function: source.function.clone(),
+        role: "target",
+    };
+    assert_eq!(covered_lines(&[source, target]), 20);
+}
+
+#[test]
+fn coverage_respects_exclusive_ends_and_tolerates_missing_or_invalid_positions() {
+    let members: Vec<_> = [
+        json!({"path": "exclusive.rs", "startLine": 2, "endLine": 5, "endColumn": 1}),
+        json!({"path": "single.rs", "startLine": 2, "endLine": 2, "endColumn": 1}),
+        json!({"path": "missing-end.rs", "startLine": 5}),
+        json!({"path": "missing.rs"}),
+        json!({"path": "reversed.rs", "startLine": 5, "endLine": 2}),
+        json!({"path": "zero.rs", "startLine": 0, "endLine": 0}),
+    ]
+    .into_iter()
+    .map(|function| ClusterMember {
+        function,
+        role: "index",
+    })
+    .collect();
+    assert_eq!(covered_lines(&members), 8);
+
+    let huge = ClusterMember {
+        function: span("huge", "huge.rs", 1, u64::MAX),
+        role: "index",
+    };
+    assert_eq!(covered_lines(&[huge.clone(), huge]), u64::MAX);
+}
 
 #[test]
 fn clusters_are_transitive_and_limit_applies_after_components_form() {
@@ -31,7 +145,7 @@ fn clusters_are_transitive_and_limit_applies_after_components_form() {
     )
     .unwrap();
     let output = String::from_utf8(out).unwrap();
-    assert!(output.contains("*** Cluster 1 · 4 symbols · similarity 0.91-0.95"));
+    assert!(output.contains("*** Cluster 1 · 4 symbols · 4 lines · similarity 0.91-0.95"));
     assert!(output.contains(concat!(
         "src/a.rs:1:a\n",
         "src/b.rs:1:b\n",
@@ -53,7 +167,7 @@ fn cross_repository_clusters_do_not_merge_swapped_or_identical_node_ids() {
             .iter()
             .map(ClusterMember::label)
             .collect::<Vec<_>>(),
-        ["[source] src/a.rs:1:1 :: a", "[target] src/b.rs:1:1 :: b"]
+        ["[source] src/b.rs:1:1 :: b", "[target] src/a.rs:1:1 :: a"]
     );
     assert_eq!(
         grouped[1]
@@ -61,10 +175,10 @@ fn cross_repository_clusters_do_not_merge_swapped_or_identical_node_ids() {
             .iter()
             .map(ClusterMember::label)
             .collect::<Vec<_>>(),
-        ["[source] src/b.rs:1:1 :: b", "[target] src/a.rs:1:1 :: a"]
+        ["[source] src/a.rs:1:1 :: a", "[target] src/b.rs:1:1 :: b"]
     );
-    assert_eq!((grouped[0].min, grouped[0].max), (0.8, 0.8));
-    assert_eq!((grouped[1].min, grouped[1].max), (0.9, 0.9));
+    assert_eq!((grouped[0].min, grouped[0].max), (0.9, 0.9));
+    assert_eq!((grouped[1].min, grouped[1].max), (0.8, 0.8));
     assert_eq!(clusters(&rows, true).len(), 1);
     let mut same_id = edge("a", "a", 0.7);
     same_id["source"]["id"] = json!(0);
@@ -81,7 +195,7 @@ fn cross_repository_clusters_do_not_merge_swapped_or_identical_node_ids() {
     assert_eq!(
         String::from_utf8(out).unwrap(),
         concat!(
-            "*** Cluster 1 · 2 symbols · similarity 0.70\n",
+            "*** Cluster 1 · 2 symbols · 2 lines · similarity 0.70\n",
             "src/a.rs:\n",
             "  1:a [source]\n",
             "  1:a [target]\n"
@@ -164,7 +278,7 @@ fn cluster_members_in_one_file_follow_numeric_source_lines() {
     let output = String::from_utf8(output).unwrap();
     assert_eq!(
         output,
-        "*** Cluster 1 · 2 symbols · similarity 0.90\nsame.rs:\n  2:first\n  10:second\n"
+        "*** Cluster 1 · 2 symbols · 2 lines · similarity 0.90\nsame.rs:\n  2:first\n  10:second\n"
     );
 }
 
@@ -188,7 +302,7 @@ fn cluster_locations_use_ranges_only_for_multiline_symbols() {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             concat!(
-                "*** Cluster 1 · 2 symbols · similarity 0.91\n",
+                "*** Cluster 1 · 2 symbols · 7 lines · similarity 0.91\n",
                 "src/api/routes.ts:12:validateSession\n",
                 "src/auth/session.ts:5-10:Session.validate\n"
             )

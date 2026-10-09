@@ -1,6 +1,7 @@
 //! Decode keys using their document's quoting rules, rather than JSON's rules.
 
-use super::document::{children, text};
+use super::super::syntax::text;
+use super::document::children;
 use tree_sitter::Node;
 
 pub(super) fn decode(language: &str, value: &str) -> String {

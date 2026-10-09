@@ -903,11 +903,20 @@ fn all_rerankers_validate_and_return_descending_scores() {
             assert_eq!(requests[0].body["text"]["format"]["type"], "json_schema");
         } else {
             assert_eq!(requests[0].path, "/v1/rerank");
-            assert_eq!(requests[0].body["top_n"], 2);
-            assert_eq!(requests[0].body["query"], "query");
+            let mut expected = json!({"model": if provider == "cohere" {
+                "rerank-v4.0-pro"
+            } else {
+                "jina-reranker-v3.5"
+            }, "query": "query", "documents": ["first", "second"], "top_n": 2});
             if provider == "jina" {
-                assert_eq!(requests[0].body["return_documents"], false);
+                expected["return_documents"] = json!(false);
             }
+            assert_eq!(requests[0].body, expected);
+            assert!(
+                requests[0]
+                    .headers
+                    .contains("authorization: bearer mock-secret")
+            );
         }
     }
     for ranking in [
@@ -926,6 +935,39 @@ fn all_rerankers_validate_and_return_descending_scores() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn native_rerankers_preserve_provider_credentials_models_and_endpoint_overrides() {
+    for provider in ["cohere", "jina"] {
+        let mock = Mock::new(vec![(
+            200,
+            json!({"results": [{"index": 0, "relevance_score": 0.8}]}),
+        )]);
+        let mut config = mock.config();
+        config["rerankerProvider"] = json!(provider);
+        config["rerankerModel"] = json!(format!("{provider}/custom-model"));
+        config["rerankerBaseUrl"] = json!(format!("{}/rerank/?route=custom", mock.base));
+        config.as_object_mut().unwrap().remove("rerankerApiKey");
+        config[format!("{provider}ApiKey")] = json!("provider-secret");
+        let p = Providers::new(&config).unwrap();
+        let reranker = p.reranker().unwrap();
+        assert!(reranker.rerank("query", &[]).unwrap().is_empty());
+        assert!(mock.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            reranker.rerank("query", &["document".into()]).unwrap(),
+            vec![(0, 0.8)]
+        );
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/v1/rerank?route=custom");
+        assert_eq!(requests[0].body["model"], "custom-model");
+        assert!(
+            requests[0]
+                .headers
+                .contains("authorization: bearer provider-secret")
+        );
+    }
 }
 
 #[test]

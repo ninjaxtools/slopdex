@@ -4,6 +4,7 @@
 //! zero-based, half-open; lines and UTF-8 byte columns are one-based, with an
 //! exclusive end (including an end at column 1 of the following line).
 
+use super::syntax::{children, text, unwrap_value};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
@@ -77,14 +78,6 @@ pub(super) fn extract(language: &str, root: Node<'_>, source: &str) -> FileStruc
     FileStructure {
         nodes: collector.nodes,
     }
-}
-
-fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    super::syntax::children(node)
-}
-
-fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
-    source.get(node.byte_range()).unwrap_or("")
 }
 
 fn compact(value: &str, language: &str) -> String {
@@ -175,10 +168,6 @@ fn value(node: Node<'_>) -> Option<Node<'_>> {
         .child_by_field_name("value")
         .or_else(|| node.child_by_field_name("right"))?;
     Some(unwrap_value(value))
-}
-
-fn unwrap_value(value: Node<'_>) -> Node<'_> {
-    super::syntax::unwrap_value(value)
 }
 
 fn function_value(node: Node<'_>) -> bool {

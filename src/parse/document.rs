@@ -8,10 +8,6 @@ pub(in crate::parse) fn children(node: Node<'_>) -> Vec<Node<'_>> {
     node.named_children(&mut cursor).collect()
 }
 
-pub(in crate::parse) fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
-    source.get(node.byte_range()).unwrap_or("")
-}
-
 pub(in crate::parse) struct Positions {
     lines: Vec<usize>,
 }
