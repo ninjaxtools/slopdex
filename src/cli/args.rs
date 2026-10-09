@@ -1,6 +1,6 @@
 //! Command-line declarations, parsing, and argument validation.
 
-use crate::{filter, map, ui};
+use crate::{filter, formats::FormatGroup, map, ui};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -114,7 +114,8 @@ pub(super) enum Command {
     SearchCode(QueryArgs),
     /// Search only the generated callable/file description index
     SearchDescriptions(QueryArgs),
-    /// Search only the heading-aware Markdown content index
+    /// Search only the documentation content index
+    #[command(name = "search-docs", visible_alias = "search-md")]
     SearchMd(QueryArgs),
     /// Search only the symbol-name/alias and heading-title index
     SearchSymbols(QueryArgs),
@@ -198,6 +199,9 @@ impl Filters {
 
 #[derive(Debug, Args)]
 pub(super) struct SelectionArgs {
+    /// Format groups: code,docs,config,markup,all (default: code,docs)
+    #[arg(long, value_delimiter = ',', value_parser = valid_format)]
+    pub(super) formats: Vec<String>,
     /// Repository-relative glob; repeat in order, ! excludes, last match wins
     #[arg(short = 'g', long, value_parser = valid_glob)]
     pub(super) glob: Vec<String>,
@@ -218,6 +222,9 @@ pub(super) struct SelectionArgs {
 impl SelectionArgs {
     pub(super) fn options(&self) -> Value {
         let mut value = json!({});
+        if !self.formats.is_empty() {
+            value["formats"] = json!(self.formats);
+        }
         if !self.glob.is_empty() {
             value["glob"] = json!(self.glob);
         }
@@ -394,8 +401,8 @@ pub(super) struct SearchArgs {
     /// Select the generated callable/file description index
     #[arg(long)]
     pub(super) descriptions: bool,
-    /// Select the Markdown content index
-    #[arg(long)]
+    /// Select the documentation content index
+    #[arg(long = "docs", visible_alias = "md")]
     pub(super) md: bool,
     /// Select the symbol-name/alias and heading-title index
     #[arg(long)]
@@ -408,7 +415,7 @@ impl SearchArgs {
         if self.code || self.descriptions || self.md || self.symbols {
             options["code"] = json!(self.code);
             options["descriptions"] = json!(self.descriptions);
-            options["md"] = json!(self.md);
+            options["docs"] = json!(self.md);
             options["symbols"] = json!(self.symbols);
         }
         options
@@ -427,7 +434,7 @@ impl Command {
             }
             Self::SearchCode(args) => (args, "search-code"),
             Self::SearchDescriptions(args) => (args, "search-descriptions"),
-            Self::SearchMd(args) => (args, "search-md"),
+            Self::SearchMd(args) => (args, "search-docs"),
             Self::SearchSymbols(args) => (args, "search-symbols"),
             _ => return None,
         };
@@ -627,6 +634,15 @@ fn valid_glob(input: &str) -> std::result::Result<String, String> {
     filter::Selection::compile(&json!({"glob": [input]}))
         .map(|_| input.to_owned())
         .map_err(|error| format!("{error:#}"))
+}
+
+fn valid_format(input: &str) -> std::result::Result<String, String> {
+    if input == "all" {
+        return Ok(input.into());
+    }
+    FormatGroup::from_name(input)
+        .map(|group| group.as_str().into())
+        .map_err(|error| error.to_string())
 }
 
 fn valid_kind(input: &str) -> std::result::Result<String, String> {

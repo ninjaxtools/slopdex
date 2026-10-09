@@ -1,6 +1,7 @@
 //! Shared repository-relative path and symbol selection for search and structure maps.
 
 use crate::{
+    formats::{self, FormatGroup},
     parse::{FileStructure, StructureNode},
     symbols,
 };
@@ -8,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ignore::overrides::{Override, OverrideBuilder};
 use regex::{RegexSet, RegexSetBuilder};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub struct Selection {
@@ -19,6 +20,7 @@ pub struct Selection {
     semantic_paths: HashSet<String>,
     kinds: HashSet<&'static str>,
     private: bool,
+    formats: BTreeSet<FormatGroup>,
 }
 
 impl Selection {
@@ -79,6 +81,7 @@ impl Selection {
             Some(Value::Bool(value)) => *value,
             _ => bail!("private must be a boolean"),
         };
+        let formats = formats::selected_groups(options)?;
         Ok(Self {
             globs: globs.build().context("compile selection globs")?,
             names,
@@ -87,12 +90,22 @@ impl Selection {
             semantic_paths: HashSet::new(),
             kinds,
             private,
+            formats,
         })
     }
 
     /// Match an already normalized repository-relative file path, never a cwd path.
     pub fn path_matches(&self, path: &str) -> bool {
-        !self.globs.matched(path, false).is_ignore()
+        self.format_matches(path) && !self.globs.matched(path, false).is_ignore()
+    }
+
+    /// Cross-search targets share format filtering, but not source-only selectors.
+    pub(crate) fn format_matches(&self, path: &str) -> bool {
+        FormatGroup::for_path(path).is_none_or(|group| self.includes_group(group))
+    }
+
+    pub(crate) fn includes_group(&self, group: FormatGroup) -> bool {
+        self.formats.contains(&group)
     }
 
     /// Match exactly the supplied name. Search/cross-search should supply
@@ -203,6 +216,9 @@ impl Selection {
     }
 
     pub fn symbol_matches_at(&self, path: &str, node: &StructureNode) -> bool {
+        if !self.format_matches(path) {
+            return false;
+        }
         let prefix = if node.kind == "import" {
             ""
         } else {
@@ -494,6 +510,43 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn format_groups_replace_defaults_and_intersect_globs() {
+        let paths = ["src/lib.rs", "guide.MD", "settings.JSON", "page.html"];
+        let default = Selection::compile(&json!({})).unwrap();
+        assert_eq!(
+            paths.map(|path| default.path_matches(path)),
+            [true, true, false, false]
+        );
+        let config_code = Selection::compile(&json!({"formats":"config,code"})).unwrap();
+        assert_eq!(
+            paths.map(|path| config_code.path_matches(path)),
+            [true, false, true, false]
+        );
+        let all = Selection::compile(&json!({"formats":"all"})).unwrap();
+        assert!(paths.iter().all(|path| all.path_matches(path)));
+        let implicit_glob = Selection::compile(&json!({"glob":"*.json"})).unwrap();
+        assert!(!implicit_glob.path_matches("settings.json"));
+        let glob = Selection::compile(&json!({"formats":"all", "glob":["*.json", "!hidden.json"]}))
+            .unwrap();
+        assert!(glob.path_matches("settings.json"));
+        assert!(!glob.path_matches("hidden.json"));
+        assert!(!glob.path_matches("src/lib.rs"));
+        // Cross-search target group checks do not inherit source-only globs.
+        assert!(glob.format_matches("src/lib.rs"));
+
+        let parsed = crate::parse::parse("settings.json", "{\"enabled\":true}").unwrap();
+        assert!(
+            default
+                .select_structure_at("settings.json", &parsed.structure)
+                .is_empty()
+        );
+        assert!(
+            !all.select_structure_at("settings.json", &parsed.structure)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn ordered_globs_require_positive_matches_and_allow_reinclusion() {
         let selection =
             Selection::compile(&json!({"glob": ["*.rs", "!src/**", "src/keep.rs"]})).unwrap();
@@ -567,6 +620,7 @@ mod tests {
             json!({"regexp": ["valid", "("]}),
             json!({"regexp": true}),
             json!({"ignoreCase": "true"}),
+            json!({"formats": ["code", "json"]}),
             json!({"kinds": ["methdos"]}),
             json!({"kinds": "functions,"}),
             json!({"private": "true"}),

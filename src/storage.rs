@@ -1274,7 +1274,9 @@ pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>
         });
     }
     for (ordinal, chunk) in parsed.chunks.iter().enumerate() {
-        let kind = if file.language == "markdown" {
+        let kind = if crate::formats::FormatGroup::for_language(&file.language)
+            == Some(crate::formats::FormatGroup::Docs)
+        {
             "markdown"
         } else {
             "document"

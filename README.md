@@ -16,7 +16,7 @@ The main supported functions are
 - `slopdex map [PATH]...`
    <br/>show a map/skeleton of the code structure
 - `slopdex cross-search`
-   <br/>find clusters of similar code/docs
+   <br/>find clusters of similar code
 - `slopdex search <query>`
    <br/>find code/docs similar to the query
 - `slopdex describe <query>`
@@ -24,7 +24,7 @@ The main supported functions are
 
 `map` shows a map/skeleton of the code, excluding implementation details like function bodies. This can be helpful to get a concise map of the code to allow an LLM to explore the codebase incrementally.
 
-`search` does a vector search across all supported code/docs/config files.
+`search` does a vector search across code/docs and optionally other formats.
 
 `cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
 
@@ -91,7 +91,7 @@ To create a vector index, the `update` command needs tobe run once in a git repo
 
 Each worktree has its own index in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). There is also a `global-v1.sqlite` cache that is reused across worktrees, so hash-identical code will not cause unneeded model provider requests. Project settings are stored in `.slopdex/config.json` (add `.slopdex` to `.gitignore`). See also [cache configuration](docs/reference.md#shared-provider-artifacts).
 
-By default all indexes are searched and ranked together.
+By default code and docs indexes are searched and ranked together, see `--formats` to enable other file types.
 
 ```console
 $ slopdex search "keep the repository index synchronized"
@@ -111,11 +111,11 @@ To search indexes individually:
 
 ```console
 $ slopdex search-code "configure the embedding provider"
-$ slopdex search-md "configure the embedding provider" 
+$ slopdex search-docs "configure the embedding provider"
 $ slopdex search-code 'reject expired credentials' -q 'validate session' --symbol-threshold 0.6
 ```
 
-Or pass any combination of `--symbols` `--code`, `--descriptions`, `--md`:
+Or pass any combination of `--symbols`, `--code`, `--descriptions`, and `--docs`:
 
 ```console
 $ slopdex search-symbols 'validate session' --threshold 0.6 --limit 20
@@ -242,6 +242,26 @@ $ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
 ```
 
 The fallback-model is used if the main model reports an error, and if the fallback-model reports an error the main model is tried again.
+
+### Other formats
+
+All commands accept a `--formats` argument to select what file types should be considered:
+
+| Group | Formats |
+| --- | --- |
+| `code` | code |
+| `docs` | markdown |
+| `config` | JSON, YAML, TOML, and Terraform/HCL |
+| `markup` | HTML, XML, and CSS |
+| `all` | all groups |
+
+The default is `code,docs`.
+
+```console
+$ slopdex map --formats all
+$ slopdex map --formats code --formats config
+$ slopdex search "deployment settings" --formats config
+```
 
 ### Interactive Config
 

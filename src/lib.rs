@@ -3,6 +3,7 @@ pub mod callgraph;
 pub mod cli;
 pub mod engine;
 pub mod filter;
+pub mod formats;
 pub mod git;
 pub mod map;
 pub mod models;

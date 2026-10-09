@@ -639,7 +639,7 @@ fn function(name: &str, marker: &str) -> String {
 fn all() -> Value {
     // Most fixtures compare content scores. Select those streams explicitly;
     // tests of the default all-index search use their own options.
-    json!({"minSimilarity": -1.0, "code": true, "md": true})
+    json!({"minSimilarity": -1.0, "code": true, "docs": true})
 }
 
 fn names(rows: &[Value]) -> BTreeSet<String> {
@@ -659,7 +659,9 @@ fn strings(values: &[&str]) -> BTreeSet<String> {
 }
 
 fn assert_incomplete(engine: &Engine) {
-    for kind in ["search", "search-code", "search-md"] {
+    // These fixtures have incomplete code. A docs-only query is independent of
+    // that content group and need not fail when its own units are prepared.
+    for kind in ["search", "search-code"] {
         let error = engine.search("east", kind, &all()).unwrap_err();
         assert!(
             error.to_string().contains("incomplete"),
@@ -2306,7 +2308,7 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
     drop(engine);
     for round in 0..4 {
         let mut sidecars = BTreeSet::new();
-        for kind in ["code", "markdown", "descriptions"] {
+        for kind in ["code", "docs", "descriptions"] {
             let pointer = shared_pointer(&repo, kind)?;
             let directory = shared_base_directory(&repo, &pointer)?;
             let id = pointer["base_id"].as_str().unwrap();
@@ -2341,7 +2343,7 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
             config["artifactCachePath"].as_str().unwrap()
         ));
         let damaged = filesystem_snapshot(&global_indexes)?;
-        let damaged_pointers: Vec<_> = ["code", "markdown", "descriptions"]
+        let damaged_pointers: Vec<_> = ["code", "docs", "descriptions"]
             .into_iter()
             .map(|kind| fs::read(format!("{}.{kind}.shared.json", repo.index.display())).ok())
             .collect();
@@ -2370,7 +2372,7 @@ fn sqlite_restart_recovers_deleted_and_corrupt_vector_sidecars_without_provider_
             damaged,
             "cache hits must not rebuild or publish shared bases"
         );
-        for (kind, bytes) in ["code", "markdown", "descriptions"]
+        for (kind, bytes) in ["code", "docs", "descriptions"]
             .into_iter()
             .zip(damaged_pointers)
         {
@@ -4571,6 +4573,156 @@ fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_art
         }
     }
     assert_eq!(mock.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn cli_map_format_selection_matches_unindexed_and_indexed_queries() -> Result<()> {
+    let repo = Repo::new()?;
+    let config = json!({
+        "include": ["config/**", "web/**", "src/**", "docs/**"],
+        "artifactCachePath": repo.home.join("cache/slopdex/global-v1.sqlite")
+    });
+    let settings = repo.home.join("settings.json");
+    fs::write(&settings, config.to_string())?;
+    for (path, source) in [
+        ("config/app.json", "{\"service\": {\"port\": 8080}}\n"),
+        ("config/app.yaml", "service:\n  port: 8080\n"),
+        ("config/app.yml", "service:\n  port: 8080\n"),
+        ("config/app.toml", "[service]\nport = 8080\n"),
+        (
+            "config/main.tf",
+            "resource \"service\" \"app\" { port = 8080 }\n",
+        ),
+        ("config/app.hcl", "service \"app\" { port = 8080 }\n"),
+        ("web/app.xml", "<service><port>8080</port></service>\n"),
+        ("web/index.html", "<main><h1>Service</h1></main>\n"),
+        ("web/app.css", ".service { color: red; }\n"),
+        ("src/api.rs", "pub fn serve() {}\n"),
+        ("docs/guide.md", "# Guide\n\nService documentation.\n"),
+        ("not-included.rs", "pub fn excluded_by_settings() {}\n"),
+    ] {
+        repo.write(path, source)?;
+    }
+    let config_paths = strings(&[
+        "config/app.json",
+        "config/app.yaml",
+        "config/app.yml",
+        "config/app.toml",
+        "config/main.tf",
+        "config/app.hcl",
+    ]);
+    let visible_paths = strings(&["src/api.rs", "docs/guide.md"]);
+    let markup_paths = strings(&["web/app.xml", "web/index.html", "web/app.css"]);
+    let hidden_paths: BTreeSet<_> = config_paths.union(&markup_paths).cloned().collect();
+    let cases: [(&[&str], BTreeSet<String>); 7] = [
+        (&[], hidden_paths.union(&visible_paths).cloned().collect()),
+        (&["config"], config_paths.clone()),
+        (&["-g", "config/**"], config_paths.clone()),
+        (
+            &["config/app.json", "-g", "**/*.json"],
+            strings(&["config/app.json"]),
+        ),
+        (&["web"], markup_paths.clone()),
+        (&["-g", "web/**"], markup_paths.clone()),
+        (
+            &["web/index.html", "-g", "**/*.html"],
+            strings(&["web/index.html"]),
+        ),
+    ];
+    let before = filesystem_snapshot(repo._temp.path())?;
+    let mut unindexed = Vec::new();
+    for indexed in [false, true] {
+        if indexed {
+            repo.open_map(&config)?.refresh_structure()?;
+            for path in &hidden_paths {
+                assert_eq!(file_record(&repo, path)?["path"], *path);
+            }
+        }
+        for no_reindex in [false, true] {
+            for (case, (selectors, included_paths)) in cases.iter().enumerate() {
+                for explicit_formats in [false, true] {
+                    let mut args = vec!["--config", settings.to_str().unwrap()];
+                    if no_reindex {
+                        args.push("--no-reindex");
+                    }
+                    args.push("map");
+                    args.extend_from_slice(selectors);
+                    if explicit_formats {
+                        args.extend(["--formats", "all"]);
+                    }
+                    let rows = repo.cli_json(&args)?;
+                    let paths: BTreeSet<_> = rows
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row["path"].as_str().unwrap().to_owned())
+                        .collect();
+                    let expected = if explicit_formats {
+                        included_paths.clone()
+                    } else if case == 0 {
+                        visible_paths.clone()
+                    } else {
+                        BTreeSet::new()
+                    };
+                    assert_eq!(paths, expected, "indexed={indexed}, {args:?}");
+                    assert!(
+                        rows.as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|row| { !row["nodes"].as_array().unwrap().is_empty() })
+                    );
+                    if indexed {
+                        assert_eq!(
+                            rows,
+                            unindexed[case * 2 + usize::from(explicit_formats)],
+                            "indexed/unindexed parity: {args:?}"
+                        );
+                    } else {
+                        if !no_reindex {
+                            unindexed.push(rows);
+                        }
+                        assert!(!repo.index.exists());
+                        assert_eq!(filesystem_snapshot(repo._temp.path())?, before);
+                    }
+                }
+            }
+        }
+        for (formats, expected) in [
+            ("config", config_paths.clone()),
+            ("code", strings(&["src/api.rs"])),
+            ("docs", strings(&["docs/guide.md"])),
+            (
+                "markup",
+                strings(&["web/app.xml", "web/index.html", "web/app.css"]),
+            ),
+            (
+                "config,code",
+                config_paths
+                    .union(&strings(&["src/api.rs"]))
+                    .cloned()
+                    .collect(),
+            ),
+        ] {
+            let rows = repo.cli_json(&[
+                "--config",
+                settings.to_str().unwrap(),
+                "map",
+                "--formats",
+                formats,
+            ])?;
+            let paths: BTreeSet<_> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["path"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(paths, expected, "indexed={indexed}, formats={formats}");
+            if !indexed {
+                assert_eq!(filesystem_snapshot(repo._temp.path())?, before);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -7001,7 +7153,8 @@ fn search_symbols_mixed_modes_rank_separate_streams_with_global_limits_and_expli
     engine.refresh()?;
     let plain = engine.search("east", "search", &all())?;
     assert!(plain.iter().all(|row| row["type"] != "symbol"));
-    assert!(plain.iter().any(|row| row["type"] == "document"));
+    assert!(plain.iter().any(|row| row["type"] == "markdown"));
+    assert!(plain.iter().all(|row| row["type"] != "document"));
     assert!(
         !PathBuf::from(format!("{}.symbols.shared.json", repo.index.display())).exists(),
         "explicit content search does not initialize symbols"
@@ -7068,21 +7221,26 @@ fn search_symbols_mixed_modes_rank_separate_streams_with_global_limits_and_expli
         1,
         "empty headings exist only in the structural stream"
     );
-    let default = engine.search("east", "search", &json!({"minSimilarity":-1}))?;
+    // This fixture intentionally compares every indexed content format.
+    let default = engine.search(
+        "east",
+        "search",
+        &json!({"minSimilarity":-1, "formats":["all"]}),
+    )?;
     assert!(default.iter().any(|row| row["type"] == "symbol"));
     assert!(default.iter().any(|row| row["type"] == "function"));
     assert!(default.iter().any(|row| row["type"] == "markdown"));
     assert!(default.iter().any(|row| row["type"] == "document"));
     assert_eq!(
-        engine.search("east", "search", &json!({"code":true, "md":true, "symbols":true, "descriptions":true, "minSimilarity":-1}))?,
-        default
+        engine.search("east", "search", &json!({"code":true, "docs":true, "symbols":true, "descriptions":true, "minSimilarity":-1, "formats":["all"]}))?,
+        default.iter().filter(|row| row["type"] != "document").cloned().collect::<Vec<_>>()
     );
     for limit in [1, 2, 4, 20] {
         assert_eq!(
             engine.search(
                 "east",
                 "search",
-                &json!({"minSimilarity":-1, "limit":limit})
+                &json!({"minSimilarity":-1, "limit":limit, "formats":["all"]})
             )?,
             default[..limit.min(default.len())]
         );
@@ -7907,15 +8065,18 @@ fn shared_search_globs_precede_limit_and_markdown_regexes_match_heading_paths() 
 fn configuration_markup_and_shell_are_indexed_end_to_end() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
     repo.write(
         "config/app.json",
         "{\"service\": {\"port\": 8080}, \"marker\": \"VECTOR_NORTH\"}\n",
     )?;
     repo.write("web/index.html", "<main><h1>VECTOR_EAST</h1></main>\n")?;
     repo.write("scripts/deploy.sh", "deploy() { echo VECTOR_MID; }\n")?;
-    let mut engine = repo.open(&mock.config())?;
+    repo.write("docs/guide.md", "# Guide\n\nVECTOR_MID documentation.\n")?;
+    let mut engine = repo.open(&config)?;
     engine.refresh()?;
-    let map = engine.map(&json!({}))?;
+    let map = engine.map(&json!({"formats":["all"]}))?;
     assert!(map.iter().any(|file| {
         file["path"] == "config/app.json"
             && file["nodes"]
@@ -7935,25 +8096,106 @@ fn configuration_markup_and_shell_are_indexed_end_to_end() -> Result<()> {
     let results = engine.search(
         "north",
         "search",
-        &json!({"minSimilarity":-1,"glob":["config/**"]}),
+        &json!({"minSimilarity":-1,"glob":["config/**"],"formats":["config"]}),
     )?;
     assert!(
         results
             .iter()
             .any(|row| row["type"] == "document" && row["chunk"]["path"] == "config/app.json")
     );
-    let documents = engine.search("north", "search-md", &json!({"minSimilarity":-1}))?;
-    assert_eq!(documents.len(), 2);
-    assert!(documents.iter().all(|row| row["type"] == "document"));
+    let documents = engine.search(
+        "north",
+        "search-docs",
+        &json!({"minSimilarity":-1,"formats":["all"]}),
+    )?;
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0]["type"], "markdown");
+    assert_eq!(documents[0]["chunk"]["path"], "docs/guide.md");
     assert_eq!(
+        engine.search(
+            "north",
+            "search-md",
+            &json!({"minSimilarity":-1,"formats":"all"})
+        )?,
         documents
-            .iter()
-            .map(|row| row["chunk"]["path"].as_str().unwrap().to_owned())
-            .collect::<BTreeSet<_>>(),
-        strings(&["config/app.json", "web/index.html"])
     );
+    let all_results = engine.search(
+        "north",
+        "search",
+        &json!({"minSimilarity":-1,"formats":["all"]}),
+    )?;
+    for path in ["config/app.json", "web/index.html"] {
+        assert!(
+            all_results
+                .iter()
+                .any(|row| row["type"] == "document" && row["chunk"]["path"] == path)
+        );
+    }
     let code = engine.search("mid", "search-code", &json!({"minSimilarity":-1}))?;
     assert_eq!(names(&code), strings(&["deploy"]));
+    let markup = engine.search(
+        "north",
+        "search",
+        &json!({"minSimilarity":-1, "formats":"markup"}),
+    )?;
+    assert!(
+        markup
+            .iter()
+            .any(|row| row["type"] == "document" && row["chunk"]["path"] == "web/index.html")
+    );
+    drop(engine);
+    let args = ["--no-reindex", "search", "north", "--threshold", "-1"];
+    let visible = repo.cli_json(&args)?;
+    assert!(visible.as_array().unwrap().iter().all(|row| {
+        let data = match row["type"].as_str().unwrap() {
+            "function" => &row["function"],
+            "symbol" => &row["symbol"],
+            "file" => &row["file"],
+            _ => &row["chunk"],
+        };
+        matches!(
+            data["path"].as_str(),
+            Some("scripts/deploy.sh" | "docs/guide.md")
+        )
+    }));
+    let selected = [args.to_vec(), vec!["-g", "config/**"]].concat();
+    assert_eq!(repo.cli_json(&selected)?, json!([]));
+    let selected_markup = [args.to_vec(), vec!["-g", "web/**"]].concat();
+    assert_eq!(repo.cli_json(&selected_markup)?, json!([]));
+    assert_eq!(
+        repo.cli_json(&[selected_markup, vec!["--formats", "markup"]].concat())?,
+        json!(markup)
+    );
+    assert_eq!(
+        repo.cli_json(&[selected.clone(), vec!["--formats", "config"]].concat())?,
+        json!(results)
+    );
+    assert_eq!(
+        repo.cli_json(&[args.to_vec(), vec!["--formats", "all"]].concat())?,
+        json!(all_results)
+    );
+    for command in ["search-docs", "search-md"] {
+        assert_eq!(
+            repo.cli_json(&[
+                "--no-reindex",
+                command,
+                "north",
+                "--threshold",
+                "-1",
+                "--formats",
+                "all"
+            ])?,
+            json!(documents)
+        );
+    }
+    for selector in ["--docs", "--md"] {
+        assert_eq!(
+            repo.cli_json(&[args.to_vec(), vec![selector, "--formats", "all"]].concat())?,
+            json!(documents)
+        );
+    }
+    assert_eq!(repo.cli_json(&selected)?, json!([]));
+    assert_eq!(repo.cli_json(&args)?, visible);
     Ok(())
 }
 

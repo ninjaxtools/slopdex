@@ -195,6 +195,640 @@ fn hit_keys(rows: &[Value]) -> BTreeSet<String> {
         .collect()
 }
 
+fn configuration_fixture() -> Result<Fixture> {
+    let fixture = Fixture::with_sources(
+        false,
+        &[
+            ("a.JSON", "{\"limit\":\"json configuration\"}\n"),
+            ("b.YaMl", "limit: yaml configuration\n"),
+            ("c.yML", "limit: yml configuration\n"),
+            ("d.ToMl", "limit = \"toml configuration\"\n"),
+            ("e.Tf", "limit = \"terraform configuration\"\n"),
+            ("f.TfVaRs", "limit = \"variables configuration\"\n"),
+            ("g.HcL", "limit = \"hcl configuration\"\n"),
+            ("z.html", "<run>html content</run>\n"),
+            ("z.xml", "<run>xml content</run>\n"),
+            ("z.css", ".run { run: visible; }\n"),
+            ("z.md", "# run\n\nMarkdown content.\n"),
+            ("z.rs", "pub fn run() {\n    println!(\"rust\");\n}\n"),
+        ],
+    )?;
+    let mut db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
+    let mut records = Vec::new();
+    for file in db.files()? {
+        let mut parsed = parse::parse(&file.path, &file.source)?;
+        assert!(
+            parsed.errors.is_empty(),
+            "{}: {:?}",
+            file.path,
+            parsed.errors
+        );
+        // Seed prose directly rather than generating descriptions through a provider.
+        let prose = if file.path.starts_with("z.") {
+            "silver token"
+        } else {
+            "copper token"
+        };
+        parsed.description = Some(prose.into());
+        for node in &mut parsed.structure.nodes {
+            node.description = Some(prose.into());
+        }
+        for callable in &mut parsed.callables {
+            callable.description = Some(prose.into());
+        }
+        records.push((file, parsed));
+    }
+    db.apply_structure(&records, &[], None)?;
+    db.conn.execute("DELETE FROM global.embeddings", [])?;
+    let profile = Providers::new(&fixture.config)?.embedding_profile();
+    for item in db.items()? {
+        let vector = if item.path.starts_with("z.") {
+            [0.8, 0.6]
+        } else {
+            [1.0, 0.0]
+        };
+        if let Some(input) = item.data["embeddingInput"].as_str() {
+            db.put_embedding(&Database::embedding_key(&profile, false, input), &vector)?;
+        }
+    }
+    for (text, vector) in [("copper token", [1.0, 0.0]), ("silver token", [0.8, 0.6])] {
+        db.put_embedding(&Database::embedding_key(&profile, false, text), &vector)?;
+    }
+    db.put_embedding(
+        &Database::embedding_key(&profile, true, "copper token"),
+        &[1.0, 0.0],
+    )?;
+    let mut symbol_profile = profile;
+    symbol_profile["symbolNormalizationVersion"] = json!("symbols-v1");
+    for (name, vector) in [("limit", [1.0, 0.0]), ("run", [0.8, 0.6])] {
+        db.put_embedding(
+            &Database::embedding_key(&symbol_profile, false, name),
+            &vector,
+        )?;
+    }
+    db.put_embedding(
+        &Database::embedding_key(&symbol_profile, true, "copper token"),
+        &[1.0, 0.0],
+    )?;
+    Ok(fixture)
+}
+
+fn result_path(row: &Value) -> &str {
+    let item = match row["type"].as_str().unwrap() {
+        "function" => &row["function"],
+        "symbol" => &row["symbol"],
+        "file" => &row["file"],
+        _ => &row["chunk"],
+    };
+    item["path"].as_str().unwrap()
+}
+
+#[test]
+fn configuration_and_markup_remain_indexed_but_map_requires_opt_in() -> Result<()> {
+    let fixture = configuration_fixture()?;
+    let engine = fixture.engine()?;
+    let defaults = json!({"private":true});
+    let rows = engine.map(&defaults)?;
+    let visible = BTreeSet::from(["z.md", "z.rs"]);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["path"].as_str().unwrap())
+            .collect::<BTreeSet<_>>(),
+        visible
+    );
+    let options = json!({"private":true, "formats":"all"});
+    let all = engine.map(&options)?;
+    let db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
+    let indexed: BTreeSet<_> = db.files()?.into_iter().map(|file| file.path).collect();
+    assert_eq!(indexed.len(), 12);
+    assert_eq!(
+        all.iter()
+            .map(|row| row["path"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>(),
+        indexed
+    );
+    for path in indexed.iter().filter(|path| !path.starts_with("z.")) {
+        assert!(
+            db.items()?
+                .iter()
+                .any(|item| item.path == *path && item.kind == "document")
+        );
+    }
+    assert_eq!(all, engine.map(&options)?);
+    assert_eq!(rows, engine.map(&defaults)?);
+    assert!(
+        engine
+            .map(&json!({"glob":"*.html", "private":true}))?
+            .is_empty()
+    );
+    assert_eq!(
+        engine
+            .map(&json!({"glob":"*.html", "private":true, "formats":"markup"}))?
+            .len(),
+        1
+    );
+    assert!(
+        engine
+            .map(&json!({"glob":"*.JSON", "private":true}))?
+            .is_empty()
+    );
+    assert_eq!(
+        engine
+            .map(&json!({"glob":"*.JSON", "private":true, "formats":["config"]}))?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn configuration_and_markup_search_filter_every_stream_before_limits_and_cache_opt_in() -> Result<()>
+{
+    let fixture = configuration_fixture()?;
+    let engine = fixture.engine()?;
+    for (command, selector) in [
+        ("search", None),
+        ("search-code", Some("code")),
+        ("search-descriptions", Some("descriptions")),
+        ("search-docs", Some("docs")),
+        ("search-md", Some("md")),
+        ("search-symbols", Some("symbols")),
+    ] {
+        let defaults = json!({"minSimilarity":-1});
+        let rows = engine.search("copper token", command, &defaults)?;
+        assert!(!rows.is_empty(), "{command}");
+        assert!(
+            rows.iter()
+                .all(|row| matches!(result_path(row), "z.rs" | "z.md")),
+            "{command}: {rows:?}"
+        );
+        let options = json!({"minSimilarity":-1, "formats":"all"});
+        let all = engine.search("copper token", command, &options)?;
+        let includes_configs =
+            matches!(command, "search" | "search-descriptions" | "search-symbols");
+        if includes_configs {
+            let configs: BTreeSet<_> = all
+                .iter()
+                .map(result_path)
+                .filter(|path| !path.starts_with("z."))
+                .collect();
+            assert_eq!(
+                configs,
+                BTreeSet::from([
+                    "a.JSON", "b.YaMl", "c.yML", "d.ToMl", "e.Tf", "f.TfVaRs", "g.HcL"
+                ]),
+                "{command}: {all:?}"
+            );
+        } else {
+            assert_eq!(all, rows, "{command}");
+            let expected = if command == "search-code" {
+                "z.rs"
+            } else {
+                "z.md"
+            };
+            assert!(
+                all.iter().all(|row| result_path(row) == expected),
+                "{command}: {all:?}"
+            );
+        }
+        assert_eq!(all, engine.search("copper token", command, &options)?);
+        assert_eq!(rows, engine.search("copper token", command, &defaults)?);
+        if let Some(selector) = selector {
+            let mut explicit = options.clone();
+            explicit[selector] = json!(true);
+            assert_eq!(
+                hit_keys(&all),
+                hit_keys(&engine.search("copper token", "search", &explicit)?)
+            );
+        }
+        let limited = engine.search(
+            "copper token",
+            command,
+            &json!({"minSimilarity":-1, "limit":2}),
+        )?;
+        assert_eq!(limited.len(), rows.len().min(2), "{command}: {limited:?}");
+        assert!(
+            limited
+                .iter()
+                .all(|row| matches!(result_path(row), "z.rs" | "z.md"))
+        );
+        if includes_configs {
+            let top = engine.search(
+                "copper token",
+                command,
+                &json!({"minSimilarity":-1, "limit":2, "formats":"all"}),
+            )?;
+            assert_eq!(top.len(), 2);
+            assert!(
+                top.iter().all(|row| !result_path(row).starts_with("z.")),
+                "{command}: {top:?}"
+            );
+        }
+    }
+    let db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
+    let items = db.items()?;
+    let mut contracts = BTreeSet::new();
+    for (group, paths) in [
+        ("code", vec!["z.rs"]),
+        ("docs", vec!["z.md"]),
+        (
+            "config",
+            vec![
+                "a.JSON", "b.YaMl", "c.yML", "d.ToMl", "e.Tf", "f.TfVaRs", "g.HcL",
+            ],
+        ),
+        ("markup", vec!["z.html", "z.xml", "z.css"]),
+    ] {
+        let pointer: Value = serde_json::from_slice(&fs::read(
+            fixture
+                .index
+                .with_extension(format!("sqlite.{group}.shared.json")),
+        )?)?;
+        let membership = pointer["membership"]
+            .as_object()
+            .context("missing content membership")?;
+        let expected: BTreeSet<_> = items
+            .iter()
+            .filter(|item| item.kind != "symbol-description" && paths.contains(&item.path.as_str()))
+            .map(|item| item.id.to_string())
+            .collect();
+        assert!(!expected.is_empty(), "{group}");
+        assert_eq!(
+            membership.keys().cloned().collect::<BTreeSet<_>>(),
+            expected,
+            "{group}"
+        );
+        contracts.insert(
+            pointer["contract"]
+                .as_str()
+                .context("missing content contract")?
+                .to_owned(),
+        );
+        assert!(
+            !fixture
+                .index
+                .with_extension(format!("sqlite.{group}.usearch"))
+                .exists()
+        );
+    }
+    assert_eq!(
+        contracts.len(),
+        4,
+        "content groups must have separate graph namespaces"
+    );
+    assert!(
+        !fixture
+            .index
+            .with_extension("sqlite.markdown.shared.json")
+            .exists()
+    );
+    Ok(())
+}
+
+#[test]
+fn selected_content_queries_ignore_missing_or_corrupt_excluded_group_vectors() -> Result<()> {
+    for corrupt in [false, true] {
+        let fixture = Fixture::with_sources(
+            false,
+            &[
+                ("source.rs", "pub fn run() {\n    println!(\"code\");\n}\n"),
+                ("guide.md", "# Guide\n\nDocumentation.\n"),
+                ("hidden.json", "{\"run\":\"configuration\"}\n"),
+                ("hidden.html", "<run>markup</run>\n"),
+            ],
+        )?;
+        let db = Database::open_with_config(
+            &fixture.index,
+            fixture.temp.path(),
+            &fixture.config,
+            false,
+        )?;
+        let profile = Providers::new(&fixture.config)?.embedding_profile();
+        for item in db
+            .items_for_profile(&profile)?
+            .iter()
+            .filter(|item| item.path.starts_with("hidden."))
+        {
+            let sql = if corrupt {
+                "UPDATE global.embeddings SET vector=x'ff' WHERE key=?"
+            } else {
+                "DELETE FROM global.embeddings WHERE key=?"
+            };
+            db.conn.execute(sql, [&item.embedding])?;
+        }
+        let engine = fixture.engine()?;
+        let options = json!({"formats":"all", "minSimilarity":-1});
+        for (command, path) in [("search-code", "source.rs"), ("search-docs", "guide.md")] {
+            let rows = engine.search("copper token", command, &options)?;
+            assert_eq!(rows.len(), 1, "corrupt={corrupt}: {command}: {rows:?}");
+            assert_eq!(result_path(&rows[0]), path);
+            assert_eq!(rows, engine.search("copper token", command, &options)?);
+        }
+        for group in ["config", "markup"] {
+            assert!(
+                engine
+                    .search("copper token", "search", &json!({"formats":[group]}))
+                    .is_err(),
+                "corrupt={corrupt}: {group}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn identical_content_inputs_reuse_embeddings_but_not_format_index_contracts() -> Result<()> {
+    let fixture = Fixture::with_sources(
+        false,
+        &[
+            ("guide.md", "# Guide\n\nDocumentation.\n"),
+            ("settings.json", "{\"run\":\"configuration\"}\n"),
+        ],
+    )?;
+    let mut db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
+    let mut records = Vec::new();
+    for file in db.files()? {
+        let mut parsed = parse::parse(&file.path, &file.source)?;
+        assert_eq!(parsed.chunks.len(), 1);
+        parsed.chunks[0].embedding_input = "identical content input".into();
+        records.push((file, parsed));
+    }
+    db.apply_structure(&records, &[], None)?;
+    let profile = Providers::new(&fixture.config)?.embedding_profile();
+    let shared_key = Database::embedding_key(&profile, false, "identical content input");
+    db.put_embedding(&shared_key, &[0.0, 1.0])?;
+    let engine = fixture.engine()?;
+    let rows = engine.search(
+        "copper token",
+        "search",
+        &json!({"formats":["docs", "config"], "minSimilarity":-1}),
+    )?;
+    assert!(rows.iter().any(|row| row["type"] == "markdown"));
+    assert!(rows.iter().any(|row| row["type"] == "document"));
+    let mut contracts = BTreeSet::new();
+    for group in ["docs", "config"] {
+        let pointer: Value = serde_json::from_slice(&fs::read(
+            fixture
+                .index
+                .with_extension(format!("sqlite.{group}.shared.json")),
+        )?)?;
+        let membership = pointer["membership"].as_object().unwrap();
+        assert_eq!(membership.len(), 1);
+        assert_eq!(membership.values().next().unwrap(), &json!(shared_key));
+        contracts.insert(pointer["contract"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(contracts.len(), 2);
+    let count: i64 = db.conn.query_row(
+        "SELECT count(*) FROM global.embeddings WHERE key=?",
+        [&shared_key],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 1, "format indexes must reuse paid embeddings");
+    assert_eq!(db.embedding(&shared_key)?, Some(vec![0.0, 1.0]));
+    Ok(())
+}
+
+#[test]
+fn format_groups_filter_map_and_shared_search_channels_and_validate_options() -> Result<()> {
+    let fixture = configuration_fixture()?;
+    let engine = fixture.engine()?;
+    let configs = [
+        "a.JSON", "b.YaMl", "c.yML", "d.ToMl", "e.Tf", "f.TfVaRs", "g.HcL",
+    ];
+    for (formats, paths) in [
+        (json!(null), vec!["z.rs", "z.md"]),
+        (json!(["code"]), vec!["z.rs"]),
+        (json!(["docs"]), vec!["z.md"]),
+        (json!(["markup"]), vec!["z.html", "z.xml", "z.css"]),
+        (json!(["config"]), configs.to_vec()),
+        (
+            json!(["code", "config"]),
+            [configs.to_vec(), vec!["z.rs"]].concat(),
+        ),
+        (
+            json!("all"),
+            [
+                configs.to_vec(),
+                vec!["z.rs", "z.md", "z.html", "z.xml", "z.css"],
+            ]
+            .concat(),
+        ),
+    ] {
+        let expected: BTreeSet<_> = paths.into_iter().collect();
+        let options = json!({"formats":formats, "private":true, "minSimilarity":-1});
+        let map = engine.map(&options)?;
+        assert_eq!(
+            map.iter()
+                .map(|row| row["path"].as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            expected,
+            "{options:?}"
+        );
+        for command in ["search", "search-descriptions", "search-symbols"] {
+            let rows = engine.search("copper token", command, &options)?;
+            assert_eq!(
+                rows.iter().map(result_path).collect::<BTreeSet<_>>(),
+                expected,
+                "{command}: {options:?}"
+            );
+            assert_eq!(rows, engine.search("copper token", command, &options)?);
+            let mut limited = options.clone();
+            limited["limit"] = json!(2);
+            let top = engine.search("copper token", command, &limited)?;
+            assert_eq!(top.len(), rows.len().min(2));
+            assert!(top.iter().all(|row| expected.contains(result_path(row))));
+        }
+    }
+    for formats in [json!("unknown"), json!(true), json!(["code", 1]), json!("")] {
+        let options = json!({"formats":formats});
+        assert!(engine.map(&options).is_err(), "{options:?}");
+        for command in [
+            "search",
+            "search-docs",
+            "search-md",
+            "search-symbols",
+            "search-descriptions",
+        ] {
+            assert!(
+                engine.search("copper token", command, &options).is_err(),
+                "{command}: {options:?}"
+            );
+        }
+        assert!(engine.cross_search(None, &options).is_err(), "{options:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn cross_search_is_code_only_and_keeps_target_globs_and_names_source_only() -> Result<()> {
+    let source = Fixture::with_sources(
+        false,
+        &[
+            (
+                "source.rs",
+                "pub fn source() {\n    println!(\"source\");\n}\n",
+            ),
+            ("source.JSON", "{\"limit\":1}\n"),
+        ],
+    )?;
+    let target = Fixture::with_sources(
+        false,
+        &[
+            (
+                "target.rs",
+                "pub fn target() {\n    println!(\"target\");\n}\n",
+            ),
+            ("target.TfVaRs", "limit = 1\n"),
+        ],
+    )?;
+    for (fixture, config_path) in [(&source, "source.JSON"), (&target, "target.TfVaRs")] {
+        let mut db = Database::open_with_config(
+            &fixture.index,
+            fixture.temp.path(),
+            &fixture.config,
+            false,
+        )?;
+        let file = db
+            .files()?
+            .into_iter()
+            .find(|file| file.path == config_path)
+            .unwrap();
+        // Config parsers have no callables. Publish a synthetic legacy callable
+        // to exercise the query-layer gate independently of parser behavior.
+        let parsed = parse::parse(
+            "synthetic.rs",
+            "pub fn run() {\n    println!(\"configuration callable\");\n}\n",
+        )?;
+        db.apply_structure(&[(file, parsed)], &[], None)?;
+    }
+    source.seed_code_vectors(&[("source.rs", [1.0, 0.0]), ("source.JSON", [1.0, 0.0])])?;
+    target.seed_code_vectors(&[("target.rs", [0.8, 0.6]), ("target.TfVaRs", [1.0, 0.0])])?;
+    for fixture in [&source, &target] {
+        fixture.seed_symbols(false)?;
+        let db = Database::open_with_config(
+            &fixture.index,
+            fixture.temp.path(),
+            &fixture.config,
+            false,
+        )?;
+        let mut profile = Providers::new(&fixture.config)?.embedding_profile();
+        profile["symbolNormalizationVersion"] = json!("symbols-v1");
+        for name in ["source", "target"] {
+            db.put_embedding(&Database::embedding_key(&profile, false, name), &[0.0, 1.0])?;
+        }
+    }
+    let source_engine = source.engine()?;
+    let target_engine = target.engine()?;
+    let mut options =
+        json!({"glob":"source.rs", "regexp":"^source$", "minSimilarity":0, "matches":1});
+    let rows = source_engine.cross_search(Some(&target_engine), &options)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["source"]["path"], "source.rs");
+    assert_eq!(rows[0]["matches"][0]["function"]["path"], "target.rs");
+    options["formats"] = json!("all");
+    let all = source_engine.cross_search(Some(&target_engine), &options)?;
+    assert_eq!(all, rows, "config callables must never enter cross-search");
+    assert_eq!(
+        all,
+        source_engine.cross_search(Some(&target_engine), &options)?
+    );
+    options = json!({"sourcePath":"source.JSON", "minSimilarity":0, "matches":1});
+    assert!(
+        source_engine
+            .cross_search(Some(&target_engine), &options)?
+            .is_empty()
+    );
+    options["formats"] = json!("all");
+    let configs = source_engine.cross_search(Some(&target_engine), &options)?;
+    assert!(configs.is_empty(), "{configs:?}");
+    for formats in [json!(["config"]), json!(["docs", "markup"])] {
+        assert!(
+            source_engine
+                .cross_search(
+                    Some(&target_engine),
+                    &json!({"formats":formats, "minSimilarity":0, "symbolQuery":"never embedded"})
+                )?
+                .is_empty()
+        );
+    }
+    assert!(
+        source_engine
+            .search(
+                "copper token",
+                "search-docs",
+                &json!({"formats":"config", "symbolQuery":"never embedded"})
+            )?
+            .is_empty()
+    );
+    drop(source_engine);
+    drop(target_engine);
+    for fixture in [&source, &target] {
+        let engine = fixture.engine()?;
+        let defaults = engine.search(
+            "copper token",
+            "search-code",
+            &json!({"minSimilarity":-1, "limit":1}),
+        )?;
+        assert_eq!(defaults.len(), 1);
+        assert!(result_path(&defaults[0]).ends_with(".rs"));
+        let all = engine.search(
+            "copper token",
+            "search-code",
+            &json!({"minSimilarity":-1, "formats":"all"}),
+        )?;
+        assert_eq!(all, defaults);
+        let configs = engine.search(
+            "copper token",
+            "search",
+            &json!({"minSimilarity":-1, "formats":["config"]}),
+        )?;
+        assert!(
+            configs.iter().any(|row| row["type"] == "function"),
+            "{configs:?}"
+        );
+        assert!(
+            configs.iter().all(|row| !result_path(row).ends_with(".rs")),
+            "{configs:?}"
+        );
+        let db = Database::open_with_config(
+            &fixture.index,
+            fixture.temp.path(),
+            &fixture.config,
+            false,
+        )?;
+        for group in ["code", "config"] {
+            let pointer: Value = serde_json::from_slice(&fs::read(
+                fixture
+                    .index
+                    .with_extension(format!("sqlite.{group}.shared.json")),
+            )?)?;
+            let expected: BTreeSet<_> = db
+                .items()?
+                .iter()
+                .filter(|item| {
+                    item.kind == "function" && item.path.ends_with(".rs") == (group == "code")
+                })
+                .map(|item| item.id.to_string())
+                .collect();
+            assert_eq!(
+                pointer["membership"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                expected,
+                "{group}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn default_search_unions_all_indexes_and_explicit_selectors_agree() -> Result<()> {
     let fixture = Fixture::new(true)?;
@@ -205,7 +839,7 @@ fn default_search_unions_all_indexes_and_explicit_selectors_agree() -> Result<()
     for (selector, command) in [
         ("code", "search-code"),
         ("descriptions", "search-descriptions"),
-        ("md", "search-md"),
+        ("docs", "search-docs"),
         ("symbols", "search-symbols"),
     ] {
         let direct = engine.search("copper token", command, &options)?;
@@ -218,6 +852,16 @@ fn default_search_unions_all_indexes_and_explicit_selectors_agree() -> Result<()
         union.extend(hit_keys(&direct));
     }
     assert_eq!(hit_keys(&all), union);
+    let docs = engine.search("copper token", "search-docs", &options)?;
+    assert_eq!(docs, engine.search("copper token", "search-md", &options)?);
+    assert_eq!(
+        hit_keys(&docs),
+        hit_keys(&engine.search(
+            "copper token",
+            "search",
+            &json!({"minSimilarity":-1, "md":true})
+        )?)
+    );
     assert!(all.iter().any(|row| row["type"] == "file"));
     assert!(
         all.iter()
@@ -232,7 +876,7 @@ fn default_search_unions_all_indexes_and_explicit_selectors_agree() -> Result<()
             .any(|row| row["type"] == "function" && row["function"]["path"] == "b.rs")
     );
     assert!(all.iter().any(|row| row["type"] == "markdown"));
-    for kind in ["code", "markdown", "descriptions", "symbols"] {
+    for kind in ["code", "docs", "descriptions", "symbols"] {
         let pointer: Value = serde_json::from_slice(&fs::read(
             fixture
                 .index

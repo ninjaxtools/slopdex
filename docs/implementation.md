@@ -18,13 +18,15 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/cli.rs` | Clap commands/validation, root-selected JSON configuration, interactive prompts, summary/JSON/JSONL output, connected-component clusters. |
 | `src/ui.rs` | Shared cliclack progress and diagnostic rendering on terminal stderr, plain redirected diagnostics, synchronized provider notices. |
 | `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, independent-index search/filtering/reranking, cross-search, and task explanation context. |
-| `src/filter.rs` | Shared ordered path globs, qualified-name regexes, resolved semantic selection, and map kind selection with ancestor context. |
+| `src/formats.rs` | Central code/docs/config/markup groups, language/extension membership, defaults, and format-selection validation. |
+| `src/filter.rs` | Shared format-group selection, ordered path globs, qualified-name regexes, resolved semantic selection, and map kind selection with ancestor context. |
 | `src/symbols.rs` | Stable normalization of bare names and queries for name-only symbol embeddings. |
 | `src/map.rs` | Compact structure summaries from canonical metadata; display-only truncation. |
-| `src/parse/mod.rs` | Shared parsing result types, file-language detection, and dispatch to code or Markdown parsing. |
+| `src/parse/mod.rs` | Shared parsing result types, file-language detection, and dispatch to code, Markdown, or configuration/markup parsing. |
 | `src/parse/code.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery. |
 | `src/parse/structure.rs`, `src/parse/imports.rs` | Canonical declarations, signatures, hierarchy, source ranges, and imported bindings/aliases. |
 | `src/parse/markdown.rs` | Structural heading hierarchy and separate bounded Markdown search chunks, fence and comment handling. |
+| `src/parse/data.rs` | Configuration/markup structure and bounded document search chunks. |
 | `src/parse/descriptions.rs` | Shared source-comment attachment, Python function/class docstrings, and file/symbol description extraction. |
 | `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits and hosted implementations, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
 | `src/storage.rs` | Worktree SQLite bindings, attached global artifacts, immutable snapshot manifests, transactional live-state reconciliation, schema validation. |
@@ -101,9 +103,14 @@ filters, while the engine override resolves semantic selection; both map queryin
 and expanded heading-body rendering use the resolved selection.
 
 The CLI's `Command::SearchSymbols(QueryArgs)` forwards `search-symbols` to the
-engine. `SearchArgs` adds `symbols` to the explicit `code`/`descriptions`/`md`
-selector family: any true index flag serializes all four booleans. Plain search
-includes all indexes, including symbols and available descriptions.
+engine. Canonical `search-docs` keeps `search-md` as a visible alias; the internal
+`Command::SearchMd` variant forwards `search-docs`. `SearchArgs` serializes the
+explicit `code`/`descriptions`/`docs`/`symbols` selector family: any true index
+flag serializes all four booleans. Its internal `md` field accepts canonical
+`--docs` and the visible `--md` alias but emits the `docs` option. Engine callers
+may still use the legacy `md` option or `search-md` kind; both select Markdown
+content only, never config or markup. Plain search includes the selected groups'
+content indexes plus group-filtered shared symbols and available descriptions.
 `CommandMode` centralizes
 opening and refresh: pure `search-symbols` and `search --symbols` use
 `Engine::open_symbol_map(root, index, config, readonly)` and `refresh_structure`,
@@ -121,6 +128,20 @@ callables, and all Markdown files, are excluded from generation. Description tex
 is optional, but any available source or generated prose is indexed without an
 enablement setting. CLI config validation rejects the removed setting.
 
+`formats.rs` defines four groups: programming languages including shell (`code`),
+Markdown (`docs`), JSON/YAML/TOML/Terraform/HCL (`config`), and HTML/XML/CSS
+(`markup`). The default is `code,docs`; explicit `--formats` replaces the
+default and accepts repeated/comma-separated groups or `all`. `SelectionArgs`
+emits an array under `formats`; engine options also accept a comma-separated
+string. Unknown/empty groups are rejected. Group membership is centralized in the
+language/extension mapping, not per-command individual-filename heuristics.
+`--config <path>` still selects settings and is independent of result formats.
+Discovery and refresh still index all supported groups under their existing
+ignore/include/exclude rules. Formats filter query/map eligibility, including
+explicit paths and globs, and can be changed with `--no-reindex` against the saved
+snapshot. Shared symbols and descriptions use the same group filter; result-cache
+keys include the versioned format-group contract.
+
 Shared selectors compile ordered `ignore::overrides` path rules and an ORed Rust
 `RegexSet`; `-i` affects regexes only. Positive globs require a match, `!` excludes,
 and the last matching rule wins. Query names use callable `qualifiedName` or
@@ -128,7 +149,9 @@ Markdown heading paths joined with `.`. Map shares qualified names, qualifies
 extra declaration bindings in their enclosing scope, and exposes import paths
 and aliases. Its kind/name
 matches retain ancestors as context without expanding unmatched children.
-Cross-search applies selectors only to sources, intersecting path/Git selection.
+Cross-search remains callable-code-only for both sources and neighbors. A format
+selection omitting `code` returns no results. Path/name/semantic selectors apply
+only to sources, intersecting path/Git selection.
 
 Shared `SelectionArgs` serializes `symbolQuery` only for supplied `-q` values and
 `symbolThreshold` only when supplied. Queries are ORed with default minimum
@@ -295,11 +318,21 @@ rejection, or change the store binding. Refresh has no divergence/ancestry gate.
 ### Shared vector bases and search
 
 The engine lazily supplies `(occurrence ID, embedding key, vector)` snapshots to
-`SharedIndex::open` for code, Markdown/document content, descriptions, and symbols.
-Worktree channel pointers are `<index>.<kind>.shared.json`; global bases live under
-`<global-store>.indexes/<contract>/`. The contract includes the embedding profile,
-dimensions, native/USearch versions, metric/scoring, and graph settings. There is
-no concatenated/fusion index. File descriptions are scored directly.
+`SharedIndex::open`. Each content group has a separate ANN channel and worktree
+pointer: `<index>.code.shared.json`, `<index>.docs.shared.json`,
+`<index>.config.shared.json`, and `<index>.markup.shared.json`. Shared descriptions
+and symbols retain `<index>.descriptions.shared.json` and
+`<index>.symbols.shared.json`; selection filters eligible occurrences by group.
+Global bases live under `<global-store>.indexes/<contract>/`. The contract includes
+the ANN profile, dimensions, native/USearch versions, metric/scoring, and graph
+settings. Content ANN profiles add `indexChannel: "content"` and `formatGroup`
+to a copy of the provider vector profile; the description channel uses
+`indexChannel: "descriptions"`. This prevents a content group from opening a
+mixed-group or description ANN base, even when vector dimensions match.
+Provider vector profiles and embedding artifact keys are unchanged: identical
+paid inputs still reuse the same global/S3 vectors independently of ANN grouping.
+Switching formats therefore does not regenerate matching embeddings. There is no
+concatenated/fusion index. File descriptions are scored directly.
 
 Bases are immutable and deduplicate embedding keys, mapping them to checked native
 IDs rather than worktree occurrence IDs. A pointer records base identity, exact

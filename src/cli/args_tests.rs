@@ -32,7 +32,7 @@ fn help_describes_all_indexes_semantic_selection_and_explicit_generation() {
     for index in [
         "callable code",
         "generated callable/file description",
-        "Markdown content",
+        "documentation content",
         "symbol-name/alias and heading-title",
     ] {
         assert!(
@@ -76,6 +76,7 @@ fn shared_selection_arguments_reach_all_search_options() {
         "search",
         "search-code",
         "search-descriptions",
+        "search-docs",
         "search-md",
         "search-symbols",
         "describe",
@@ -138,12 +139,100 @@ fn shared_selection_arguments_reach_all_search_options() {
 }
 
 #[test]
+fn formats_are_shared_selection_and_do_not_replace_settings_path() {
+    for command in [
+        "map",
+        "search",
+        "search-code",
+        "search-descriptions",
+        "search-docs",
+        "search-md",
+        "search-symbols",
+        "describe",
+        "cross-search",
+    ] {
+        let mut argv = vec!["--config", "settings/custom.json", command];
+        if !matches!(command, "map" | "cross-search") {
+            argv.push("query");
+        }
+        let options = |cli: Cli| {
+            assert_eq!(
+                cli.global.config,
+                Some(PathBuf::from("settings/custom.json"))
+            );
+            match cli.command {
+                Command::Map(args) => args.options(),
+                Command::Search(args) => args.query.filters.options(),
+                Command::SearchCode(args)
+                | Command::SearchDescriptions(args)
+                | Command::SearchMd(args)
+                | Command::SearchSymbols(args) => args.filters.options(),
+                Command::Describe(args) => args.query.filters.options(),
+                Command::CrossSearch(args) => args.options(),
+                _ => unreachable!(),
+            }
+        };
+        let defaults = options(parse(&argv));
+        assert!(defaults.get("formats").is_none(), "{command}: {defaults}");
+        argv.extend(["--formats", "config,code", "--formats", "docs,markup"]);
+        let selected = options(parse(&argv));
+        assert_eq!(
+            selected["formats"],
+            json!(["config", "code", "docs", "markup"]),
+            "{command}"
+        );
+        assert!(selected.get("config").is_none(), "{command}: {selected}");
+        let mut all = argv[..argv.len() - 4].to_vec();
+        all.extend(["--formats", "all"]);
+        assert_eq!(options(parse(&all))["formats"], json!(["all"]), "{command}");
+        for value in ["", "bad", "others", "md", "code,bad", "code,", ",docs"] {
+            let mut invalid = all[..all.len() - 2].to_vec();
+            invalid.extend(["--formats", value]);
+            assert!(
+                Cli::try_parse_from(std::iter::once("slopdex").chain(invalid)).is_err(),
+                "{command}: {value}"
+            );
+        }
+        let mut removed = all[..all.len() - 2].to_vec();
+        removed.push("--include-config");
+        assert!(Cli::try_parse_from(std::iter::once("slopdex").chain(removed)).is_err());
+    }
+}
+
+#[test]
+fn docs_command_and_selector_keep_md_as_a_visible_compatibility_alias() {
+    for command in ["search-docs", "search-md"] {
+        let cli = parse(&[command, "query"]);
+        assert!(matches!(cli.command, Command::SearchMd(_)));
+        let (_, kind, _, _) = cli.command.search_request().unwrap();
+        assert_eq!(kind, "search-docs", "{command}");
+    }
+    for selector in ["--docs", "--md"] {
+        let cli = parse(&["search", "query", selector]);
+        let (_, _, options, _) = cli.command.search_request().unwrap();
+        assert_eq!(options["docs"], true, "{selector}");
+        assert!(options.get("md").is_none(), "{selector}: {options}");
+    }
+    let help = Cli::try_parse_from(["slopdex", "search", "--help"])
+        .unwrap_err()
+        .to_string();
+    assert!(help.contains("--docs") && help.contains("--md"), "{help}");
+    let help = Cli::try_parse_from(["slopdex", "--help"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        help.contains("search-docs") && help.contains("search-md"),
+        "{help}"
+    );
+}
+
+#[test]
 fn search_commands_select_explicit_indexes_and_structural_mode() {
     let plain = parse(&["search", "query"]);
     let (_, kind, options, descriptions) = plain.command.search_request().unwrap();
     assert_eq!(kind, "search");
     assert!(!descriptions);
-    for selector in ["code", "descriptions", "md", "symbols"] {
+    for selector in ["code", "descriptions", "docs", "symbols"] {
         assert!(options.get(selector).is_none());
     }
     assert_eq!(
@@ -160,14 +249,14 @@ fn search_commands_select_explicit_indexes_and_structural_mode() {
         assert_eq!(CommandMode::for_command(&cli.command), CommandMode::Symbols);
         if kind == "search" {
             assert_eq!(options["symbols"], true);
-            for selector in ["code", "descriptions", "md"] {
+            for selector in ["code", "descriptions", "docs"] {
                 assert_eq!(options[selector], false);
             }
         } else {
             assert_eq!(kind, "search-symbols");
         }
     }
-    for selector in ["--code", "--md", "--descriptions"] {
+    for selector in ["--code", "--docs", "--descriptions"] {
         let cli = parse(&["search", "query", "--symbols", selector]);
         let (_, _, options, _) = cli.command.search_request().unwrap();
         assert_eq!(options["symbols"], true);

@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::{
     cache::{Artifacts, DescriptionArtifact, DescriptionGeneration},
     filter::Selection,
+    formats::FormatGroup,
     git, hash,
     models::{Message, Vector},
     parse,
@@ -92,10 +93,8 @@ pub struct Engine {
     items: Vec<Item>,
     files: HashMap<String, File>,
     sources: HashMap<String, OnceCell<String>>,
-    vectors: OnceCell<HashMap<String, Vec<f32>>>,
+    vectors: RefCell<HashMap<String, Vec<f32>>>,
     indexes: RefCell<HashMap<String, SharedIndex>>,
-    complete_descriptions: bool,
-    complete_code: bool,
     structural_only: bool,
     // Readers share a lock; writers hold it across SQLite and USearch publication.
     _lock: fs::File,
@@ -105,6 +104,49 @@ pub struct Engine {
 struct SymbolIndex {
     names: BTreeMap<u64, String>,
     index: SharedIndex,
+}
+
+struct SearchPlan {
+    groups: Vec<FormatGroup>,
+    descriptions: bool,
+    symbols: bool,
+}
+
+impl SearchPlan {
+    fn compile(kind: &str, options: &Value, selection: &Selection) -> Self {
+        let explicit = ["code", "descriptions", "docs", "md", "symbols"]
+            .iter()
+            .any(|channel| flag(options, channel));
+        let selected = |channel| kind == "search" && (!explicit || flag(options, channel));
+        let groups = FormatGroup::ALL
+            .into_iter()
+            .filter(|group| {
+                selection.includes_group(*group)
+                    && match group {
+                        FormatGroup::Code => kind == "search-code" || selected("code"),
+                        FormatGroup::Docs => {
+                            matches!(kind, "search-docs" | "search-md")
+                                || selected("docs")
+                                || selected("md")
+                        }
+                        FormatGroup::Config | FormatGroup::Markup => kind == "search" && !explicit,
+                    }
+            })
+            .collect();
+        Self {
+            groups,
+            descriptions: kind == "search-descriptions" || selected("descriptions"),
+            symbols: kind == "search-symbols" || selected("symbols"),
+        }
+    }
+
+    fn roles(&self) -> impl Iterator<Item = &str> {
+        self.groups
+            .iter()
+            .map(|group| group.as_str())
+            .chain(self.descriptions.then_some("descriptions"))
+            .chain(self.symbols.then_some("symbols"))
+    }
 }
 
 type DescriptionQueries<'a> = (Option<&'a [f32]>, Option<&'a [f32]>);
@@ -292,10 +334,8 @@ impl Engine {
             items: Vec::new(),
             files: HashMap::new(),
             sources: HashMap::new(),
-            vectors: OnceCell::new(),
+            vectors: RefCell::new(HashMap::new()),
             indexes: RefCell::new(HashMap::new()),
-            complete_descriptions: false,
-            complete_code: false,
             structural_only,
             _lock: lock,
             readonly,
@@ -893,6 +933,7 @@ impl Engine {
         let path = PathBuf::from(path);
         let mut profile = profile;
         profile["dimensions"] = json!(vector.dimensions());
+        profile["indexChannel"] = json!("symbols");
         let index = SharedIndex::open(
             &self.global_indexes(),
             &path,
@@ -1252,7 +1293,7 @@ impl Engine {
             for (file_index, (prepared, conversation)) in
                 prepared.iter().zip(&mut conversations).enumerate()
             {
-                if prepared.file.language == "markdown" {
+                if FormatGroup::for_path(&prepared.file.path) == Some(FormatGroup::Docs) {
                     continue;
                 }
                 let (callable_index, symbol, source_hash, regenerate, messages) = if !conversation
@@ -1547,44 +1588,38 @@ impl Engine {
             .keys()
             .map(|path| (path.clone(), OnceCell::new()))
             .collect();
-        self.vectors.take();
+        self.vectors.get_mut().clear();
         self.indexes.get_mut().clear();
-        self.complete_code = !self.structural_only
-            && self
-                .items
-                .iter()
-                .filter(|i| i.kind != "symbol-description")
-                .all(|i| !i.embedding.is_empty());
-        self.complete_descriptions = !self.structural_only
-            && self
-                .items
-                .iter()
-                .filter(|i| i.data["description"].is_string())
-                .all(|i| i.description_embedding.is_some())
-            && self
-                .files
-                .values()
-                .filter(|f| f.description.is_some())
-                .all(|f| f.description_embedding.is_some());
         for item in &mut self.items {
             item.data["id"] = json!(item.id);
         }
         Ok(())
     }
 
-    fn vectors(&self) -> Result<&HashMap<String, Vec<f32>>> {
-        if let Some(vectors) = self.vectors.get() {
-            return Ok(vectors);
+    fn vector(&self, key: &str) -> Result<Vec<f32>> {
+        if let Some(vector) = self.vectors.borrow().get(key) {
+            return Ok(vector.clone());
         }
+        let vector = self
+            .db
+            .embedding(key)?
+            .context("Missing indexed embedding")?;
+        self.vectors.borrow_mut().insert(key.into(), vector.clone());
+        Ok(vector)
+    }
+
+    fn vectors(&self, matches: impl Fn(&str) -> bool) -> Result<HashMap<String, Vec<f32>>> {
         let keys: HashSet<_> = self
             .items
             .iter()
+            .filter(|item| matches(&item.path))
             .flat_map(|i| {
                 std::iter::once(i.embedding.clone()).chain(i.description_embedding.clone())
             })
             .chain(
                 self.files
                     .values()
+                    .filter(|file| matches(&file.path))
                     .filter_map(|f| f.description_embedding.clone()),
             )
             .filter(|key| !key.is_empty())
@@ -1592,17 +1627,11 @@ impl Engine {
         let loading = ui::counted("Loading embeddings", keys.len());
         let mut vectors = HashMap::new();
         for key in keys {
-            vectors.insert(
-                key.clone(),
-                self.db
-                    .embedding(&key)?
-                    .context("Missing indexed embedding")?,
-            );
+            vectors.insert(key.clone(), self.vector(&key)?);
             loading.inc(1);
         }
         loading.finish();
-        let _ = self.vectors.set(vectors);
-        Ok(self.vectors.get().expect("initialized vectors"))
+        Ok(vectors)
     }
 
     fn ensure_index(&self, kind: &str) -> Result<()> {
@@ -1615,10 +1644,9 @@ impl Engine {
             .filter(|i| {
                 if kind == "descriptions" {
                     i.data["description"].is_string() && i.description_embedding.is_some()
-                } else if kind == "markdown" {
-                    matches!(i.kind.as_str(), "markdown" | "document") && !i.embedding.is_empty()
                 } else {
-                    i.kind == "function" && !i.embedding.is_empty()
+                    content_group(i).is_some_and(|group| group.as_str() == kind)
+                        && !i.embedding.is_empty()
                 }
             })
             .collect();
@@ -1641,6 +1669,14 @@ impl Engine {
         ui::progress(format_args!("Loading {kind} vector index"));
         let mut profile = self.providers.vector().profile();
         profile["dimensions"] = json!(self.providers.vector().dimensions());
+        profile["indexChannel"] = json!(if kind == "descriptions" {
+            "descriptions"
+        } else {
+            "content"
+        });
+        if let Ok(group) = FormatGroup::from_name(kind) {
+            profile["formatGroup"] = json!(group);
+        }
         let index = SharedIndex::open(
             &self.global_indexes(),
             &PathBuf::from(path),
@@ -1670,32 +1706,41 @@ impl Engine {
         } else {
             &item.embedding
         };
-        Ok(self
-            .vectors()?
-            .get(key)
-            .context("Missing indexed vector")?
-            .clone())
+        self.vector(key)
     }
 
     pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>> {
-        let explicit = ["code", "descriptions", "md", "symbols"]
-            .iter()
-            .any(|k| flag(options, k));
-        let code =
-            kind == "search-code" || (kind == "search" && (!explicit || flag(options, "code")));
-        let descriptions = kind == "search-descriptions"
-            || (kind == "search" && (!explicit || flag(options, "descriptions")));
-        let markdown =
-            kind == "search-md" || (kind == "search" && (!explicit || flag(options, "md")));
-        let symbols = kind == "search-symbols"
-            || (kind == "search" && (!explicit || flag(options, "symbols")));
-        let content = code || descriptions || markdown;
+        let formats = Selection::compile(options)?;
+        let SearchPlan {
+            groups,
+            descriptions,
+            symbols,
+        } = SearchPlan::compile(kind, options, &formats);
+        let content = !groups.is_empty() || descriptions;
+        if !content && !symbols {
+            return Ok(Vec::new());
+        }
         ensure!(
-            (!(code || markdown) || self.complete_code)
-                && (!descriptions || self.complete_descriptions),
+            (!content || !self.structural_only)
+                && self.items.iter().all(|item| {
+                    content_group(item).is_none_or(|group| !groups.contains(&group))
+                        || !item.embedding.is_empty()
+                })
+                && (!descriptions
+                    || (self
+                        .items
+                        .iter()
+                        .filter(|item| formats.format_matches(&item.path))
+                        .all(|item| !item.data["description"].is_string()
+                            || item.description_embedding.is_some())
+                        && self
+                            .files
+                            .values()
+                            .filter(|file| formats.format_matches(&file.path))
+                            .all(|file| file.description.is_none()
+                                || file.description_embedding.is_some()))),
             "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"
         );
-        Selection::compile(options)?;
         let key = self.query_key(query, kind, options)?;
         if let Some(results) = self.db.search_cache(&key)? {
             return Ok(results);
@@ -1712,7 +1757,6 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let stored_vectors = if content { Some(self.vectors()?) } else { None };
         let rerank = flag(&self.config, "rerankingEnabled");
         let limit = options["limit"].as_u64().map(|v| v as usize);
         let candidate_limit = if rerank {
@@ -1730,7 +1774,7 @@ impl Engine {
             limit
         };
         let mut results = Vec::new();
-        let structures = if code || descriptions || markdown {
+        let structures = if content {
             self.files
                 .keys()
                 .map(|path| Ok((path.clone(), self.presentation_structure(path)?)))
@@ -1740,25 +1784,23 @@ impl Engine {
         };
         let searching = ui::counted(
             "Searching vector indexes",
-            usize::from(code)
-                + usize::from(descriptions)
-                + usize::from(markdown)
-                + usize::from(symbols),
+            groups.len() + usize::from(descriptions) + usize::from(symbols),
         );
         let mut item_results: HashMap<u64, Value> = HashMap::new();
-        for index_kind in ["code", "descriptions"] {
-            if index_kind == "code" && !code || index_kind == "descriptions" && !descriptions {
-                continue;
-            }
+        for index_kind in groups
+            .iter()
+            .map(|group| group.as_str())
+            .chain(descriptions.then_some("descriptions"))
+        {
             ui::progress(format_args!("Searching {index_kind} index"));
             let allowed = self
                 .items
                 .iter()
                 .filter(|i| {
-                    (if index_kind == "code" {
-                        i.kind == "function"
-                    } else {
+                    (if index_kind == "descriptions" {
                         i.data["description"].is_string() && i.description_embedding.is_some()
+                    } else {
+                        content_group(i).is_some_and(|group| group.as_str() == index_kind)
                     }) && selection.unit_matches(
                         &i.path,
                         &i.data,
@@ -1775,10 +1817,14 @@ impl Engine {
                     let mut symbol = item.data.clone();
                     symbol.as_object_mut().unwrap().remove("calls");
                     json!({"type":"symbol","symbol":symbol,"similarity":similarity})
-                } else {
+                } else if item.kind == "function" {
                     json!({"type":"function","function":item.data,"similarity":similarity})
+                } else {
+                    json!({"type":item.kind,"chunk":item.data,"similarity":similarity})
                 };
-                self.add_scores(&mut result, item, &vector, None, index_kind)?;
+                if matches!(item.kind.as_str(), "function" | "symbol-description") {
+                    self.add_scores(&mut result, item, &vector, None, index_kind)?;
+                }
                 item_results
                     .entry(id)
                     .and_modify(|existing| {
@@ -1801,14 +1847,10 @@ impl Engine {
                 .values()
                 .filter(|file| selection.file_matches(&file.path))
             {
-                let Some(description) = file
-                    .description_embedding
-                    .as_ref()
-                    .and_then(|key| stored_vectors?.get(key))
-                else {
+                let Some(key) = file.description_embedding.as_ref() else {
                     continue;
                 };
-                let similarity = cosine(&vector, description);
+                let similarity = cosine(&vector, &self.vector(key)?);
                 if similarity >= min && similarity < max {
                     results.push(json!({"type":"file", "file":{
                         "path":file.path, "description":file.description,
@@ -1816,29 +1858,6 @@ impl Engine {
                     }, "similarity":similarity, "fileDescriptionSimilarity":similarity}));
                 }
             }
-        }
-        if markdown {
-            ui::progress("Searching markdown index");
-            let allowed = self
-                .items
-                .iter()
-                .filter(|i| {
-                    matches!(i.kind.as_str(), "markdown" | "document")
-                        && selection.unit_matches(
-                            &i.path,
-                            &i.data,
-                            structures.get(&i.path).and_then(Option::as_ref),
-                        )
-                })
-                .map(|i| i.id)
-                .collect();
-            for (id, similarity) in
-                self.neighbors("markdown", &vector, &allowed, candidate_limit, options)?
-            {
-                let item = self.item(id)?;
-                results.push(json!({"type":item.kind,"chunk":item.data,"similarity":similarity}));
-            }
-            searching.inc(1);
         }
         if symbols {
             ui::progress("Searching symbol index");
@@ -1928,29 +1947,19 @@ impl Engine {
             config.remove("noReindex");
             config.remove("forceReindex");
         }
-        let explicit = ["code", "descriptions", "md", "symbols"]
-            .iter()
-            .any(|name| flag(options, name));
-        let roles: Vec<_> = ["code", "descriptions", "markdown", "symbols"]
-            .into_iter()
-            .filter(|role| {
-                kind == match *role {
-                    "markdown" => "search-md",
-                    "code" => "search-code",
-                    "descriptions" => "search-descriptions",
-                    _ => "search-symbols",
-                } || (kind == "search"
-                    && (!explicit || flag(options, if *role == "markdown" { "md" } else { role })))
-                    || (*role == "symbols"
-                        && options["symbolQuery"]
-                            .as_array()
-                            .is_some_and(|queries| !queries.is_empty()))
-            })
+        let formats = Selection::compile(options)?;
+        let plan = SearchPlan::compile(kind, options, &formats);
+        let selector_symbols =
+            !plan.symbols && !crate::filter::strings(options, "symbolQuery")?.is_empty();
+        let roles: Vec<_> = plan
+            .roles()
+            .chain(selector_symbols.then_some("symbols"))
             .map(|role| (role, self.index_fingerprint(role)))
             .collect();
         Ok(hash(
             json!([
-                "query-v5-shared-snapshots",
+                "query-v7-format-groups",
+                crate::formats::VERSION,
                 self.db.meta("snapshot")?,
                 self.db.generation()?,
                 config,
@@ -2038,29 +2047,23 @@ impl Engine {
         other: Option<DescriptionQueries<'_>>,
         _kind: &str,
     ) -> Result<()> {
-        let vectors = self.vectors()?;
-        if let Some(vector) = vectors.get(&item.embedding) {
-            result["codeSimilarity"] = json!(cosine(code, vector));
+        if !item.embedding.is_empty() {
+            result["codeSimilarity"] = json!(cosine(code, &self.vector(&item.embedding)?));
         }
         let (description, file) = other.unwrap_or((Some(code), Some(code)));
-        if let Some((query, vector)) = description.zip(
-            item.description_embedding
-                .as_ref()
-                .and_then(|key| vectors.get(key)),
-        ) {
-            let similarity = cosine(query, vector);
+        if let Some((query, key)) = description.zip(item.description_embedding.as_ref()) {
+            let similarity = cosine(query, &self.vector(key)?);
             result["descriptionSimilarity"] = json!(similarity);
             if item.kind == "function" {
                 result["functionDescriptionSimilarity"] = json!(similarity);
             }
         }
-        if let Some((query, vector)) = file.zip(
+        if let Some((query, key)) = file.zip(
             self.files
                 .get(&item.path)
-                .and_then(|file| file.description_embedding.as_ref())
-                .and_then(|key| vectors.get(key)),
+                .and_then(|file| file.description_embedding.as_ref()),
         ) {
-            result["fileDescriptionSimilarity"] = json!(cosine(query, vector));
+            result["fileDescriptionSimilarity"] = json!(cosine(query, &self.vector(key)?));
         }
         Ok(())
     }
@@ -2075,10 +2078,19 @@ impl Engine {
         }
         let options = &options;
         let target = target.unwrap_or(self);
+        if !Selection::compile(options)?.includes_group(FormatGroup::Code) {
+            return Ok(Vec::new());
+        }
         let mut exclusions = cross_search_exclusions(&self.config)?;
         exclusions.extend(cross_search_exclusions(&target.config)?);
         ensure!(
-            self.complete_code && target.complete_code,
+            !self.structural_only
+                && !target.structural_only
+                && [self, target]
+                    .iter()
+                    .all(|engine| engine.items.iter().all(|item| {
+                        content_group(item) != Some(FormatGroup::Code) || !item.embedding.is_empty()
+                    })),
             "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"
         );
         ensure!(
@@ -2100,7 +2112,8 @@ impl Engine {
         let cache_key = || -> Result<String> {
             Ok(hash(
                 json!([
-                    "cross-v5-hash-exclusions",
+                    "cross-v7-format-groups",
+                    crate::formats::VERSION,
                     self.db.meta("snapshot")?,
                     self.db.generation()?,
                     target.db.path.canonicalize()?,
@@ -2122,7 +2135,9 @@ impl Engine {
         if let Some(results) = self.db.search_cache(&key)? {
             return Ok(results);
         }
-        let stored_vectors = self.vectors()?;
+        let selection = self.selection(options)?;
+        let stored_vectors =
+            self.vectors(|path| FormatGroup::for_path(path) == Some(FormatGroup::Code))?;
         let min_lines = options["minLines"].as_u64().unwrap_or(2);
         let max_lines = options["maxLines"].as_u64();
         let lines_match = |item: &Item| {
@@ -2134,7 +2149,6 @@ impl Engine {
                 .as_str()
                 .is_some_and(|hash| exclusions.contains(hash))
         };
-        let selection = self.selection(options)?;
         let structures = self
             .files
             .keys()
@@ -2153,14 +2167,19 @@ impl Engine {
         let eligible: HashMap<_, _> = target
             .items
             .iter()
-            .filter(|i| i.kind == "function" && lines_match(i) && !excluded(i))
+            .filter(|i| {
+                content_group(i) == Some(FormatGroup::Code)
+                    && lines_match(i)
+                    && !excluded(i)
+                    && selection.format_matches(&i.path)
+            })
             .map(|i| (i.id, target.root.join(&i.path)))
             .collect();
         let sources: Vec<_> = self
             .items
             .iter()
             .filter(|source| {
-                source.kind == "function"
+                content_group(source) == Some(FormatGroup::Code)
                     && lines_match(source)
                     && !excluded(source)
                     && selection.unit_matches(
@@ -2361,7 +2380,9 @@ impl Engine {
             self.db.meta("description_generation_profile")?.as_deref() != Some(&profile);
         let mut inputs = Vec::new();
         for file in self.files.values() {
-            if file.language == "markdown" || !file.errors.is_empty() {
+            if FormatGroup::for_path(&file.path) == Some(FormatGroup::Docs)
+                || !file.errors.is_empty()
+            {
                 continue;
             }
             let source_description = file
@@ -2723,9 +2744,17 @@ fn index_artifact(path: &Path, index: &Path) -> bool {
         return false;
     };
     matches!(suffix, ".lock" | "-wal" | "-shm")
-        || ["code", "markdown", "descriptions", "symbols"]
-            .iter()
+        || FormatGroup::ALL
+            .into_iter()
+            .map(FormatGroup::as_str)
+            .chain(["markdown", "descriptions", "symbols"])
             .any(|role| suffix == format!(".{role}.shared.json"))
+}
+
+fn content_group(item: &Item) -> Option<FormatGroup> {
+    matches!(item.kind.as_str(), "function" | "markdown" | "document")
+        .then(|| FormatGroup::for_path(&item.path))
+        .flatten()
 }
 
 pub(crate) fn cross_search_exclusions(config: &Value) -> Result<BTreeSet<&str>> {
@@ -3284,6 +3313,26 @@ mod tests {
         }
         assert_eq!(engine.normalize_path("./src/source.rs")?, "src/source.rs");
         assert!(engine.normalize_path("../outside").is_err());
+        Ok(())
+    }
+    #[test]
+    fn all_grouped_index_pointers_are_excluded_from_discovery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let index = temp.path().join("index.sqlite");
+        fs::write(temp.path().join("visible.json"), "{}")?;
+        for role in FormatGroup::ALL
+            .into_iter()
+            .map(FormatGroup::as_str)
+            .chain(["markdown", "descriptions", "symbols"])
+        {
+            let pointer = temp.path().join(format!("index.sqlite.{role}.shared.json"));
+            fs::write(&pointer, "{}")?;
+            assert!(index_artifact(&pointer, &index));
+        }
+        assert_eq!(
+            source_paths(temp.path(), &index, &json!({"include":["**"]}))?,
+            ["visible.json"]
+        );
         Ok(())
     }
 }

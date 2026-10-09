@@ -35,14 +35,14 @@ can also follow the command. Quote multiword queries.
 
 | Command | Actual operation | Default output |
 | --- | --- | --- |
-| `search <query>` | Search all indexes: callable code, available descriptions, Markdown/documents, and symbols. | Summary |
+| `search <query>` | Search selected format groups' content, available descriptions, and symbols; default groups are code and docs. | Summary |
 | `search-code <query>` | Search only the callable code index. | Summary |
 | `search-descriptions <query>` | Search only available source/generated callable, symbol, and file descriptions. | Ranked declaration/file excerpts |
-| `search-md <query>` | Search only the heading-aware `.md`/`.markdown` content index. | Ranked heading paths |
+| `search-docs <query>` (alias `search-md`) | Search only the heading-aware Markdown content index, never config or markup content. | Ranked heading paths |
 | `search-symbols <query>` | Search only the bare symbol-name/alias and Markdown heading-title index. | Ranked declaration/heading excerpts |
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
-| `map [PATH]...` | Show code declarations/Markdown headings; refresh existing index structure or parse directly if no index exists. | Summary |
+| `map [PATH]...` | Show selected groups' declarations, keys, sections, elements, and Markdown headings; refresh existing structure or parse directly if no index exists. | Summary |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
@@ -114,7 +114,7 @@ use plain diagnostics without animations; result data on stdout retains its
 ## Structure map
 
 ```text
-slopdex map [PATH]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--symbol-threshold NUMBER] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--format text|json]
+slopdex map [PATH]... [--formats GROUPS]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--symbol-threshold NUMBER] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--format text|json]
 ```
 
 With no paths, map selects the repository. Paths select files or recursive
@@ -174,8 +174,8 @@ selected callables by up to N call-graph edges in the specified direction. Relat
 callables are shown even when they are outside the requested paths, glob, name,
 kind, visibility, or result limit. Expansion stops at cycles and deduplicates
 symbols. It is also available on `search`, `search-code`, `search-descriptions`,
-`search-md`, `describe`, and `cross-search`; Markdown-only results have no callable
-to expand. Cross-index results expand within their respective indexes. Calls are
+`search-docs` (alias `search-md`), `describe`, and `cross-search`; Markdown-only
+results have no callable to expand. Cross-index results expand within their respective indexes. Calls are
 extracted from indexed source; only uniquely resolved static targets, including
 supported explicit imports, form edges. Dynamic receivers and unresolved calls
 do not create speculative links. Run without `--no-reindex` once after upgrading
@@ -281,6 +281,9 @@ slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
 
 Map, query searches, `describe`, and cross-search accept:
 
+- `--formats <GROUPS>`: comma-separated or repeated `code`, `docs`, `config`,
+  or `markup`; `all` selects every group. An explicit selection replaces the
+  default `code,docs`. This restricts result eligibility, not indexing.
 - `-g`, `--glob <GLOB>`: repeatable, case-sensitive globs over root-relative file
   paths. Uses ignore-style override rules: positive patterns include, `!` patterns
   exclude, and the last matching rule wins. If any positive rule exists, a path
@@ -311,6 +314,33 @@ Map, query searches, `describe`, and cross-search accept:
   `0.5`; inclusive minimum semantic selector similarity, independent of `--threshold`.
   Ranges are not accepted.
 
+| Format group | Supported formats |
+| --- | --- |
+| `code` | Supported programming languages, including shell |
+| `docs` | Markdown (`md`, `markdown`) |
+| `config` | JSON, YAML, TOML, and Terraform/HCL |
+| `markup` | HTML, XML (including SVG), and CSS |
+
+Group membership uses the central language/extension mapping, not special cases
+for individual filenames. Paths and globs cannot bypass the group selection:
+config and markup files are hidden by default even when explicitly named. Discovery still
+indexes all supported groups subject to its ignore/include/exclude rules, so
+`--formats config` or `--formats all` can select existing saved data with
+`--no-reindex`. That flag does not prepare content vectors missing from a
+structure-only index. `--config <path>` remains the settings-file override,
+independent of `--formats`.
+
+```bash
+slopdex map --formats all
+slopdex map --formats code --formats config
+slopdex search 'deployment settings' --formats config --no-reindex
+slopdex search-symbols 'service port' --formats config
+```
+
+The CLI forwards groups as a `formats` array. Engine API options also accept
+comma-separated strings, for example `{"formats":"config,code"}` or
+`{"formats":["config","code"]}`. Unknown or empty group names are errors.
+
 Names and symbol queries normalize camelCase/PascalCase, snake_case, acronym and
 letter/digit boundaries, and punctuation into lowercase space-separated words.
 For example, `getHTTPResponse`, `get_http_response`, and `get HTTP response`
@@ -327,8 +357,10 @@ separate symbol search channel is opened lazily from normalized names in saved
 structures, using a shared base and a worktree `<index>.symbols.shared.json`
 pointer. Ordinary map initializes no model.
 
-Path and name selection intersect and apply before query result limits, including
-to Markdown results. Cross-search applies these selectors **only to sources**,
+Format, path, and name selection intersect and apply before query result limits,
+including to Markdown results. Cross-search is always callable-code-only: omitting
+`code` from `--formats` yields no results, even when config or markup is selected.
+Cross-search applies path, name, and semantic selectors **only to sources**,
 intersecting `--source-path`, `--changed-since`, and `--uncommitted`; candidate
 neighbors remain eligible regardless of source selectors. `-k` is map-only.
 
@@ -343,13 +375,20 @@ Common query/cross-search filters:
   Markdown), or the context matches for `describe`. For cross-search it caps
   emitted clusters or matched-source rows **after all selected sources are
   searched**.
-- `-g`, `-e`, `-i`, `-q`, and `--symbol-threshold`: the [shared selectors](#shared-selectors).
+- `--formats`, `-g`, `-e`, `-i`, `-q`, and `--symbol-threshold`: the [shared selectors](#shared-selectors).
 
-`search` accepts the explicit index selectors `--code`, `--descriptions`, `--md`,
-and `--symbols`. With no selector, it searches all indexes: callable code,
-available descriptions, Markdown/document content, and symbol names/heading titles.
-Any selector makes selection explicit, omitting unselected indexes. Description
-search uses source descriptions and previously generated prose. Description text
+`search` accepts the explicit index selectors `--code`, `--descriptions`, `--docs`
+(alias `--md`), and `--symbols`. With no index selector, it searches the selected
+groups' independent content indexes and the shared descriptions and symbols
+indexes. The default groups are code and docs; `search --formats config`
+searches config content, symbols, and available descriptions instead.
+Any index selector makes selection explicit, omitting unselected indexes;
+`--formats` further restricts eligible file groups without enabling an omitted
+index. `search-docs` (alias `search-md`) and `--docs` search only Markdown content,
+even with `--formats all`; JSON, YAML, TOML, Terraform/HCL, HTML, XML, and CSS do
+not enter the docs index. Engine API aliases `md` and `search-md` have the same
+Markdown-only behavior. Description search uses source descriptions and previously
+generated prose. Description text
 is optional; existing descriptions are indexed without an enable/disable setting.
 Run `slopdex generate descriptions` to prepare missing or stale generated prose
 where no source description exists. `-q` is an additional shared filter,
@@ -373,9 +412,9 @@ caps the ranked hits. Optional `-q` filters eligible symbols using names or desc
 (ORed with `-e`, if supplied),
 using `--symbol-threshold` independently of the ranking threshold.
 
-Combining `--symbols` with `--code`, `--md`, or `--descriptions` uses normal
+Combining `--symbols` with `--code`, `--docs`, or `--descriptions` uses normal
 semantic refresh. Code and description hits for the same callable merge by maximum
-similarity; file, Markdown/document, and symbol hits remain independent, with
+similarity; file, content-group, and symbol hits remain independent, with
 global ranking and one global output limit. A
 declaration can appear in both function and symbol rows; text combines their
 annotations on the same declaration.
@@ -402,7 +441,9 @@ slopdex update
 slopdex search "keep the repository index synchronized"
 slopdex search-code "configure the embedding provider"
 slopdex search-code 'reject expired credentials' -q 'validate session' --symbol-threshold 0.6
-slopdex search-md "configure the embedding provider"
+slopdex search-docs "configure the embedding provider"
+slopdex search 'deployment settings' --formats config
+slopdex search 'render a page' --formats markup
 slopdex search-symbols 'validate session' --threshold 0.6 --limit 20
 slopdex search 'installation' --symbols -g '*.md' --detail expanded
 slopdex search 'validate session' --code --symbols
@@ -445,8 +486,10 @@ still needs the local Git history.
 ### Scores, independent indexes, and ANN recall
 
 SQLite stores the authoritative embeddings; USearch performs filtered F32 cosine
-HNSW search over independent code, Markdown/document, and description indexes.
-Code and description vectors use the configured content dimension; no concatenated
+HNSW search over independent code, docs, config, and markup content indexes,
+plus shared description and symbol indexes. Symbols and descriptions are filtered
+by the selected format groups; they are not split into per-group indexes.
+All content and description vectors use the configured content dimension; no concatenated
 2D/3D vectors or combined index are used. Source or generated descriptions are
 indexed whenever present. Missing descriptions are allowed and do not prevent
 code search or require every callable to be described.
@@ -456,7 +499,7 @@ callable/symbol descriptions and independent file descriptions. When both indexe
 are selected, code and description retrieval apply score thresholds independently;
 hits for the same search unit merge by **maximum matching similarity**, not an
 average. File descriptions are scored directly against the query vector and can
-produce a file hit even without callables. Markdown/document and symbol-name hits
+produce a file hit even without callables. Docs/config/markup and symbol-name hits
 retain their own scores; all selected results share global ranking and limits.
 
 Query JSON exposes available component scores: `codeSimilarity`,
@@ -668,9 +711,9 @@ format and wording are not deterministic.
 ### Create and refresh
 
 Run `slopdex update` once for the selected root/index path before searching.
-`search`, `search-code`, `search-md`, `search-descriptions`, `search-symbols`,
-and `cross-search`
-fail promptly if the resolved source index does not exist, with an instruction to
+`search`, `search-code`, `search-docs` (alias `search-md`), `search-descriptions`,
+`search-symbols`, and `cross-search` fail promptly if the resolved source index
+does not exist, with an instruction to
 run `slopdex update`, including with `--no-reindex`. Cross-search also requires
 the target index to exist and validates it before opening or refreshing the
 source engine. Missing-index failures create no index/cache artifacts and make
@@ -805,13 +848,19 @@ To run the MinIO integration test against a local server with
 `minioadmin`/`minioadmin` credentials, set `SLOPDEX_MINIO_ENDPOINT` (for example,
 `SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 cargo test --test rust_integration minio_shares_artifacts`).
 
-Derived vector indexes are opened lazily per channel: code, Markdown,
-descriptions, and name-only symbols. Worktree pointers sit beside the database as
-`<index>.code.shared.json`, `<index>.markdown.shared.json`,
-`<index>.descriptions.shared.json`, and `<index>.symbols.shared.json`.
+Derived vector indexes are opened lazily per channel. Each content group has its
+own worktree pointer beside the database: `<index>.code.shared.json`,
+`<index>.docs.shared.json`, `<index>.config.shared.json`, and
+`<index>.markup.shared.json`. Shared descriptions and name-only symbols use
+`<index>.descriptions.shared.json` and `<index>.symbols.shared.json`; format-group
+filters restrict their eligible occurrences.
 There is no combined/fusion index. Compatible worktrees reuse immutable global
-USearch bases under `<global-store>.indexes/<contract>/`, keyed by embedding
-profile and native index contract. Each pointer
+USearch bases under `<global-store>.indexes/<contract>/`. Content ANN contracts
+use a group-scoped profile separate from the provider vector profile, so code,
+docs, config, and markup cannot share a mixed-content ANN base. Provider embedding
+keys remain based on the original provider profile, input, and query/document
+role: splitting ANN indexes or changing selected groups reuses matching paid
+vectors rather than requesting them again. Each pointer
 records exact worktree membership and delta hashes. Membership masks exclude
 deleted or foreign occurrences; vectors absent from the base are searched as an
 exact worktree delta. Large deltas or insufficient active overlap compact into a
@@ -902,6 +951,9 @@ A structure-only index can have search units without vectors; `--no-reindex`
 does not prepare those missing vectors. Run a semantic command with normal
 refresh to prepare them.
 
+Changing `--formats` selects groups from the same saved snapshot, including with
+`--no-reindex`; it does not require reindexing files or changing provider profiles.
+
 Native index identity includes canonical root and schema. Embedding profiles
 (provider/model/dimensions/strategy) are separate projections: changing a model
 does not reset structural data, and cached vectors from older profiles remain
@@ -957,9 +1009,11 @@ Supported extensions: TS/TSX (`ts`, `mts`, `cts`, `tsx`), JS/JSX (`js`, `mjs`,
 (`md`, `markdown`), JSON (`json`), Terraform/HCL (`tf`, `tfvars`, `hcl`),
 YAML (`yaml`, `yml`), TOML (`toml`), XML (`xml`, `svg`, `xsd`, `xsl`, `xslt`),
 HTML (`html`, `htm`), and CSS (`css`). Code search indexes recognized
-callables; Markdown search uses bounded heading-aware chunks. General `search`
-also indexes bounded content chunks from configuration and markup files (JSON
-result type `document`, with `chunk` content). `search-md` / `--md` selects
+callables; docs search uses bounded heading-aware Markdown chunks. Indexing also
+stores bounded content chunks from config and markup files in their separate
+content indexes (JSON result type `document`, with `chunk` content). General
+`search` includes code and docs by default; config and markup require explicit
+`--formats` selection or `--formats all`. `search-docs` / `--docs` (aliases `search-md` / `--md`) selects
 Markdown only. `map` exposes keys, sections, blocks, elements, and CSS rules
 and declarations for these formats.
 
@@ -999,8 +1053,9 @@ is not an atomic filesystem snapshot.
 The root defaults to the current directory; select another with `--root`. There
 is no automatic climb to a Git/project root. The default config is
 `<root>/.slopdex/config.json`, a JSON object; a missing file means defaults.
-`--config` selects another file. `--index` overrides `indexPath`, otherwise the
-index defaults to the per-workspace XDG cache path described above. Explicit relative config/index
+`--config <path>` selects another settings file; it does not select config-format
+results (use `--formats config` for that). `--index` overrides `indexPath`, otherwise
+the index defaults to the per-workspace XDG cache path described above. Explicit relative config/index
 paths and relative JSON `indexPath` resolve from **the process working directory**,
 not the root or config's directory.
 
