@@ -968,8 +968,17 @@ rules, and ignore-file rules, including without a Git repository. Config
 `include`/`exclude` globs further narrow repository-relative paths. Built-in
 excluded directories are `.git`, `.slopdex`, `node_modules`, `dist`, `build`,
 `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`,
-`.mypy_cache`, `.pytest_cache`, and `target`. Inclusion globs cannot reopen these
-pruned directories. Refresh removes deleted/newly excluded entries.
+`.mypy_cache`, `.pytest_cache`, and `target`. Generated dependency lock files are
+also excluded at every depth: `*.lock`, `*.lockb`, `*.lockfile`, `*.locked`,
+`*.lock.json`, `*.lock.yaml`, `*.lock.yml`, `*-lock.json`, `*-lock.yaml`,
+`*-lock.yml`, and ecosystem-specific names such as
+`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `packages-lock.json`,
+`pylock.toml`, `go.sum`, `Package.resolved`, `.terraform.lock.hcl`, Gleam/Julia
+lock manifests, and `dub.selections.json`, plus the contents of `esy.lock/`.
+Dependency manifests such as `package.json`,
+`Cargo.toml`, and `pyproject.toml` remain eligible. Inclusion globs cannot reopen
+these files or pruned directories. Refresh removes deleted/newly excluded entries,
+including lock files indexed by an older version.
 
 Read/UTF-8/size failures and parser diagnostics are saved; healthy callable
 siblings remain searchable where parsing permits. `maxFileSize` defaults to

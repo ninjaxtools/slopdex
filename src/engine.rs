@@ -43,6 +43,41 @@ const EXCLUDED: &[&str] = &[
     "target",
 ];
 
+// Generated dependency resolutions, including ecosystems without a .lock suffix.
+// Match at any depth, but do not exclude dependency manifests or source names.
+const EXCLUDED_LOCK_FILES: &[&str] = &[
+    "**/*.lock",
+    "**/*.lockb",
+    "**/*.lockfile",
+    "**/*.locked",
+    "**/*.lock.json",
+    "**/*.lock.yaml",
+    "**/*.lock.yml",
+    "**/*-lock.json",
+    "**/*-lock.yaml",
+    "**/*-lock.yml",
+    "**/npm-shrinkwrap.json",
+    "**/shrinkwrap.yaml",
+    "**/esy.lock/**",
+    "**/pylock.toml",
+    "**/pylock.*.toml",
+    "**/go.sum",
+    "**/go.work.sum",
+    "**/Package.resolved",
+    "**/Cartfile.resolved",
+    "**/.terraform.lock.hcl",
+    "**/manifest.toml",
+    "**/Manifest.toml",
+    "**/Manifest-v*.toml",
+    "**/JuliaManifest.toml",
+    "**/JuliaManifest-v*.toml",
+    "**/cpanfile.snapshot",
+    "**/cabal.project.freeze",
+    "**/cabal.project.*.freeze",
+    "**/dub.selections.json",
+    "**/.meteor/versions",
+];
+
 const DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. When asked about a file, return exactly one concise paragraph about its purpose, responsibilities, and important relationships. When asked about a callable, return exactly one sentence describing what it does, including relevant inputs, outputs, or side effects. Use plain text without a heading, bullets, or a preamble. Do not propose changes.";
 // A byte cap is deliberately conservative even for providers with different tokenizers.
 // Leave room for the task, expanded search context, and the model's response.
@@ -2442,6 +2477,7 @@ fn source_paths_subset(
 ) -> Result<Vec<String>> {
     let include = globs(&config["include"])?;
     let exclude = globs(&config["exclude"])?;
+    let lock_files = globs(&json!(EXCLUDED_LOCK_FILES))?;
     ensure!(
         config["maxFileSize"].as_u64().unwrap_or(1_048_576) > 0,
         "maxFileSize must be positive"
@@ -2495,6 +2531,7 @@ fn source_paths_subset(
         }
         let path = relative(root, entry.path())?;
         if parse::language_for_path(&path).is_some()
+            && !lock_files.is_match(&path)
             && !exclude.is_match(&path)
             && (include.is_empty() || include.is_match(&path))
         {
@@ -2563,7 +2600,8 @@ fn selection_contract(config: &Value) -> String {
         config["include"],
         config["exclude"],
         config["maxFileSize"].as_u64().unwrap_or(1_048_576),
-        EXCLUDED
+        EXCLUDED,
+        EXCLUDED_LOCK_FILES
     ])
     .to_string()
 }
@@ -2841,6 +2879,206 @@ mod tests {
             json!({"artifactCachePath":temp.path().join("global.sqlite")}),
         )?;
         Ok((temp, engine))
+    }
+
+    #[test]
+    fn lock_file_patterns_cover_dependency_ecosystems_without_hiding_manifests() -> Result<()> {
+        let locks = globs(&json!(EXCLUDED_LOCK_FILES))?;
+        for name in [
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "pnpm-lock.yml",
+            "shrinkwrap.yaml",
+            "bun.lock",
+            "bun.lockb",
+            "deno.lock",
+            "lazy-lock.json",
+            "esy.lock/index.json",
+            "Cargo.lock",
+            "Pipfile.lock",
+            "poetry.lock",
+            "pdm.lock",
+            "uv.lock",
+            "pylock.toml",
+            "pylock.dev.toml",
+            "requirements.lock",
+            "Gemfile.lock",
+            "gems.locked",
+            "composer.lock",
+            "go.sum",
+            "go.work.sum",
+            "Gopkg.lock",
+            "glide.lock",
+            "mix.lock",
+            "pubspec.lock",
+            "packages.lock.json",
+            "project.lock.json",
+            "paket.lock",
+            "packages-lock.json",
+            "Package.resolved",
+            "Podfile.lock",
+            "Cartfile.resolved",
+            "gradle.lockfile",
+            "compileClasspath.lockfile",
+            ".terraform.lock.hcl",
+            "flake.lock",
+            "conan.lock",
+            "vcpkg-lock.json",
+            "manifest.toml",
+            "Manifest.toml",
+            "Manifest-v1.11.toml",
+            "JuliaManifest.toml",
+            "JuliaManifest-v1.11.toml",
+            "renv.lock",
+            "packrat.lock",
+            "cpanfile.snapshot",
+            "cabal.project.freeze",
+            "cabal.project.local.freeze",
+            "stack.yaml.lock",
+            "example.opam.locked",
+            "dub.selections.json",
+            "Berksfile.lock",
+            "Puppetfile.lock",
+            "custom.lock.yaml",
+            "custom.lock.yml",
+            ".meteor/versions",
+        ] {
+            for prefix in ["", "nested/workspace/"] {
+                let path = format!("{prefix}{name}");
+                assert!(locks.is_match(&path), "lock file was not excluded: {path}");
+            }
+        }
+        for path in [
+            "package.json",
+            "nested/Cargo.toml",
+            "pyproject.toml",
+            "go.mod",
+            "Project.toml",
+            "build.zig.zon",
+            "src/lock.rs",
+            "src/lock.json",
+            "package-lock.json.md",
+            "lockfile.py",
+            "Manifest.toml.md",
+        ] {
+            assert!(!locks.is_match(path), "non-lock file was excluded: {path}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_excludes_lock_files_even_with_explicit_includes_and_candidates() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        let mut candidates = HashSet::new();
+        for prefix in ["", "nested/workspace/"] {
+            for name in [
+                "package-lock.json",
+                "npm-shrinkwrap.json",
+                "lazy-lock.json",
+                "pnpm-lock.yaml",
+                "packages.lock.json",
+                "pylock.toml",
+                "pylock.dev.toml",
+                ".terraform.lock.hcl",
+                "Manifest.toml",
+                "manifest.toml",
+                "Manifest-v1.11.toml",
+                "dub.selections.json",
+                "package.json",
+                "Cargo.toml",
+                "pyproject.toml",
+                "lock.rs",
+            ] {
+                let relative = format!("{prefix}{name}");
+                let path = root.join(&relative);
+                fs::create_dir_all(path.parent().unwrap())?;
+                fs::write(path, "")?;
+                candidates.insert(relative);
+            }
+        }
+        // Only files are excluded; a directory with a lock-file name is still walked.
+        fs::create_dir_all(root.join("workspace/package-lock.json"))?;
+        fs::write(root.join("workspace/package-lock.json/source.rs"), "")?;
+        candidates.insert("workspace/package-lock.json/source.rs".to_owned());
+        let expected = [
+            "Cargo.toml",
+            "lock.rs",
+            "nested/workspace/Cargo.toml",
+            "nested/workspace/lock.rs",
+            "nested/workspace/package.json",
+            "nested/workspace/pyproject.toml",
+            "package.json",
+            "pyproject.toml",
+            "workspace/package-lock.json/source.rs",
+        ];
+        for include in [json!([]), json!(["**"])] {
+            let config = json!({
+                "include":include,
+                "artifactCachePath":temp.path().join("global.sqlite"),
+            });
+            for subset in [None, Some(&candidates)] {
+                assert_eq!(
+                    source_paths_subset(
+                        &root,
+                        &temp.path().join("index.sqlite"),
+                        &config,
+                        subset,
+                        None,
+                    )?,
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lock_file_policy_change_removes_legacy_entries_from_clean_git_index() -> Result<()> {
+        let (_temp, mut engine) = git_fixture()?;
+        let path = "package-lock.json";
+        let source = "{\"lockfileVersion\":3}";
+        fs::write(engine.root.join(path), source)?;
+        git_command(&engine.root, &["add", "."])?;
+        git_command(&engine.root, &["commit", "-qm", "lock file"])?;
+        engine.refresh_structure()?;
+        assert_eq!(engine.files.len(), 1);
+
+        // Seed the entry and policies an older version would have published.
+        let mut file = engine.files["source.rs"].clone();
+        file.path = path.to_owned();
+        file.source = source.to_owned();
+        file.hash = hash(source);
+        file.language = "json".to_owned();
+        engine.db.apply_structure(
+            &[(file, parse::parse(path, source)?)],
+            &[],
+            git::head(&engine.root).as_deref(),
+        )?;
+        let mut legacy: Value = serde_json::from_str(&selection_contract(&engine.config))?;
+        assert_eq!(
+            legacy.as_array_mut().unwrap().pop(),
+            Some(json!(EXCLUDED_LOCK_FILES))
+        );
+        let legacy = legacy.to_string();
+        engine.db.set_meta("selection_policy", &legacy)?;
+        let mut policy: Value =
+            serde_json::from_str(&engine.db.meta("discovery_policy")?.unwrap())?;
+        policy[0] = json!(legacy);
+        engine
+            .db
+            .set_meta("discovery_policy", &policy.to_string())?;
+        engine.load()?;
+        assert!(engine.files.contains_key(path));
+        assert!(git::dirty_paths(&engine.root)?.is_empty());
+
+        assert_eq!(engine.refresh_structure()?["filesDeleted"], 1);
+        assert_eq!(engine.db.paths()?, ["source.rs"]);
+        assert!(!engine.files.contains_key(path));
+        assert_eq!(engine.refresh_structure()?["filesDeleted"], 0);
+        Ok(())
     }
 
     #[test]
