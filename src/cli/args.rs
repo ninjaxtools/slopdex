@@ -144,6 +144,8 @@ pub(super) enum Command {
         topic: Option<HelpTopic>,
     },
     /// Edit configuration without opening an index; optional prefix filters interactive prompts
+    ///
+    /// Use `config set <key> <value>` or `config exclude-cross-search <file>:<symbol> ...`.
     Config { args: Vec<String> },
 }
 

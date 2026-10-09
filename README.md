@@ -187,6 +187,14 @@ Only use matching symbols under src/services as sources:
 $ slopdex cross-search --source-path src/services -e '^UserService\.' --threshold 0.9
 ```
 
+### Exclude symbols from cross-search
+
+```console
+$ slopdex config exclude-cross-search src/services/user.rs:UserService.validate ...
+```
+
+This will add the hash for the given functions to the `crossSearchExclusions` config setting. This is useful to exclude similar functions that however are intended to be similar and shouldn't be refactored from appearing repeatedly in `cross-search` results.
+
 ### Find related code stored far apart
 
 When code is similar but not actually duplicated, then `--cohesion` can help find similar code that exists far apart in the filesystem tree, which could potentially be refactored to make it more cohesive, by ordering matches from farthest to nearest.

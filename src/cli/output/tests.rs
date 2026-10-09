@@ -1,6 +1,6 @@
 use super::{
     CrossOutput, Presentation, print_cross, print_errors, print_map, print_search,
-    test_support::{edge, function},
+    test_support::{edge, function, map_config},
 };
 use crate::{
     cli::args::{Detail, Format},
@@ -19,7 +19,7 @@ fn indexed_file_and_callable_descriptions_are_comments_at_the_requested_detail()
     let source = "pub fn run() {}\n";
     fs::write(dir.path().join("api.rs"), source)?;
     let index = dir.path().join("index.sqlite");
-    let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+    let mut engine = Engine::open_map(dir.path(), &index, map_config(dir.path()))?;
     engine.refresh_structure()?;
     drop(engine);
     let db = rusqlite::Connection::open(&index)?;
@@ -50,7 +50,7 @@ fn indexed_file_and_callable_descriptions_are_comments_at_the_requested_detail()
     drop(db);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let engine = loop {
-        match Engine::open_map(dir.path(), &index, json!({})) {
+        match Engine::open_map(dir.path(), &index, map_config(dir.path())) {
             Err(error)
                 if error.to_string().starts_with("Index is in use")
                     && std::time::Instant::now() < deadline =>

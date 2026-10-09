@@ -148,6 +148,34 @@ impl Fixture {
     fn engine(&self) -> Result<Engine> {
         Engine::open(self.temp.path(), &self.index, self.config.clone())
     }
+
+    fn source_hash(&self, path: &str) -> Result<String> {
+        let parsed = parse::parse(path, &fs::read_to_string(self.temp.path().join(path))?)?;
+        Ok(parsed.callables[0].source_hash.clone())
+    }
+
+    fn seed_code_vectors(&self, vectors: &[(&str, [f32; 2])]) -> Result<()> {
+        let db = Database::open_with_config(&self.index, self.temp.path(), &self.config, false)?;
+        // Replace the fixture's uniform vectors before opening any search indexes.
+        db.conn.execute("DELETE FROM global.embeddings", [])?;
+        let profile = Providers::new(&self.config)?.embedding_profile();
+        for item in db.items()? {
+            let (_, vector) = vectors.iter().find(|(path, _)| *path == item.path).unwrap();
+            db.put_embedding(
+                &Database::embedding_key(
+                    &profile,
+                    false,
+                    item.data["embeddingInput"].as_str().unwrap(),
+                ),
+                vector,
+            )?;
+        }
+        db.put_embedding(
+            &Database::embedding_key(&profile, true, "copper token"),
+            &[1.0, 0.0],
+        )?;
+        Ok(())
+    }
 }
 
 fn hit_keys(rows: &[Value]) -> BTreeSet<String> {
@@ -410,6 +438,248 @@ fn cross_search_works_with_existing_unembedded_descriptions() -> Result<()> {
             .get("fileDescriptionSimilarity")
             .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn cross_search_exclusions_filter_same_index_hashes_before_limits_and_preserve_search() -> Result<()>
+{
+    let excluded_source = "pub fn duplicate() {\n    println!(\"old\");\n}\n";
+    let mut fixture = Fixture::with_sources(
+        false,
+        &[
+            (
+                "source.rs",
+                "pub fn source() {\n    println!(\"source\");\n}\n",
+            ),
+            ("a.rs", excluded_source),
+            ("b.rs", excluded_source),
+            (
+                "changed.rs",
+                "pub fn duplicate() {\n    println!(\"new\");\n}\n",
+            ),
+            (
+                "fallback.rs",
+                "pub fn fallback() {\n    println!(\"fallback\");\n}\n",
+            ),
+        ],
+    )?;
+    fixture.seed_code_vectors(&[
+        ("source.rs", [1.0, 0.0]),
+        ("a.rs", [1.0, 0.0]),
+        ("b.rs", [1.0, 0.0]),
+        ("changed.rs", [0.8, 0.6]),
+        ("fallback.rs", [0.6, 0.8]),
+    ])?;
+    let excluded_hash = fixture.source_hash("a.rs")?;
+    assert_eq!(excluded_hash, fixture.source_hash("b.rs")?);
+    assert_ne!(excluded_hash, fixture.source_hash("changed.rs")?);
+    let options = json!({
+        "crossFileOnly":true, "includeSymmetricDuplicates":true,
+        "minSimilarity":0, "matches":1
+    });
+    let mut selected = options.clone();
+    selected["sourcePath"] = json!("source.rs");
+    let query_options = json!({"minSimilarity":-1});
+    let engine = fixture.engine()?;
+    let baseline = engine.cross_search(None, &options)?;
+    let selected_baseline = engine.cross_search(None, &selected)?;
+    let search_baseline = engine.search("copper token", "search-code", &query_options)?;
+    assert_eq!(baseline.len(), 5, "{baseline:?}");
+    assert_eq!(search_baseline.len(), 5);
+    assert_eq!(selected_baseline.len(), 1);
+    assert!(
+        ["a.rs", "b.rs"]
+            .iter()
+            .any(|path| { selected_baseline[0]["matches"][0]["function"]["path"] == *path })
+    );
+    assert_eq!(baseline, engine.cross_search(None, &options)?);
+    drop(engine);
+
+    fixture.config["crossSearchExclusions"] = json!([excluded_hash]);
+    let engine = fixture.engine()?;
+    let rows = engine.cross_search(None, &options)?;
+    let paths: BTreeSet<_> = rows
+        .iter()
+        .map(|row| row["source"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        BTreeSet::from(["source.rs", "changed.rs", "fallback.rs"])
+    );
+    for row in &rows {
+        let matches = row["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1, "{row:?}");
+        assert!(
+            matches.iter().all(|hit| {
+                hit["function"]["path"] != "a.rs" && hit["function"]["path"] != "b.rs"
+            })
+        );
+    }
+    let selected_rows = engine.cross_search(None, &selected)?;
+    assert_eq!(selected_rows.len(), 1, "{selected_rows:?}");
+    assert_eq!(selected_rows[0]["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        selected_rows[0]["matches"][0]["function"]["path"],
+        "changed.rs"
+    );
+    assert_eq!(rows, engine.cross_search(None, &options)?);
+    assert_eq!(
+        search_baseline,
+        engine.search("copper token", "search-code", &query_options)?
+    );
+    drop(engine);
+
+    fixture
+        .config
+        .as_object_mut()
+        .unwrap()
+        .remove("crossSearchExclusions");
+    let engine = fixture.engine()?;
+    assert_eq!(baseline, engine.cross_search(None, &options)?);
+    assert_eq!(selected_baseline, engine.cross_search(None, &selected)?);
+    Ok(())
+}
+
+#[test]
+fn cross_search_unions_external_configs_and_tracks_both_exclusions_in_cache() -> Result<()> {
+    let source_excluded = "pub fn source_excluded() {\n    println!(\"source exclusion\");\n}\n";
+    let target_excluded = "pub fn target_excluded() {\n    println!(\"target exclusion\");\n}\n";
+    let mut source_fixture = Fixture::with_sources(
+        false,
+        &[
+            ("keep.rs", "pub fn keep() {\n    println!(\"keep\");\n}\n"),
+            ("source_excluded.rs", source_excluded),
+            ("target_excluded.rs", target_excluded),
+        ],
+    )?;
+    let mut target_fixture = Fixture::with_sources(
+        false,
+        &[
+            ("source_copy.rs", source_excluded),
+            ("target_copy.rs", target_excluded),
+            (
+                "fallback.rs",
+                "pub fn fallback() {\n    println!(\"fallback\");\n}\n",
+            ),
+        ],
+    )?;
+    source_fixture.seed_code_vectors(&[
+        ("keep.rs", [1.0, 0.0]),
+        ("source_excluded.rs", [1.0, 0.0]),
+        ("target_excluded.rs", [1.0, 0.0]),
+    ])?;
+    target_fixture.seed_code_vectors(&[
+        ("source_copy.rs", [1.0, 0.0]),
+        ("target_copy.rs", [0.8, 0.6]),
+        ("fallback.rs", [0.6, 0.8]),
+    ])?;
+    let source_hash = source_fixture.source_hash("source_excluded.rs")?;
+    let target_hash = target_fixture.source_hash("target_copy.rs")?;
+    assert_eq!(source_hash, target_fixture.source_hash("source_copy.rs")?);
+    assert_eq!(
+        target_hash,
+        source_fixture.source_hash("target_excluded.rs")?
+    );
+    let options = json!({"crossFileOnly":true, "minSimilarity":0, "matches":1});
+    let source = source_fixture.engine()?;
+    let target = target_fixture.engine()?;
+    let baseline = source.cross_search(Some(&target), &options)?;
+    assert_eq!(baseline.len(), 3, "{baseline:?}");
+    assert!(
+        baseline
+            .iter()
+            .all(|row| row["matches"][0]["function"]["path"] == "source_copy.rs")
+    );
+    assert_eq!(baseline, source.cross_search(Some(&target), &options)?);
+    drop(source);
+
+    source_fixture.config["crossSearchExclusions"] = json!([source_hash]);
+    let source = source_fixture.engine()?;
+    let source_only = source.cross_search(Some(&target), &options)?;
+    assert_eq!(source_only.len(), 2, "{source_only:?}");
+    assert!(source_only.iter().all(|row| {
+        row["source"]["path"] != "source_excluded.rs"
+            && row["matches"].as_array().unwrap().len() == 1
+            && row["matches"][0]["function"]["path"] == "target_copy.rs"
+    }));
+    drop(target);
+
+    target_fixture.config["crossSearchExclusions"] = json!([target_hash]);
+    let target = target_fixture.engine()?;
+    let both = source.cross_search(Some(&target), &options)?;
+    assert_eq!(both.len(), 1, "{both:?}");
+    assert_eq!(both[0]["source"]["path"], "keep.rs");
+    assert_eq!(both[0]["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(both[0]["matches"][0]["function"]["path"], "fallback.rs");
+    assert_eq!(both, source.cross_search(Some(&target), &options)?);
+    drop(source);
+
+    source_fixture.config["crossSearchExclusions"] = json!([]);
+    let source = source_fixture.engine()?;
+    let target_only = source.cross_search(Some(&target), &options)?;
+    assert_eq!(target_only.len(), 2, "{target_only:?}");
+    assert!(target_only.iter().all(|row| {
+        row["source"]["path"] != "target_excluded.rs"
+            && row["matches"][0]["function"]["path"] == "source_copy.rs"
+    }));
+    drop(target);
+
+    target_fixture.config["crossSearchExclusions"] = json!([]);
+    let target = target_fixture.engine()?;
+    assert_eq!(baseline, source.cross_search(Some(&target), &options)?);
+    Ok(())
+}
+
+#[test]
+fn cross_search_excluded_function_returns_after_its_source_hash_changes() -> Result<()> {
+    let original = "pub fn duplicate() {\n    println!(\"old\");\n}\n";
+    let changed = "pub fn duplicate() {\n    println!(\"new\");\n}\n";
+    let mut fixture = Fixture::with_sources(
+        false,
+        &[
+            (
+                "source.rs",
+                "pub fn source() {\n    println!(\"source\");\n}\n",
+            ),
+            ("edited.rs", original),
+            ("unchanged.rs", original),
+        ],
+    )?;
+    let excluded_hash = fixture.source_hash("edited.rs")?;
+    fixture.config["crossSearchExclusions"] = json!([excluded_hash]);
+    let options = json!({"sourcePath":"source.rs", "crossFileOnly":true, "matches":1});
+    let engine = fixture.engine()?;
+    assert!(engine.cross_search(None, &options)?.is_empty());
+    assert!(engine.cross_search(None, &options)?.is_empty());
+    drop(engine);
+
+    fs::write(fixture.temp.path().join("edited.rs"), changed)?;
+    let parsed = parse::parse("edited.rs", changed)?;
+    assert_ne!(parsed.callables[0].source_hash, excluded_hash);
+    let mut db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
+    let mut file = db
+        .files()?
+        .into_iter()
+        .find(|file| file.path == "edited.rs")
+        .unwrap();
+    file.hash = hash(changed);
+    file.source = changed.into();
+    let profile = Providers::new(&fixture.config)?.embedding_profile();
+    db.put_embedding(
+        &Database::embedding_key(&profile, false, &parsed.callables[0].embedding_input),
+        &[0.0, 1.0],
+    )?;
+    db.apply_structure(&[(file, parsed)], &[], None)?;
+    drop(db);
+
+    let engine = fixture.engine()?;
+    let rows = engine.cross_search(None, &options)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["matches"][0]["function"]["path"], "edited.rs");
+    assert_eq!(rows, engine.cross_search(None, &options)?);
     Ok(())
 }
 

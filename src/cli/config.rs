@@ -3,7 +3,7 @@
 use super::args::{Format, Global};
 use super::io::print_json;
 use super::workspace::absolute;
-use crate::ui;
+use crate::{engine::cross_search_exclusions, parse, ui};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -85,6 +85,7 @@ pub(super) fn effective_config(global: &Global, path: &Path) -> Result<Value> {
 
 fn validate_config(config: &Value) -> Result<()> {
     ensure!(config.is_object(), "config must be a JSON object");
+    cross_search_exclusions(config)?;
     ensure!(
         config.get("descriptionsEnabled").is_none(),
         "descriptionsEnabled has been removed; remove it from config and run `slopdex generate descriptions` to generate descriptions explicitly"
@@ -220,6 +221,72 @@ fn write_config(path: &Path, config: &Value) -> Result<()> {
     result.with_context(|| format!("save config {}", path.display()))
 }
 
+fn exclude_cross_search(global: &Global, config: &mut Value, args: &[String]) -> Result<Value> {
+    ensure!(
+        args.len() >= 2,
+        "usage: slopdex config exclude-cross-search <file>:<symbol> [<file>:<symbol> ...]"
+    );
+    validate_config(config)?;
+    let root = absolute(global.root.as_deref().unwrap_or(Path::new(".")))?;
+    let mut hashes = config
+        .get("crossSearchExclusions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for selector in &args[1..] {
+        // Skip a Windows drive prefix when finding the file/symbol separator.
+        let start = if selector.as_bytes().get(1) == Some(&b':')
+            && matches!(selector.as_bytes().get(2), Some(b'/' | b'\\'))
+        {
+            2
+        } else {
+            0
+        };
+        let separator = selector[start..]
+            .find(':')
+            .map(|index| index + start)
+            .context("expected <file>:<symbol> for cross-search exclusion")?;
+        let (file, symbol) = (&selector[..separator], &selector[separator + 1..]);
+        ensure!(
+            !file.is_empty() && !symbol.is_empty(),
+            "expected <file>:<symbol> for cross-search exclusion"
+        );
+        let path = root.join(file);
+        let source =
+            fs::read_to_string(&path).with_context(|| format!("read source {}", path.display()))?;
+        let parsed = parse::parse(file, &source)?;
+        let qualified = parsed
+            .callables
+            .iter()
+            .any(|callable| callable.qualified_name == symbol);
+        let matches: Vec<_> = parsed
+            .callables
+            .iter()
+            .filter(|callable| {
+                if qualified {
+                    callable.qualified_name == symbol
+                } else {
+                    callable.name == symbol
+                }
+            })
+            .collect();
+        ensure!(
+            !matches.is_empty(),
+            "no callable symbol found for {selector}"
+        );
+        ensure!(
+            matches.len() == 1,
+            "ambiguous callable symbol {selector}; use a unique qualified symbol name"
+        );
+        let hash = json!(matches[0].source_hash);
+        if !hashes.contains(&hash) {
+            hashes.push(hash);
+        }
+    }
+    config["crossSearchExclusions"] = json!(hashes);
+    Ok(json!({"crossSearchExclusions": hashes}))
+}
+
 pub(super) fn run_config(
     global: &Global,
     path: &Path,
@@ -227,8 +294,11 @@ pub(super) fn run_config(
     out: &mut impl Write,
 ) -> Result<()> {
     let mut config = read_config(path)?;
-    let interactive = args.first().is_none_or(|arg| arg != "set");
-    let changed = if !interactive {
+    let action = args.first().map(String::as_str);
+    let interactive = !matches!(action, Some("set" | "exclude-cross-search"));
+    let changed = if action == Some("exclude-cross-search") {
+        exclude_cross_search(global, &mut config, args)?
+    } else if !interactive {
         ensure!(args.len() == 3, "usage: slopdex config set <key> <value>");
         let key = &args[1];
         ensure!(

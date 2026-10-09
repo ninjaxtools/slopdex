@@ -1,6 +1,6 @@
 use std::{
     cell::{OnceCell, RefCell},
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -2075,6 +2075,8 @@ impl Engine {
         }
         let options = &options;
         let target = target.unwrap_or(self);
+        let mut exclusions = cross_search_exclusions(&self.config)?;
+        exclusions.extend(cross_search_exclusions(&target.config)?);
         ensure!(
             self.complete_code && target.complete_code,
             "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"
@@ -2098,7 +2100,7 @@ impl Engine {
         let cache_key = || -> Result<String> {
             Ok(hash(
                 json!([
-                    "cross-v4-shared-snapshots",
+                    "cross-v5-hash-exclusions",
                     self.db.meta("snapshot")?,
                     self.db.generation()?,
                     target.db.path.canonicalize()?,
@@ -2110,6 +2112,7 @@ impl Engine {
                     kind,
                     base,
                     self.db.meta("checkpoint")?,
+                    exclusions,
                     options
                 ])
                 .to_string(),
@@ -2125,6 +2128,11 @@ impl Engine {
         let lines_match = |item: &Item| {
             let lines = item.data["lineCount"].as_u64().unwrap_or(0);
             lines >= min_lines && max_lines.is_none_or(|max| lines < max)
+        };
+        let excluded = |item: &Item| {
+            item.data["sourceHash"]
+                .as_str()
+                .is_some_and(|hash| exclusions.contains(hash))
         };
         let selection = self.selection(options)?;
         let structures = self
@@ -2145,7 +2153,7 @@ impl Engine {
         let eligible: HashMap<_, _> = target
             .items
             .iter()
-            .filter(|i| i.kind == "function" && lines_match(i))
+            .filter(|i| i.kind == "function" && lines_match(i) && !excluded(i))
             .map(|i| (i.id, target.root.join(&i.path)))
             .collect();
         let sources: Vec<_> = self
@@ -2154,6 +2162,7 @@ impl Engine {
             .filter(|source| {
                 source.kind == "function"
                     && lines_match(source)
+                    && !excluded(source)
                     && selection.unit_matches(
                         &source.path,
                         &source.data,
@@ -2719,6 +2728,31 @@ fn index_artifact(path: &Path, index: &Path) -> bool {
             .any(|role| suffix == format!(".{role}.shared.json"))
 }
 
+pub(crate) fn cross_search_exclusions(config: &Value) -> Result<BTreeSet<&str>> {
+    let Some(value) = config.get("crossSearchExclusions") else {
+        return Ok(BTreeSet::new());
+    };
+    let values = value
+        .as_array()
+        .context("crossSearchExclusions must be an array of SHA-256 hashes")?;
+    values
+        .iter()
+        .map(|value| {
+            let hash = value
+                .as_str()
+                .context("crossSearchExclusions must contain SHA-256 hash strings")?;
+            ensure!(
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "crossSearchExclusions must contain lowercase SHA-256 hashes"
+            );
+            Ok(hash)
+        })
+        .collect()
+}
+
 fn flag(value: &Value, key: &str) -> bool {
     value[key].as_bool().unwrap_or(false)
 }
@@ -3228,7 +3262,11 @@ mod tests {
         fs::create_dir(&outside)?;
         symlink(&root, &alias)?;
         symlink(&outside, root.join("escape"))?;
-        let engine = Engine::open(&alias, &temp.path().join("index.sqlite"), json!({}))?;
+        let engine = Engine::open(
+            &alias,
+            &temp.path().join("index.sqlite"),
+            json!({"artifactCachePath":temp.path().join("global.sqlite")}),
+        )?;
 
         // Both spellings must match the canonical root stored by Engine::open,
         // including when a system temp directory itself is a symlink on macOS.

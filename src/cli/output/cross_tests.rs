@@ -3,7 +3,7 @@ use crate::cli::{
     args::{Detail, Format},
     output::{
         render::Presentation,
-        test_support::{edge, function},
+        test_support::{edge, function, map_config},
     },
 };
 use crate::engine::Engine;
@@ -45,7 +45,7 @@ fn cross_summary_groups_sources_and_matches_from_the_same_file() -> Result<()> {
         "impl Api {\n  fn first(&self) {}\n  fn second(&self) {}\n}\n",
     )?;
     let index = dir.path().join("index.sqlite");
-    let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+    let mut engine = Engine::open_map(dir.path(), &index, map_config(dir.path()))?;
     engine.refresh_structure()?;
     let first = json!({"path":"api.rs", "qualifiedName":"Api.first", "name":"first", "startLine":2,"endLine":2});
     let second = json!({"path":"api.rs", "qualifiedName":"Api.second", "name":"second", "startLine":3,"endLine":3});

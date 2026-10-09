@@ -2,7 +2,7 @@ use super::{Presentation, print_markdown, rank, score_details};
 use crate::{
     cli::{
         args::{CallDepths, Detail, Format},
-        output::{array, search::print_search},
+        output::{array, search::print_search, test_support::map_config},
     },
     engine::Engine,
 };
@@ -22,7 +22,7 @@ fn symbol_search_renders_saved_nodes_heading_bodies_and_independent_scores() -> 
         "# Guide\nParent body.\n## Setup\nSaved setup body.\n### Empty\n## Other\nOther body.\n",
     )?;
     let index = dir.path().join("index.sqlite");
-    let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+    let mut engine = Engine::open_map(dir.path(), &index, map_config(dir.path()))?;
     engine.refresh_structure()?;
     let symbol = |path: &str, name: &str| -> Result<Value> {
         let structure = engine.presentation_structure(path)?.unwrap();
@@ -265,7 +265,7 @@ fn ranked_hits_group_files_and_emit_ancestors_once_in_source_order() -> Result<(
         "# Guide\n\n## Setup\nFirst.\n\n### Details\nSecond.\n",
     )?;
     let index = dir.path().join("index.sqlite");
-    let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+    let mut engine = Engine::open_map(dir.path(), &index, map_config(dir.path()))?;
     engine.refresh_structure()?;
     let rows = vec![
         json!({"type":"function", "similarity":0.9, "function":{"path":"api.rs", "qualifiedName":"Api.flush", "name":"flush", "startLine":3, "endLine":3}}),
@@ -312,7 +312,7 @@ fn search_orders_files_by_best_rerank_score_and_keeps_individual_scores() -> Res
     )?;
     fs::write(dir.path().join("b.rs"), "fn other() {}\n")?;
     let index = dir.path().join("index.sqlite");
-    let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+    let mut engine = Engine::open_map(dir.path(), &index, map_config(dir.path()))?;
     engine.refresh_structure()?;
     let rows = vec![
         json!({"type":"function", "similarity":0.8, "rerankScore":0.9, "function":{"path":"a.rs", "name":"second", "qualifiedName":"second", "startLine":6, "endLine":6}}),

@@ -2,7 +2,7 @@ use super::print_search;
 use crate::{
     cli::{
         args::{Detail, Format},
-        output::render::Presentation,
+        output::{render::Presentation, test_support::map_config},
     },
     engine::Engine,
 };
@@ -82,7 +82,7 @@ fn search_uses_indexed_declaration_instead_of_callable_source() -> Result<()> {
         "pub struct Api;\nimpl Api {\n  pub fn run(&self) { secret(); }\n}\n",
     )?;
     let index = dir.path().join("index.sqlite");
-    let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+    let mut engine = Engine::open_map(dir.path(), &index, map_config(dir.path()))?;
     engine.refresh_structure()?;
     let rows = vec![json!({"type":"function", "similarity":0.9, "function":{
         "path":"api.rs", "qualifiedName":"Api.run", "name":"run", "startLine":3,
@@ -162,7 +162,7 @@ fn file_hits_group_with_callable_and_symbol_hits_and_preserve_json_with_calls() 
     )?;
     fs::write(dir.path().join("other.rs"), "pub fn other() {}\n")?;
     let index = dir.path().join("index.sqlite");
-    let mut engine = Engine::open_map(dir.path(), &index, json!({}))?;
+    let mut engine = Engine::open_map(dir.path(), &index, map_config(dir.path()))?;
     engine.refresh_structure()?;
     let structure = engine.presentation_structure("api.rs")?.unwrap();
     let mut symbol = serde_json::to_value(

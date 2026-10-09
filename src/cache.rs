@@ -201,6 +201,21 @@ pub fn store_path(config: &Value) -> Result<PathBuf> {
 }
 
 pub(crate) fn open_store(path: &Path, readonly: bool) -> Result<Connection> {
+    // Fail deterministically instead of letting parallel unit tests contend on
+    // (or pollute) the developer's real per-user artifact store.
+    #[cfg(test)]
+    {
+        let path = std::path::absolute(path)?;
+        let path = if path.exists() {
+            std::fs::canonicalize(path)?
+        } else {
+            path
+        };
+        anyhow::ensure!(
+            path != store_path(&serde_json::json!({}))?,
+            "Unit tests must use artifactCachePath inside their own TempDir, not the default per-user artifact store"
+        );
+    }
     if !readonly {
         std::fs::create_dir_all(
             path.parent()
@@ -794,6 +809,21 @@ mod tests {
             store_path(&serde_json::json!({"artifactCachePath":"custom-global.sqlite"}))?,
             std::path::absolute("custom-global.sqlite")?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unit_tests_cannot_open_the_default_per_user_store() -> Result<()> {
+        let path = store_path(&serde_json::json!({}))?;
+        for readonly in [false, true] {
+            let error = open_store(&path, readonly).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Unit tests must use artifactCachePath inside their own TempDir"),
+                "{error}"
+            );
+        }
         Ok(())
     }
 
