@@ -491,12 +491,18 @@ struct Repo {
 
 impl Repo {
     fn new() -> Result<Self> {
-        let temp = tempfile::tempdir()?;
-        let root = temp.path().join("repo");
-        let home = temp.path().join("home");
+        Self::from_temp(tempfile::tempdir()?)
+    }
+
+    fn from_temp(temp: TempDir) -> Result<Self> {
+        // Child current_dir() resolves symlinked ancestors (e.g. macOS /var).
+        // Keep fixture paths in that same namespace, including not-yet-created files.
+        let base = temp.path().canonicalize()?;
+        let root = base.join("repo");
+        let home = base.join("home");
         fs::create_dir(&root)?;
         fs::create_dir(&home)?;
-        let index = temp.path().join("index.sqlite");
+        let index = base.join("index.sqlite");
         Ok(Self {
             _temp: temp,
             root,
@@ -1451,6 +1457,25 @@ fn query_threshold_endpoints_apply_to_code_and_markdown_and_survive_restart() ->
 #[test]
 fn cli_config_defaults_to_global_and_updates_the_selected_file() -> Result<()> {
     let repo = Repo::new()?;
+    assert_cli_config_selection(&repo)
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_config_selection_with_symlinked_temp_directory() -> Result<()> {
+    let parent = tempfile::tempdir()?;
+    let actual = parent.path().join("actual");
+    let alias = parent.path().join("alias");
+    fs::create_dir(&actual)?;
+    std::os::unix::fs::symlink(&actual, &alias)?;
+    let temp = tempfile::tempdir_in(&alias)?;
+    assert!(temp.path().starts_with(&alias));
+    assert_ne!(temp.path(), temp.path().canonicalize()?);
+    let repo = Repo::from_temp(temp)?;
+    assert_cli_config_selection(&repo)
+}
+
+fn assert_cli_config_selection(repo: &Repo) -> Result<()> {
     let global = repo.home.join("slopdex/config.json");
     let local = repo.root.join(".slopdex/config.json");
     let explicit = repo.root.join("custom/config.json");
