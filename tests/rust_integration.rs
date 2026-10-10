@@ -1475,17 +1475,72 @@ fn cli_config_selection_with_symlinked_temp_directory() -> Result<()> {
     assert_cli_config_selection(&repo)
 }
 
+#[cfg(windows)]
+#[test]
+fn cli_config_paths_accept_verbatim_paths_and_mixed_separators() -> Result<()> {
+    let repo = Repo::new()?;
+    let root = repo.root.to_str().context("Fixture path must be UTF-8")?;
+    let ordinary_root = if let Some(unc_root) = root.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc_root}")
+    } else {
+        root.strip_prefix(r"\\?\")
+            .context("Canonical Windows fixture path must have a verbatim prefix")?
+            .to_owned()
+    };
+    let expected = repo.root.join("custom/config.json");
+    for (index, config) in [
+        "custom/config.json".to_owned(),
+        r"custom\config.json".to_owned(),
+        format!(r"{ordinary_root}\custom\config.json"),
+        format!("{ordinary_root}/custom/config.json"),
+        format!(r"{root}\custom\config.json"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let model = format!("windows-path-model-{index}");
+        let result = repo.cli_json(&["--config", &config, "config", "set", "model", &model])?;
+        assert_cli_config_path(&result, &expected)?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&expected)?)?["model"],
+            model
+        );
+    }
+    Ok(())
+}
+
+fn assert_cli_config_path(result: &Value, expected: &Path) -> Result<()> {
+    let reported = Path::new(
+        result["configPath"]
+            .as_str()
+            .context("CLI configPath must be a string")?,
+    );
+    assert!(reported.is_absolute(), "{}", reported.display());
+    // Config commands have created the file by now. Compare both identities,
+    // not JSON spelling: Windows prefixes/separators and Unix symlinks may differ.
+    assert_eq!(
+        reported
+            .canonicalize()
+            .with_context(|| format!("resolve reported config path {}", reported.display()))?,
+        expected.canonicalize()?,
+        "reported config path {} must identify {}",
+        reported.display(),
+        expected.display()
+    );
+    Ok(())
+}
+
 fn assert_cli_config_selection(repo: &Repo) -> Result<()> {
     let global = repo.home.join("slopdex/config.json");
     let local = repo.root.join(".slopdex/config.json");
     let explicit = repo.root.join("custom/config.json");
     let result = repo.cli_json(&["config", "set", "model", "global-model"])?;
-    assert_eq!(result["configPath"], json!(global));
+    assert_cli_config_path(&result, &global)?;
     assert!(!local.exists());
     repo.cli_json(&["config", "set", "defaultLimit", "2"])?;
     repo.write("code.rs", "pub fn first() {}\npub fn second() {}\n")?;
     let result = repo.cli_json(&["config", "exclude-cross-search", "code.rs:first"])?;
-    assert_eq!(result["configPath"], json!(global));
+    assert_cli_config_path(&result, &global)?;
     assert_eq!(result["crossSearchExclusions"].as_array().unwrap().len(), 1);
     let global_bytes = fs::read(&global)?;
     let saved: Value = serde_json::from_slice(&global_bytes)?;
@@ -1495,7 +1550,7 @@ fn assert_cli_config_selection(repo: &Repo) -> Result<()> {
     // An existing local file replaces the global settings, rather than merging.
     repo.write(".slopdex/config.json", "{}")?;
     let result = repo.cli_json(&["config", "set", "model", "local-model"])?;
-    assert_eq!(result["configPath"], json!(local));
+    assert_cli_config_path(&result, &local)?;
     let local_bytes = fs::read(&local)?;
     assert_eq!(
         serde_json::from_slice::<Value>(&local_bytes)?,
@@ -1512,7 +1567,7 @@ fn assert_cli_config_selection(repo: &Repo) -> Result<()> {
         "model",
         "explicit-model",
     ])?;
-    assert_eq!(result["configPath"], json!(explicit));
+    assert_cli_config_path(&result, &explicit)?;
     assert_eq!(fs::read(&local)?, local_bytes);
     assert_eq!(fs::read(&global)?, global_bytes);
 
@@ -1678,7 +1733,7 @@ fn cli_config_xdg_falls_back_to_home_for_unset_empty_or_relative_paths() -> Resu
             String::from_utf8_lossy(&output.stderr)
         );
         let result: Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(result["configPath"], json!(expected));
+        assert_cli_config_path(&result, &expected)?;
     }
     assert!(!repo.root.join(".slopdex").exists());
     assert!(!repo.root.join("relative").exists());
