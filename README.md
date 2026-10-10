@@ -17,9 +17,9 @@ The main supported functions are
    <br/>show a map/skeleton of the code structure
 - `slopdex cross-search`
    <br/>find clusters of similar code
-- `slopdex search <query>`
+- `slopdex search "QUERY1" ["QUERY2"...]`
    <br/>find code/docs similar to the query
-- `slopdex describe <query>`
+- `slopdex describe "QUERY"`
    <br/>explain code relevant to a task
 
 `map` shows a map/skeleton of the code, excluding implementation details like function bodies. This can be helpful to get a concise map of the code to allow an LLM to explore the codebase incrementally.
