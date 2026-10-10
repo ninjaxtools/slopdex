@@ -28,11 +28,11 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
         cls.binary = runner.executable("slopdex")
         temporary = tempfile.TemporaryDirectory(prefix="typescript-native-ann-")
         cls.addClassCleanup(temporary.cleanup)
-        cls.root = Path(temporary.name)
+        cls.root = Path(temporary.name).resolve()
         home = cls.root / "home"
         home.mkdir()
         # No inherited provider credentials, proxy settings, or user config.
-        environment = patch.dict(os.environ, {
+        cls.environment = {
             "PATH": os.environ.get("PATH", os.defpath),
             "HOME": str(home),
             "XDG_CONFIG_HOME": str(home / "config"),
@@ -42,9 +42,22 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
             "NO_PROXY": "127.0.0.1,localhost",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
-        }, clear=True)
-        environment.start()
-        cls.addClassCleanup(environment.stop)
+        }
+        original_command, original_process = runner.command, runner.logged_process
+
+        def isolated_command(argv, *, cwd=runner.ROOT, env=None, timeout=120):
+            return original_command(argv, cwd=cwd, env=cls.environment, timeout=timeout)
+
+        def isolated_process(argv, cwd, env, directory, timeout):
+            result = original_process(argv, cwd, cls.environment, directory, timeout)
+            if result[0] or result[1]:
+                raise AssertionError(f"Fixture command failed: {argv!r}\n{(directory / 'stderr.log').read_text()}\nRequests: {cls.requests!r}")
+            return result
+
+        for name, implementation in (("command", isolated_command), ("logged_process", isolated_process)):
+            isolation = patch.object(runner, name, side_effect=implementation)
+            isolation.start()
+            cls.addClassCleanup(isolation.stop)
         cls.requests = []
         model, api_key, dimensions = "native-ann-fixture", "fixture-key", 4
 
@@ -101,7 +114,9 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
             "// beta doubles a number.\n"
             "func beta(value int) int { return value * 2 }\n\n"
             "// gamma composes the two transformations.\n"
-            "func gamma(value int) int { return beta(alpha(value)) }\n"
+            "func gamma(value int) int { return beta(alpha(value)) }\n\n"
+            "// \".\" | \"@\" | \"#\"\n"
+            "const separator = 0\n"
         )
         runner.command(["git", "init", "-q", str(cls.source)], cwd=cls.root)
         runner.command(["git", "add", "source.go"], cwd=cls.source)
@@ -109,36 +124,28 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
                         "user.email=ann@example.invalid", "commit", "-qm", "fixture"],
                        cwd=cls.source)
         cls.commit = runner.command(["git", "rev-parse", "HEAD"], cwd=cls.source)
-        cls.cache = cls.root / "cache"
-        cls.config_path = cls.cache / "config.json"
         cls.config = {
             "provider": "openai", "model": model, "dimensions": dimensions,
             "embeddingBaseUrl": f"http://127.0.0.1:{cls.server.server_port}/v1",
-            "embeddingApiKey": api_key, "descriptionsEnabled": False,
+            "embeddingApiKey": api_key, "artifactCachePath": str(cls.root / "artifacts.sqlite"),
             "rerankingEnabled": False, "include": ["*.go"],
             "providerMaxRetries": 0, "providerTimeoutMs": 2000,
         }
-        runner.write_json(cls.config_path, cls.config)
-        cls.index = cls.cache / "index.sqlite"
-        argv = [cls.binary, "--root", str(cls.source), "--config", str(cls.config_path),
-                "--index", str(cls.index)]
-        # One real update for the entire class; warm-up and validation are offline.
-        runner.command(argv + ["update"], cwd=cls.source, timeout=60)
-        status = json.loads(runner.command(argv + ["--no-reindex", "status"], cwd=cls.source))
-        cls.metadata = {
-            "identity": {"commit": cls.commit,
-                         "slopdex_version": runner.command([cls.binary, "--version"], cwd=cls.source),
-                         "config": dict(cls.config)},
-            "status": status,
-        }
-        cls.update_requests = list(cls.requests)
-        cls.metadata = runner.warm_native_ann(cls.cache, cls.metadata, cls.binary, cls.source, 30)
-        cls.warm_requests = list(cls.requests)
+        # Build only the symbol map snapshot; no semantic content preparation.
         symbol_config = {"slopdex": dict(cls.config), "index_timeout_seconds": 30}
         tasks = [{"targets": [{"path": "source.go", "symbol": name} for name in ("alpha", "beta", "gamma")]}]
         with patch.object(runner, "SUBMODULE", cls.source):
             cls.symbol_cache, cls.symbol_metadata = runner.prepare_map_index(
                 symbol_config, cls.commit, cls.root / "symbol-cache", cls.binary, tasks, symbols=True)
+        cls.symbol_warm_requests = list(cls.requests)
+        warm_trial = cls.root / "symbol-preflight"
+        warm_trial.mkdir()
+        copied_index = warm_trial / "index.sqlite"
+        runner.copy_index(cls.symbol_cache / "index.sqlite", copied_index, cls.source, cls.commit, symbol_only=True)
+        runner.verify_native_ann_reuse(cls.binary, cls.source, cls.symbol_cache / "config.json", copied_index,
+                                       warm_trial, 30, symbol_only=True)
+        if cls.requests != cls.symbol_warm_requests:
+            raise AssertionError("Prepared map snapshot required provider calls during preflight")
         runner.command([cls.binary, "--root", str(cls.source), "--config", str(cls.symbol_cache / "config.json"),
                         "--index", str(cls.symbol_cache / "index.sqlite"), "--no-reindex", "map", "--private",
                         "-q", "alpha", "--symbol-threshold", "0.99"], cwd=cls.source)
@@ -147,9 +154,12 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
         # Preserve the endpoint/profile, but make accidental provider use fail
         # against a stopped localhost server without any available credentials.
         cls.config.pop("embeddingApiKey")
-        runner.write_json(cls.config_path, cls.config)
-        runner.write_json(cls.symbol_cache / "config.json", cls.config)
-        cls.source_snapshot = runner.native_ann_snapshot(cls.index)
+        symbol_settings = runner.read_json(cls.symbol_cache / "config.json")
+        symbol_settings.pop("embeddingApiKey")
+        runner.write_json(cls.symbol_cache / "config.json", symbol_settings)
+        cls.index = cls.symbol_cache / "index.sqlite"
+        cls.config_path = cls.symbol_cache / "config.json"
+        cls.source_snapshot = runner.native_ann_snapshot(cls.index, symbol_only=True)
         cls.source_files = cls.file_snapshot(cls.index, cls.source_snapshot)
         cls.source_metadata = cls.sqlite_metadata(cls.index)
 
@@ -160,14 +170,13 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
 
     @staticmethod
     def file_snapshot(index, snapshot):
-        return {suffix: (runner.file_digest(path), path.stat().st_mtime_ns)
-                for suffix in ["", *snapshot["artifacts"]]
-                for path in [Path(str(index) + suffix)]}
+        paths = {"": index, **runner.native_ann_paths(index, snapshot)}
+        return {key: (runner.file_digest(path), path.stat().st_mtime_ns) for key, path in paths.items()}
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="trial-", dir=self.root)
         self.addCleanup(temporary.cleanup)
-        self.trial = Path(temporary.name)
+        self.trial = Path(temporary.name).resolve()
         self.workspace = self.trial / "relocated-repo"
         runner.command(["git", "clone", "--quiet", "--no-hardlinks", str(self.source),
                         str(self.workspace)], cwd=self.trial)
@@ -175,113 +184,112 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
         self.assertEqual(runner.command(["git", "rev-parse", "HEAD"], cwd=self.workspace), self.commit)
         self.assertEqual(runner.command(["git", "status", "--porcelain"], cwd=self.workspace), "")
 
-    def test_writable_native_reuse_after_real_git_clone_relocation(self):
-        self.assertGreater(len(self.update_requests), 0)
-        self.assertEqual(self.warm_requests, self.update_requests, "Content ANN warm-up called the provider")
-        inputs = [text for path, authorization, payload in self.update_requests
-                  for text in payload["input"]]
-        for name in ("alpha", "beta", "gamma"):
-            self.assertTrue(any(f"func {name}(" in text for text in inputs))
+    def test_symbol_map_preparation_and_writable_reuse_after_clone_relocation(self):
+        self.assertGreater(len(self.symbol_warm_requests), 0)
+        inputs = [text for path, authorization, payload in self.symbol_warm_requests for text in payload["input"]]
+        self.assertIn("slopdex eval warmup", inputs)
+        self.assertEqual(self.symbol_metadata["identity"]["kind"], "map-symbols")
         task = {"targets": [{"path": "source.go", "symbol": name}
                             for name in ("alpha", "beta", "gamma")]}
-        self.assertEqual(runner.index_coverage(self.index, [task]),
-                         {"validated_targets": 3, "parser_diagnostics": 0})
-        self.assertGreater(self.metadata["status"]["functionCount"], 0)
-        self.assertEqual(self.metadata["status"]["rootDir"], str(self.source.resolve()))
-        self.assertEqual(runner.read_json(self.cache / "manifest.json"), self.metadata)
-        self.assertTrue(runner.native_ann_ready(self.index, self.metadata))
-        self.assertEqual(set(self.source_snapshot["artifacts"]), {
-            ".code.usearch", ".code.usearch.manifest.json",
-            ".markdown.usearch", ".markdown.usearch.manifest.json",
-        })
+        self.assertEqual(runner.index_coverage(self.index, [task], semantic=False),
+                          {"validated_targets": 3, "parser_diagnostics": 0})
+        self.assertEqual(Path(self.symbol_metadata["status"]["rootDir"]).resolve(), self.source.resolve())
+        saved = runner.read_json(self.symbol_cache / "manifest.json")
+        self.assertEqual(saved, {key: value for key, value in self.symbol_metadata.items() if key != "coverage"})
+        self.assertTrue(runner.native_ann_ready(self.index, self.symbol_metadata, symbol_only=True))
+        self.assertEqual(set(self.source_snapshot["artifacts"]), {".symbols.shared.json"})
 
         destination = self.trial / "index.sqlite"
-        runner.copy_index(self.index, destination, self.workspace, self.commit)
-        self.assertEqual(runner.native_ann_snapshot(destination), self.source_snapshot)
+        runner.copy_index(self.index, destination, self.workspace, self.commit, symbol_only=True)
+        self.assertEqual(runner.native_ann_snapshot(destination, symbol_only=True), self.source_snapshot)
         before = self.file_snapshot(destination, self.source_snapshot)
-        for suffix in self.source_snapshot["artifacts"]:
-            self.assertEqual(before[suffix], self.source_files[suffix], suffix)
+        for key in runner.native_ann_paths(destination, self.source_snapshot):
+            self.assertEqual(before[key], self.source_files[key], key)
         copied_metadata = self.sqlite_metadata(destination)
         identity = json.loads(copied_metadata["identity"])
-        self.assertEqual(identity["root"], str(self.workspace.resolve()))
+        self.assertEqual(Path(identity["root"]).resolve(), self.workspace.resolve())
         self.assertEqual(copied_metadata["checkpoint"], self.commit)
         self.assertEqual(copied_metadata["generation"], self.source_metadata["generation"])
         self.assertNotIn("embeddingApiKey", runner.read_json(self.config_path))
-        self.assertFalse(any("API_KEY" in key for key in os.environ))
+        self.assertFalse(any("API_KEY" in key for key in self.environment))
 
         result = runner.verify_native_ann_reuse(self.binary, self.workspace, self.config_path,
-                                              destination, self.trial, 30)
+                                              destination, self.trial, 30, symbol_only=True)
         self.assertTrue(result["validated"])
-        self.assertEqual(result["snapshot"], self.source_snapshot)
+        self.assertEqual({key: value for key, value in result["snapshot"].items() if key != "generation"},
+                         {key: value for key, value in self.source_snapshot.items() if key != "generation"})
         self.assertEqual(runner.read_json(self.trial / "ann-validation.json"), result)
         after = self.file_snapshot(destination, self.source_snapshot)
-        for suffix in self.source_snapshot["artifacts"]:
-            self.assertEqual(after[suffix], before[suffix], f"Native artifact rebuilt: {suffix}")
-        self.assertEqual(self.sqlite_metadata(destination)["generation"], copied_metadata["generation"])
-        self.assertTrue(runner.native_ann_ready(destination, self.metadata))
+        for key in runner.native_ann_paths(destination, self.source_snapshot):
+            self.assertEqual(after[key], before[key], f"Native artifact rebuilt: {key}")
+        self.assertEqual(self.sqlite_metadata(destination)["generation"], str(result["snapshot"]["generation"]))
+        self.assertTrue(runner.native_ann_ready(destination, {"native_ann": {**result["snapshot"], "warmup_version": 2}}, symbol_only=True))
         self.assertEqual(self.requests, self.symbol_requests)
-        for logs in (self.cache / "ann-warmup", self.trial / "ann-validation"):
+        for logs in (self.trial / "ann-validation",):
             for name in ("stdout.jsonl", "stderr.log"):
                 self.assertNotIn("external model call", (logs / name).read_text())
-        self.assertEqual(runner.native_ann_snapshot(self.index), self.source_snapshot)
+        self.assertEqual(runner.native_ann_snapshot(self.index, symbol_only=True), self.source_snapshot)
         self.assertEqual(self.sqlite_metadata(self.index), self.source_metadata)
         self.assertEqual(self.file_snapshot(self.index, self.source_snapshot), self.source_files)
 
-    def test_missing_sidecar_and_stale_generation_are_rejected(self):
-        for fault in ("missing-binary", "missing-manifest", "stale-generation"):
+    def test_missing_shared_base_and_stale_pointer_are_rejected(self):
+        for fault in ("missing-binary", "missing-manifest", "stale-pointer"):
             with self.subTest(fault=fault):
                 directory = self.trial / fault
                 directory.mkdir()
                 index = directory / "index.sqlite"
-                runner.copy_index(self.index, index, self.workspace, self.commit)
-                self.assertTrue(runner.native_ann_ready(index, self.metadata))
-                if fault == "stale-generation":
+                runner.copy_index(self.index, index, self.workspace, self.commit, symbol_only=True)
+                self.assertTrue(runner.native_ann_ready(index, self.symbol_metadata, symbol_only=True))
+                if fault == "stale-pointer":
                     with closing(sqlite3.connect(index)) as db, db:
-                        db.execute("UPDATE metadata SET value=? WHERE key='generation'",
-                                   (str(self.source_snapshot["generation"] + 1),))
+                        db.execute("UPDATE metadata SET value=? WHERE key='index_state_symbols'", ("0" * 64,))
                 else:
-                    suffix = ".code.usearch"
+                    pointer = runner.read_json(Path(str(index) + ".symbols.shared.json"))
+                    binding = self.sqlite_metadata(index)["global_path"]
+                    path = Path(binding + ".indexes") / pointer["contract"] / (pointer["base_id"] + ".usearch")
                     if fault == "missing-manifest":
-                        suffix += ".manifest.json"
-                    Path(str(index) + suffix).unlink()
-                self.assertFalse(runner.native_ann_ready(index, self.metadata))
+                        path = Path(str(path) + ".manifest.json")
+                    path.unlink()
+                self.assertFalse(runner.native_ann_ready(index, self.symbol_metadata, symbol_only=True))
                 with self.assertRaises((OSError, ValueError)):
-                    runner.native_ann_snapshot(index)
+                    runner.native_ann_snapshot(index, symbol_only=True)
                 with self.assertRaises((OSError, ValueError)):
                     runner.verify_native_ann_reuse(self.binary, self.workspace, self.config_path,
-                                                  index, directory, 30)
+                                                  index, directory, 30, symbol_only=True)
                 self.assertFalse((directory / "ann-validation.json").exists())
         self.assertEqual(self.requests, self.symbol_requests)
-        self.assertEqual(runner.native_ann_snapshot(self.index), self.source_snapshot)
+        self.assertEqual(runner.native_ann_snapshot(self.index, symbol_only=True), self.source_snapshot)
         self.assertEqual(self.file_snapshot(self.index, self.source_snapshot), self.source_files)
 
     def test_real_map_preparation_needs_no_embeddings_or_ann(self):
         tasks = [{"targets": [{"path": "source.go", "symbol": name} for name in ("alpha", "beta", "gamma")]}]
         configuration = {"slopdex": dict(self.config), "index_timeout_seconds": 30}
         with patch.object(runner, "SUBMODULE", self.source):
-            cache, metadata = runner.prepare_map_index(configuration, self.commit, self.trial / "map-cache", self.binary, tasks)
+            cache, metadata = runner.prepare_map_index(configuration, self.commit, self.trial / "map-cache", self.binary, tasks, symbols=False)
         index = cache / "index.sqlite"
         self.assertEqual(metadata["coverage"]["validated_targets"], 3)
         self.assertEqual(metadata["identity"]["kind"], "map")
-        with closing(sqlite3.connect(index)) as db:
+        with runner.open_index(index) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM embeddings").fetchone()[0], 0)
-        self.assertFalse(Path(str(index) + ".code.usearch").exists())
+        self.assertFalse(Path(str(index) + ".symbols.shared.json").exists())
         destination = self.trial / "map-copy.sqlite"
         runner.copy_index(index, destination, self.workspace, self.commit, include_ann=False)
         self.assertEqual(runner.index_coverage(destination, tasks, semantic=False)["validated_targets"], 3)
-        self.assertFalse(Path(str(destination) + ".code.usearch").exists())
-        output = runner.command([self.binary, "--root", str(self.workspace), "--config", str(cache / "config.json"),
+        self.assertFalse(Path(str(destination) + ".symbols.shared.json").exists())
+        copied_config = self.trial / "map-config.json"
+        runner.write_json(copied_config, runner.index_config(cache / "config.json", destination))
+        output = runner.command([self.binary, "--root", str(self.workspace), "--config", str(copied_config),
                                  "--index", str(destination), "--no-reindex", "map", "--private", "-e", "alpha"], cwd=self.workspace)
         self.assertIn("alpha", output)
         self.assertEqual(self.requests, self.symbol_requests)
 
     def test_symbol_map_snapshot_reuses_vectors_and_graph_offline(self):
         index = self.symbol_cache / "index.sqlite"
-        with closing(sqlite3.connect(index)) as db:
+        with runner.open_index(index) as db:
             self.assertGreater(db.execute("SELECT count(*) FROM embeddings").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM unit_embeddings").fetchone()[0], 0)
         snapshot = runner.native_ann_snapshot(index, symbol_only=True)
-        self.assertEqual(set(snapshot["artifacts"]), {".symbols.usearch", ".symbols.usearch.manifest.json"})
+        self.assertEqual(set(snapshot["artifacts"]), {".symbols.shared.json"})
         destination = self.trial / "symbols.sqlite"
         runner.copy_index(index, destination, self.workspace, self.commit, symbol_only=True)
         result = runner.verify_native_ann_reuse(self.binary, self.workspace, self.symbol_cache / "config.json",
@@ -291,46 +299,47 @@ class NativeAnnCompatibilityTests(unittest.TestCase):
         self.assertTrue(result["symbol_query"]["provider_credentials_removed"])
         self.assertTrue(result["symbol_query"]["selector_cache_cleared"])
         self.assertNotIn("external model call", (self.trial / "ann-validation" / "stderr.log").read_text())
-        output = runner.command([self.binary, "--root", str(self.workspace), "--config", str(self.symbol_cache / "config.json"),
+        copied_config = self.trial / "symbol-config.json"
+        runner.write_json(copied_config, runner.index_config(self.symbol_cache / "config.json", destination))
+        output = runner.command([self.binary, "--root", str(self.workspace), "--config", str(copied_config),
                                  "--index", str(destination), "--no-reindex", "map", "--private", "-g", "*.go",
                                  "-q", "alpha", "--symbol-threshold", "0.99"], cwd=self.workspace)
         self.assertIn("func alpha", output)
-        self.assertEqual(runner.native_ann_snapshot(destination, symbol_only=True), snapshot)
+        self.assertEqual(runner.native_ann_snapshot(destination, symbol_only=True), result["snapshot"])
         self.assertEqual(self.requests, self.symbol_requests)
 
     def test_symbol_preflight_rejects_stale_graph(self):
         destination = self.trial / "stale-symbols.sqlite"
         runner.copy_index(self.symbol_cache / "index.sqlite", destination, self.workspace, self.commit, symbol_only=True)
-        path = Path(str(destination) + ".symbols.usearch.manifest.json")
+        pointer = runner.read_json(Path(str(destination) + ".symbols.shared.json"))
+        binding = self.sqlite_metadata(destination)["global_path"]
+        path = Path(binding + ".indexes") / pointer["contract"] / (pointer["base_id"] + ".base.json")
         manifest = runner.read_json(path)
         manifest["dimensions"] += 1
         runner.write_json(path, manifest)
-        with self.assertRaisesRegex(ValueError, "rebuilt.*ANN index"):
+        with self.assertRaisesRegex(ValueError, "stale or corrupt"):
             runner.verify_native_ann_reuse(self.binary, self.workspace, self.symbol_cache / "config.json",
                                           destination, self.trial, 30, symbol_only=True)
         self.assertFalse((self.trial / "ann-validation.json").exists())
         self.assertEqual(self.requests, self.symbol_requests)
 
     def test_real_cli_help_clusters_and_protected_overrides_are_not_navigation(self):
-        for arm in ("map", "search"):
-            with self.subTest(arm=arm):
-                sandbox = self.trial / arm
-                sandbox.mkdir()
-                cache = self.symbol_cache if arm == "map" else self.cache
-                binaries, log = runner.install_wrapper(sandbox, self.workspace, arm, self.binary, cache, self.commit)
-                wrapper = str(binaries / "slopdex")
-                result = runner.command([wrapper, arm, "-ih"], cwd=self.workspace)
-                self.assertIn("Usage:", result)
-                calls = runner.read_slopdex_calls(log)
-                self.assertEqual(runner.slopdex_command_counts(calls), {"help": 1})
-                self.assertEqual(runner.slopdex_protocol_violations(arm, calls), [
-                    {"reason": "required_command_not_used_successfully", "command": arm}])
-                other_index = sandbox / "other.sqlite"
-                with self.assertRaisesRegex(RuntimeError, "unavailable"):
-                    runner.command([wrapper, arm, "--index", str(other_index)], cwd=self.workspace)
-                self.assertFalse(other_index.exists())
-                with self.assertRaisesRegex(RuntimeError, "unavailable"):
-                    runner.command([wrapper, "help", "models"], cwd=self.workspace)
+        sandbox = self.trial / "map"
+        sandbox.mkdir()
+        binaries, log = runner.install_wrapper(sandbox, self.workspace, "map", self.binary, self.symbol_cache, self.commit)
+        wrapper = str(binaries / "slopdex")
+        result = runner.command([wrapper, "map", "-ih"], cwd=self.workspace)
+        self.assertIn("Usage:", result)
+        calls = runner.read_slopdex_calls(log)
+        self.assertEqual(runner.slopdex_command_counts(calls), {"help": 1})
+        self.assertEqual(runner.slopdex_protocol_violations("map", calls), [
+            {"reason": "required_command_not_used_successfully", "command": "map"}])
+        other_index = sandbox / "other.sqlite"
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            runner.command([wrapper, "map", "--index", str(other_index)], cwd=self.workspace)
+        self.assertFalse(other_index.exists())
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            runner.command([wrapper, "help", "models"], cwd=self.workspace)
         self.assertEqual(self.requests, self.symbol_requests)
 
 

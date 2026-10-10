@@ -1,7 +1,6 @@
 """Offline regression tests: python3 -m unittest discover -s evals/typescript."""
 
 import copy
-import collections
 from contextlib import closing
 import fnmatch
 import hashlib
@@ -18,12 +17,13 @@ import unittest
 from unittest.mock import patch
 
 import run as runner
+import saved
 
 
 class EvaluationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="typescript-eval-test-")
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.task = {"id": "fixture", "prompt": "Find the three implementation roles.", "targets": [
             {"path": "source.go", "symbol": name} for name in ("alpha", "beta", "gamma")
         ]}
@@ -33,6 +33,9 @@ class EvaluationTests(unittest.TestCase):
             for (path, symbol), line in self.gold.items()
         ], "flow": "The implementation flows from alpha to beta to gamma."}
         self.config, _ = runner.load_inputs(runner.HERE / "config.json")
+        self.main_options = ["--cache", str(self.root / "durable"), "--results", str(self.root / "results")]
+        self.implementation = {"commit": "b" * 40, "dirty": False,
+                               "source_sha256": "fixture-source", "binary_sha256": "fixture-binary"}
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -182,21 +185,22 @@ class EvaluationTests(unittest.TestCase):
     def create_index(self):
         directory = self.root / "cache"
         directory.mkdir()
-        runner.write_json(directory / "config.json", {})
+        runner.write_json(directory / "config.json", {"embeddingApiKey": "fixture-key"})
         with closing(sqlite3.connect(directory / "index.sqlite")) as db, db:
             db.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+            db.execute("CREATE TABLE search_cache (key TEXT PRIMARY KEY, value TEXT)")
+            db.execute("INSERT INTO search_cache VALUES ('selector', 'cached selection')")
+            db.execute("CREATE TABLE embeddings (key TEXT PRIMARY KEY, vector BLOB)")
+            db.execute("INSERT INTO embeddings VALUES ('warmup', X'00000000')")
             db.execute("INSERT INTO metadata VALUES ('identity', ?)", (json.dumps({"schema": 3, "root": "/old/root"}),))
             db.execute("INSERT INTO metadata VALUES ('checkpoint', 'commit')")
             db.execute("INSERT INTO metadata VALUES ('generation', '1')")
-            db.execute("INSERT INTO metadata VALUES ('active_embedding_profile', ?)", (json.dumps({"dimensions": 3, "model": "fixture", "provider": "openai"}),))
             db.execute("INSERT INTO metadata VALUES ('descriptions_enabled', 'false')")
         self.write_native_sidecars(directory / "index.sqlite")
         return directory
 
     def write_native_sidecars(self, index, *, descriptions=False):
-        kinds = {"code": 1, "markdown": 1}
-        if descriptions:
-            kinds.update({"descriptions": 2, "combined": 3})
+        kinds = {"code": 1, "markdown": 1, "descriptions": 2, "combined": 3} if descriptions else {"symbols": 1}
         for kind, parts in kinds.items():
             binary = Path(str(index) + f".{kind}.usearch")
             binary.write_bytes(f"native fixture for {kind}".encode())
@@ -208,55 +212,82 @@ class EvaluationTests(unittest.TestCase):
     def test_index_copy_relocates_root_without_mutating_cache(self):
         directory = self.create_index()
         destination = self.root / "copy.sqlite"
-        runner.copy_index(directory / "index.sqlite", destination, self.root, "commit")
-        self.assertEqual(runner.native_ann_snapshot(destination), runner.native_ann_snapshot(directory / "index.sqlite"))
-        for suffix in runner.native_ann_snapshot(destination)["artifacts"]:
+        runner.copy_index(directory / "index.sqlite", destination, self.root, "commit", symbol_only=True)
+        self.assertEqual(runner.native_ann_snapshot(destination, symbol_only=True), runner.native_ann_snapshot(directory / "index.sqlite", symbol_only=True))
+        for suffix in runner.native_ann_snapshot(destination, symbol_only=True)["artifacts"]:
             source_file, copied_file = Path(str(directory / "index.sqlite") + suffix), Path(str(destination) + suffix)
-            self.assertNotEqual(source_file.stat().st_ino, copied_file.stat().st_ino)
+            self.assertFalse(os.path.samefile(source_file, copied_file))
             self.assertEqual(source_file.stat().st_mtime_ns, copied_file.stat().st_mtime_ns)
         with closing(sqlite3.connect(destination)) as db:
             identity = json.loads(db.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
-            self.assertEqual(identity["root"], str(self.root))
+            self.assertEqual(Path(identity["root"]).resolve(), self.root.resolve())
         with closing(sqlite3.connect(directory / "index.sqlite")) as db:
             identity = json.loads(db.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
             self.assertEqual(identity["root"], "/old/root")
         with self.assertRaises(ValueError):
-            runner.copy_index(directory / "index.sqlite", self.root / "bad.sqlite", self.root, "other-commit")
+            runner.copy_index(directory / "index.sqlite", self.root / "bad.sqlite", self.root, "other-commit", symbol_only=True)
 
     def test_native_cache_validation_rejects_corruption_staleness_and_old_metadata(self):
         directory = self.create_index()
         index = directory / "index.sqlite"
-        metadata = {"native_ann": {**runner.native_ann_snapshot(index), "wall_seconds": .1}}
-        self.assertTrue(runner.native_ann_ready(index, metadata))
-        self.assertFalse(runner.native_ann_ready(index, {}))
-        self.assertFalse(runner.native_ann_ready(index, {"native_ann": None}))
-        self.assertFalse(runner.native_ann_ready(index, {"native_ann": []}))
-        manifest_path = Path(str(index) + ".code.usearch.manifest.json")
+        metadata = {"native_ann": {**runner.native_ann_snapshot(index, symbol_only=True), "wall_seconds": .1}}
+        self.assertTrue(runner.native_ann_ready(index, metadata, symbol_only=True))
+        self.assertFalse(runner.native_ann_ready(index, {}, symbol_only=True))
+        self.assertFalse(runner.native_ann_ready(index, {"native_ann": None}, symbol_only=True))
+        self.assertFalse(runner.native_ann_ready(index, {"native_ann": []}, symbol_only=True))
+        manifest_path = Path(str(index) + ".symbols.usearch.manifest.json")
         manifest = manifest_path.read_text()
         for malformed in (None, [], 42, "corrupt"):
             runner.write_json(manifest_path, malformed)
-            self.assertFalse(runner.native_ann_ready(index, metadata))
+            self.assertFalse(runner.native_ann_ready(index, metadata, symbol_only=True))
         manifest_path.write_text(manifest)
-        binary = Path(str(index) + ".code.usearch")
+        binary = Path(str(index) + ".symbols.usearch")
         original = binary.read_bytes()
         binary.write_bytes(b"corrupt")
-        self.assertFalse(runner.native_ann_ready(index, metadata))
+        self.assertFalse(runner.native_ann_ready(index, metadata, symbol_only=True))
         binary.write_bytes(original)
         with closing(sqlite3.connect(index)) as db, db:
             db.execute("UPDATE metadata SET value='2' WHERE key='generation'")
-        self.assertFalse(runner.native_ann_ready(index, metadata))
+        self.assertFalse(runner.native_ann_ready(index, metadata, symbol_only=True))
         with closing(sqlite3.connect(index)) as db, db:
             db.execute("UPDATE metadata SET value='1' WHERE key='generation'")
         binary.unlink()
-        self.assertFalse(runner.native_ann_ready(index, metadata))
+        self.assertFalse(runner.native_ann_ready(index, metadata, symbol_only=True))
         with self.assertRaises(FileNotFoundError):
-            runner.copy_index(index, self.root / "missing.sqlite", self.root, "commit")
+            runner.copy_index(index, self.root / "missing.sqlite", self.root, "commit", symbol_only=True)
+
+    def test_schema_four_copies_bound_artifacts_including_wal_without_sharing_trial_writes(self):
+        directory = self.create_index()
+        index = directory / "index.sqlite"
+        artifacts = directory / "artifacts.sqlite"
+        with closing(sqlite3.connect(artifacts)) as store:
+            store.execute("PRAGMA journal_mode=WAL")
+            store.execute("CREATE TABLE embeddings(key TEXT PRIMARY KEY, vector BLOB)")
+            store.execute("INSERT INTO embeddings VALUES('cached', X'00000000')")
+            store.commit()
+            with closing(sqlite3.connect(index)) as db, db:
+                db.execute("UPDATE metadata SET value=? WHERE key='identity'", (json.dumps({"schema": 4, "root": "/old/root"}),))
+                db.execute("INSERT INTO metadata VALUES('global_path', ?)", (str(artifacts.resolve()),))
+                db.execute("DROP TABLE embeddings")
+            destination = self.root / "trial.sqlite"
+            runner.copy_index(index, destination, self.root, "commit", include_ann=False)
+            settings = runner.index_config(directory / "config.json", destination)
+            copied_store = Path(settings["artifactCachePath"])
+            self.assertNotEqual(copied_store.resolve(), artifacts.resolve())
+            with runner.open_index(destination) as db:
+                self.assertEqual(db.execute("SELECT key FROM embeddings").fetchall(), [("cached",)])
+            with closing(sqlite3.connect(copied_store)) as db, db:
+                db.execute("INSERT INTO embeddings VALUES('trial-query', X'00000000')")
+            self.assertEqual(store.execute("SELECT key FROM embeddings").fetchall(), [("cached",)])
+            with runner.open_index(index) as db:
+                self.assertEqual(db.execute("SELECT key FROM embeddings").fetchall(), [("cached",)])
 
     def test_description_and_combined_sidecars_are_copied_when_enabled(self):
         directory = self.create_index()
         index = directory / "index.sqlite"
         with closing(sqlite3.connect(index)) as db, db:
             db.execute("UPDATE metadata SET value='true' WHERE key='descriptions_enabled'")
+            db.execute("INSERT INTO metadata VALUES ('active_embedding_profile', ?)", (json.dumps({"dimensions": 3, "model": "fixture", "provider": "openai"}),))
         self.write_native_sidecars(index, descriptions=True)
         destination = self.root / "descriptions.sqlite"
         runner.copy_index(index, destination, self.root, "commit")
@@ -264,69 +295,58 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(len(copied["artifacts"]), 8)
         self.assertEqual(copied, runner.native_ann_snapshot(index))
 
-    def test_prepare_upgrades_and_repairs_native_cache_without_reembedding(self):
+    def test_map_preparation_upgrades_and_repairs_symbol_cache_without_reembedding(self):
         directory = self.create_index()
         config = copy.deepcopy(self.config)
         config["slopdex"].update({"model": "fixture", "dimensions": 3, "include": ["*.go"]})
-        metadata = {"identity": {"commit": "commit", "slopdex_version": "fixture-version", "config": config["slopdex"]},
+        metadata = {"identity": {"kind": "map-symbols", "commit": "commit", "slopdex_version": "fixture-version", "config": {**config["slopdex"], "rerankingEnabled": False}},
                     "wall_seconds": .1, "status": {"functionCount": 3, "descriptionsEnabled": False}}
         runner.write_json(directory / "manifest.json", metadata)
 
-        def warm(path, saved, binary, workspace, timeout):
+        def warm(path, saved, binary, workspace, timeout, *, symbol_only):
+            self.assertTrue(symbol_only)
             self.write_native_sidecars(path / "index.sqlite")
-            saved["native_ann"] = {**runner.native_ann_snapshot(path / "index.sqlite"), "wall_seconds": .2}
+            saved["native_ann"] = {**runner.native_ann_snapshot(path / "index.sqlite", symbol_only=True), "wall_seconds": .2}
             runner.write_json(path / "manifest.json", saved)
             return saved
 
         coverage = {"validated_targets": 3, "parser_diagnostics": 0}
         with patch.object(runner, "digest", return_value="cache"), patch.object(runner, "command", return_value="fixture-version"), patch.object(runner, "index_coverage", return_value=coverage), patch.object(runner, "warm_native_ann", side_effect=warm) as warming, patch.object(runner, "logged_process") as process:
-            path, result = runner.prepare_index(config, "commit", self.root, "fixture-slopdex", [self.task])
+            path, result = runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task], symbols=True)
             self.assertEqual(path, directory)
             self.assertEqual(result["coverage"], coverage)
-            self.assertTrue(runner.native_ann_ready(directory / "index.sqlite", result))
+            self.assertTrue(runner.native_ann_ready(directory / "index.sqlite", result, symbol_only=True))
             self.assertEqual(warming.call_count, 1)
-            runner.prepare_index(config, "commit", self.root, "fixture-slopdex", [self.task])
+            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task], symbols=True)
             self.assertEqual(warming.call_count, 1)
-            Path(str(directory / "index.sqlite") + ".code.usearch").unlink()
-            runner.prepare_index(config, "commit", self.root, "fixture-slopdex", [self.task])
+            Path(str(directory / "index.sqlite") + ".symbols.usearch").unlink()
+            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task], symbols=True)
             self.assertEqual(warming.call_count, 2)
-            runner.write_json(Path(str(directory / "index.sqlite") + ".code.usearch.manifest.json"), None)
-            runner.prepare_index(config, "commit", self.root, "fixture-slopdex", [self.task])
+            runner.write_json(Path(str(directory / "index.sqlite") + ".symbols.usearch.manifest.json"), None)
+            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task], symbols=True)
             self.assertEqual(warming.call_count, 3)
             process.assert_not_called()
 
-    def test_index_coverage_allows_unrelated_parser_errors_but_requires_target_vectors(self):
+    def test_index_coverage_allows_unrelated_parser_errors_but_requires_target_symbols(self):
         index = self.root / "coverage.sqlite"
         with closing(sqlite3.connect(index)) as db, db:
             db.executescript("""
                 CREATE TABLE metadata(key TEXT, value TEXT);
                 CREATE TABLE diagnostics(path TEXT, code TEXT, message TEXT);
-                CREATE TABLE symbols(id INTEGER, path TEXT, name TEXT);
-                CREATE TABLE search_units(id INTEGER, path TEXT, symbol_id INTEGER, kind TEXT, data TEXT, embedding_input_hash TEXT);
-                CREATE TABLE unit_embeddings(unit_id INTEGER, role TEXT, embedding_key TEXT);
-                CREATE TABLE embeddings(key TEXT);
+                CREATE TABLE symbols(id INTEGER, path TEXT, name TEXT, kind TEXT);
                 INSERT INTO diagnostics VALUES('unrelated.go', 'parse-error', 'Recovered source region');
             """)
-            profile = {"model": "fixture", "provider": "openai", "dimensions": 3}
-            db.execute("INSERT INTO metadata VALUES('active_embedding_profile', ?)", (json.dumps(profile),))
-            keys = []
             for number, target in enumerate(self.task["targets"]):
-                db.execute("INSERT INTO symbols VALUES(?, ?, ?)", (number, target["path"], target["symbol"]))
-                text = f"func {target['symbol']}() {{}}"
-                payload = json.dumps([profile, "document", text], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                key = hashlib.sha256(payload.encode()).hexdigest()
-                keys.append(key)
-                db.execute("INSERT INTO search_units VALUES(?, ?, ?, 'function', ?, ?)", (number, target["path"], number, json.dumps({"embeddingInput": text}), hashlib.sha256(text.encode()).hexdigest()))
-                db.execute("INSERT INTO embeddings VALUES(?)", (key,))
-        self.assertEqual(runner.index_coverage(index, [self.task]), {"validated_targets": 3, "parser_diagnostics": 1})
+                db.execute("INSERT INTO symbols VALUES(?, ?, ?, ?)", (number, target["path"], target["symbol"], "method" if number == 1 else "function"))
+        self.assertEqual(runner.index_coverage(index, [self.task], semantic=False), {"validated_targets": 3, "parser_diagnostics": 1})
         with closing(sqlite3.connect(index)) as db, db:
-            db.execute("DELETE FROM embeddings WHERE key=?", (keys[-1],))
+            db.execute("UPDATE symbols SET kind='constant' WHERE name='gamma'")
         with self.assertRaisesRegex(ValueError, "Task targets are missing"):
-            runner.index_coverage(index, [self.task])
+            runner.index_coverage(index, [self.task], semantic=False)
         with closing(sqlite3.connect(index)) as db, db:
             db.execute("INSERT INTO diagnostics VALUES('source.go', 'read-error', 'Cannot read source')")
         with self.assertRaisesRegex(ValueError, "non-parser indexing failures"):
-            runner.index_coverage(index, [self.task])
+            runner.index_coverage(index, [self.task], semantic=False)
 
     def test_isolation_keeps_auth_but_removes_inherited_opencode_settings(self):
         with patch.dict(os.environ, {"OPENCODE_CONFIG": "/user/config", "OPENCODE_CONFIG_CONTENT": "inherited", "OPENCODE_API_KEY": "fixture-key", "XDG_DATA_HOME": "/auth/data"}):
@@ -355,90 +375,163 @@ class EvaluationTests(unittest.TestCase):
 
     def test_paired_schedule_is_reproducible_and_counterbalanced(self):
         tasks = [dict(self.task, id=f"task-{index}") for index in range(10)]
-        schedule = runner.make_trials(self.config, tasks, ["off", "slopdex"], 2, 7)
-        self.assertEqual(schedule, runner.make_trials(self.config, tasks, ["off", "slopdex"], 2, 7))
+        schedule = runner.make_trials(self.config, tasks, ["off", "map"], 2, 7)
+        self.assertEqual(schedule, runner.make_trials(self.config, tasks, ["off", "map"], 2, 7))
         self.assertEqual(len(schedule), 80)
         self.assertEqual(len({trial["id"] for trial in schedule}), 80)
         first_arms = [schedule[index]["arm"] for index in range(0, len(schedule), 2)]
-        self.assertEqual(first_arms.count("off"), first_arms.count("slopdex"))
+        self.assertEqual(first_arms.count("off"), first_arms.count("map"))
         for index in range(0, len(schedule), 2):
             a, b = schedule[index:index + 2]
             self.assertEqual((a["task"], a["model"], a["repeat"]), (b["task"], b["model"], b["repeat"]))
             self.assertNotEqual(a["arm"], b["arm"])
 
-    def test_completed_resume_and_incompatible_settings_do_not_prepare_an_index(self):
+    def test_completed_resume_rechecks_identity_without_preparing_an_index(self):
         corpus = {"repository_commit": "a" * 40, "tasks": [self.task]}
-        trials = runner.make_trials(self.config, corpus["tasks"], ["off", "slopdex"], 1, 0)
+        trials = runner.make_trials(self.config, corpus["tasks"], ["off", "map"], 1, 0)
         output = self.root / "completed"
         settings = {"config": self.config, "tasks": corpus["tasks"], "commit": corpus["repository_commit"],
-                    "trials": trials, "arm_instructions": {arm: runner.arm_instructions(arm) for arm in ("off", "slopdex")},
+                    "trials": trials, "arm_instructions": {arm: runner.arm_instructions(arm) for arm in ("off", "map")},
                     "harness_sha256": hashlib.sha256(Path(runner.__file__).read_bytes()).hexdigest()}
-        runner.write_json(output / "manifest.json", {**settings, "fingerprint": "saved"})
+        implementation = self.implementation
+        identity = {**settings, "opencode_version": "fixture-version", "slopdex_version": "fixture-version", "implementation": implementation}
+        runner.write_json(output / "manifest.json", {**identity, "fingerprint": runner.digest(identity)})
         for trial in trials:
             runner.write_json(output / "trials" / trial["id"] / "result.json", {})
-        with patch.object(runner, "load_inputs", return_value=(self.config, corpus)), patch.object(runner, "report") as report, patch.object(runner, "ensure_source") as source, patch.object(runner, "prepare_index") as index, patch.object(runner, "executable") as binary:
-            runner.main(["run", "--arms", "off", "slopdex", "--output", str(output)])
+        with patch.object(runner, "load_inputs", return_value=(self.config, corpus)), \
+                patch.object(runner, "report") as report, patch.object(runner, "ensure_source") as source, \
+                patch.object(runner, "prepare_map_index") as index, \
+                patch.object(runner, "executable", side_effect=lambda name: name) as binary, \
+                patch.object(runner, "command", return_value="fixture-version"), \
+                patch.object(runner, "implementation_identity", return_value=implementation) as inspect_implementation, \
+                patch.object(saved, "save_bundle") as save, patch.object(saved, "compare_saved") as compare, \
+                patch("sys.stdout", new=io.StringIO()):
+            argv = [*self.main_options, "run", "--arms", "off", "map", "--output", str(output)]
+            runner.main(argv)
             report.assert_called_once_with(output)
             source.assert_not_called()
             index.assert_not_called()
-            binary.assert_not_called()
+            self.assertEqual([call.args for call in binary.call_args_list], [("opencode",), ("slopdex",)])
+            inspect_implementation.assert_called_once_with("slopdex")
+            self.assertEqual([call.args for call in save.call_args_list], [
+                (output, self.root / "results", "off"), (output, self.root / "results", "map")])
+            compare.assert_called_once_with(self.root / "results")
             changed = copy.deepcopy(self.config)
             changed["timeout_seconds"] += 1
             with patch.object(runner, "load_inputs", return_value=(changed, corpus)), self.assertRaises(ValueError):
-                runner.main(["run", "--arms", "off", "slopdex", "--output", str(output)])
+                runner.main(argv)
+            with patch.object(runner, "implementation_identity", return_value={**implementation, "binary_sha256": "different-build"}), self.assertRaisesRegex(ValueError, "implementation identity differs"):
+                runner.main(argv)
             source.assert_not_called()
             index.assert_not_called()
-
-    def test_map_prompt_arms_share_structural_preparation_without_semantic_index(self):
-        corpus = {"repository_commit": "a" * 40, "tasks": [self.task]}
-        structural = self.root / "structural"
-        with patch.object(runner, "load_inputs", return_value=(self.config, corpus)), \
-                patch.object(runner, "ensure_source"), patch.object(runner, "target_lines", return_value=self.gold), \
-                patch.object(runner, "executable", side_effect=lambda name: name), \
-                patch.object(runner, "command", return_value="fixture-version"), \
-                patch.object(runner, "prepare_index", side_effect=AssertionError("semantic preparation")), \
-                patch.object(runner, "prepare_map_index", return_value=(structural, {})) as prepare, \
-                patch.object(runner, "report"), \
-                patch.object(runner, "run_trial", return_value={"status": "ok", "grade": {"f1": 1}, "wall_seconds": 1}) as trial, \
-                patch("sys.stdout", new=io.StringIO()):
-            runner.main(["run", "--arms", "map-first", "map-follow", "--output", str(self.root / "profiles")])
-        prepare.assert_called_once()
-        self.assertEqual(trial.call_count, 4)
-        for call in trial.call_args_list:
-            self.assertEqual(call.args[8], structural)
-            self.assertEqual(call.kwargs["instruction"], runner.arm_instructions(call.args[0]["arm"]))
 
     def test_readme_map_arm_prepares_symbol_vectors_without_content_index(self):
         corpus = {"repository_commit": "a" * 40, "tasks": [self.task]}
         symbols = self.root / "symbols"
+        implementation = self.implementation
         with patch.object(runner, "load_inputs", return_value=(self.config, corpus)), \
                 patch.object(runner, "ensure_source"), patch.object(runner, "target_lines", return_value=self.gold), \
                 patch.object(runner, "executable", side_effect=lambda name: name), \
                 patch.object(runner, "command", return_value="fixture-version"), \
-                patch.object(runner, "prepare_index", side_effect=AssertionError("content preparation")), \
+                patch.object(runner, "implementation_identity", return_value=implementation), \
                 patch.object(runner, "prepare_map_index", return_value=(symbols, {})) as prepare, \
-                patch.object(runner, "report"), \
+                patch.object(runner, "report"), patch.object(saved, "save_bundle"), patch.object(saved, "compare_saved"), \
                 patch.object(runner, "run_trial", return_value={"status": "ok", "grade": {"f1": 1}, "wall_seconds": 1}) as trial, \
                 patch("sys.stdout", new=io.StringIO()):
-            runner.main(["run", "--arms", "map", "--output", str(self.root / "symbol-map")])
+            runner.main([*self.main_options, "run", "--arms", "map", "--output", str(self.root / "symbol-map")])
         prepare.assert_called_once()
-        self.assertEqual(prepare.call_args.kwargs, {"symbols": True})
+        self.assertEqual(prepare.call_args.kwargs, {"implementation": implementation})
         self.assertEqual(trial.call_count, 2)
         for call in trial.call_args_list:
             self.assertEqual(call.args[8], symbols)
             self.assertIn('-q "<short symbol concept>"', call.kwargs["instruction"])
 
-    def test_multi_arm_order_balances_every_position(self):
-        arms = ["off", "map", "map-first", "map-follow"]
-        tasks = [dict(self.task, id=f"task-{index}") for index in range(4)]
-        trials = runner.make_trials(self.config, tasks, arms, 2, 42)
-        self.assertEqual(len({trial["id"] for trial in trials}), 64)
-        counts = collections.Counter((trial["arm"], index % 4) for index, trial in enumerate(trials))
-        self.assertEqual(set(counts.values()), {4})
-        for index in range(0, len(trials), 4):
-            group = trials[index:index + 4]
-            self.assertEqual({row["arm"] for row in group}, set(arms))
-            self.assertEqual(len({(row["model"], row["task"], row["repeat"]) for row in group}), 1)
+    def test_baseline_only_run_needs_no_slopdex_or_preparation(self):
+        corpus = {"repository_commit": "a" * 40, "tasks": [self.task]}
+        with patch.object(runner, "load_inputs", return_value=(self.config, corpus)), \
+                patch.object(runner, "ensure_source"), patch.object(runner, "target_lines", return_value=self.gold), \
+                patch.object(runner, "executable", return_value="opencode") as binary, \
+                patch.object(runner, "command", return_value="fixture-version"), \
+                patch.object(runner, "implementation_identity") as implementation, \
+                patch.object(runner, "prepare_map_index") as prepare, patch.object(runner, "report"), \
+                patch.object(saved, "save_bundle"), patch.object(saved, "compare_saved"), \
+                patch.object(runner, "run_trial", return_value={"status": "ok", "grade": {"f1": 1}, "wall_seconds": 1}) as trial, \
+                patch("sys.stdout", new=io.StringIO()):
+            runner.main([*self.main_options, "run", "--arms", "off", "--output", str(self.root / "baseline")])
+        binary.assert_called_once_with("opencode")
+        prepare.assert_not_called()
+        implementation.assert_not_called()
+        self.assertEqual(trial.call_count, len(self.config["models"]))
+        for call in trial.call_args_list:
+            self.assertIsNone(call.args[7])
+            self.assertIsNone(call.args[8])
+
+    def test_main_reuses_durable_results_and_only_reruns_map_for_a_new_build(self):
+        config = dict(self.config, models=self.config["models"][:1])
+        corpus = {"repository_commit": "a" * 40, "tasks": [self.task]}
+        symbols = self.root / "symbols"
+        implementation = self.implementation
+
+        def trial_result(trial, task, gold, config, commit, directory, opencode, slopdex, index_dir, *, instruction):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "prompt.txt").write_text(runner.task_prompt(task))
+            (directory / "AGENTS.md").write_text(runner.BASE_INSTRUCTIONS + instruction)
+            (directory / "answer.txt").write_text(json.dumps(self.answer))
+            result = {**{key: value for key, value in trial.items() if key != "model_config"},
+                      "status": "ok", "grade": self.grade(self.answer), "wall_seconds": 1,
+                      "steps": 1, "cost_usd": .01, "tokens": {"input": 100, "output": 20},
+                      "slopdex_calls": int(trial["arm"] == "map"),
+                      "slopdex_commands": {"map": 1} if trial["arm"] == "map" else {}}
+            runner.write_json(directory / "result.json", result)
+            return result
+
+        with patch.object(runner, "load_inputs", return_value=(config, corpus)), \
+                patch.object(runner, "ensure_source") as source, patch.object(runner, "target_lines", return_value=self.gold), \
+                patch.object(runner, "executable", side_effect=lambda name: name), \
+                patch.object(runner, "command", return_value="fixture-version"), \
+                patch.object(runner, "implementation_identity", return_value=implementation) as build, \
+                patch.object(runner, "prepare_map_index", return_value=(symbols, {})) as prepare, \
+                patch.object(runner, "run_trial", side_effect=trial_result) as trial, \
+                patch("sys.stdout", new=io.StringIO()):
+            first = self.root / "first"
+            runner.main([*self.main_options, "run", "--output", str(first)])
+            self.assertEqual(trial.call_count, 2)
+            prepare.assert_called_once()
+            baseline = next((self.root / "results" / "baselines").glob("*.json"))
+            baseline_bytes = baseline.read_bytes()
+            first_manifest = runner.read_json(first / "manifest.json")
+            trial.reset_mock()
+            prepare.reset_mock()
+            source.reset_mock()
+
+            reused = self.root / "reused"
+            runner.main([*self.main_options, "run", "--output", str(reused)])
+            trial.assert_not_called()
+            prepare.assert_not_called()
+            source.assert_not_called()
+            reused_manifest = runner.read_json(reused / "manifest.json")
+            self.assertEqual(len(reused_manifest["reused_trials"]), 2)
+            self.assertEqual(reused_manifest["comparison_mode"], "saved baseline/map (not interleaved)")
+            for row in first_manifest["trials"]:
+                for artifact in ("result.json", "prompt.txt", "AGENTS.md", "answer.txt"):
+                    self.assertEqual((reused / "trials" / row["id"] / artifact).read_bytes(),
+                                     (first / "trials" / row["id"] / artifact).read_bytes())
+
+            changed = self.root / "new-build"
+            build.return_value = {**implementation, "binary_sha256": "changed-binary"}
+            runner.main([*self.main_options, "run", "--output", str(changed)])
+            source.assert_called_once_with(corpus["repository_commit"])
+            prepare.assert_called_once()
+            self.assertEqual(prepare.call_args.kwargs, {"implementation": build.return_value})
+            trial.assert_called_once()
+            self.assertEqual(trial.call_args.args[0]["arm"], "map")
+            changed_manifest = runner.read_json(changed / "manifest.json")
+            self.assertEqual(len(changed_manifest["reused_trials"]), 1)
+            off = next(row for row in changed_manifest["trials"] if row["arm"] == "off")
+            self.assertIn(off["id"], changed_manifest["reused_trials"])
+            self.assertEqual(baseline.read_bytes(), baseline_bytes)
+            latest = runner.read_json(self.root / "results" / "latest-map.json")
+            self.assertEqual(latest["records"][0]["controls"]["implementation"], build.return_value)
 
     def test_baseline_guard_allows_workspace_paths_and_denies_slopdex_commands(self):
         rules = runner.opencode_config(self.config["models"][0], "off", 40)["permission"]["bash"]
@@ -484,11 +577,16 @@ if sys.argv[1:3] == ['debug', 'config']:
     print(json.dumps(config))
     sys.exit(0)
 assert sys.argv[sys.argv.index('--variant') + 1] == 'medium'
-assert sys.argv[sys.argv.index('--dir') + 1] == str(workspace) == os.environ['PWD']
-assert config['instructions'] == [str(workspace / 'AGENTS.md')]
+assert pathlib.Path(sys.argv[sys.argv.index('--dir') + 1]).resolve() == workspace.resolve() == pathlib.Path(os.environ['PWD']).resolve()
+assert [pathlib.Path(path).resolve() for path in config['instructions']] == [(workspace / 'AGENTS.md').resolve()]
 assert config['permission']['task'] == 'deny'
-if 'Use slopdex for code navigation' in (workspace / 'AGENTS.md').read_text():
-    subprocess.run(['slopdex', 'map'], check=True, stdout=subprocess.DEVNULL)
+if '`slopdex map ' in (workspace / 'AGENTS.md').read_text():
+    mode = os.environ.get('TEST_EVAL_MODE', 'ok')
+    if mode != 'missing-map':
+        subprocess.run(['slopdex', 'map', '--ignore-errors', '--private', '-g', '*.go', '-q', 'implementation flow'], check=True, stdout=subprocess.DEVNULL)
+    if mode == 'blocked-search':
+        result = subprocess.run(['slopdex', 'search', 'implementation flow'], capture_output=True)
+        assert result.returncode == 126
 print(json.dumps({{'type': 'text', 'part': {{'messageID': 'final', 'text': os.environ['TEST_EVAL_ANSWER']}}}}))
 print(json.dumps({{'type': 'step_finish', 'part': {{'cost': 0.01, 'tokens': {{'input': 100, 'output': 20}}}}}}))
 ''')
@@ -500,8 +598,21 @@ root = sys.argv[sys.argv.index('--root') + 1]
 index = sys.argv[sys.argv.index('--index') + 1]
 with sqlite3.connect(index) as db:
     identity = json.loads(db.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
-    assert identity['root'] == str(pathlib.Path.cwd()) == root
-assert '--no-reindex' in sys.argv
+    assert pathlib.Path(identity['root']).resolve() == pathlib.Path.cwd().resolve() == pathlib.Path(root).resolve()
+    assert db.execute('SELECT count(*) FROM embeddings').fetchone()[0] == 1
+assert 'map' in sys.argv and '-q' in sys.argv and '--private' in sys.argv
+assert pathlib.Path(index + '.symbols.usearch').exists()
+assert not pathlib.Path(index + '.code.usearch').exists()
+if '--force-reindex' in sys.argv:
+    assert '--yes-really-rebuild-the-index' in sys.argv
+    assert sys.argv[sys.argv.index('-q') + 1] == 'slopdex eval warmup'
+    settings = json.loads(pathlib.Path(sys.argv[sys.argv.index('--config') + 1]).read_text())
+    assert 'embeddingApiKey' not in settings
+    with sqlite3.connect(index) as db:
+        assert db.execute('SELECT count(*) FROM search_cache').fetchone()[0] == 0
+else:
+    assert '--no-reindex' in sys.argv
+    assert sys.argv[sys.argv.index('-q') + 1] == 'implementation flow'
 print('alpha beta gamma')
 ''')
         dex.chmod(0o755)
@@ -515,7 +626,7 @@ print('alpha beta gamma')
         with closing(sqlite3.connect(cache / "index.sqlite")) as db, db:
             db.execute("UPDATE metadata SET value=? WHERE key='checkpoint'", (commit,))
         config = dict(self.config, models=self.config["models"][:1])
-        trials = runner.make_trials(config, [self.task], ["off", "slopdex"], 1, 0)
+        trials = runner.make_trials(config, [self.task], ["off", "map"], 1, 0)
         output = self.root / "output"
         runner.write_json(output / "manifest.json", {"commit": commit, "trials": trials})
         with patch.object(runner, "SUBMODULE", source), patch.dict(os.environ, {"TEST_EVAL_ANSWER": json.dumps(self.answer)}):
@@ -523,10 +634,14 @@ print('alpha beta gamma')
                 result = runner.run_trial(trial, self.task, self.gold, config, commit, output / "trials" / trial["id"], str(fake), str(dex), cache)
                 self.assertEqual(result["status"], "ok")
                 self.assertEqual(result["grade"]["f1"], 1)
-                self.assertEqual(result["slopdex_calls"], int(trial["arm"] == "slopdex"))
-                self.assertEqual(result["slopdex_commands"], {"map": 1} if trial["arm"] == "slopdex" else {})
-                if trial["arm"] == "slopdex":
+                self.assertEqual(result["slopdex_protocol_violations"], [])
+                self.assertEqual(result["slopdex_calls"], int(trial["arm"] == "map"))
+                self.assertEqual(result["slopdex_commands"], {"map": 1} if trial["arm"] == "map" else {})
+                if trial["arm"] == "map":
                     self.assertTrue(result["native_ann"]["validated"])
+                    self.assertEqual(result["native_ann"]["symbol_query"]["command"], "map -q")
+                    self.assertTrue(result["native_ann"]["symbol_query"]["provider_credentials_removed"])
+                    self.assertTrue(result["native_ann"]["symbol_query"]["selector_cache_cleared"])
                     self.assertTrue((output / "trials" / trial["id"] / "ann-validation.json").exists())
                 else:
                     self.assertIsNone(result["native_ann"])
@@ -544,17 +659,17 @@ print('alpha beta gamma')
         self.assertEqual(summary["paired"][0]["f1_delta"], 0)
         self.assertEqual(summary["slopdex_commands"], {"map": 1})
         self.assertEqual(len(summary["trials"]), 2)
-        group = next(group for group in summary["groups"] if group["arm"] == "slopdex")
+        group = next(group for group in summary["groups"] if group["arm"] == "map")
         self.assertEqual(group["slopdex_commands"], {"map": 1})
         self.assertEqual(group["slopdex_command_trials"], {"map": 1})
         for trial in trials:
             result = runner.read_json(output / "trials" / trial["id"] / "result.json")
             self.assertEqual(result["grade"], grades[trial["id"]])
-            self.assertEqual(result["slopdex_commands"], {"map": 1} if trial["arm"] == "slopdex" else {})
+            self.assertEqual(result["slopdex_commands"], {"map": 1} if trial["arm"] == "map" else {})
         self.assertTrue((output / "report.md").exists())
         self.assertIn("## Slopdex command usage", (output / "report.md").read_text())
         self.assertIn("`map` × 1", (output / "report.md").read_text())
-        treatment = next(trial for trial in trials if trial["arm"] == "slopdex")
+        treatment = next(trial for trial in trials if trial["arm"] == "map")
         path = output / "trials" / treatment["id"] / "result.json"
         result = runner.read_json(path)
         result.pop("slopdex_commands")
@@ -562,6 +677,17 @@ print('alpha beta gamma')
         (path.parent / "slopdex-calls.jsonl").unlink()
         self.assertEqual(runner.report(output)["slopdex_commands"], {"unknown": 1})
         self.assertEqual(runner.read_json(path)["grade"], grades[treatment["id"]])
+        for mode, expected in (("missing-map", [{"reason": "required_command_not_used_successfully", "command": "map"}]),
+                               ("blocked-search", [{"reason": "command_not_allowed", "command": "search", "argv": ["search", "implementation flow"]}])):
+            with self.subTest(mode=mode), patch.object(runner, "SUBMODULE", source), \
+                    patch.dict(os.environ, {"TEST_EVAL_ANSWER": json.dumps(self.answer), "TEST_EVAL_MODE": mode}):
+                result = runner.run_trial(treatment, self.task, self.gold, config, commit, output / "protocol" / mode,
+                                          str(fake), str(dex), cache)
+                self.assertEqual(result["status"], "protocol_violation")
+                self.assertEqual(result["grade"]["f1"], 0)
+                self.assertFalse(result["grade"]["passed"])
+                self.assertEqual(result["slopdex_protocol_violations"], expected)
+                self.assertTrue(result["native_ann"]["validated"])
 
 
 @unittest.skipUnless(os.environ.get("SLOPDEX_EVAL_CHECK_OPENCODE") == "1", "Optional installed-OpenCode config smoke check")
@@ -570,9 +696,9 @@ class OpenCodeCompatibilityTests(unittest.TestCase):
         config, _ = runner.load_inputs(runner.HERE / "config.json")
         opencode = runner.executable("opencode")
         for model in config["models"]:
-            for arm in ("off", "map", "search", "slopdex"):
+            for arm in ("off", "map"):
                 with self.subTest(model=model["model"], arm=arm), tempfile.TemporaryDirectory(prefix="typescript-opencode-smoke-") as temporary:
-                    sandbox = Path(temporary)
+                    sandbox = Path(temporary).resolve()
                     workspace = sandbox / "repo"
                     workspace.mkdir()
                     subprocess.run(["git", "init", "-q", str(workspace)], check=True)

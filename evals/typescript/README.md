@@ -1,472 +1,203 @@
-# TypeScript paired evaluation
+# TypeScript: baseline versus README map
 
-Compare OpenCode using **slopdex map only** (`map`) against OpenCode using
-**slopdex search only** (`search`) on twenty source-navigation and
-implementation-understanding tasks. Each arm uses the corresponding agent
-instruction block from the project's root [README.md](../../README.md).
-The default matrix is **20 tasks × 2 models × 2 arms = 80 trials**, all at medium
-thinking. The harness is Python 3.11+ with no third-party Python dependencies.
-Add `map-search` to evaluate both tools together: **120 trials** across three arms.
-For map-only discovery prompting and measured context/cost savings, see the
-[map prompt study](MAP_PROMPTS.md) and the `map-first`/`map-follow` experimental arms.
+Compare conventional local navigation (**`off`**, no slopdex) with **`map`** using
+the exact agent instruction from the root [README.md](../../README.md). There are
+no search, combined-tool, or experimental-prompt evaluations.
 
-## Quick start
+The corpus contains **20 tasks and 80 reference declarations** in the Go-native
+TypeScript compiler. The default matrix is two models at medium thinking, one
+repetition, and two arms: 80 results, but **only missing or changed trials run**.
 
-From the slopdex repository root:
+## Run and compare
+
+From the repository root:
 
 ```sh
-# Inspect tasks and the matrix without model calls or downloads.
+# No downloads or model calls.
 python3 evals/typescript/run.py list
 python3 evals/typescript/run.py run --dry-run
 
-# Optional: download the source and validate the reference declarations.
-python3 evals/typescript/run.py validate
+# Read the checked-in comparison without any executable or model calls.
+python3 evals/typescript/run.py report
 
-# Optional: prepare local structure and the warmed semantic index ahead of trials.
-python3 evals/typescript/run.py prepare
-
-# Run all 80 trials; run performs source/index preparation automatically.
-python3 evals/typescript/run.py run --arms map search --output evals/typescript/jobs/map-vs-search
-
-# Repeating the same command resumes, skipping trials with saved results.
-python3 evals/typescript/run.py run --arms map search --output evals/typescript/jobs/map-vs-search
-
-# Rerun only the README map arm with symbol-vector -q: 20 tasks × 2 models = 40 trials.
-PATH="$PWD/target/release:$PATH" TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run --arms map --output evals/typescript/jobs/map-symbol-query
-
-# Rerun with concise discovery-and-follow guidance and offline map -q preflight.
-PATH="$PWD/target/release:$PATH" TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run --arms map --output evals/typescript/jobs/map-concise-symbols
-
-# Rerun the OR-fixed selectors with concise guidance and both depth-2 expansion flags.
-PATH="$PWD/target/release:$PATH" TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run --arms map --output evals/typescript/jobs/map-or-discovery
-
-# Regenerate the comparison from saved artifacts.
-python3 evals/typescript/run.py report evals/typescript/jobs/map-vs-search
-
-# Compare map, bounded search, and combined navigation with the current guidance.
-TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run \
-  --arms map search map-search --output evals/typescript/jobs/map-search-limit-50
-
-# Compare conventional navigation, README map guidance and two discovery prompts.
-TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run \
-  --arms off map map-first map-follow --seed 42 \
-  --output evals/typescript/jobs/map-prompt-comparison
+# Rebuild slopdex after implementation changes, then evaluate.
+cargo build --release
+PATH="/path/to/opencode-v1:$PWD/target/release:$PATH" \
+  python3 evals/typescript/run.py run
 ```
 
-Requirements: Linux/macOS, Python 3.11+, Git, `opencode` and `slopdex` on `PATH`.
-Authenticate OpenCode to the `opencode-go` provider first, or supply its API key
-through the usual environment variables. Existing OpenCode authentication in
-the user's XDG data directory is copied for the selected provider into a temporary
-data directory. Set `OPENAI_API_KEY` for the default
-embedding configuration for the map and search arms. The default map arm needs an
-embedding key to prepare a cold symbol cache, and `map -q` queries may call the
-embedding provider. The experimental `map-first`, `map-follow` and `map-verify`
-arms use provider-free structural caches. Neither TypeScript build dependencies
-nor a Go toolchain are needed: tasks inspect source rather than compiling or
-changing it.
+The runner automatically reuses matching checked-in baselines and the latest map
+results. With unchanged controls/builds it makes **zero model calls**. Changing
+only the map implementation or README instruction reruns map, not baseline.
+Changing a model or its reasoning options requires a new baseline for that
+setting; existing settings remain reusable, including when selecting a subset.
 
-The runner honors `TMPDIR`. Trial index snapshots can be large; on hosts with a
-small RAM-backed `/tmp`, use disk-backed scratch space under the ignored jobs
-directory:
+```sh
+# Optional source/index validation and preparation.
+python3 evals/typescript/run.py validate
+PATH="$PWD/target/release:$PATH" python3 evals/typescript/run.py prepare
+
+# Select a configured model/task, or just one of the two arms.
+python3 evals/typescript/run.py run \
+  --model opencode-go/deepseek-v4.1-flash@medium \
+  --task ambiguous-expression-type-arguments
+python3 evals/typescript/run.py run --arms off
+python3 evals/typescript/run.py run --arms map
+
+# Raw jobs are resumable, with identical controls and build identity.
+python3 evals/typescript/run.py run --output evals/typescript/jobs/my-run
+python3 evals/typescript/run.py run --output evals/typescript/jobs/my-run
+
+# Import an already-completed run without rerunning it.
+python3 evals/typescript/run.py save evals/typescript/jobs/map-prompt-validation
+python3 evals/typescript/run.py save evals/typescript/jobs/map-readme-frontload-039
+python3 evals/typescript/run.py report
+
+# Regenerate a raw job report rather than the checked-in comparison.
+python3 evals/typescript/run.py report evals/typescript/jobs/my-run
+```
+
+Use `--config PATH`, `--cache PATH`, and `--results PATH` **before** the subcommand
+to choose alternative settings, caches, or a separate result store. For example:
+
+```sh
+python3 evals/typescript/run.py --results /tmp/opencode/eval-results run --arms off
+```
+
+Requirements: Linux/macOS, Python 3.11+, Git, OpenCode **V1**, and slopdex on `PATH`
+when running map. The saved runs use **OpenCode 1.18.34**; use that version to reuse
+their baselines. V2's configuration and usage events are not supported by this
+harness. Authenticate to the configured provider (`opencode-go` by default).
+Credentials are copied only into disposable trial directories and never checked
+in. Supply embedding credentials through the environment, not `config.json`.
+
+Map preparation and new `-q` queries need an embedding key (`OPENAI_API_KEY` for
+the default OpenAI configuration). Baseline needs no slopdex or embedding key.
+Neither TypeScript build dependencies nor a Go toolchain are required.
+
+For limited RAM-backed temporary space, use disk-backed scratch:
 
 ```sh
 mkdir -p evals/typescript/jobs/tmp
-TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run \
-  --task ambiguous-expression-type-arguments \
-  --output evals/typescript/jobs/map-search-smoke
+TMPDIR="$PWD/evals/typescript/jobs/tmp" python3 evals/typescript/run.py run
 ```
 
-For a smaller first experiment:
+## Checked-in results and invalidation
 
-```sh
-python3 evals/typescript/run.py run \
-  --task ambiguous-expression-type-arguments \
-  --model opencode-go/deepseek-v4.1-flash@medium \
-  --output evals/typescript/jobs/map-search-smoke
+[`results/report.md`](results/report.md) and [`results/summary.json`](results/summary.json)
+compare the saved baseline with the latest complete map evaluation.
 
-# More repetitions reduce sensitivity to a single model response.
-python3 evals/typescript/run.py run --repeats 3 --seed 42 \
-  --output evals/typescript/jobs/repeated
+- `results/baselines/*.json`: immutable baseline datasets. Each trial stores its
+  exact prompt, agent instructions, model/variant/options, OpenCode controls and
+  version, TypeScript commit, answer, grade, time, tokens, steps, cost, and reuse
+  fingerprint. Adding new settings does not discard old baselines.
+- `results/latest-map.json`: the latest complete map dataset, with the same
+  evidence plus the README guidance, slopdex settings/version, harness hash,
+  slopdex source commit, source-content hash (including dirty source), and binary
+  hash. A partial run never replaces the latest complete dataset.
+- `jobs/`: ignored full traces, generated CLI configs, commands, validation logs,
+  and resumable manifests. `cache/`: ignored prepared indexes. Neither is needed
+  to read the checked-in comparison or reuse portable results.
 
-# Baseline alone needs no slopdex executable or embedding key.
-python3 evals/typescript/run.py run --arms off \
-  --output evals/typescript/jobs/baseline
+Reuse is per model/task/repetition, not just per variant name. Baseline keys cover
+the task and reference source, full prompt/instructions, model provider ID and
+reasoning options, OpenCode version/config, timeout, and step limit. They
+deliberately exclude slopdex configuration, implementation, and README map
+guidance. Map adds those controls and the harness/build identity. Rebuild slopdex
+before evaluating changed source: both the source hash and actual executable
+hash are recorded. A Git commit change also invalidates map. Report-only
+regeneration never changes the measured evidence.
 
-# README map alone prepares structure and symbol-name embeddings; a cold cache needs an embedding key.
-python3 evals/typescript/run.py prepare --arms map
-python3 evals/typescript/run.py run --arms map \
-  --output evals/typescript/jobs/map-only
+The imported baseline has 80 completed trials (two repetitions) from the saved
+`map-prompt-validation` job, with exactly matching prompts, settings, and command
+permissions. The default comparison uses repetition 1 for its 40 pairs; both
+repetitions are reusable. An older `baseline-limit-50` job used a broader bash
+denial rule and is not silently treated as the current baseline.
+The imported `map-readme-frontload-039` has 40 completed trials
+using slopdex 0.39.0 and the current frontloaded README instruction. Its original
+manifest did not record source/binary hashes: these remain unknown, rather than
+being invented at import. It is available for comparison, but the first current
+map run conservatively reruns it to establish a reusable build fingerprint.
+The original harness hash and tool versions remain saved.
 
-# Retain the previous conventional-vs-combined comparison when explicitly selected.
-python3 evals/typescript/run.py run --arms off slopdex \
-  --output evals/typescript/jobs/conventional-vs-combined
-```
+Changes to model-facing protocol or scoring semantics should bump
+`saved.PROTOCOL_VERSION`; cosmetic reporting changes need not invalidate a
+baseline. Check in newly generated `results/` along with relevant code changes.
 
-## Pinned source and tasks
+## What is measured
 
-`repo/` is a real Git submodule of
-<https://github.com/microsoft/TypeScript>, pinned to
-`edf7da4e93ab65e1f7766deae156c35132c0cde3`
-(the current default-branch HEAD when this eval was created).
-Upstream now uses **`main`**, with no `master` ref. This checkout contains the
-**Go-native compiler under `tsc/internal/`**, so the tasks reference its Go
-implementation.
+Reports compare **map − baseline**, grouped by model and thinking setting:
 
-On the first source-dependent command the runner executes:
+- Execution wall time (agent run only) and `step_finish` count.
+- Input, output, reasoning, cache-read, cache-write, and total tokens.
+- OpenCode-reported USD cost, with missing cost telemetry kept as unknown.
+- Citation F1, all-target passes, answer/protocol status, and map invocations.
+- Per-task differences and aggregate absolute/percentage changes.
 
-```sh
-git submodule update --init --depth 1 -- evals/typescript/repo
-```
+Total tokens use OpenCode's reported total when available; otherwise they sum
+the distinct V1 input/output/reasoning/cache categories. Reports retain the
+original categories and identify the total's source. USD is model-call spend,
+not subscription billing or slopdex embedding costs.
 
-Shallow submodules are supported. This fetches the recorded gitlink, including
-the pinned commit if it is no longer the branch tip. The runner does not follow
-the moving upstream branch on subsequent runs. It checks that the gitlink,
-checkout HEAD and `tasks.json` agree, and refuses tracked local modifications.
-Each trial uses an independent local clone of this commit, so agents never work
-in the canonical submodule. Temporary trial workspaces are cleaned up afterward.
+All-trial totals include resources consumed by failures. Protocol-valid and
+both-passed paired cohorts are reported separately: a failed or shortened answer
+must not be presented as an efficiency improvement. Accuracy includes failures
+as zero. Saved-baseline comparisons are explicitly **not interleaved**; elapsed
+time and provider caching can vary between runs.
 
-`tasks.json` defines ten intermediate cases with three reference functions each
-and ten advanced cases with five reference functions each, for **80 verified
-reference functions**. Every advanced case spans at least three implementation
-files and requires causal reasoning about state, ownership, caching or emit
-behavior across subsystem boundaries.
+## Source, controls, and grading
 
-### Intermediate cases (three required findings)
+`repo/` is a Git submodule pinned to TypeScript commit
+`edf7da4e93ab65e1f7766deae156c35132c0cde3`. Source-dependent commands initialize
+the recorded gitlink, never a moving branch, and verify it against `tasks.json`.
+Every executed trial gets an independent clone. There are ten intermediate tasks
+(three findings each) and ten advanced tasks (five findings across at least three
+files). Agents see the role-based prompt, not reference symbols or paths.
 
-| Task | Area |
-|---|---|
-| `overloaded-generic-calls` | Overload selection, inference and contextual callbacks |
-| `discriminant-branch-types` | Discriminated-union control-flow narrowing |
-| `conditional-package-subpaths` | Conditional exports and wildcard subpath resolution |
-| `inherited-config-file-selection` | Config inheritance and file selection |
-| `unbuilt-referenced-project` | Declaration-to-source project-reference redirection |
-| `single-file-program-reuse` | Incremental program reuse after an editor edit |
-| `lazy-auto-import-completion` | Export candidates and lazy completion resolution |
-| `rename-occurrence-consistency` | Shorthand/alias rename edits and deduplication |
-| `async-lexical-runtime-semantics` | Async lowering and lexical bindings |
-| `ambiguous-expression-type-arguments` | Speculative parsing and state rollback |
+Default models in `config.json`:
 
-### Advanced cases (five required findings)
+- `opencode-go/deepseek-v4.1-flash@medium`
+- `opencode-go/muse-spark-1.3-contributor@medium`
+- Explicit `{"reasoningEffort": "medium"}`, 600-second timeout, 40 steps.
 
-| Task | Area |
-|---|---|
-| `request-snapshot-autoimport-adoption-race` | Deferred requests, snapshot adoption races, cancellation and shared-program ownership |
-| `mapped-diagnostic-provenance-and-synthesized-output` | Canonical/supplemental virtual files, synthesized diagnostics, mapping fidelity and UTF-16 |
-| `watcher-missing-lookup-and-project-dirty-state` | Watch batches, missing-ancestor lookups, overlays, cache refresh and rebuild eligibility |
-| `granular-autoimport-index-refresh-and-visibility` | Shared realpath extraction, granular export-index replacement, cancellation and package shadowing |
-| `dynamic-contentmapper-refresh-and-bundle-cache` | Remote mapper reopening, configuration identity, locale-sensitive caches and concurrent bundle ownership |
-| `declaration-alias-visibility-fixed-point` | Late-visible aliases, accessibility diagnostics, portable module spelling and declaration worklists |
-| `async-generator-iterator-close-helper-flow` | Async delegation, iterator cleanup/error precedence and runtime-helper dependencies |
-| `decorator-private-field-initializer-handoff` | Decorator queues, computed accessors, private brands and class-field transform ordering |
-| `reverse-mapped-inference-expansion-cache` | Recursive expansion guards, cached inference failures and array/tuple/object reconstruction |
-| `source-map-pending-segments-round-trip` | Segment accumulation, malformed decoding, UTF-16 positions and asymmetric mapping lookups |
+Trials run sequentially in a seeded task/model order, alternating arm order when
+both are fresh. Both arms allow glob, grep, and reads. Map uses the root README
+snippet verbatim and must successfully invoke `slopdex map`; other slopdex
+navigation and root/index/config overrides are blocked. Baseline denies all
+slopdex calls. Missing required map use or disallowed commands is a protocol
+violation. These are cooperative controls, not a security sandbox.
 
-These are navigation tasks, not patch-generation tasks. Each asks for specific
-implementation roles and a flow explanation. Advanced prompts require tracing
-intervening adapters, contrasting success/failure or fresh/stale paths, and
-explaining invariants rather than just locating declarations. The five findings
-identify mandatory stages; supporting helpers can be cited in the explanations.
-Prompts explicitly target the active Go-native implementation, avoiding bundled
-legacy TypeScript compiler fixtures. Prompts do not disclose the target
-paths or symbols. The answer key and harness artifacts are outside the agent's
-workspace, and external-directory access is denied. Treat this as a cooperative
-local benchmark rather than a security sandbox.
+Global configs, instructions, plugins, and previous sessions are isolated.
+Editing, delegation, network tools, interactive questions, and LSP are disabled.
+Effective OpenCode controls are checked before timing. Source edits are checked
+afterward.
 
-## Models, thinking, and controls
+The map index contains structure, normalized-name vectors, and attached source
+description vectors, not full code-body embeddings. Preparation uses an isolated
+schema-4 artifact store. Each trial gets its own workspace/store backup and
+warmed shared ANN base. An offline `map -q` preflight clears selector caches and
+removes provider credentials, checking graph hashes/mtimes and embedding counts.
+Preparation, copying, and preflight are excluded from agent timing and USD;
+ordinary map loading and query embedding latency remain timed.
 
-Edit `config.json` to change models, variants, provider reasoning options, step
-limits, timeouts, or slopdex configuration. Use `--config PATH` and `--cache PATH`
-**before** the subcommand for alternative configurations/cache directories.
-`--task` and `--model provider/model@variant` can each be repeated to select a
-subset of the configured matrix.
+Answers must be JSON with exactly the requested findings (`path`, `symbol`,
+`line`, `explanation`) and a nonempty `flow`. Citations must identify the first
+declaration line or either of the next two lines. Duplicate findings and
+call-site citations do not earn extra credit. F1 measures declaration evidence,
+not explanation correctness; review saved answers manually. No model judge is
+used.
 
-Defaults:
-
-- `opencode-go/deepseek-v4.1-flash`, `medium`
-- `opencode-go/muse-spark-1.3-contributor`, `medium`
-- Explicit variant options: `{"reasoningEffort": "medium"}` for both.
-- 600-second timeout and 40 agent iterations per trial.
-- Arms: `map`, `search`.
-
-The CLI command is `opencode run --model PROVIDER/MODEL --variant medium
---agent build --format json --title TRIAL_ID -- PROMPT`. The injected OpenCode
-configuration defines the variant explicitly. This matters for DeepSeek, whose
-current published OpenCode catalog lists `low`, `high`, and `max` but omits
-`medium`. The requested setting is sent as `reasoningEffort: medium`; provider
-rejection appears as an agent error, with no fallback to another effort level.
-The provider ultimately determines how that setting maps to actual reasoning.
-
-Trials are sequential. Model/task/repetition pairs are seeded-shuffled, with
-alternating arm order for two arms; larger matrices rotate and reverse order to
-balance every arm position. Each arm gets the same
-task prompt, model, iteration budget and fresh checkout. Navigation guidance and
-available slopdex commands differ between arms:
-
-| Arm | Agent navigation guidance | Allowed slopdex navigation | Cache |
-|---|---|---|---|
-| `map` (default) | Root README's concise discovery-and-follow snippet: one scoped map, ORed `-e`/`-q`, depth-2 callers/callees, then implementation reads | `map` only | Separate symbol-only cache |
-| `search` (default) | Root README's exact semantic-search agent snippet with threshold 0.3, limit 50 and query variation | `search` only | Semantic/ANN cache |
-| `map-search` (optional) | Both exact README snippets, with targeted reads and bounded output | `map` and `search` only; both must succeed at least once | Semantic/ANN cache |
-| `map-first` (experimental) | [Map-first discovery prompt](prompts/map-first.md), immediately followed by implementation reads | `map` only | Provider-free structural cache |
-| `map-follow` (experimental) | [One discovery pass, then follow source](prompts/map-follow.md), with an explicit stop rule | `map` only | Provider-free structural cache |
-| `map-verify` (experimental) | [Source-following with predicate/cleanup verification](prompts/map-verify.md) | `map` only | Provider-free structural cache |
-| `off` (optional legacy baseline) | Conventional glob/grep/reads | None | None |
-| `slopdex` (optional legacy combined arm) | Original combined map/search guidance | All slopdex commands | Semantic/ANN cache |
-
-README instruction blocks are read verbatim when planning the run and frozen in its
-manifest's `arm_instructions` and resume fingerprint. Each trial's `AGENTS.md`
-contains its selected block plus common evaluation controls. Map guidance also
-reminds agents to include `--private` for unexported Go implementation symbols.
-The experimental `map-first`, `map-follow` and `map-verify` prompts share a
-provider-free structural cache and map-only controls. The default README `map`
-arm instead uses a separate symbol-only cache. The experimental prompts' exact
-text is frozen in each manifest. They suppress
-prevalidated parser warnings, exclude test files during declaration discovery,
-batch terms/paths and avoid metadata/help inventories. Source verification is
-still required. Compare steps, model tokens/cost, tool-output characters and
-discovery timing alongside citation and answer-format validity.
-Map's `-g` selects path globs, `-e` filters symbol names and qualified names rather
-than raw source text, and `-q` performs symbol-vector search. The root README NOTE
-combines `-e` name terms and `-q` short symbol concepts with OR semantics, retaining
-`--private --callers 2 --callees 2`. Agents start with map before grep/read, use
-known paths or `.` rather than guessed directories, and immediately read plausible
-implementation ranges. They follow source calls, using grep for usages or missing
-links, and remap only unknown declaration locations. Discovery excludes Go tests
-and suppresses prevalidated parser diagnostics; setup/help and root/index/config
-overrides are discouraged.
-Use `jobs/map-or-discovery` for the current 40-trial rerun. The previous
-`jobs/map-symbol-query`, `jobs/map-concise-symbols` and `jobs/map-callgraph-symbols`
-runs used the former AND composition when both name selectors were supplied. The
-historical [map prompt study](MAP_PROMPTS.md) describes its original structural-only
-runs. The earlier
-`jobs/map-vs-search` run used the prior map guidance and search threshold 0.5;
-use a fresh output directory, such as `jobs/map-vs-search-03`, for the updated
-instructions. Existing run manifests preserve the instructions used at the time.
-The subsequent `jobs/map-vs-search-03` run used threshold 0.3 without a result
-limit; `jobs/map-search-limit-50` uses limit 50, includes the combined arm, and
-uses the stdout broken-pipe fix. Closed stdout is quiet success; other output
-errors remain failures. These changes are evaluated together in that run.
-Conventional local reads, globbing and grep remain available in both default
-arms for path discovery and source verification.
-
-The PATH wrapper blocks other slopdex navigation commands before execution.
-Help/version requests remain available. `search-code`, `search-md`, `describe`,
-`cross-search`, indexing/configuration commands and `map` are blocked in the
-search-only arm; analogous non-map commands are blocked in the map-only arm.
-The catalog-fetching `help models` operation is also blocked. Agents cannot
-override the pinned root, index, provider/configuration, or rebuild controls.
-Each exclusive arm must successfully invoke its assigned navigation command at
-least once; help-only/no-command runs and disallowed-command attempts are
-recorded as protocol violations, receiving zero comparison F1. This verifies
-actual use of the advertised approach. These are cooperative protocol controls,
-not an OS-level sandbox.
-The combined `map-search` arm applies the same protected-configuration controls,
-allows only map/search navigation, and requires an exit-zero invocation of each.
-It shares one semantic index snapshot containing both structure and embeddings.
-
-Reports compare **search − map** for the default pair. If additional arms are
-selected with `--arms`, all available paired arm combinations are reported with
-explicit reference/comparison labels; historical off/slopdex reports remain
-readable.
-
-Global OpenCode configuration, global instruction files, external skills, project
-config, and external plugins are isolated/disabled. Provider authentication and
-API-key environment variables are retained. Account/organization configuration,
-other providers' credentials and previous sessions are not copied. Delegation, web search/fetch, editing,
-interactive questions and LSP are disabled for both arms. Source edits are also
-checked after the trial. The baseline denies bash commands matching the slopdex
-executable name and has a blocking PATH shim; ordinary workspace paths remain
-allowed. These are protocol controls, not an OS-level sandbox.
-Every new CLI process loads its generated config automatically. The runner sets
-both `PWD` and `--dir`, loads the arm instructions explicitly, and validates the
-effective benchmark configuration with `opencode debug config` before timing.
-
-## Indexing and costs
-
-The search, `map-search` and `slopdex` arms retain their existing semantic-index
-setup. That index uses OpenAI `text-embedding-3-large`, 3072 dimensions, embeddings
-only, and no reranker. It indexes `tsc/internal/**/*.go`, including compiler tests
-but excluding the unrelated baseline corpus outside that subtree. `maxFileSize`
-is 16 MiB so the large checker implementation is not skipped. Agents can still
-read the entire checkout. The scope/configuration is saved in the run manifest.
-To use another embedding provider, edit the `slopdex` object in `config.json` and
-set that provider's key in the environment.
-
-The default README `map` arm has a separate symbol-only map cache containing
-structural symbols and source metadata, normalized-name embeddings, and a native
-`.symbols.usearch` sidecar. Symbol embeddings default to 256 dimensions and use
-the same configured embedding provider/model as the semantic index. Full
-code-body embeddings are not required for this arm. Structural target coverage
-is verified before trials. `prepare --arms map` needs the embedding provider's
-key on a cold symbol cache; `run --arms map` performs that preparation automatically,
-and agents' `map -q` queries may call the provider. Agents remain restricted to
-`map` navigation.
-
-The experimental `map-first`, `map-follow` and `map-verify` arms keep a separate
-provider-free structural cache containing local symbols and source metadata,
-without embedding vectors or ANN files. Their cold-cache preparation requires no
-embedding key. The search and optional combined arms continue to use the
-semantic/ANN cache described below.
-
-Index caches are keyed by repository commit, slopdex version, and full slopdex
-configuration. Preparation fails on operational indexing failures, an empty
-index, or missing required structural/vector coverage for any selected task's
-target function.
-Parser-recovery diagnostics elsewhere in the checkout are retained and reported;
-they do not prevent running a fully covered task. A failed preparation can be
-retried while preserving paid embedding artifacts. Cache builds and result-directory
-runs use advisory locks. Each search/combined trial receives a separate SQLite backup, including
-WAL pages, plus the warmed native ANN binaries and their manifests. The schema-3
-root identity is adjusted to the clone's root; generation, vector IDs, paths and
-reference commit remain unchanged. An unsupported schema fails explicitly.
-
-Semantic-cache preparation runs an offline, no-reindex `cross-search` with an
-impossible source regex to load and persist the native indexes without querying a provider. Cache
-metadata records the ANN generation, embedding profile, artifact sizes and SHA-256
-hashes. Older embedding-only caches are warmed in place; missing, stale or corrupt
-sidecars are repaired during preparation. Code, Markdown, and independent
-description indexes are included; the description index contains any available
-source or generated prose and can be empty. There is no combined/fusion index,
-and preparing the cache does not generate descriptions.
-
-Before timing each search/combined trial, the runner copies all matching binaries and
-manifests and opens them through the writable native loader using the same offline
-probe. Their hashes and modification times must remain unchanged. This verifies
-the relocated snapshot is reusable; an unexpected rebuild fails preparation.
-The check is recorded in `ann-validation.json` and its CLI logs.
-
-Before timing each default `map` trial, the runner also copies the symbol sidecar
-and validates its reuse with an actual `map -q` query in the relocated symbol-only
-snapshot. The preflight clears selector-result caches, removes embedding credentials,
-and uses the preembedded warm-up query with the writable loader. This prevents
-read-only in-memory rebuilding from passing unnoticed. The native graph's hash/mtime,
-vocabulary, dimensions and embedding count must remain unchanged, with no external
-model calls. A structural refresh may update only the manifest generation/fingerprint;
-that metadata-only update is recorded separately. Thus `-q` must use the
-prebuilt symbol vectors and graph. New agent queries may still embed their query text.
-The evidence is recorded under `symbol_query` in `ann-validation.json`. Symbol-cache
-preparation, native sidecar construction, copying and reuse validation are
-excluded from model timing; ordinary map loading and any `-q` query embedding
-latency remain included.
-
-Reports separate one-time index preparation time from trial time. OpenCode's
-reported USD cost covers its model calls, **not** embedding preparation/query
-costs or subscription billing. Token fields are recorded as reported by OpenCode,
-including input, output, reasoning, and cache reads/writes; missing usage fields
-are zero, while absent cost telemetry is `null`. Query embedding latency is
-included in the trial's wall time. Cached indexing makes the default comparison
-an embedding-preindexed and ANN-prebuilt workflow. Native graph construction,
-snapshot copying and the pre-trial reuse check are excluded from the timed model
-run. Ordinary per-command index loading and query embedding time remain included.
-Reports record cache-level ANN warm-up separately from embedding preparation;
-per-trial results record reuse-validation time separately from agent wall time.
-The earlier mixed-tool experiments have different arm definitions; use a new
-output directory such as `jobs/map-symbol-query` for the README map rerun.
-Provider-side prompt caches cannot be reset by
-this harness; cache-token counters and counterbalanced order help interpret them.
-
-## Scoring and artifacts
-
-Each answer must be JSON with exactly the task's required number of `findings`
-(`path`, `symbol`, `line`, `explanation`) and a nonempty `flow` explanation:
-**three for intermediate cases, five for advanced cases**. The runner injects the
-required count into each task prompt and rejects answers with fewer or more
-findings. Grading compares repository-
-relative paths and exact unqualified symbol names. A citation must point to the
-function declaration's first line or the next two lines. Duplicate findings earn
-credit only once; call-site citations do not earn citation credit.
-
-- **Symbol recall:** reference symbols identified, ignoring citation quality.
-- **Citation recall/precision/F1:** uniquely identified reference symbols with
-  valid declaration citations. F1 is the primary comparison metric.
-- **Passed:** all required symbols have valid citations.
-- Timeouts, model errors, malformed answers and protocol violations receive
-  zero comparison F1 and do not pass. Their raw partial grading remains saved.
-
-This scorer checks navigation evidence and answer shape. It does **not** certify
-the explanation's semantic correctness. Review `answer.txt` and the trace for that;
-there is no extra model judge or hidden grading model cost.
-
-Each output directory contains:
-
-- `manifest.json`: pinned commit, exact config/prompts, ordered trial matrix, tool
-  versions, frozen README instructions, structural/symbol/semantic index metadata
-  and resume fingerprint.
-- `trials/ID/`: prompt, arm instructions, generated OpenCode config, CLI argv,
-  raw JSONL events, stderr, final answer, slopdex invocation log if used, and graded
-  `result.json` with time, cost, tokens, steps, tool counts and command-protocol
-  violations. Default map and search/combined trials also
-  include `ann-validation.json` and `ann-validation/` logs from the untimed reuse
-  check.
-- `summary.json` and `report.md`: per-model/variant/arm statistics and paired
-  per-task differences (default: `search − map`). Failures count as zero in accuracy;
-  latency/token/cost deltas use pairs where both trials completed validly.
-
-Slopdex usage is recorded both as a total invocation count (`slopdex_calls`) and
-per-command counts (`slopdex_commands`, for example `{"search": 2, "map": 1}`).
-Reports show totals across the run, counts by model/thinking mode/arm, the number
-of trials using each command, and the command breakdown for each treatment trial.
-`summary.json` includes these counters and a compact per-trial usage list.
-Counts are invocation attempts captured by the PATH wrapper, including failed
-commands. `--help`, `-h`, and command help requests count as `help`; version
-requests count as `version`. Other counts use the top-level command name, with
-full arguments retained in `slopdex-calls.jsonl`. New logs journal invocation
-start/finish events, whether the command was allowed, and its exit status;
-reports collapse those events into one count per attempt. Automatic cache preparation and
-ANN reuse-validation commands are excluded from agent usage counters.
-
-The `report` subcommand backfills command counts into existing `result.json`
-files from their saved invocation logs, preserving their grading and timings.
-Legacy artifacts with a positive total but no log or command breakdown retain
-that count under `unknown`. Regenerating an existing report requires no model runs:
-
-```sh
-python3 evals/typescript/run.py report evals/typescript/jobs/warmed-full
-```
-
-Resume requires the same selected tasks, models, seed, repetitions, arms,
-configuration, harness source and executable versions. Fully completed runs can
-regenerate reports without downloading source or rebuilding indexes. Saved failed trials are retained too;
-to retry one, remove its generated `trials/ID/result.json` and resume, or start a
-new output directory. An interrupted trial without a result is rerun from a fresh
-checkout. `jobs/` and `cache/` are Git-ignored; no API-key environment values are
-written into harness configuration or manifests.
-
-## Verification and extension
+## Verification
 
 ```sh
 python3 -m unittest discover -s evals/typescript -v
-python3 evals/typescript/run.py validate
 cargo verify
 
-# Optional: check installed OpenCode config compatibility without model calls.
+# Optional installed-CLI checks, without external model calls.
 SLOPDEX_EVAL_CHECK_OPENCODE=1 python3 -m unittest discover -s evals/typescript -v
-
-# Optional: real native-index build/copy/reuse with a local embedding fixture.
-# Uses installed slopdex; no external model or embedding calls.
 SLOPDEX_EVAL_CHECK_ANN=1 python3 -m unittest discover -s evals/typescript -p test_native_ann.py -v
 ```
 
-The offline tests cover duplicate/call-site scoring, invalid answers, event and
-usage parsing, per-command invocation counts and backfilling, timeouts, index relocation, config isolation, deterministic paired
-scheduling, resume behavior, and an end-to-end pair with fake CLIs (no model or
-embedding calls). The optional installed-CLI check validates both models and arms
-using OpenCode's resolved configuration, without running any model.
-Exclusive-arm tests exercise the generated wrapper, successful-use requirements,
-denied commands, journal merging and README guidance. Paired-report tests cover
-map/search, legacy off/slopdex, partial runs, and all multi-arm comparisons.
-Native ANN tests verify sidecar integrity and optional description indexes. The
-installed-slopdex test builds a tiny real index using a localhost embedding
-fixture, then verifies relocated native binaries are reused unchanged offline.
-It also builds and uses a local structural-only map index with the provider
-offline and no embedding credentials, matching the experimental map arms' cache
-requirements.
-
-To add tasks, add prompts and at least three distinct reference declarations to
-`tasks.json`, then run `validate`. Cases marked `difficulty: "advanced"` must have
-at least five targets spanning at least three files. The scorer uses each task's
-own reference count. The earlier ten-case reports describe the earlier prompt
-version; use a fresh output directory for the expanded corpus.
-To update upstream, deliberately update the submodule gitlink and
-`repository_commit`, review every task against the new source, and validate again.
-Do not use `git submodule update --remote` for ordinary eval runs.
+To add tasks, update `tasks.json` and validate every reference declaration. To
+update TypeScript, deliberately update its gitlink and `repository_commit`, then
+review and validate all tasks; this invalidates the baseline as well as map.

@@ -1,4 +1,4 @@
-"""Offline report regressions using synthetic completed trial artifacts."""
+"""Offline no-map / README-guided map reporting regressions."""
 
 import copy
 from pathlib import Path
@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import report as reporting
 import run as runner
 
 
@@ -14,12 +15,11 @@ class ArmReportTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="typescript-arm-reports-")
         self.addCleanup(self.temporary.cleanup)
         self.output = Path(self.temporary.name)
-        self.trials = []
-        self.results = {}
+        self.trials, self.results = [], []
 
     def add_trial(self, arm, *, task="fixture", repeat=1, model="test/model", variant="medium",
-                  f1=1.0, seconds=10.0, input_tokens=100, cost=0.01, status="ok",
-                  commands=None, completed=True):
+                  f1=1.0, seconds=10.0, tokens=None, cost=0.01, steps=2,
+                  status="ok", commands=None, completed=True):
         trial = {"id": f"trial-{len(self.trials)}", "model": model, "variant": variant,
                  "arm": arm, "task": task, "repeat": repeat}
         self.trials.append(trial)
@@ -27,181 +27,222 @@ class ArmReportTests(unittest.TestCase):
             return trial
         commands = dict(commands or {})
         result = {
-            **trial, "tokens": {"input": input_tokens, "output": 20, "reasoning": 5,
-                                "total": input_tokens + 25, "cache_read": 3, "cache_write": 2},
-            "tools": {"bash": 1}, "cost_usd": cost, "steps": 1, "errors": [],
-            "sessions": ["fixture-session"], "malformed_event_lines": 0,
-            "status": status, "exit_code": 0, "timed_out": status == "timeout",
-            "wall_seconds": seconds,
-            "grade": {"valid_answer": True, "symbol_recall": f1, "recall": f1,
-                      "precision": f1, "f1": f1, "passed": f1 == 1,
-                      "matches": [{"path": "fixture.go", "symbol": "fixture", "identified": True,
-                                   "citation_valid": True, "expected_line": 1}]},
-            "workspace_violations": [], "slopdex_calls": sum(commands.values()),
-            "slopdex_commands": commands, "native_ann": None,
+            **trial, "tokens": dict(tokens if tokens is not None else {
+                "input": 100, "output": 20, "reasoning": 5, "cache_read": 3, "cache_write": 2, "total": 0}),
+            "cost_usd": cost, "steps": steps, "status": status, "wall_seconds": seconds,
+            "grade": {"valid_answer": True, "f1": f1, "passed": f1 == 1},
+            "slopdex_calls": sum(commands.values()), "slopdex_commands": commands,
         }
-        self.results[trial["id"]] = copy.deepcopy(result)
+        self.results.append(copy.deepcopy(result))
         runner.write_json(self.output / "trials" / trial["id"] / "result.json", result)
         return trial
 
-    def report(self, **metadata):
-        runner.write_json(self.output / "manifest.json", {"commit": "a" * 40,
-                                                       "trials": self.trials, **metadata})
-        # Reports must be entirely offline, even with preparation metadata present.
+    def manifest(self, **metadata):
+        return {"commit": "a" * 40, "trials": self.trials, **metadata}
+
+    def saved_report(self, **metadata):
+        runner.write_json(self.output / "manifest.json", self.manifest(**metadata))
+        originals = {path: runner.read_json(path) for path in (self.output / "trials").glob("*/result.json")}
         with patch.object(runner, "command", side_effect=AssertionError("external command")), \
                 patch.object(runner, "run_trial", side_effect=AssertionError("model call")), \
-                patch.object(runner, "prepare_index", side_effect=AssertionError("index preparation")):
-            summary = runner.report(self.output)
+                patch.object(runner, "prepare_map_index", side_effect=AssertionError("index preparation")):
+            summary = reporting.report(self.output)
         self.assertEqual(summary, runner.read_json(self.output / "summary.json"))
-        for trial_id, original in self.results.items():
-            result = runner.read_json(self.output / "trials" / trial_id / "result.json")
-            self.assertEqual(result, {**original, "slopdex_commands": result["slopdex_commands"]})
+        for path, original in originals.items():
+            updated = runner.read_json(path)
+            original.pop("slopdex_commands", None)
+            updated.pop("slopdex_commands", None)
+            self.assertEqual(original, updated)
         return summary, (self.output / "report.md").read_text()
 
-    def assert_pair(self, row, reference, comparison, *, f1, seconds, tokens, cost):
-        self.assertEqual((row["reference_arm"], row["comparison_arm"]), (reference, comparison))
-        self.assertAlmostEqual(row["f1_delta"], f1)
-        self.assertTrue(row["both_ok"])
-        self.assertAlmostEqual(row["seconds_delta"], seconds)
-        self.assertEqual(row["input_tokens_delta"], tokens)
-        self.assertAlmostEqual(row["cost_delta_usd"], cost)
+    def test_full_off_map_metrics_and_report(self):
+        self.add_trial("off", f1=.5, seconds=20, steps=4, cost=.04)
+        self.add_trial("map", seconds=10, steps=2, cost=.02,
+                       tokens={"input": 50, "output": 10, "reasoning": 3, "cache_read": 2, "cache_write": 1, "total": 66},
+                       commands={"map": 3, "help": 1})
+        summary, text = self.saved_report()
+        self.assertEqual(summary["comparison_mode"], "interleaved")
+        self.assertEqual((summary["completed"], summary["planned"]), (2, 2))
+        baseline, mapped = summary["groups"]
+        self.assertEqual(baseline["mean_tokens"]["total"], 130)
+        self.assertEqual(mapped["mean_tokens"]["total"], 66)
+        self.assertEqual(mapped["mean_steps"], 2)
+        self.assertEqual(mapped["total_cost_usd"], .02)
+        self.assertEqual(mapped["slopdex_command_trials"], {"help": 1, "map": 1})
+        self.assertEqual(set(mapped["mean_tokens"]), set(reporting.TOKEN_NAMES))
+        case = summary["paired"][0]
+        self.assertEqual((case["reference_arm"], case["comparison_arm"]), ("off", "map"))
+        self.assertEqual(case["f1_delta"], .5)
+        self.assertEqual(case["seconds_delta"], -10)
+        self.assertEqual(case["steps_delta"], -2)
+        self.assertEqual(case["total_tokens_delta"], -64)
+        metric = summary["paired_summary"][0]["cohorts"]["all_pairs"]["metrics"]["wall_seconds"]
+        self.assertEqual((metric["mean_delta"], metric["mean_delta_pct"], metric["aggregate_ratio"]), (-10, -50, .5))
+        self.assertIn("Side-by-side means and accuracy", text)
+        self.assertIn("Cache write", text)
+        self.assertIn("Observed execution and spend totals", text)
+        self.assertIn("`map` × 3", text)
+        self.assertEqual(summary["slopdex_commands"], {"help": 1, "map": 3})
 
-    def test_map_search_deltas_and_invocation_counters(self):
-        self.add_trial("search", f1=1, seconds=8, input_tokens=70, cost=.02, commands={"search": 2})
-        self.add_trial("map", f1=.5, seconds=12, input_tokens=110, cost=.03, commands={"map": 3})
-        summary, text = self.report()
-        self.assertEqual(len(summary["paired"]), 1)
-        self.assert_pair(summary["paired"][0], "map", "search", f1=.5, seconds=-4, tokens=-40, cost=-.01)
-        self.assertEqual(summary["slopdex_commands"], {"map": 3, "search": 2})
-        for group in summary["groups"]:
-            command = group["arm"]
-            self.assertEqual(group["slopdex_command_trials"], {command: 1})
-            self.assertEqual(group["slopdex_commands"], {command: 3 if command == "map" else 2})
-        self.assertIn("**test/model / medium / search − map**: 1 pairs; mean F1 Δ +0.500", text)
-        self.assertIn("| test/model | medium | search − map | fixture | 1 | +0.500 |", text)
+    def test_failure_consumption_is_kept_but_valid_cohorts_are_separate(self):
+        self.add_trial("off", repeat=1, seconds=100, steps=10, cost=1)
+        self.add_trial("map", repeat=1, seconds=1, steps=1, cost=.01, status="agent_error", f1=1)
+        self.add_trial("off", repeat=2, seconds=20, steps=4, cost=.2, f1=.5)
+        self.add_trial("map", repeat=2, seconds=10, steps=2, cost=.1)
+        self.add_trial("off", repeat=3, seconds=30, steps=6, cost=.3)
+        self.add_trial("map", repeat=3, seconds=25, steps=5, cost=.25)
+        summary, text = self.saved_report()
+        failed = summary["paired"][0]
+        self.assertTrue(failed["failure_shortened_possible"])
+        self.assertFalse(failed["both_ok"])
+        self.assertFalse(failed["both_passed"])
+        self.assertEqual(failed["f1_delta"], -1)
+        self.assertEqual(failed["seconds_delta"], -99)
+        self.assertAlmostEqual(failed["cost_delta_usd"], -.99)
+        cohorts = summary["paired_summary"][0]["cohorts"]
+        self.assertEqual({key: value["n"] for key, value in cohorts.items()}, {"all_pairs": 3, "both_ok": 2, "both_passed": 1})
+        self.assertEqual(cohorts["all_pairs"]["failure_shortened_possible_n"], 1)
+        self.assertEqual(cohorts["both_ok"]["metrics"]["wall_seconds"]["mean_delta"], -7.5)
+        self.assertEqual(cohorts["both_passed"]["metrics"]["wall_seconds"]["mean_delta"], -5)
+        mapped = summary["groups"][1]
+        self.assertEqual(mapped["passed"], 2)
+        self.assertAlmostEqual(mapped["mean_f1"], 2 / 3)
+        self.assertIn("failure-shortened runs can look cheaper/faster", text)
+        self.assertIn("survivor bias", text)
 
-    def test_legacy_off_slopdex_and_count_only_backfill(self):
-        self.add_trial("off", f1=.25, seconds=15, input_tokens=200, cost=.04)
-        trial = self.add_trial("slopdex", f1=.75, seconds=10, input_tokens=120, cost=.01,
-                               commands={"map": 2})
-        path = self.output / "trials" / trial["id"] / "result.json"
+    def test_missing_telemetry_total_fallback_and_reported_total_never_double_count(self):
+        self.add_trial("off", cost=None, tokens={"input": 100, "output": 20, "reasoning": 5, "cache_read": 3, "cache_write": 2})
+        self.add_trial("map", tokens={"input": 100, "output": 20, "reasoning": 5, "cache_read": 3, "cache_write": 2, "total": 125})
+        self.add_trial("off", repeat=2, tokens={}, seconds=None, steps=None)
+        self.add_trial("map", repeat=2, tokens={"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0, "total": 0})
+        summary, text = self.saved_report()
+        first, second = summary["paired"]
+        self.assertEqual(first["total_tokens_sources"], {"off": "category_sum", "map": "reported"})
+        self.assertEqual(first["total_tokens_delta"], -5)
+        self.assertIsNone(first["cost_delta_usd"])
+        self.assertIsNone(second["total_tokens_delta"])
+        baseline, mapped = summary["groups"]
+        self.assertEqual(baseline["mean_tokens"]["total"], 130)
+        self.assertEqual(mapped["mean_tokens"]["total"], 62.5)
+        self.assertEqual(mapped["total_tokens_sources"], {"category_sum": 1, "reported": 1})
+        self.assertEqual(baseline["missing_telemetry"]["cost_usd"], 1)
+        self.assertEqual(baseline["missing_telemetry"]["total_tokens"], 1)
+        metrics = summary["paired_summary"][0]["cohorts"]["all_pairs"]["metrics"]
+        self.assertEqual((metrics["cost_usd"]["n"], metrics["cost_usd"]["missing_n"]), (1, 1))
+        self.assertEqual(metrics["total_tokens"]["off_missing_n"], 1)
+        self.assertEqual(metrics["total_tokens"]["sum_map"], 125)
+        self.assertIn("reasoning is distinct", text)
+        self.assertIn("missing is not zero", text)
+
+    def test_zero_denominators_and_case_vs_aggregate_effects(self):
+        for repeat, seconds, cost in ((1, 0, 0), (2, 10, .1), (3, 100, 1)):
+            self.add_trial("off", repeat=repeat, seconds=seconds, cost=cost)
+            self.add_trial("map", repeat=repeat, seconds=20, cost=.2)
+        summary = reporting.build_summary(self.manifest(), self.results)
+        metric = summary["paired_summary"][0]["cohorts"]["all_pairs"]["metrics"]["wall_seconds"]
+        self.assertEqual((metric["n"], metric["ratio_n"], metric["zero_reference_n"]), (3, 2, 1))
+        self.assertAlmostEqual(metric["mean_case_ratio"], 1.1)
+        self.assertAlmostEqual(metric["mean_delta_pct"], 10)
+        self.assertAlmostEqual(metric["aggregate_ratio"], 60 / 110)
+        self.assertIsNone(summary["paired"][0]["metrics"]["cost_usd"]["delta_pct"])
+
+    def test_partial_and_single_arm_runs_match_task_and_repeat(self):
+        self.add_trial("off", task="first")
+        self.add_trial("map", task="first", completed=False)
+        self.add_trial("off", task="second", repeat=2, completed=False)
+        self.add_trial("map", task="second", repeat=2)
+        self.add_trial("off", task="third")
+        self.add_trial("map", task="third")
+        summary, text = self.saved_report()
+        self.assertEqual((summary["completed"], summary["planned"]), (4, 6))
+        self.assertEqual([row["task"] for row in summary["paired"]], ["third"])
+        comparison = summary["paired_summary"][0]
+        self.assertEqual((comparison["available_pairs"], comparison["planned_pairs"], comparison["missing_pairs"]), (1, 3, 2))
+        self.assertEqual(comparison["unmatched_results"], {"off": 1, "map": 1})
+        self.assertIn("Partial run", text)
+        empty = reporting.build_summary(self.manifest(), [])
+        self.assertEqual(empty["paired"], [])
+        self.assertEqual(empty["groups"][0]["n"], 0)
+        self.assertIsNone(empty["groups"][0]["total_cost_usd"])
+        single = reporting.build_summary({"trials": self.trials[:1]}, self.results[:1])
+        self.assertEqual(single["paired"], [])
+        self.assertEqual(single["paired_summary"][0]["planned_pairs"], 0)
+
+    def test_model_variant_pairing_is_deterministic_and_only_off_map(self):
+        for model, variant in (("test/two", "low"), ("test/one", "high"), ("test/one", "low")):
+            for repeat in (2, 1):
+                self.add_trial("map", model=model, variant=variant, repeat=repeat)
+                self.add_trial("off", model=model, variant=variant, repeat=repeat)
+        self.add_trial("search")
+        self.add_trial("off", model="test/unmatched", variant="high")
+        self.add_trial("map", model="test/unmatched", variant="low")
+        before = copy.deepcopy((self.trials, self.results))
+        summary = reporting.build_summary(self.manifest(), self.results)
+        reverse = reporting.build_summary({"trials": list(reversed(self.trials))}, list(reversed(self.results)))
+        self.assertEqual(summary, reverse)
+        self.assertEqual((self.trials, self.results), before)
+        self.assertEqual(len(summary["paired"]), 6)
+        self.assertEqual(summary["ignored_planned_trials"], 1)
+        self.assertEqual({row["arm"] for row in summary["groups"]}, {"off", "map"})
+        self.assertIn("1 historical trials from other arms are excluded", reporting.markdown(self.manifest(), summary))
+        self.assertEqual([(row["model"], row["variant"]) for row in summary["paired_summary"]],
+                         [("test/one", "high"), ("test/one", "low"), ("test/two", "low"), ("test/unmatched", "high"), ("test/unmatched", "low")])
+
+    def test_saved_historical_mode_and_sources_with_preparation(self):
+        self.add_trial("off")
+        self.add_trial("map")
+        metadata = {"comparison_mode": "historical_saved", "sources": {"off": "baseline.json", "map": "map.json"},
+                    "baseline_source": "older-job", "map_symbol_index": {"wall_seconds": 2, "native_ann": {"wall_seconds": 3}}}
+        summary, text = self.saved_report(**metadata)
+        self.assertEqual(summary["comparison_mode"], "historical_saved")
+        self.assertEqual(summary["sources"]["baseline_source"], "older-job")
+        self.assertIn("not an interleaved experiment", text)
+        self.assertIn("baseline.json", text)
+        self.assertIn("Map symbol-index preparation", text)
+        self.assertIn("symbol embedding/ANN preparation: 3.0s", text)
+        self.assertEqual(text, reporting.markdown(self.manifest(**metadata), summary))
+
+    def test_command_backfill_prefers_journal_then_saved_then_unknown(self):
+        self.add_trial("off")
+        logged = self.add_trial("map", commands={"map": 99})
+        directory = self.output / "trials" / logged["id"]
+        (directory / "slopdex-calls.jsonl").write_text('{"argv":["map"],"exit_code":0}\n{"argv":["--help"]}\n')
+        legacy = self.add_trial("map", repeat=2, commands={"map": 2})
+        path = self.output / "trials" / legacy["id"] / "result.json"
         result = runner.read_json(path)
         result.pop("slopdex_commands")
         runner.write_json(path, result)
-        summary, text = self.report()
-        self.assert_pair(summary["paired"][0], "off", "slopdex", f1=.5, seconds=-5, tokens=-80, cost=-.03)
-        self.assertEqual(summary["slopdex_commands"], {"unknown": 2})
+        summary, text = self.saved_report()
+        self.assertEqual(summary["slopdex_commands"], {"help": 1, "map": 1, "unknown": 2})
+        logged_row = next(row for row in summary["trials"] if row["id"] == logged["id"])
+        self.assertEqual(logged_row["slopdex_calls"], 2)
+        self.assertEqual(logged_row["saved_slopdex_calls"], 99)
+        self.assertEqual(runner.read_json(directory / "result.json")["slopdex_commands"], {"help": 1, "map": 1})
         self.assertEqual(runner.read_json(path)["grade"], result["grade"])
-        self.assertIn("slopdex − off", text)
+        self.assertEqual(runner.read_json(path)["slopdex_commands"], {"unknown": 2})
+        self.assertIn("Older count-only artifacts", text)
+        self.assertIn("By task and trial", text)
 
-    def test_combined_navigation_is_compared_with_both_single_tool_arms(self):
-        self.add_trial("map-search", f1=.8, seconds=90, input_tokens=120, cost=.02)
-        self.add_trial("search", f1=.9, seconds=100, input_tokens=140, cost=.03)
-        self.add_trial("map", f1=.7, seconds=50, input_tokens=100, cost=.01)
-        summary, text = self.report()
-        self.assertEqual(len(summary["paired"]), 3)
-        self.assert_pair(summary["paired"][0], "map", "search", f1=.2, seconds=50, tokens=40, cost=.02)
-        self.assert_pair(summary["paired"][1], "map", "map-search", f1=.1, seconds=40, tokens=20, cost=.01)
-        self.assert_pair(summary["paired"][2], "search", "map-search", f1=-.1, seconds=-10, tokens=-20, cost=-.01)
-        for reference, comparison in (("map", "search"), ("map", "map-search"), ("search", "map-search")):
-            self.assertIn(f"**test/model / medium / {comparison} − {reference}**", text)
-
-    def test_partial_runs_pair_only_matching_completed_trials(self):
-        self.add_trial("search", task="first", f1=.75)
-        self.add_trial("off", task="first", f1=.25)
-        self.add_trial("map", task="first", completed=False)
-        self.add_trial("map", task="second", repeat=2)
-        self.add_trial("search", task="second", repeat=1)
-        self.add_trial("off", task="second", repeat=2, completed=False)
-        summary, _ = self.report()
-        self.assertEqual((summary["completed"], summary["planned"]), (4, 6))
-        self.assertEqual(len(summary["paired"]), 1)
-        self.assertEqual(summary["paired"][0]["task"], "first")
-        self.assertEqual((summary["paired"][0]["reference_arm"], summary["paired"][0]["comparison_arm"]),
-                         ("off", "search"))
-
-    def test_single_arm_and_empty_results_have_no_pairs(self):
+    def test_duplicate_or_mismatched_identities_are_not_arbitrarily_paired(self):
+        self.add_trial("off")
         self.add_trial("map")
-        summary, text = self.report()
-        self.assertEqual(summary["paired"], [])
-        self.assertIn("| test/model | medium | map | fixture | 1 | 0 | — |", text)
-        (self.output / "trials" / self.trials[0]["id"] / "result.json").unlink()
-        self.results.clear()
-        summary, _ = self.report()
-        self.assertEqual(summary["completed"], 0)
-        self.assertEqual(summary["paired"], [])
+        with self.assertRaisesRegex(ValueError, "Duplicate result"):
+            reporting.build_summary(self.manifest(), self.results + self.results[:1])
+        with self.assertRaisesRegex(ValueError, "Duplicate planned"):
+            reporting.build_summary({"trials": self.trials + self.trials[:1]}, self.results)
+        changed = copy.deepcopy(self.results)
+        changed[0]["variant"] = "other"
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            reporting.build_summary(self.manifest(), changed)
 
-    def test_three_and_four_arms_generate_every_combination_in_order(self):
-        expected_three = [("off", "map"), ("off", "search"), ("map", "search")]
-        expected_four = [("off", "map"), ("off", "search"), ("off", "slopdex"),
-                         ("map", "search"), ("map", "slopdex"), ("search", "slopdex")]
-        for arms, expected in ((["search", "map", "off"], expected_three),
-                               (["slopdex", "search", "map", "off"], expected_four)):
-            with self.subTest(arms=arms):
-                self.trials.clear()
-                self.results.clear()
-                for arm in arms:
-                    self.add_trial(arm, f1={"off": .1, "map": .3, "search": .7, "slopdex": 1}[arm])
-                summary, text = self.report()
-                actual = [(row["reference_arm"], row["comparison_arm"]) for row in summary["paired"]]
-                self.assertEqual(actual, expected)
-                headings = [text.index(f"**test/model / medium / {comparison} − {reference}**")
-                            for reference, comparison in expected]
-                self.assertEqual(headings, sorted(headings))
-                for row in summary["paired"]:
-                    self.assertGreater(row["f1_delta"], 0)
-
-    def test_pair_summary_separates_models_variants_and_comparisons(self):
-        for model, variant in (("test/one", "low"), ("test/one", "high"), ("test/two", "low")):
-            for repeat in (1, 2):
-                for arm, f1 in (("off", .25), ("map", .5), ("search", 1)):
-                    self.add_trial(arm, model=model, variant=variant, repeat=repeat, f1=f1)
-        summary, text = self.report()
-        self.assertEqual(len(summary["paired"]), 18)
-        self.assertEqual(text.count("**: 2 pairs;"), 9)
-        self.assertIn("**test/one / low / search − map**: 2 pairs; mean F1 Δ +0.500", text)
-        self.assertIn("**test/two / low / search − off**: 2 pairs; mean F1 Δ +0.750", text)
-
-    def test_invalid_pairs_and_missing_cost_preserve_legacy_delta_rules(self):
-        self.add_trial("map", f1=1, seconds=8, cost=None)
-        self.add_trial("search", f1=0, status="timeout", seconds=100)
-        self.add_trial("map", repeat=2, f1=.5, cost=None)
-        self.add_trial("search", repeat=2, f1=1, seconds=6)
-        summary, text = self.report()
-        invalid, valid = summary["paired"]
-        self.assertEqual(invalid["f1_delta"], -1)
-        self.assertFalse(invalid["both_ok"])
-        for key in ("seconds_delta", "input_tokens_delta", "cost_delta_usd"):
-            self.assertNotIn(key, invalid)
-        self.assertTrue(valid["both_ok"])
-        self.assertEqual(valid["seconds_delta"], -4)
-        self.assertNotIn("cost_delta_usd", valid)
-        self.assertIn("mean F1 Δ -0.250; mean time Δ -4.0s (1 valid pairs)", text)
-
-    def test_zero_call_treatment_rows_and_both_preparation_sections(self):
-        for arm in ("off", "map", "search", "map-search", "slopdex"):
-            self.add_trial(arm)
-        summary, text = self.report(index={"wall_seconds": 12, "native_ann": {"wall_seconds": 3},
-                                          "coverage": {"parser_diagnostics": 2, "validated_targets": 4}},
-                                    map_index={"wall_seconds": 5})
-        self.assertEqual(summary["slopdex_commands"], {})
+    def test_zero_call_map_trial_is_still_listed(self):
+        self.add_trial("off")
+        self.add_trial("map")
+        _, text = self.saved_report(map_index={"wall_seconds": 2})
         usage = text.split("### By task and trial", 1)[1]
-        for arm in ("map", "search", "map-search", "slopdex"):
-            self.assertIn(f"| test/model | medium | {arm} | fixture | 1 | 0 | — |", usage)
+        self.assertIn("| test/model | medium | map | fixture | 1 | 0 | — |", usage)
         self.assertNotIn("| test/model | medium | off | fixture", usage)
-        self.assertIn("## Index preparation", text)
-        self.assertIn("One-time preparation: 12.0s", text)
-        self.assertIn("Native ANN warm-up: 3.0s", text)
-        self.assertIn("Search and combined (`map-search` and `slopdex`) trials", text)
-        self.assertIn("## Structural-index preparation", text)
-        self.assertIn("One-time structural-index preparation: 5.0s", text)
-        self.assertIn("validated searchable task targets: 4", text)
-
-    def test_structural_only_preparation_has_no_ann_statement(self):
-        self.add_trial("map")
-        _, text = self.report(map_index={"wall_seconds": 2})
-        self.assertIn("## Structural-index preparation", text)
-        self.assertNotIn("Native ANN warm-up", text)
+        self.assertIn("Structural-index preparation", text)
 
 
 if __name__ == "__main__":
