@@ -73,7 +73,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > Add this to your `AGENTS.md` to let the agent use the map command to explore the codebase:
 >
 > ```text
-> - Start discovery with one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" --private --callers 2 --callees 2 <paths...>`. Use known paths or `.`. Immediately read plausible implementation ranges and follow calls in source; grep for usages or missing links. Map again only for unknown declaration locations. Batch reads; skip repeated inventories and setup/help.
+> - Start discovery with one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" --private --callers 2 --callees 2 <paths...>`. Immediately read plausible implementation ranges from the source files directly. Avoid mapping repeatedly, frontload the map in one call.
 > ```
 
 ## Search
