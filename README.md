@@ -130,7 +130,7 @@ Descriptions refer to source comments found above symbols or at the start of a f
 > Add this to your `AGENTS.md` to use semantic search with your agent:
 >
 > ```text
-> - use semantic code search to find code with: `slopdex search "<query>" --threshold 0.3 --limit 20 --formats all`; vary the search query if you get no results
+> - use semantic code search to find code with: `slopdex search "<query>" ["<query>"...] --threshold 0.3 --limit 20 --formats all`. Provide multiple alternative queries.
 > ```
 
 See the [attachment rules](docs/reference.md#descriptions).
