@@ -2,7 +2,7 @@
 
 use super::args::{Format, Global};
 use super::io::print_json;
-use super::workspace::absolute;
+use super::workspace::{absolute, root_path};
 use crate::{engine::cross_search_exclusions, parse, ui};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -228,7 +228,7 @@ fn exclude_cross_search(global: &Global, config: &mut Value, args: &[String]) ->
         "usage: slopdex config exclude-cross-search <file>:<symbol> [<file>:<symbol> ...]"
     );
     validate_config(config)?;
-    let root = absolute(global.root.as_deref().unwrap_or(Path::new(".")))?;
+    let root = root_path(global.root.as_deref())?;
     let mut hashes = config
         .get("crossSearchExclusions")
         .and_then(Value::as_array)

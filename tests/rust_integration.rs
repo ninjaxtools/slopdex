@@ -1449,6 +1449,238 @@ fn query_threshold_endpoints_apply_to_code_and_markdown_and_survive_restart() ->
 }
 
 #[test]
+fn cli_config_defaults_to_global_and_updates_the_selected_file() -> Result<()> {
+    let repo = Repo::new()?;
+    let global = repo.home.join("slopdex/config.json");
+    let local = repo.root.join(".slopdex/config.json");
+    let explicit = repo.root.join("custom/config.json");
+    let result = repo.cli_json(&["config", "set", "model", "global-model"])?;
+    assert_eq!(result["configPath"], json!(global));
+    assert!(!local.exists());
+    repo.cli_json(&["config", "set", "defaultLimit", "2"])?;
+    repo.write("code.rs", "pub fn first() {}\npub fn second() {}\n")?;
+    let result = repo.cli_json(&["config", "exclude-cross-search", "code.rs:first"])?;
+    assert_eq!(result["configPath"], json!(global));
+    assert_eq!(result["crossSearchExclusions"].as_array().unwrap().len(), 1);
+    let global_bytes = fs::read(&global)?;
+    let saved: Value = serde_json::from_slice(&global_bytes)?;
+    assert_eq!(saved["model"], "global-model");
+    assert_eq!(saved["defaultLimit"], 2);
+
+    // An existing local file replaces the global settings, rather than merging.
+    repo.write(".slopdex/config.json", "{}")?;
+    let result = repo.cli_json(&["config", "set", "model", "local-model"])?;
+    assert_eq!(result["configPath"], json!(local));
+    let local_bytes = fs::read(&local)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&local_bytes)?,
+        json!({"model": "local-model"})
+    );
+    assert_eq!(fs::read(&global)?, global_bytes);
+
+    // Explicit selection wins even when the requested file does not yet exist.
+    let result = repo.cli_json(&[
+        "--config",
+        "custom/config.json",
+        "config",
+        "set",
+        "model",
+        "explicit-model",
+    ])?;
+    assert_eq!(result["configPath"], json!(explicit));
+    assert_eq!(fs::read(&local)?, local_bytes);
+    assert_eq!(fs::read(&global)?, global_bytes);
+
+    // Never silently fall back from an invalid selected config.
+    repo.write(".slopdex/config.json", "invalid JSON")?;
+    let output = repo.cli(&["config", "set", "model", "not-saved"])?;
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&global)?, global_bytes);
+    assert_eq!(fs::read_to_string(&local)?, "invalid JSON");
+    fs::write(&global, "invalid JSON")?;
+    repo.write(".slopdex/config.json", "{}")?;
+    repo.cli_json(&["config", "set", "model", "local-only"])?;
+    assert_eq!(fs::read_to_string(&global)?, "invalid JSON");
+    Ok(())
+}
+
+#[test]
+fn cli_bare_map_uses_checkout_root_or_non_git_cwd_and_respects_explicit_root() -> Result<()> {
+    for git in [false, true] {
+        let repo = Repo::new()?;
+        if git {
+            repo.git(&["init", "--quiet"])?;
+        }
+        repo.write("root.rs", "pub fn root_symbol() {}\n")?;
+        repo.write("nested/code.rs", "pub fn nested_symbol() {}\n")?;
+        let nested = repo.root.join("nested");
+        for explicit in [false, true] {
+            let mut command = repo.child(env!("CARGO_BIN_EXE_slopdex"));
+            command
+                .current_dir(&nested)
+                .args(["--output", "json", "map"]);
+            if explicit {
+                command.arg("--root").arg(&nested);
+            }
+            let output = command.output()?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rows: Value = serde_json::from_slice(&output.stdout)?;
+            let expected = if git && !explicit {
+                strings(&["root_symbol", "nested_symbol"])
+            } else {
+                strings(&["nested_symbol"])
+            };
+            assert_eq!(map_names(rows.as_array().unwrap()), expected);
+            let mut dot = repo.child(env!("CARGO_BIN_EXE_slopdex"));
+            dot.current_dir(&nested)
+                .args(["--output", "json", "map", "."]);
+            if explicit {
+                dot.arg("--root").arg(&nested);
+            }
+            let dot = dot.output()?;
+            ensure!(dot.status.success(), "{:?}", dot);
+            assert_eq!(serde_json::from_slice::<Value>(&dot.stdout)?, rows);
+        }
+        assert!(!repo.root.join(".slopdex").exists());
+        assert!(!repo.home.join("cache").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_search_multiple_queries_unions_best_hits_with_one_limit_and_reuses_cache() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write(
+        "code.rs",
+        &(function("east", "VECTOR_EAST")
+            + &function("middle", "VECTOR_MID")
+            + &function("north", "VECTOR_NORTH")),
+    )?;
+    repo.open(&config)?.refresh()?;
+    let queries = ["VECTOR_EAST", "VECTOR_NORTH"];
+    let output = repo.cli(&[
+        "search",
+        queries[0],
+        queries[1],
+        "--code",
+        "--threshold",
+        "0.5",
+        "--limit",
+        "3",
+        "--no-reindex",
+    ])?;
+    ensure!(output.status.success(), "{:?}", output);
+    let rows: Vec<Value> = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(names(&rows), strings(&["east", "middle", "north"]));
+    assert_eq!(rows.len(), 3);
+    near(&row(&rows, "east")["similarity"], 1.0);
+    near(&row(&rows, "north")["similarity"], 1.0);
+    near(&row(&rows, "middle")["similarity"], 0.8);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("omitted"));
+    let calls = mock.count();
+    let warm = repo.cli_json(&[
+        "search",
+        queries[1],
+        queries[0],
+        queries[0],
+        "--code",
+        "--threshold",
+        "0.5",
+        "--limit",
+        "3",
+        "--no-reindex",
+    ])?;
+    assert_eq!(warm, json!(rows));
+    assert_eq!(mock.count(), calls);
+    let limited = repo.cli(&[
+        "search",
+        queries[0],
+        queries[1],
+        "--code",
+        "--threshold",
+        "0.5",
+        "--limit",
+        "2",
+        "--no-reindex",
+    ])?;
+    ensure!(limited.status.success(), "{:?}", limited);
+    let hits: Vec<Value> = serde_json::from_slice(&limited.stdout)?;
+    assert_eq!(hits, rows[..2]);
+    assert!(String::from_utf8_lossy(&limited.stderr).contains("omitted"));
+    let duplicates = repo.cli(&[
+        "search",
+        queries[0],
+        queries[0],
+        "--code",
+        "--threshold",
+        "0.5",
+        "--limit",
+        "2",
+        "--no-reindex",
+    ])?;
+    ensure!(duplicates.status.success(), "{:?}", duplicates);
+    let hits: Vec<Value> = serde_json::from_slice(&duplicates.stdout)?;
+    assert_eq!(names(&hits), strings(&["east", "middle"]));
+    assert_eq!(hits.len(), 2);
+    assert!(!String::from_utf8_lossy(&duplicates.stderr).contains("omitted"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_config_xdg_falls_back_to_home_for_unset_empty_or_relative_paths() -> Result<()> {
+    let repo = Repo::new()?;
+    let expected = repo.home.join(".config/slopdex/config.json");
+    for xdg in [None, Some(""), Some("relative/config")] {
+        let mut command = repo.child(env!("CARGO_BIN_EXE_slopdex"));
+        command.env_remove("XDG_CONFIG_HOME");
+        if let Some(xdg) = xdg {
+            command.env("XDG_CONFIG_HOME", xdg);
+        }
+        let output = command
+            .args(["--output", "json", "config", "set", "model", "home-model"])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(result["configPath"], json!(expected));
+    }
+    assert!(!repo.root.join(".slopdex").exists());
+    assert!(!repo.root.join("relative").exists());
+    Ok(())
+}
+
+#[test]
+fn cli_map_uses_global_config_across_repositories_and_local_config_overrides_it() -> Result<()> {
+    let repo = Repo::new()?;
+    let mut other = Repo::new()?;
+    other.home = repo.home.clone();
+    repo.cli_json(&["config", "set", "defaultLimit", "1"])?;
+    for workspace in [&repo, &other] {
+        workspace.write("code.rs", "pub fn first() {}\npub fn second() {}\n")?;
+        let rows = workspace.cli_json(&["map"])?;
+        assert_eq!(rows[0]["nodes"].as_array().unwrap().len(), 1);
+        assert!(!workspace.root.join(".slopdex").exists());
+    }
+    other.write(".slopdex/config.json", "{\"defaultLimit\":2}")?;
+    let rows = other.cli_json(&["map"])?;
+    assert_eq!(rows[0]["nodes"].as_array().unwrap().len(), 2);
+    let rows = repo.cli_json(&["map"])?;
+    assert_eq!(rows[0]["nodes"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+#[test]
 fn cross_search_default_separates_strong_groups_and_explicit_thresholds_can_bridge_them()
 -> Result<()> {
     let mock = Mock::start()?;

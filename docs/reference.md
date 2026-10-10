@@ -35,7 +35,7 @@ can also follow the command. Quote multiword queries.
 
 | Command | Actual operation | Default output |
 | --- | --- | --- |
-| `search <query>` | Search selected format groups' content, available descriptions, and symbols; default groups are code and docs. | Summary |
+| `search <query> [<query>...]` | Search selected format groups' content, available descriptions, and symbols for any query; default groups are code and docs. | Summary |
 | `search-code <query>` | Search only the callable code index. | Summary |
 | `search-descriptions <query>` | Search only available source/generated callable, symbol, and file descriptions. | Ranked declaration/file excerpts |
 | `search-docs <query>` (alias `search-md`) | Search only the heading-aware Markdown content index, never config or markup content. | Ranked heading paths |
@@ -117,9 +117,12 @@ use plain diagnostics without animations; result data on stdout retains its
 slopdex map [PATH]... [--formats GROUPS]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--symbol-threshold NUMBER] [--limit N|none] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--output text|json]
 ```
 
-With no paths, map selects the repository. Paths select files or recursive
-directories and are relative to `--root`, including when invoked from another
-working directory. Absolute paths and `..` components are accepted. A path outside
+With no paths, map implies `.` and maps the selected root: the Git checkout root
+when the working directory is inside a repository, otherwise the working
+directory. Explicit `--root` takes priority. Bare map also works without Git.
+Paths select files or recursive directories and are relative to the selected
+root, including when invoked from another working directory. Absolute paths and
+`..` components are accepted. A path outside
 the selected root uses its own Git checkout root, configuration, and index, as if
 invoked from that source's directory. Without Git, that directory is the root.
 Explicit `--config` and `--index` overrides still apply and remain relative to the
@@ -369,13 +372,28 @@ neighbors remain eligible regardless of source selectors. `-k` is map-only.
 
 ## Search and analysis options
 
+Only general `search <query> [<query>...]` accepts multiple positional queries.
+Dedicated `search-code`, `search-descriptions`, `search-docs` (alias `search-md`),
+and `search-symbols`, as well as `describe`, still accept one positional query.
+Quote multiword queries: `search "validate session" "reject expired credentials"`
+runs two searches, while unquoted words become separate queries.
+
+Multiple queries have OR semantics: a hit matching any query is eligible. Each
+query is searched and cached independently, and reranked independently when
+enabled. The combined results are deduplicated by indexed hit and result type;
+the whole best-ranking row is retained using `rerankScore` with reranking enabled,
+otherwise `similarity`. Different result types for the same declaration remain
+independent. Results are ranked together and one overall `--limit` is applied
+after merging. Single-query behavior and output JSON shape are unchanged; multiple
+queries return the same result array, not separate per-query arrays.
+
 Common query/cross-search filters:
 
 - `--threshold <number|min-max>`: default `0.8` for cross-search and `0.3` for
   query commands (including `describe`); finite endpoints in `[-1,1]`,
   inclusive minimum and exclusive maximum. A range requires minimum < maximum.
 - `--limit <positive integer|none>`: default `4096`, configurable with
-  `defaultLimit` in `.slopdex/config.json`. `--limit none` disables the output
+  `defaultLimit` in the selected config file. `--limit none` disables the output
   limit, overriding the config. Caps query results (including Markdown), or the
   context matches for `describe`. For `map`, it caps direct declaration matches
   across files and mapped workspaces; ancestor and call-graph context do not count.
@@ -441,13 +459,14 @@ Cross-search options:
 | `--include-symmetric-duplicates` | Keep both directions of same-index pairs. By default each unordered observed pair is emitted once. |
 | `--cohesion` | Sort each source's selected matches by descending filesystem distance, then similarity. Defaults to summary; incompatible with clusters. |
 | `--target-root <path> --target-index <path>` | Compare to another existing index; both are required together. The target is checked before the source engine opens or refreshes. Embedding profiles must match. |
-| `--target-config <path>` | Config for the second root; defaults to `<target-root>/.slopdex/config.json`. Requires both target options. |
+| `--target-config <path>` | Explicit config for the second root; otherwise uses its existing `.slopdex/config.json`, or the user config if absent, without merging. Requires both target options. |
 
 Examples:
 
 ```bash
 slopdex update
 slopdex search "keep the repository index synchronized"
+slopdex search "validate session" "reject expired credentials" --limit 20
 slopdex search-code "configure the embedding provider"
 slopdex search-code 'reject expired credentials' -q 'validate session' --symbol-threshold 0.6
 slopdex search-docs "configure the embedding provider"
@@ -661,6 +680,9 @@ without a limit. OpenAI receives up to
 `min(100, max(limit or 100, rerankerCandidates))`; the configured candidate count
 defaults to `10`. With `--limit none` the OpenAI retrieval cap is still **100**.
 Query JSON retains `similarity` and adds `rerankScore`.
+For multi-query general `search`, reranking and its candidate budget apply to
+each query independently before the best rows are merged and the overall output
+limit is applied.
 
 Clusters are connected components of observed callable matches, sorted by highest
 pair similarity × distinct covered source lines, descending. Line coverage is the
@@ -830,7 +852,7 @@ global store after acquiring them, preventing duplicate work across concurrent
 worktrees. Locks remain held through local persistence, with a bounded 30-second
 wait; unrelated artifact keys can proceed independently.
 
-Example `.slopdex/config.json` fields (credentials come from standard AWS
+Example config fields (credentials come from standard AWS
 environment variables or credentials files, not this JSON):
 
 ```json
@@ -1060,24 +1082,37 @@ is not an atomic filesystem snapshot.
 
 ## Root configuration and provider overrides
 
-The root defaults to the current directory; select another with `--root`. There
-is no automatic climb to a Git/project root. The default config is
-`<root>/.slopdex/config.json`, a JSON object; a missing file means defaults.
-`--config <path>` selects another settings file; it does not select config-format
-results (use `--formats config` for that). `--index` overrides `indexPath`, otherwise
+The root defaults to the Git checkout root when the process working directory is
+inside a repository, otherwise the working directory. Explicit `--root <path>`
+always takes priority, even inside a repository. Configuration is a JSON object,
+selected using that root in this order:
+
+1. Explicit `--config <path>`.
+2. An existing `<root>/.slopdex/config.json`.
+3. `$XDG_CONFIG_HOME/slopdex/config.json`, falling back to
+   `~/.config/slopdex/config.json` when `XDG_CONFIG_HOME` is unset, empty, or not absolute.
+
+Only the selected file is loaded: repository settings replace, rather than merge
+with, user settings. A missing selected file means defaults. `--config` does not
+select config-format results (use `--formats config` for that).
+`--index` overrides `indexPath`, otherwise
 the index defaults to the per-workspace XDG cache path described above. Explicit relative config/index
 paths and relative JSON `indexPath` resolve from **the process working directory**,
 not the root or config's directory.
 
 Command-line provider/model/dimension settings override JSON. Target repositories
-load their own root-selected config, then receive the same global overrides.
+select their config using their own root and the same user-config fallback
+(or explicit `--target-config`), then receive the same global overrides.
 When neither description provider nor model is specified, the index's saved
 description profile supplies both. Description generation is always explicit;
-the removed description enablement setting is rejected. Config writes preserve
-other unknown properties
-and replace the JSON file through a synced temporary file.
+the removed description enablement setting is rejected. All configuration
+updates, including interactive setup, `config set`, and exclusion edits, write
+the selected file. Writes preserve other unknown properties and replace the
+JSON file through a synced temporary file. To create repository-specific settings,
+use `slopdex --config .slopdex/config.json config`; subsequent commands select
+that existing file automatically.
 
-Example `.slopdex/config.json`:
+Example `config.json` (user or repository settings):
 
 ```json
 {

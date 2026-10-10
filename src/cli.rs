@@ -18,7 +18,7 @@ use self::{
     },
     workspace::{
         SourceWorkspace, absolute, config_path, index_path, map_workspaces, require_index,
-        same_path, source_workspace,
+        root_path, same_path, source_workspace,
     },
 };
 use crate::{
@@ -128,7 +128,7 @@ pub fn run() -> Result<()> {
 }
 
 fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
-    let root = absolute(cli.global.root.as_deref().unwrap_or(Path::new(".")))?;
+    let root = root_path(cli.global.root.as_deref())?;
     let workspaces = match &cli.command {
         Command::Map(args) => map_workspaces(&root, &args.paths)?,
         Command::CrossSearch(args) if args.source_path.is_some() => {
@@ -371,8 +371,12 @@ fn run_workspace(
         | Command::SearchMd(_)
         | Command::SearchSymbols(_) => {
             let (args, kind, options, descriptions) = cli.command.search_request().unwrap();
+            let mut queries = vec![args.query.clone()];
+            if let Command::Search(search) = &cli.command {
+                queries.extend(search.additional_queries.iter().cloned());
+            }
             let rows = match ui::spin("Searching index", || {
-                engine.search_limited(&args.query, kind, &options)
+                engine.search_queries_limited(&queries, kind, &options)
             }) {
                 Err(error) if error.is::<crate::engine::NeedsWrite>() => {
                     drop(engine);
@@ -383,7 +387,7 @@ fn run_workspace(
                         mode.refresh(&mut engine)?;
                     }
                     ui::spin("Searching index", || {
-                        engine.search_limited(&args.query, kind, &options)
+                        engine.search_queries_limited(&queries, kind, &options)
                     })?
                 }
                 result => result?,

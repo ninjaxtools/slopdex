@@ -337,6 +337,41 @@ fn search_commands_select_explicit_indexes_and_structural_mode() {
 }
 
 #[test]
+fn search_accepts_multiple_nonempty_queries_with_shared_options() {
+    let cli = parse(&[
+        "search",
+        "validate session",
+        "load settings",
+        "--code",
+        "--threshold",
+        "0.6",
+        "another query",
+        "--limit",
+        "5",
+    ]);
+    let Command::Search(args) = cli.command else {
+        panic!()
+    };
+    assert_eq!(args.query.query, "validate session");
+    assert_eq!(args.additional_queries, ["load settings", "another query"]);
+    assert_eq!(args.options()["minSimilarity"], 0.6);
+    assert_eq!(args.options()["limit"], 5);
+    assert_eq!(args.options()["code"], true);
+    let Command::Search(single) = parse(&["search", "one query"]).command else {
+        panic!()
+    };
+    assert!(single.additional_queries.is_empty());
+    for args in [
+        vec!["slopdex", "search"],
+        vec!["slopdex", "search", "query", ""],
+        vec!["slopdex", "search", "query", "   "],
+        vec!["slopdex", "describe", "first", "second"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+}
+
+#[test]
 fn symbol_selection_defaults_and_scalar_threshold_validation() {
     for command in [
         "map",
@@ -462,7 +497,7 @@ fn map_paths_kinds_and_shared_selection_parse() {
     let Command::Map(args) = parse(&["map"]).command else {
         panic!()
     };
-    assert_eq!(args.options(), json!({}));
+    assert_eq!(args.options(), json!({"paths": ["."]}));
     for args in [
         vec!["map", "-k", "unknown"],
         vec!["map", "-k", "functions,"],

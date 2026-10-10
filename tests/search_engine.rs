@@ -149,6 +149,21 @@ impl Fixture {
         Engine::open(self.temp.path(), &self.index, self.config.clone())
     }
 
+    fn seed_query(&self, query: &str, vector: &[f32]) -> Result<()> {
+        let db = Database::open_with_config(&self.index, self.temp.path(), &self.config, false)?;
+        let providers = Providers::new(&self.config)?;
+        db.put_embedding(
+            &Database::embedding_key(&providers.embedding_profile(), true, query),
+            vector,
+        )?;
+        let mut config = self.config.clone();
+        config["dimensions"] = self.config["symbolDimensions"].clone();
+        let mut profile = Providers::new(&config)?.embedding_profile();
+        profile["symbolNormalizationVersion"] = json!("symbols-v1");
+        db.put_embedding(&Database::embedding_key(&profile, true, query), vector)?;
+        Ok(())
+    }
+
     fn source_hash(&self, path: &str) -> Result<String> {
         let parsed = parse::parse(path, &fs::read_to_string(self.temp.path().join(path))?)?;
         Ok(parsed.callables[0].source_hash.clone())
@@ -193,6 +208,224 @@ fn hit_keys(rows: &[Value]) -> BTreeSet<String> {
             )
         })
         .collect()
+}
+
+#[test]
+fn multiple_queries_keep_best_scores_across_code_docs_and_symbols() -> Result<()> {
+    let fixture = Fixture::new(true)?;
+    fixture.seed_query("silver token", &[0.6, 0.8])?;
+    let engine = fixture.engine()?;
+    let queries: Vec<String> = vec!["copper token".into(), "silver token".into()];
+    let options = json!({"minSimilarity":-1, "limit":"none"});
+    for kind in ["search-code", "search-docs", "search-symbols"] {
+        let copper = engine.search(&queries[0], kind, &options)?;
+        let silver = engine.search(&queries[1], kind, &options)?;
+        assert!(!copper.is_empty(), "{kind}");
+        assert_eq!(hit_keys(&copper), hit_keys(&silver), "{kind}");
+        let combined = engine.search_queries(&queries, kind, &options)?;
+        assert_eq!(combined.len(), copper.len(), "{kind}: {combined:?}");
+        assert_eq!(hit_keys(&combined), hit_keys(&copper), "{kind}");
+        for row in &combined {
+            let key = hit_keys(std::slice::from_ref(row));
+            let best = copper
+                .iter()
+                .chain(&silver)
+                .filter(|candidate| hit_keys(std::slice::from_ref(*candidate)) == key)
+                .max_by(|a, b| {
+                    a["similarity"]
+                        .as_f64()
+                        .unwrap()
+                        .total_cmp(&b["similarity"].as_f64().unwrap())
+                })
+                .unwrap();
+            assert_eq!(row, best, "{kind}");
+        }
+        assert_eq!(combined, engine.search_queries(&queries, kind, &options)?);
+        assert_eq!(
+            combined,
+            engine.search_queries(
+                &[queries[1].clone(), queries[0].clone(), queries[1].clone()],
+                kind,
+                &options,
+            )?
+        );
+        assert_eq!(
+            copper,
+            engine.search_queries(&queries[..1], kind, &options)?
+        );
+        assert_eq!(
+            copper,
+            engine.search_queries(&[queries[0].clone(), queries[0].clone()], kind, &options)?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn multiple_queries_or_thresholds_and_apply_one_global_limit() -> Result<()> {
+    let mut fixture = Fixture::with_sources(
+        false,
+        &[
+            ("a.rs", "pub fn run() { println!(\"a\"); }\n"),
+            ("b.rs", "pub fn run() { println!(\"b\"); }\n"),
+            ("c.rs", "pub fn run() { println!(\"c\"); }\n"),
+        ],
+    )?;
+    fixture.seed_code_vectors(&[
+        ("a.rs", [1.0, 0.0]),
+        ("b.rs", [0.8, 0.6]),
+        ("c.rs", [0.0, 1.0]),
+    ])?;
+    fixture.seed_query("silver token", &[0.0, 1.0])?;
+    fixture.config["defaultLimit"] = json!(1);
+    let engine = fixture.engine()?;
+    let queries: Vec<String> = vec!["copper token".into(), "silver token".into()];
+    let unlimited = json!({"minSimilarity":0.7, "limit":"none"});
+    let rows = engine.search_queries(&queries, "search-code", &unlimited)?;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(hit_keys(&rows).len(), 3);
+    assert_eq!(rows[0]["function"]["path"], "a.rs");
+    assert_eq!(rows[1]["function"]["path"], "c.rs");
+    assert_eq!(rows[2]["function"]["path"], "b.rs");
+    assert!((rows[2]["similarity"].as_f64().unwrap() - 0.8).abs() < 0.001);
+    assert_eq!(
+        engine.search_queries(&queries, "search-code", &json!({"minSimilarity":0.7}))?,
+        rows[..1]
+    );
+    for count in [1, 2, 3, 4] {
+        let options = json!({"minSimilarity":0.7, "limit":count});
+        assert_eq!(
+            engine.search_queries(&queries, "search-code", &options)?,
+            rows[..count.min(rows.len())]
+        );
+    }
+    assert!(
+        engine
+            .search_queries(&[], "search-code", &unlimited)?
+            .is_empty()
+    );
+    assert!(
+        engine
+            .search_queries(&queries, "search-code", &json!({"limit":0}))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn multiple_queries_preserve_different_locations_and_result_streams() -> Result<()> {
+    let fixture = Fixture::new(true)?;
+    fixture.seed_query("silver token", &[0.6, 0.8])?;
+    let engine = fixture.engine()?;
+    let queries: Vec<String> = vec!["copper token".into(), "silver token".into()];
+    let options = json!({"minSimilarity":-1, "limit":"none"});
+    let rows = engine.search_queries(&queries, "search", &options)?;
+    for path in ["a.rs", "b.rs"] {
+        for (kind, field) in [("function", "function"), ("symbol", "symbol")] {
+            assert!(
+                rows.iter().any(|row| {
+                    row["type"] == kind && row[field]["path"] == path && row[field]["name"] == "run"
+                }),
+                "missing {kind} in {path}: {rows:?}"
+            );
+        }
+    }
+    assert!(rows.iter().any(|row| row["type"] == "file"));
+    assert!(rows.iter().any(|row| row["type"] == "markdown"));
+    assert_eq!(
+        rows,
+        engine.search_queries(
+            &[queries[1].clone(), queries[0].clone()],
+            "search",
+            &options
+        )?
+    );
+    Ok(())
+}
+
+#[test]
+fn multiple_queries_choose_and_sort_best_rerank_scores_without_provider_calls() -> Result<()> {
+    let mut fixture = Fixture::with_sources(
+        false,
+        &[
+            ("a.rs", "pub fn run() { println!(\"a\"); }\n"),
+            ("b.rs", "pub fn run() { println!(\"b\"); }\n"),
+        ],
+    )?;
+    fixture.seed_code_vectors(&[("a.rs", [1.0, 0.0]), ("b.rs", [0.0, 1.0])])?;
+    fixture.seed_query("silver token", &[0.0, 1.0])?;
+    let queries: Vec<String> = vec!["copper token".into(), "silver token".into()];
+    let options = json!({"minSimilarity":-1, "limit":"none"});
+    let baseline = fixture.engine()?;
+    let documents = queries
+        .iter()
+        .map(|query| baseline.search(query, "search-code", &options))
+        .collect::<Result<Vec<_>>>()?;
+    drop(baseline);
+    fixture.config["rerankingEnabled"] = json!(true);
+    fixture.config["rerankerProvider"] = json!("openai");
+    fixture.config["rerankerModel"] = json!("rerank-fixture");
+    fixture.config["rerankerBaseUrl"] = json!("http://127.0.0.1:1/v1");
+    fixture.config["rerankerApiKey"] = json!("fixture");
+    let db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
+    for (query, rows) in queries.iter().zip(&documents) {
+        let documents: Vec<_> = rows.iter().map(Value::to_string).collect();
+        let key = hash(
+            json!([
+                "rerank-v1",
+                fixture.config["rerankerProvider"],
+                fixture.config["rerankerModel"],
+                fixture.config["rerankerBaseUrl"],
+                query,
+                documents
+            ])
+            .to_string(),
+        );
+        let mut ranking: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let score = match (query.as_str(), row["function"]["path"].as_str().unwrap()) {
+                    ("copper token", "a.rs") => 0.1,
+                    ("copper token", "b.rs") => 0.7,
+                    ("silver token", "a.rs") => 0.9,
+                    ("silver token", "b.rs") => 0.2,
+                    _ => unreachable!(),
+                };
+                (index, score)
+            })
+            .collect();
+        ranking.sort_by(|a, b| f64::total_cmp(&b.1, &a.1));
+        db.cache_put("rerank", &key, &serde_json::to_string(&ranking)?)?;
+    }
+    drop(db);
+    let engine = fixture.engine()?;
+    let rows = engine.search_queries(&queries, "search-code", &options)?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["function"]["path"], "a.rs");
+    assert_eq!(rows[0]["rerankScore"], 0.9);
+    assert_eq!(rows[0]["similarity"], 0.0);
+    assert_eq!(rows[1]["function"]["path"], "b.rs");
+    assert_eq!(rows[1]["rerankScore"], 0.7);
+    assert_eq!(rows[1]["similarity"], 0.0);
+    assert_eq!(
+        rows,
+        engine.search_queries(
+            &[queries[1].clone(), queries[0].clone()],
+            "search-code",
+            &options
+        )?
+    );
+    assert_eq!(
+        engine.search_queries(
+            &queries,
+            "search-code",
+            &json!({"minSimilarity":-1,"limit":1})
+        )?,
+        rows[..1]
+    );
+    Ok(())
 }
 
 #[test]

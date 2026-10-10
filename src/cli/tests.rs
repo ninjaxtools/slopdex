@@ -40,6 +40,7 @@ fn external_source_saved_config_paths_use_its_directory() -> Result<()> {
 fn symbol_search_requires_existing_index_even_without_refresh() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let index = dir.path().join("missing.sqlite");
+    let config = dir.path().join("missing.json");
     for command in [
         vec!["search-symbols", "query"],
         vec!["search", "query", "--symbols"],
@@ -51,6 +52,8 @@ fn symbol_search_requires_existing_index_even_without_refresh() -> Result<()> {
                 dir.path().to_str().unwrap(),
                 "--index",
                 index.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
             ]);
             if no_reindex {
                 argv.push("--no-reindex");

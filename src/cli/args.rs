@@ -23,10 +23,13 @@ pub(super) struct Cli {
 
 #[derive(Debug, Args)]
 pub(super) struct Global {
-    /// Repository root (defaults to the current directory)
+    /// Repository root (default: Git checkout root, or current directory outside Git)
     #[arg(long, global = true)]
     pub(super) root: Option<PathBuf>,
-    /// Config file (default: <root>/.slopdex/config.json); explicit paths are relative to cwd
+    /// Settings file override (relative to cwd); all config updates write the selected file
+    ///
+    /// Defaults to $XDG_CONFIG_HOME/slopdex/config.json (fallback ~/.config/slopdex/config.json).
+    /// An existing <root>/.slopdex/config.json is used instead, without merging; --config takes priority.
     #[arg(long, global = true)]
     pub(super) config: Option<PathBuf>,
     /// Index file (default: XDG cache per workspace); overrides config indexPath
@@ -246,7 +249,8 @@ impl SelectionArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct MapArgs {
-    /// Files or recursive directories; external paths use their own repository and index
+    /// Files or recursive directories (default: . under the selected root); external paths use their own repository and index
+    #[arg(default_value = ".")]
     pub(super) paths: Vec<PathBuf>,
     #[command(flatten)]
     pub(super) selection: SelectionArgs,
@@ -401,6 +405,9 @@ pub(super) struct QueryArgs {
 pub(super) struct SearchArgs {
     #[command(flatten)]
     pub(super) query: QueryArgs,
+    /// Additional queries; OR matches, keep each hit's best score, and apply one overall limit
+    #[arg(value_name = "QUERY", value_parser = nonempty)]
+    pub(super) additional_queries: Vec<String>,
     /// Select the callable code index; any selector omits unselected indexes
     #[arg(long)]
     pub(super) code: bool,
@@ -500,6 +507,7 @@ pub(super) struct CrossArgs {
     pub(super) target_root: Option<PathBuf>,
     #[arg(long, requires = "target_root")]
     pub(super) target_index: Option<PathBuf>,
+    /// Target settings override; otherwise uses its existing repo config or the user config, without merging
     #[arg(long, requires_all = ["target_root", "target_index"])]
     pub(super) target_config: Option<PathBuf>,
 }

@@ -53,23 +53,31 @@ workspace. CLI options and output are implemented in Rust.
 
 `cli::run` parses and validates arguments before opening an engine. Help/version
 exit through Clap, model listing fetches public catalogs, and configuration
-actions read/write JSON without opening SQLite. The root defaults to the process
-working directory, with no upward Git-root discovery. Default paths are
-`<root>/.slopdex/config.json` and
+actions read/write JSON without opening SQLite. An explicit `--root` wins;
+otherwise the root is the Git checkout root discovered from the process working
+directory, falling back to that directory when outside a repository.
+Configuration selects an
+explicit `--config` first, then an existing `<root>/.slopdex/config.json`, otherwise
+`$XDG_CONFIG_HOME/slopdex/config.json` (fallback `~/.config/slopdex/config.json`
+when `XDG_CONFIG_HOME` is unset, empty, or not absolute). Only that file is loaded; repository
+and user settings are not merged. A missing selected file means defaults.
+The index defaults to
 `$XDG_CACHE_HOME/slopdex/worktrees-v1/<canonical-root-sha256>/index.sqlite`.
 The global store defaults to `$XDG_CACHE_HOME/slopdex/global-v1.sqlite`.
 No former default index or cache is copied, migrated, imported, or used as a seed.
 Explicit relative
 config/index paths, including JSON `indexPath`, resolve against the working
 directory. CLI overrides are applied after canonicalizing supported config aliases.
-Config saves use a same-directory temporary file, `sync_all`, and rename.
+All config updates write the selected file, using a same-directory temporary
+file, `sync_all`, and rename.
 
 Search variants and cross-search validate that the resolved source index exists
 before opening an engine; a missing index fails promptly with `slopdex update`
 guidance and no provider calls or index/cache artifacts. Cross-search validates
 its target index before opening or refreshing the source engine. Existing
 indexes still normally refresh before the requested operation. A second
-cross-search root loads its own config plus the same global overrides. The CLI
+cross-search root selects its own config with the same user-config fallback
+(unless `--target-config` is explicit), plus the same global overrides. The CLI
 recognizes identical source/target database paths (including
 symlinks and Unix hard links) and reuses the source engine rather than taking a
 second lock. Provider construction validates configuration without making network
@@ -77,6 +85,9 @@ requests; credentials are resolved only on a request. When neither description
 provider nor model is explicit, the saved description profile
 can supply engine defaults.
 
+Bare `map` supplies an implied `.` path, resolved against the selected root rather
+than the invocation directory. It maps the checkout from repository subdirectories
+and the working directory outside Git; explicit `--root` is still honored.
 If the resolved index is missing, `map` directly parses eligible files and renders
 structure without creating SQLite, locks, cache directories, or sidecars. This
 fallback applies with `--no-reindex` and without Git; it preserves selectors,
@@ -118,6 +129,17 @@ as semantic map does; mixed content/symbol searches use normal engine refresh.
 All search commands require an existing index. Read-only `NeedsWrite` retries
 reopen the same mode writable, retaining structural-only refresh for pure symbols.
 `--no-reindex` skips refresh but allows lazy name/query cache writes.
+
+Only general `search` accepts one or more positional queries; dedicated search
+variants and `describe` retain their single-query arguments. Multiword queries
+must be quoted to remain one query. Each query runs independently through the
+existing search/result-cache and optional reranking paths. The CLI OR-merges
+results, deduplicating by indexed hit and result type and retaining the complete
+best-ranking row by `rerankScore` when reranking is enabled, otherwise `similarity`.
+Distinct result types remain independent, even for one declaration. The merged
+rows share ranking and one overall output limit; reranker candidate budgets apply
+independently per query. Single-query behavior and the result JSON shape remain
+unchanged, with no per-query output wrapper.
 
 `Command::Generate { action: GenerateAction::Descriptions }` uses normal content
 open/refresh mode and opens writable. After the usual refresh (unless

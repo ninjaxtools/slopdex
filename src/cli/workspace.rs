@@ -100,12 +100,31 @@ pub(super) fn absolute(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub(super) fn root_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return absolute(path);
+    }
+    let cwd = std::env::current_dir()?;
+    Ok(crate::git::checkout_root(&cwd)?.unwrap_or(cwd))
+}
+
 pub(super) fn config_path(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
-    absolute(
-        &explicit
-            .map(Path::to_owned)
-            .unwrap_or_else(|| root.join(".slopdex/config.json")),
-    )
+    if let Some(path) = explicit {
+        return absolute(path);
+    }
+    let local = root.join(".slopdex/config.json");
+    if local
+        .try_exists()
+        .with_context(|| format!("Cannot inspect config {}", local.display()))?
+    {
+        return absolute(&local);
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .context("Cannot locate the user's config directory")?;
+    Ok(base.join("slopdex/config.json"))
 }
 
 pub(super) fn index_path(root: &Path, explicit: Option<&Path>, config: &Value) -> Result<PathBuf> {

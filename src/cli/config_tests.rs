@@ -13,6 +13,7 @@ fn selected_root_does_not_rebase_explicit_config_or_saved_index_paths() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("repo with spaces");
     let cwd = std::env::current_dir().unwrap();
+    write_config(&root.join(".slopdex/config.json"), &json!({})).unwrap();
     assert_eq!(
         config_path(&root, None).unwrap(),
         root.join(".slopdex/config.json")
@@ -566,18 +567,20 @@ fn config_exclusion_dispatch_creates_config_without_an_index() {
     let temp = tempfile::tempdir().unwrap();
     let source = "pub fn run() { println!(\"first\"); }\n";
     fs::write(temp.path().join("sample.rs"), source).unwrap();
+    let path = temp.path().join(".slopdex/config.json");
     let cli = parse(&[
         "config",
         "exclude-cross-search",
         "sample.rs:run",
         "--root",
         temp.path().to_str().unwrap(),
+        "--config",
+        path.to_str().unwrap(),
         "--output",
         "json",
     ]);
     let mut out = Vec::new();
     super::super::run_cli(&cli, &mut out).unwrap();
-    let path = temp.path().join(".slopdex/config.json");
     let old_hash = crate::parse::parse("sample.rs", source).unwrap().callables[0]
         .source_hash
         .clone();

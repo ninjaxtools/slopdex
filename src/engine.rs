@@ -1723,6 +1723,99 @@ impl Engine {
         Ok(self.search_limited(query, kind, options)?.rows)
     }
 
+    /// Search the union of queries, retaining each match's best-ranked result.
+    pub fn search_queries(
+        &self,
+        queries: &[String],
+        kind: &str,
+        options: &Value,
+    ) -> Result<Vec<Value>> {
+        Ok(self.search_queries_limited(queries, kind, options)?.rows)
+    }
+
+    pub(crate) fn search_queries_limited(
+        &self,
+        queries: &[String],
+        kind: &str,
+        options: &Value,
+    ) -> Result<LimitedResults<Value>> {
+        let queries: BTreeSet<_> = queries.iter().collect();
+        if queries.len() == 1 {
+            return self.search_limited(queries.first().unwrap(), kind, options);
+        }
+        let limit = limits::resolve(&self.config, options)?;
+        let ranking_score = if flag(&self.config, "rerankingEnabled") {
+            "rerankScore"
+        } else {
+            "similarity"
+        };
+        let order = |a: &Value, b: &Value| {
+            score(b, ranking_score)
+                .total_cmp(&score(a, ranking_score))
+                .then_with(|| a.to_string().cmp(&b.to_string()))
+        };
+        // Scores belong to the query, not the match. Include full item data so
+        // names shared by locations or streams stay distinct.
+        let identity = |row: &Value| {
+            json!([
+                row["type"],
+                row["function"],
+                row["symbol"],
+                row["chunk"],
+                row["file"]
+            ])
+            .to_string()
+        };
+        let mut matches: BTreeMap<String, Value> = BTreeMap::new();
+        for query in queries {
+            let mut query_options = options.clone();
+            query_options["limit"] = limit.value();
+            let rows = loop {
+                // A query's best count + 1 distinct matches suffice for both the
+                // global top count and omission detection, even if queries overlap.
+                // Keep using search_rows so individual queries reuse their caches.
+                let rows = self.search_rows(query, kind, &query_options)?;
+                let Some(count) = limit.count() else {
+                    break rows;
+                };
+                let probe = query_options["limit"].as_u64().unwrap() as usize;
+                let identities: HashSet<_> = rows.iter().map(&identity).collect();
+                if identities.len() > count || rows.len() <= probe {
+                    break rows;
+                }
+                // Duplicate streams can consume the spare candidate. Widen only
+                // in that case, rather than misreporting an exactly full union.
+                let wider = probe.saturating_mul(2);
+                if wider == probe {
+                    break rows;
+                }
+                query_options["limit"] = json!(wider);
+            };
+            for row in rows {
+                matches
+                    .entry(identity(&row))
+                    .and_modify(|existing| {
+                        if order(&row, existing).is_lt() {
+                            *existing = row.clone();
+                        }
+                    })
+                    .or_insert(row);
+            }
+        }
+        let mut rows: Vec<_> = matches.into_values().collect();
+        rows.sort_by(order);
+        let omitted = limit.count().is_some_and(|count| rows.len() > count);
+        if let Some(count) = limit.count() {
+            rows.truncate(count);
+        }
+        Ok(LimitedResults {
+            count: rows.len(),
+            rows,
+            omitted,
+            limit: limit.count(),
+        })
+    }
+
     pub(crate) fn search_limited(
         &self,
         query: &str,
