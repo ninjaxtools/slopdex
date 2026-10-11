@@ -807,6 +807,7 @@ impl Engine {
                 descriptions.push((path.clone(), None, text.clone()));
             }
         }
+        descriptions.retain(|(_, _, text)| !symbols::normalize(text).is_empty());
         let cache_key = || -> Result<String> {
             Ok(hash(
                 json!([

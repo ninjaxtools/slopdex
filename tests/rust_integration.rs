@@ -1460,6 +1460,58 @@ fn cli_config_defaults_to_global_and_updates_the_selected_file() -> Result<()> {
     assert_cli_config_selection(&repo)
 }
 
+#[test]
+fn cli_cross_search_exclusions_report_only_total_and_added() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write(
+        "code.rs",
+        "struct First;\nimpl First { pub fn run() { println!(\"first\"); } }\nstruct Second;\nimpl Second { pub fn run() { println!(\"second\"); } }\nstruct Third;\nimpl Third { pub fn run() { println!(\"first\"); } }\n",
+    )?;
+    for (selectors, total, added) in [
+        (vec!["code.rs:First.run", "code.rs:First.run"], 1, 1),
+        (
+            vec![
+                "code.rs:First.run",
+                "code.rs:Second.run",
+                "code.rs:Third.run",
+            ],
+            2,
+            1,
+        ),
+        (vec!["code.rs:First.run", "code.rs:Second.run"], 2, 0),
+    ] {
+        let args = [vec!["config", "exclude-cross-search"], selectors].concat();
+        let output = repo.cli_format(&args, "text")?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(
+            text.trim_end().ends_with(&format!(
+                ": {total} cross-search exclusions ({added} added)"
+            )),
+            "{text}"
+        );
+        let saved: Value =
+            serde_json::from_slice(&fs::read(repo.home.join("slopdex/config.json"))?)?;
+        let hashes = saved["crossSearchExclusions"].as_array().unwrap();
+        assert_eq!(hashes.len(), total);
+        for hash in hashes {
+            assert!(!text.contains(hash.as_str().unwrap()), "{text}");
+        }
+        assert!(output.stderr.is_empty());
+    }
+    let result = repo.cli_json(&["config", "exclude-cross-search", "code.rs:First.run"])?;
+    assert_cli_config_path(&result, &repo.home.join("slopdex/config.json"))?;
+    assert_eq!(result["total"], 2);
+    assert_eq!(result["added"], 0);
+    assert_eq!(result.as_object().unwrap().len(), 3);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_config_selection_with_symlinked_temp_directory() -> Result<()> {
@@ -1541,7 +1593,8 @@ fn assert_cli_config_selection(repo: &Repo) -> Result<()> {
     repo.write("code.rs", "pub fn first() {}\npub fn second() {}\n")?;
     let result = repo.cli_json(&["config", "exclude-cross-search", "code.rs:first"])?;
     assert_cli_config_path(&result, &global)?;
-    assert_eq!(result["crossSearchExclusions"].as_array().unwrap().len(), 1);
+    assert_eq!(result["total"], 1);
+    assert_eq!(result["added"], 1);
     let global_bytes = fs::read(&global)?;
     let saved: Value = serde_json::from_slice(&global_bytes)?;
     assert_eq!(saved["model"], "global-model");

@@ -1714,6 +1714,25 @@ fn structural_map_description_queries_select_precise_declarations() -> Result<()
 }
 
 #[test]
+fn map_description_queries_skip_punctuation_only_source_prose() -> Result<()> {
+    let fixture = Fixture::with_sources(
+        false,
+        &[(
+            "source.rs",
+            "//! \".\" | \"@\"\n\n/// \".\" | \"#\"\npub const LIMIT: usize = 1;\n/// copper token\npub fn run() {}\n",
+        )],
+    )?;
+    let engine = fixture.engine()?;
+    let options = json!({"symbolQuery":"copper token", "symbolThreshold":0.9, "private":true});
+    let rows = engine.map(&options)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["nodes"][0]["name"], "run");
+    assert_eq!(rows, engine.map(&options)?);
+    Ok(())
+}
+
+#[test]
 fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Result<()> {
     let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
     fs::create_dir(temp.path().join(".slopdex"))?;

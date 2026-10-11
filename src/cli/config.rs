@@ -234,6 +234,7 @@ fn exclude_cross_search(global: &Global, config: &mut Value, args: &[String]) ->
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let previous_count = hashes.len();
     for selector in &args[1..] {
         // Skip a Windows drive prefix when finding the file/symbol separator.
         let start = if selector.as_bytes().get(1) == Some(&b':')
@@ -275,17 +276,15 @@ fn exclude_cross_search(global: &Global, config: &mut Value, args: &[String]) ->
             !matches.is_empty(),
             "no callable symbol found for {selector}"
         );
-        ensure!(
-            matches.len() == 1,
-            "ambiguous callable symbol {selector}; use a unique qualified symbol name"
-        );
-        let hash = json!(matches[0].source_hash);
-        if !hashes.contains(&hash) {
-            hashes.push(hash);
+        for callable in matches {
+            let hash = json!(callable.source_hash);
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
         }
     }
     config["crossSearchExclusions"] = json!(hashes);
-    Ok(json!({"crossSearchExclusions": hashes}))
+    Ok(json!({"total": hashes.len(), "added": hashes.len() - previous_count}))
 }
 
 pub(super) fn run_config(
@@ -392,19 +391,26 @@ pub(super) fn run_config(
         result["configPath"] = json!(path);
         print_json(out, &result)
     } else {
-        let settings = changed
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(key, value)| {
-                let value = value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string());
-                format!("{key}={value}")
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        let settings = if action == Some("exclude-cross-search") {
+            format!(
+                "{} cross-search exclusions ({} added)",
+                changed["total"], changed["added"]
+            )
+        } else {
+            changed
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| {
+                    let value = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    format!("{key}={value}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let message = format!("Updated {}: {settings}", path.display());
         if ui::terminal() && io::stdout().is_terminal() {
             cliclack::log::success(message)?;

@@ -473,7 +473,7 @@ fn config_excludes_current_symbol_hashes_offline_and_without_duplicates() {
     )
     .unwrap();
     let expected = json!([existing, symbol_hash("First.run"), symbol_hash("other")]);
-    for _ in 0..2 {
+    for added in [2, 0] {
         let result = config_action_json(
             &path,
             &[
@@ -488,10 +488,9 @@ fn config_excludes_current_symbol_hashes_offline_and_without_duplicates() {
                 "jina",
             ],
         );
-        assert_eq!(
-            result,
-            json!({"configPath": path, "crossSearchExclusions": expected})
-        );
+        assert_eq!(result["total"], 3);
+        assert_eq!(result["added"], added);
+        assert!(result.get("crossSearchExclusions").is_none());
         let saved = read_config(&path).unwrap();
         assert_eq!(saved["crossSearchExclusions"], expected);
         assert_eq!(saved["custom"], json!({"keep": true}));
@@ -499,8 +498,10 @@ fn config_excludes_current_symbol_hashes_offline_and_without_duplicates() {
     }
     let absolute = format!("{}:Second.run", root.join("sample.rs").display());
     let result = config_action_json(&path, &["config", "exclude-cross-search", &absolute]);
+    assert_eq!(result["total"], 4);
+    assert_eq!(result["added"], 1);
     assert_eq!(
-        result["crossSearchExclusions"][3],
+        read_config(&path).unwrap()["crossSearchExclusions"][3],
         symbol_hash("Second.run")
     );
     assert!(!root.join(".slopdex").exists());
@@ -509,6 +510,71 @@ fn config_excludes_current_symbol_hashes_offline_and_without_duplicates() {
         read_config(&path).unwrap()["crossSearchExclusions"],
         json!([])
     );
+}
+
+#[test]
+fn config_excludes_all_ambiguous_symbol_matches_without_duplicate_hashes() {
+    for (file, source, symbol, qualified_names) in [
+        (
+            "sample.rs",
+            "struct First;\nimpl First { fn run() { println!(\"first\"); } }\nstruct Second;\nimpl Second { fn run() { println!(\"second\"); } }\nstruct Third;\nimpl Third { fn run() { println!(\"first\"); } }\nfn other() {}\n",
+            "run",
+            ["First.run", "Second.run", "Third.run"],
+        ),
+        (
+            "result_ownership.test.ts",
+            "test('first', () => { const cancel = () => 1; });\ntest('second', () => { const cancel = () => 2; });\ntest('third', () => { const cancel = () => 1; });\nfunction other() {}\n",
+            "cancel",
+            ["cancel", "cancel", "cancel"],
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(file), source).unwrap();
+        let parsed = crate::parse::parse(file, source).unwrap();
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let matches: Vec<_> = parsed
+            .callables
+            .iter()
+            .filter(|callable| callable.name == symbol)
+            .collect();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|callable| callable.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            qualified_names
+        );
+        assert_ne!(matches[0].source_hash, matches[1].source_hash);
+        assert_eq!(matches[0].source_hash, matches[2].source_hash);
+        let path = temp.path().join("config.json");
+        let existing = crate::hash("previous exclusion");
+        write_config(
+            &path,
+            &json!({"custom": "keep", "crossSearchExclusions": [existing, matches[0].source_hash]}),
+        )
+        .unwrap();
+        let expected = json!([existing, matches[0].source_hash, matches[1].source_hash]);
+        let selector = format!("{file}:{symbol}");
+        for added in [1, 0] {
+            let result = config_action_json(
+                &path,
+                &[
+                    "config",
+                    "exclude-cross-search",
+                    &selector,
+                    &selector,
+                    "--root",
+                    temp.path().to_str().unwrap(),
+                ],
+            );
+            assert_eq!(result["total"], 3);
+            assert_eq!(result["added"], added);
+            assert!(result.get("crossSearchExclusions").is_none());
+            let saved = read_config(&path).unwrap();
+            assert_eq!(saved["crossSearchExclusions"], expected);
+            assert_eq!(saved["custom"], "keep");
+        }
+    }
 }
 
 #[test]
@@ -532,7 +598,6 @@ fn invalid_cross_search_selectors_do_not_partially_save_exclusions() {
             vec![format!("{}:", source.display())],
             "expected <file>:<symbol>",
         ),
-        (vec![format!("{}:run", source.display())], "ambiguous"),
         (
             vec![format!("{}:VALUE", source.display())],
             "no callable symbol",
@@ -543,6 +608,13 @@ fn invalid_cross_search_selectors_do_not_partially_save_exclusions() {
         ),
         (
             vec![good.clone(), format!("{}:missing", source.display())],
+            "no callable symbol",
+        ),
+        (
+            vec![
+                format!("{}:run", source.display()),
+                format!("{}:missing", source.display()),
+            ],
             "no callable symbol",
         ),
         (
@@ -584,10 +656,16 @@ fn config_exclusion_dispatch_creates_config_without_an_index() {
     let old_hash = crate::parse::parse("sample.rs", source).unwrap().callables[0]
         .source_hash
         .clone();
+    let result: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&out).unwrap(),
-        json!({"configPath": path, "crossSearchExclusions": [old_hash]})
+        Path::new(result["configPath"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        path.canonicalize().unwrap()
     );
+    assert_eq!(result["total"], 1);
+    assert_eq!(result["added"], 1);
+    assert!(result.get("crossSearchExclusions").is_none());
     assert_eq!(
         read_config(&path).unwrap()["crossSearchExclusions"],
         json!([old_hash])
