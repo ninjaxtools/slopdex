@@ -75,7 +75,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > ```text
 > - Start discovery with one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" --private --callers 2 --callees 2 <paths...>` and immediately read plausible implementation ranges from the source files directly.
 > - Avoid mapping repeatedly, frontload the map in one call.
-> - Don't pipe the output trough `head`, instead save it to a file and read from there`.
+> - Don't pipe the output through `head`, instead save it to a file and read from there`.
 > ```
 
 ## Search
