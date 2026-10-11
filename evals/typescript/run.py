@@ -64,10 +64,18 @@ def readme_agent_instruction(command_name: str) -> str:
     return matches[0]
 
 
-def arm_instructions(arm: str) -> str:
+def arm_instructions(arm: str, *, map_private=None) -> str:
     guidance = ARM_INSTRUCTIONS[arm]
     if arm in ARM_NAVIGATION:
         snippets = "\n\n".join(readme_agent_instruction(command) for command in ARM_NAVIGATION[arm])
+        if map_private is not None:
+            if map_private:
+                if not re.search(r" --private(?=[ \t`]|$)", snippets):
+                    snippets = snippets.replace("`slopdex map ", "`slopdex map --private ")
+            else:
+                snippets = re.sub(r" --private(?=[ \t`]|$)", "", snippets)
+            action = "include" if map_private else "omit"
+            guidance += f"Required map visibility: {action} --private on every map invocation.\n"
         return "\n## Code navigation\n\n" + snippets + "\n" + guidance
     return guidance
 
@@ -621,7 +629,7 @@ def verify_native_ann_reuse(binary: str, workspace: Path, config_path: Path, ind
     return result
 
 
-def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None, index_dir: Path | None, commit: str):
+def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None, index_dir: Path | None, commit: str, *, map_private=None):
     bin_dir = sandbox / "bin"
     bin_dir.mkdir()
     log = sandbox / "slopdex-calls.jsonl"
@@ -641,7 +649,7 @@ ARM_NAVIGATION = {ARM_NAVIGATION!r}
 {inspect.getsource(slopdex_call_allowed)}
 call_id = uuid.uuid4().hex
 command = slopdex_command(sys.argv[1:])
-allowed = slopdex_call_allowed({arm!r}, sys.argv[1:])
+allowed = slopdex_call_allowed({arm!r}, sys.argv[1:], map_private={map_private!r})
 def record(value):
     with open({str(log)!r}, 'a') as stream:
         stream.write(json.dumps(value) + '\\n')
@@ -783,7 +791,7 @@ def slopdex_command_counts(calls) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def slopdex_call_allowed(arm: str, argv: list[str]) -> bool:
+def slopdex_call_allowed(arm: str, argv: list[str], *, map_private=None) -> bool:
     if arm in ARM_NAVIGATION:
         protected = {"--root", "--config", "--index", "--provider", "--model", "--dimensions",
                      "--description-provider", "--description-model", "--description-fallback-model",
@@ -795,6 +803,15 @@ def slopdex_call_allowed(arm: str, argv: list[str]) -> bool:
             if arg.split("=", 1)[0] in protected:
                 return False
     command_name = slopdex_command(argv)
+    if command_name == "map" and map_private is not None:
+        options = argv
+        if "--" in options:
+            separator = options.index("--")
+            options = options[separator + 1:] if options[separator + 1:separator + 2] == ["map"] else options[:separator]
+            if "--" in options:
+                options = options[:options.index("--")]
+        if ("--private" in options) != map_private:
+            return False
     return arm in ARM_NAVIGATION and command_name in {*ARM_NAVIGATION[arm], "help", "version"}
 
 
@@ -817,13 +834,14 @@ def read_slopdex_calls(path: Path):
     return calls
 
 
-def slopdex_protocol_violations(arm: str, calls):
+def slopdex_protocol_violations(arm: str, calls, *, map_private=None):
     violations = []
     for call in calls:
-        if not slopdex_call_allowed(arm, call["argv"]):
+        if not slopdex_call_allowed(arm, call["argv"], map_private=map_private):
             violations.append({"reason": "command_not_allowed", "command": slopdex_command(call["argv"]), "argv": call["argv"]})
     for required in ARM_NAVIGATION.get(arm, ()):
-        if not any(slopdex_command(call["argv"]) == required and call.get("exit_code") == 0 for call in calls):
+        if not any(slopdex_command(call["argv"]) == required and call.get("exit_code") == 0
+                   and slopdex_call_allowed(arm, call["argv"], map_private=map_private) for call in calls):
             violations.append({"reason": "required_command_not_used_successfully", "command": required})
     return violations
 
@@ -877,7 +895,7 @@ def task_prompt(task) -> str:
     return task["prompt"] + "\n" + ANSWER_FORMAT.replace("{finding_count}", str(len(task["targets"])))
 
 
-def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, index_dir, *, instruction=None):
+def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, index_dir, *, instruction=None, map_private=None):
     directory.mkdir(parents=True, exist_ok=True)
     prompt = task_prompt(task)
     (directory / "prompt.txt").write_text(prompt)
@@ -885,7 +903,7 @@ def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, i
         sandbox = Path(temporary)
         workspace = sandbox / "repo"
         clone(workspace, commit)
-        instructions = BASE_INSTRUCTIONS + (instruction if instruction is not None else arm_instructions(trial["arm"]))
+        instructions = BASE_INSTRUCTIONS + (instruction if instruction is not None else arm_instructions(trial["arm"], map_private=map_private))
         (workspace / "AGENTS.md").write_text(instructions)
         (directory / "AGENTS.md").write_text(instructions)
         cli_config = opencode_config(trial["model_config"], trial["arm"], config["max_steps"])
@@ -894,7 +912,7 @@ def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, i
         write_json(directory / "opencode.json", cli_config)
         env = isolated_environment(sandbox, cli_config)
         env["PWD"] = str(workspace)
-        bin_dir, calls = install_wrapper(sandbox, workspace, trial["arm"], slopdex, index_dir, commit)
+        bin_dir, calls = install_wrapper(sandbox, workspace, trial["arm"], slopdex, index_dir, commit, map_private=map_private)
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
         native_ann = None
         if trial["arm"] == "map":
@@ -914,7 +932,7 @@ def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, i
         if calls.exists():
             shutil.copyfile(calls, directory / "slopdex-calls.jsonl")
             slopdex_calls = read_slopdex_calls(calls)
-        command_violations = slopdex_protocol_violations(trial["arm"], slopdex_calls)
+        command_violations = slopdex_protocol_violations(trial["arm"], slopdex_calls, map_private=map_private)
         status = "ok"
         if expired:
             status = "timeout"
@@ -977,6 +995,8 @@ def main(argv=None):
     run.add_argument("--arms", nargs="+", choices=list(ARM_INSTRUCTIONS), default=DEFAULT_ARMS)
     run.add_argument("--repeats", type=int, default=1)
     run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--map-private", action=argparse.BooleanOptionalAction, default=None,
+                     help="Require --private on map calls, or forbid it with --no-map-private (default: README guidance)")
     run.add_argument("--dry-run", action="store_true", help="Print trial matrix without network, indexing or model calls")
     save_parser = sub.add_parser("save", help="Import a completed job into versioned baseline/latest-map records")
     save_parser.add_argument("output", type=Path)
@@ -1012,6 +1032,8 @@ def main(argv=None):
     if args.action == "run":
         if args.repeats <= 0 or len(set(args.arms)) != len(args.arms):
             raise ValueError("Use positive repeats and unique arms")
+        if args.map_private is not None and "map" not in args.arms:
+            raise ValueError("Map visibility requires the map arm")
         if args.task:
             unknown = set(args.task) - {task["id"] for task in tasks}
             if unknown:
@@ -1023,7 +1045,7 @@ def main(argv=None):
                 raise ValueError(f"Unknown configured models: {sorted(set(args.model) - names)}")
             config["models"] = [model for model in config["models"] if f"{model['model']}@{model['variant']}" in args.model]
         trials = make_trials(config, tasks, args.arms, args.repeats, args.seed)
-        instructions_by_arm = {arm: arm_instructions(arm) for arm in args.arms}
+        instructions_by_arm = {arm: arm_instructions(arm, map_private=args.map_private) for arm in args.arms}
         if args.dry_run:
             print(json.dumps({"commit": commit, "trials": trials, "count": len(trials), "arm_instructions": instructions_by_arm}, indent=2))
             return
@@ -1040,8 +1062,10 @@ def main(argv=None):
         return
     output = (args.output or HERE / "jobs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1000000:06d}").resolve()
     settings = {"config": config, "tasks": tasks, "commit": commit, "trials": trials,
-                "arm_instructions": instructions_by_arm,
-                "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+                 "arm_instructions": instructions_by_arm,
+                 "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    if args.map_private is not None:
+        settings["map_private"] = args.map_private
     task_by_id = {task["id"]: task for task in tasks}
     # One runner owns an output directory at a time; interrupted runs can be resumed.
     import fcntl
@@ -1095,7 +1119,8 @@ def main(argv=None):
                 continue
             print(f"[{number}/{len(trials)}] {trial['model']} / {trial['variant']} / {trial['task']} / {trial['arm']}", flush=True)
             result = run_trial(trial, task_by_id[trial["task"]], gold[trial["task"]], config, commit, directory, opencode, slopdex, symbol_index_dir,
-                               instruction=instructions_by_arm[trial["arm"]])
+                               instruction=instructions_by_arm[trial["arm"]],
+                               **({"map_private": args.map_private} if args.map_private is not None else {}))
             print(f"  {result['status']}: F1={result['grade']['f1']:.3f}, {result['wall_seconds']:.1f}s", flush=True)
             report(output)
         report(output)

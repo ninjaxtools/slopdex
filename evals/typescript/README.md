@@ -1,8 +1,9 @@
 # TypeScript: baseline versus README map
 
 Compare conventional local navigation (**`off`**, no slopdex) with **`map`** using
-the exact agent instruction from the root [README.md](../../README.md). There are
-no search, combined-tool, or experimental-prompt evaluations.
+the exact agent instruction from the root [README.md](../../README.md) by default.
+Optional visibility switches compare map with and without private symbols. There
+are no search, combined-tool, or experimental-prompt evaluations.
 
 The corpus contains **20 tasks and 80 reference declarations** in the Go-native
 TypeScript compiler. The default matrix is two models at medium thinking, one
@@ -63,6 +64,33 @@ to choose alternative settings, caches, or a separate result store. For example:
 ```sh
 python3 evals/typescript/run.py --results /tmp/opencode/eval-results run --arms off
 ```
+
+### Compare map with and without private symbols
+
+`run --map-private` requires `--private` on every map navigation call;
+`run --no-map-private` forbids it there. Help/version requests remain allowed.
+Each override adjusts the README example and adds an explicit visibility
+instruction. Omit both switches to preserve the exact README guidance and existing
+policy. Overrides require the map arm; baseline instructions and reuse controls
+stay unchanged.
+
+Use **different `--results` stores and `--output` directories** for the two runs:
+each result store retains only one `latest-map.json`, while an output directory
+can resume only the same settings.
+
+```sh
+python3 evals/typescript/run.py --results /tmp/opencode/typescript-private run \
+  --map-private --output evals/typescript/jobs/map-private
+python3 evals/typescript/run.py --results /tmp/opencode/typescript-public run \
+  --no-map-private --output evals/typescript/jobs/map-public
+
+python3 evals/typescript/run.py --results /tmp/opencode/typescript-private report
+python3 evals/typescript/run.py --results /tmp/opencode/typescript-public report
+```
+
+To reuse one baseline in both comparisons, import its completed baseline-only job
+with `--results STORE save JOB` into each store before running. Private and public
+map results have distinct reuse keys; neither silently reuses the other.
 
 Requirements: Linux/macOS, Python 3.11+, Git, OpenCode **V1**, and slopdex on `PATH`
 when running map. The saved runs use **OpenCode 1.18.34**; use that version to reuse
@@ -162,7 +190,8 @@ Default models in `config.json`:
 
 Trials run sequentially in a seeded task/model order, alternating arm order when
 both are fresh. Both arms allow glob, grep, and reads. Map uses the root README
-snippet verbatim and must successfully invoke `slopdex map`; other slopdex
+snippet verbatim unless visibility is explicitly overridden, and must
+successfully invoke `slopdex map` with the selected visibility; other slopdex
 navigation and root/index/config overrides are blocked. Baseline denies all
 slopdex calls. Missing required map use or disallowed commands is a protocol
 violation. These are cooperative controls, not a security sandbox.

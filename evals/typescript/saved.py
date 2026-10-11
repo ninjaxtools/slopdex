@@ -42,6 +42,8 @@ def trial_controls(manifest, trial, *, prompt, instructions):
             "implementation": manifest.get("implementation"),
             "harness_sha256": manifest["harness_sha256"],
         })
+        if manifest.get("map_private") is not None:
+            controls["map_private"] = manifest["map_private"]
     return controls
 
 

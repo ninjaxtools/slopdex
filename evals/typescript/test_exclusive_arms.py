@@ -3,6 +3,7 @@
 import collections
 from contextlib import closing
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,31 @@ class ExclusiveArmTests(unittest.TestCase):
             self.assertEqual(runner.readme_agent_instruction("map"), snippet)
             self.assertIn(snippet, runner.arm_instructions("map"))
             self.assertNotIn(snippet, runner.arm_instructions("off"))
+
+    def test_map_visibility_instructions_preserve_default_and_override_examples(self):
+        default = runner.arm_instructions("map")
+        self.assertEqual(runner.arm_instructions("map", map_private=None), default)
+        self.assertIn(runner.readme_agent_instruction("map"), default)
+        for private in (True, False):
+            with self.subTest(map_private=private):
+                instructions = runner.arm_instructions("map", map_private=private)
+                examples = re.findall(r"`slopdex map [^`]+`", instructions)
+                self.assertTrue(examples)
+                self.assertTrue(all(("--private" in example) == private for example in examples))
+                action = "include" if private else "omit"
+                self.assertRegex(instructions, rf"(?i)(?:required|always)[^\n]*{action}[^\n]*--private")
+                self.assertEqual(runner.arm_instructions("off", map_private=private),
+                                 runner.arm_instructions("off"))
+
+    def test_map_visibility_overrides_follow_changed_readme_without_private(self):
+        snippet = '- custom navigation: `slopdex map -q "exact concept" src`\n- keep this guidance'
+        (self.root / "README.md").write_text(
+            "> ```text\n" + "\n".join("> " + line for line in snippet.splitlines()) + "\n> ```")
+        with patch.object(runner, "ROOT", self.root):
+            self.assertIn(snippet, runner.arm_instructions("map", map_private=None))
+            self.assertIn('`slopdex map --private -q "exact concept" src`',
+                          runner.arm_instructions("map", map_private=True))
+            self.assertIn(snippet, runner.arm_instructions("map", map_private=False))
 
     def test_baseline_disallows_every_slopdex_invocation(self):
         self.assertEqual(runner.slopdex_protocol_violations("off", []), [])
@@ -116,6 +142,73 @@ class ExclusiveArmTests(unittest.TestCase):
                      ["--format=json", "map"], ["--root"], ["search", "--", "--help"]):
             with self.subTest(argv=argv):
                 self.assertFalse(runner.slopdex_call_allowed("map", argv))
+
+    def test_map_visibility_policy_checks_options_not_separator_positionals(self):
+        examples = (
+            (["map", "target.go"], False),
+            (["map", "--private", "target.go"], True),
+            (["--output=json", "map", "target.go", "--private"], True),
+            (["map", "--", "--private"], False),
+            (["--", "map", "--private"], True),
+            (["map", "--", "map", "--private"], False),
+            (["map", "--private", "--", "--private"], True),
+        )
+        for argv, has_private in examples:
+            with self.subTest(argv=argv):
+                self.assertTrue(runner.slopdex_call_allowed("map", argv))
+                self.assertTrue(runner.slopdex_call_allowed("map", argv, map_private=None))
+                for private in (True, False):
+                    self.assertEqual(runner.slopdex_call_allowed("map", argv, map_private=private),
+                                     private == has_private)
+        for private in (None, True, False):
+            for argv in ([], ["--help"], ["--version"], ["map", "--help"],
+                         ["map", "--private", "--help"], ["map", "--private", "--version"],
+                         ["map", "-ih"], ["search", "--help"], ["help", "map"]):
+                with self.subTest(map_private=private, information_argv=argv):
+                    self.assertTrue(runner.slopdex_call_allowed("map", argv, map_private=private))
+                    self.assertFalse(runner.slopdex_call_allowed("off", argv, map_private=private))
+            for argv in (["search", "--private"], ["map", "--private", "--index", "other.sqlite"]):
+                self.assertFalse(runner.slopdex_call_allowed("map", argv, map_private=private))
+
+    def test_map_visibility_protocol_requires_success_under_matching_policy(self):
+        missing = {"reason": "required_command_not_used_successfully", "command": "map"}
+        for private in (True, False):
+            matching = ["map", "--private", "target.go"] if private else ["map", "target.go"]
+            mismatching = ["map", "target.go"] if private else ["map", "--private", "target.go"]
+            denied = {"reason": "command_not_allowed", "command": "map", "argv": mismatching}
+            with self.subTest(map_private=private):
+                self.assertEqual(runner.slopdex_protocol_violations("map", [
+                    {"argv": matching, "exit_code": 0}], map_private=private), [])
+                self.assertEqual(runner.slopdex_protocol_violations("map", [
+                    {"argv": mismatching, "exit_code": 0}], map_private=private), [denied, missing])
+                self.assertEqual(runner.slopdex_protocol_violations("map", [
+                    {"argv": matching, "exit_code": 0}, {"argv": mismatching, "exit_code": 126}],
+                    map_private=private), [denied])
+                for calls in ([], [{"argv": matching, "exit_code": 9}], [{"argv": matching}],
+                              [{"argv": ["map", "--private", "--help"], "exit_code": 0}]):
+                    self.assertEqual(runner.slopdex_protocol_violations("map", calls,
+                                                                      map_private=private), [missing])
+
+    def test_cli_visibility_dry_runs_are_offline_and_leave_stores_untouched(self):
+        cache, results, output = (self.root / name for name in ("cache", "results", "job"))
+        with patch.object(runner, "executable", side_effect=AssertionError("external executable")), \
+                patch.object(runner, "command", side_effect=AssertionError("external command")), \
+                patch.object(runner, "prepare_map_index", side_effect=AssertionError("index preparation")), \
+                patch.object(runner, "run_trial", side_effect=AssertionError("model call")):
+            for private, flags in ((None, []), (True, ["--map-private"]), (False, ["--no-map-private"])):
+                with self.subTest(map_private=private), patch("sys.stdout", new=io.StringIO()) as stdout:
+                    runner.main(["--cache", str(cache), "--results", str(results), "run",
+                                 "--output", str(output), "--dry-run", *flags])
+                    plan = json.loads(stdout.getvalue())
+                self.assertEqual(plan["arm_instructions"], {
+                    arm: runner.arm_instructions(arm, map_private=private) for arm in ("off", "map")})
+                self.assertEqual({trial["arm"] for trial in plan["trials"]}, {"off", "map"})
+                self.assertEqual(plan["count"], len(plan["trials"]))
+                for path in (cache, results, output):
+                    self.assertFalse(path.exists())
+            for flag in ("--map-private", "--no-map-private"):
+                with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, "requires the map arm"):
+                    runner.main(["--results", str(results), "run", "--arms", "off", "--dry-run", flag])
 
     def test_missing_required_command_for_unused_failed_partial_or_help_only(self):
         examples = ([], [{"argv": ["map", "target"], "exit_code": 9}],
@@ -283,6 +376,67 @@ sys.exit(9 if '--fixture-fail' in sys.argv[1:] else 0)
             for argv, command, allowed, _ in expected if not allowed])
         self.assertEqual(source.read_bytes(), source_bytes)
         self.assertEqual(runner.native_ann_snapshot(copied, symbol_only=True), before)
+
+    @unittest.skipUnless(os.name == "posix", "fake CLI execution uses a shebang")
+    def test_generated_wrapper_enforces_map_visibility_and_journals_original_argv(self):
+        directory = self.create_index()
+        physical_workspace = self.root / "physical-workspace"
+        physical_workspace.mkdir()
+        workspace = self.root / "workspace"
+        workspace.symlink_to(physical_workspace, target_is_directory=True)
+        executions = self.root / "executions.jsonl"
+        fake_cli = self.root / "fake-slopdex"
+        fake_cli.write_text(f"""#!{sys.executable}
+import json, pathlib, sys
+assert pathlib.Path(sys.argv[sys.argv.index('--root') + 1]).resolve() == pathlib.Path.cwd().resolve()
+with open({str(executions)!r}, 'a') as stream:
+    stream.write(json.dumps(sys.argv[1:]) + '\\n')
+""")
+        fake_cli.chmod(0o755)
+        forwarded = []
+        for private in (True, False):
+            sandbox = self.root / ("private" if private else "public")
+            sandbox.mkdir()
+            bin_dir, log = runner.install_wrapper(sandbox, workspace, "map", str(fake_cli),
+                                                  directory, "fixture-commit", map_private=private)
+            expected = []
+            for argv, has_private in ((["map", "target.go"], False),
+                                      (["map", "--private", "target.go"], True),
+                                      (["map", "--", "--private"], False),
+                                      (["map", "--private", "--", "--private"], True),
+                                      (["map", "--private", "--help"], None)):
+                allowed = has_private is None or has_private == private
+                code = 0 if allowed else 126
+                result = subprocess.run([str(bin_dir / "slopdex"), *argv], cwd=workspace,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, code, result.stderr)
+                expected.append((argv, allowed, code))
+                if allowed:
+                    forwarded.append((sandbox, argv))
+                else:
+                    self.assertIn("unavailable", result.stderr)
+            calls = runner.read_slopdex_calls(log)
+            self.assertEqual([(call["argv"], call["allowed"], call["exit_code"]) for call in calls], expected)
+            events = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(len(events), 2 * len(expected))
+            for index, (argv, allowed, code) in enumerate(expected):
+                start, finish = events[2 * index:2 * index + 2]
+                self.assertEqual(start["argv"], argv)
+                self.assertIs(start["allowed"], allowed)
+                self.assertEqual((start["event"], finish["event"]), ("start", "finish"))
+                self.assertEqual(start["id"], finish["id"])
+                self.assertEqual(finish["exit_code"], code)
+            self.assertEqual(runner.slopdex_protocol_violations("map", calls, map_private=private), [
+                {"reason": "command_not_allowed", "command": "map", "argv": argv}
+                for argv, allowed, _ in expected if not allowed])
+        actual = [json.loads(line) for line in executions.read_text().splitlines()]
+        self.assertEqual(len(actual), len(forwarded))
+        for execution, (sandbox, argv) in zip(actual, forwarded):
+            self.assertEqual(execution[0:7:2], ["--root", "--config", "--index", "--no-reindex"])
+            for position, path in ((1, workspace), (3, sandbox / "slopdex.json"), (5, sandbox / "index.sqlite")):
+                self.assertEqual(Path(execution[position]).resolve(), path.resolve())
+            # Argument spelling is deliberately preserved, unlike filesystem identity.
+            self.assertEqual(execution[7:], argv)
 
 
 if __name__ == "__main__":

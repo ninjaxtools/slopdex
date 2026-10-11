@@ -583,7 +583,11 @@ assert config['permission']['task'] == 'deny'
 if '`slopdex map ' in (workspace / 'AGENTS.md').read_text():
     mode = os.environ.get('TEST_EVAL_MODE', 'ok')
     if mode != 'missing-map':
-        subprocess.run(['slopdex', 'map', '--ignore-errors', '--private', '-g', '*.go', '-q', 'implementation flow'], check=True, stdout=subprocess.DEVNULL)
+        arguments = ['slopdex', 'map', '--ignore-errors', '-g', '*.go', '-q', 'implementation flow']
+        if os.environ.get('TEST_EVAL_PRIVATE', '1') == '1':
+            arguments.append('--private')
+        result = subprocess.run(arguments, check=mode != 'visibility-mismatch', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        assert result.returncode == (126 if mode == 'visibility-mismatch' else 0)
     if mode == 'blocked-search':
         result = subprocess.run(['slopdex', 'search', 'implementation flow'], capture_output=True)
         assert result.returncode == 126
@@ -600,10 +604,11 @@ with sqlite3.connect(index) as db:
     identity = json.loads(db.execute("SELECT value FROM metadata WHERE key='identity'").fetchone()[0])
     assert pathlib.Path(identity['root']).resolve() == pathlib.Path.cwd().resolve() == pathlib.Path(root).resolve()
     assert db.execute('SELECT count(*) FROM embeddings').fetchone()[0] == 1
-assert 'map' in sys.argv and '-q' in sys.argv and '--private' in sys.argv
+assert 'map' in sys.argv and '-q' in sys.argv
 assert pathlib.Path(index + '.symbols.usearch').exists()
 assert not pathlib.Path(index + '.code.usearch').exists()
 if '--force-reindex' in sys.argv:
+    assert '--private' in sys.argv
     assert '--yes-really-rebuild-the-index' in sys.argv
     assert sys.argv[sys.argv.index('-q') + 1] == 'slopdex eval warmup'
     settings = json.loads(pathlib.Path(sys.argv[sys.argv.index('--config') + 1]).read_text())
@@ -688,6 +693,32 @@ print('alpha beta gamma')
                 self.assertFalse(result["grade"]["passed"])
                 self.assertEqual(result["slopdex_protocol_violations"], expected)
                 self.assertTrue(result["native_ann"]["validated"])
+        for private in (True, False):
+            for mismatch in (False, True):
+                mode = "visibility-mismatch" if mismatch else "ok"
+                invoked_private = not private if mismatch else private
+                name = f"visibility-{private}-{mismatch}"
+                directory = output / "protocol" / name
+                with self.subTest(map_private=private, mismatching_call=mismatch), \
+                        patch.object(runner, "SUBMODULE", source), patch.dict(os.environ, {
+                            "TEST_EVAL_ANSWER": json.dumps(self.answer), "TEST_EVAL_MODE": mode,
+                            "TEST_EVAL_PRIVATE": "1" if invoked_private else "0",
+                        }):
+                    result = runner.run_trial(treatment, self.task, self.gold, config, commit, directory,
+                                              str(fake), str(dex), cache, map_private=private)
+                self.assertEqual((directory / "AGENTS.md").read_text(),
+                                 runner.BASE_INSTRUCTIONS + runner.arm_instructions("map", map_private=private))
+                calls = runner.read_slopdex_calls(directory / "slopdex-calls.jsonl")
+                self.assertEqual(len(calls), 1)
+                self.assertEqual("--private" in calls[0]["argv"], invoked_private)
+                self.assertIs(calls[0]["allowed"], not mismatch)
+                self.assertEqual(calls[0]["exit_code"], 126 if mismatch else 0)
+                self.assertEqual(result["status"], "protocol_violation" if mismatch else "ok")
+                self.assertEqual(result["grade"]["f1"], 0 if mismatch else 1)
+                self.assertEqual(result["slopdex_protocol_violations"], [
+                    {"reason": "command_not_allowed", "command": "map", "argv": calls[0]["argv"]},
+                    {"reason": "required_command_not_used_successfully", "command": "map"},
+                ] if mismatch else [])
 
 
 @unittest.skipUnless(os.environ.get("SLOPDEX_EVAL_CHECK_OPENCODE") == "1", "Optional installed-OpenCode config smoke check")

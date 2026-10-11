@@ -146,6 +146,22 @@ class TrialControlTests(SavedFixture):
                     else:
                         self.assertNotEqual(self.fingerprint(manifest, trial), self.fingerprint(changed, trial))
 
+    def test_map_visibility_controls_distinguish_overrides_without_changing_baseline(self):
+        default = self.manifest()
+        manifests = [default, {**default, "map_private": None},
+                     {**default, "map_private": True}, {**default, "map_private": False}]
+        for trial in default["trials"]:
+            with self.subTest(arm=trial["arm"]):
+                controls = [self.controls(manifest, trial) for manifest in manifests]
+                self.assertNotIn("map_private", controls[0])
+                self.assertEqual(controls[0], controls[1])
+                if trial["arm"] == "off":
+                    self.assertTrue(all(control == controls[0] for control in controls))
+                else:
+                    self.assertIs(controls[2]["map_private"], True)
+                    self.assertIs(controls[3]["map_private"], False)
+                    self.assertEqual(len({runner.digest(control) for control in controls}), 3)
+
     def test_execution_and_task_settings_invalidate_each_arm(self):
         manifest = self.manifest()
         changes = [
@@ -631,7 +647,7 @@ class SavedCliTests(SavedFixture):
         implementation = implementation if implementation is not None else self.manifest()["implementation"]
         output = self.root / name
 
-        def fake_run(trial, task, gold, config, commit, directory, opencode, slopdex, index, *, instruction):
+        def fake_run(trial, task, gold, config, commit, directory, opencode, slopdex, index, *, instruction, map_private=None):
             return self.write_trial(directory, trial, task, instruction=instruction)
 
         def version(argv):
@@ -730,6 +746,50 @@ class SavedCliTests(SavedFixture):
         calls["prepare_map_index"].assert_called_once()
         calls["run_trial"].assert_called_once()
         self.assertEqual(calls["run_trial"].call_args.args[0]["arm"], "map")
+
+    def test_map_visibility_cli_records_explicit_policy_and_reuses_only_matching_map(self):
+        self.save_history()
+        baseline = next((self.results / "baselines").glob("*.json"))
+        baseline_bytes = baseline.read_bytes()
+        for private, flag in ((True, "--map-private"), (False, "--no-map-private")):
+            with self.subTest(map_private=private):
+                name = "private" if private else "public"
+                output, calls = self.run_cli(name, extra=(flag,))
+                self.assertEqual(calls["restore_record"].call_count, 1)
+                calls["run_trial"].assert_called_once()
+                call = calls["run_trial"].call_args
+                self.assertEqual(call.args[0]["arm"], "map")
+                self.assertEqual(call.kwargs, {
+                    "instruction": runner.arm_instructions("map", map_private=private),
+                    "map_private": private,
+                })
+                manifest = runner.read_json(output / "manifest.json")
+                self.assertIs(manifest["map_private"], private)
+                self.assertEqual(manifest["arm_instructions"]["off"], runner.arm_instructions("off"))
+                record = runner.read_json(self.results / "latest-map.json")["records"][0]
+                self.assertIs(record["controls"]["map_private"], private)
+                self.assertEqual(record["instructions"], runner.BASE_INSTRUCTIONS + call.kwargs["instruction"])
+                _, reused = self.run_cli(name + "-reused", extra=(flag,))
+                self.assertEqual(reused["restore_record"].call_count, 2)
+                reused["run_trial"].assert_not_called()
+                reused["prepare_map_index"].assert_not_called()
+                self.assertEqual(baseline.read_bytes(), baseline_bytes)
+
+    def test_cli_default_omits_visibility_override_from_manifest_and_trial_kwargs(self):
+        output, calls = self.run_cli("default-visibility")
+        self.assertNotIn("map_private", runner.read_json(output / "manifest.json"))
+        self.assertEqual(calls["run_trial"].call_count, 2)
+        for call in calls["run_trial"].call_args_list:
+            self.assertNotIn("map_private", call.kwargs)
+        _, baseline = self.run_cli("baseline-only", extra=("--arms", "off"))
+        baseline["prepare_map_index"].assert_not_called()
+        baseline["run_trial"].assert_not_called()
+
+    def test_cli_cannot_resume_a_different_map_visibility_in_the_same_output(self):
+        self.run_cli("visibility-resume", extra=("--map-private",))
+        for extra in ((), ("--no-map-private",)):
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "Resume settings differ"):
+                self.run_cli("visibility-resume", extra=extra)
 
     def test_changed_model_options_rerun_only_that_models_two_arms(self):
         config = copy.deepcopy(self.config)

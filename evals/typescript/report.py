@@ -256,6 +256,9 @@ def markdown(manifest, summary):
               "`off` = saved no-map baseline; `map` = README-guided map.", ""]
     if manifest.get("opencode_version"):
         lines += [f"OpenCode: `{manifest['opencode_version']}`; slopdex: `{manifest.get('slopdex_version') or 'not used'}`."]
+        if manifest.get("map_private") is not None:
+            visibility = "required" if manifest["map_private"] else "forbidden"
+            lines += [f"Map visibility override: `--private` is **{visibility}** on every map invocation."]
         implementation = manifest.get("implementation") or {}
         if implementation:
             lines += [f"Slopdex commit: `{implementation.get('commit', 'unknown')}` (dirty: `{implementation.get('dirty', False)}`).",
