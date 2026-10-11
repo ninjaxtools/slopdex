@@ -3761,7 +3761,13 @@ fn cli_redirected_progress_preserves_json_plain_diagnostics_and_offline_mode() -
     assert_eq!(status["functionCount"], 1);
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("slopdex: notice: external model call:"));
-    assert!(stderr.contains("saved indexing error(s)"));
+    let warning = "slopdex: 1 saved indexing error(s); inspect with slopdex index errors";
+    assert_eq!(
+        stderr
+            .lines()
+            .find(|line| line.contains("saved indexing error(s)")),
+        Some(warning)
+    );
     assert!(!stderr.contains('\x1b'));
     assert!(!stderr.contains("Refreshing index"));
     assert!(!stderr.contains("Embedding batches"));
@@ -3771,6 +3777,12 @@ fn cli_redirected_progress_preserves_json_plain_diagnostics_and_offline_mode() -
 
     let requests = mock.count();
     repo.write("new.rs", &function("beta", "VECTOR_NORTH"))?;
+    let output = repo.cli(&["--no-reindex", "status"])?;
+    assert!(output.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&output.stdout)?, status);
+    assert_eq!(String::from_utf8(output.stderr)?, format!("{warning}\n"));
+    assert_eq!(mock.count(), requests);
+
     let output = repo.cli(&["--no-reindex", "--ignore-errors", "status"])?;
     assert!(output.status.success());
     assert_eq!(serde_json::from_slice::<Value>(&output.stdout)?, status);

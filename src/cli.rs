@@ -328,11 +328,7 @@ fn run_workspace(
             result => result?,
         }
     };
-    warn_errors(
-        &engine,
-        &index,
-        config["ignoreErrors"].as_bool().unwrap_or(false),
-    )?;
+    warn_errors(&engine, config["ignoreErrors"].as_bool().unwrap_or(false))?;
     let format = cli.global.format.unwrap_or(Format::Summary);
     match &cli.command {
         Command::Map(_) => {
@@ -481,7 +477,6 @@ fn run_workspace(
                     }
                     warn_errors(
                         &opened,
-                        &target_index,
                         target_config["ignoreErrors"].as_bool().unwrap_or(false),
                     )?;
                     target = Some(opened);
@@ -550,14 +545,13 @@ fn run_workspace(
     Ok(())
 }
 
-fn warn_errors(engine: &Engine, index: &Path, ignore: bool) -> Result<()> {
+fn warn_errors(engine: &Engine, ignore: bool) -> Result<()> {
     if !ignore {
         let errors = engine.errors()?;
         if !errors.is_empty() {
             ui::warning(format!(
-                "slopdex: {} saved indexing error(s) in {}; inspect with index errors",
-                errors.len(),
-                index.display()
+                "slopdex: {} saved indexing error(s); inspect with slopdex index errors",
+                errors.len()
             ));
         }
     }
