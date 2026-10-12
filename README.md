@@ -75,7 +75,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > ```text
 > - Start discovery with one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" -q "<additional concept>" --private --callers 2 --callees 2 <paths...>` and immediately read plausible implementation ranges from the source files directly.
 > - Avoid mapping repeatedly, frontload the map in one call.
-> - Don't pipe the output through `head`, instead save it to a file and read from there`.
+> - Don't pipe the output through `head`, instead save it to a file and read from there.
 > ```
 
 ## Search
@@ -132,7 +132,7 @@ Descriptions refer to source comments found above symbols or at the start of a f
 > Add this to your `AGENTS.md` to use semantic search with your agent:
 >
 > ```text
-> - use semantic code search to find code with: `slopdex search "<query>" ["<query>"...] --threshold 0.3 --limit 20 --formats all`. Provide multiple alternative queries.
+> - Use semantic code search to find code with: `slopdex search "<query>" ["<query>"...] --threshold 0.3 --limit 20 --formats all`. Provide multiple alternative queries.
 > ```
 
 See the [attachment rules](docs/reference.md#descriptions).
@@ -166,7 +166,7 @@ $ slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 > Add this to your `AGENTS.md` to detect and refactor duplicate code before it is committed:
 >
 > ```text
-> - when reviewing uncommitted code, determine if similar code elsewhere warrants a refactor: `slopdex cross-search --uncommitted --cross-file-only --lines 4 --threshold 0.8`
+> - When reviewing uncommitted code determine if similar code elsewhere warrants a refactor to eliminate duplicate code: `slopdex cross-search --uncommitted --cross-file-only --threshold 0.8 --lines 4`. Exclude any code you determine to be a false positive from future searches with `slopdex config exclude-cross-search <file>:<symbol> ...`.
 > ```
 
 ### Restrict functions used in the cross-search
