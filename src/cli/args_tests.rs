@@ -402,11 +402,37 @@ fn symbol_selection_defaults_and_scalar_threshold_validation() {
         assert!(defaults.get("symbolQuery").is_none(), "{command}");
         assert!(defaults.get("symbolThreshold").is_none(), "{command}");
         let mut selected = argv.clone();
-        selected.extend(["-q", "readFile", "--symbol-query", "write file"]);
+        selected.extend([
+            "-q",
+            "readFile",
+            "--symbol-query",
+            "write file",
+            "-q",
+            "-g glob filter matching",
+            "--symbol-query",
+            "--glob include matching",
+        ]);
         let selected = options(parse(&selected));
-        assert_eq!(selected["symbolQuery"], json!(["readFile", "write file"]));
+        assert_eq!(
+            selected["symbolQuery"],
+            json!([
+                "readFile",
+                "write file",
+                "-g glob filter matching",
+                "--glob include matching"
+            ]),
+            "{command}"
+        );
         assert!(selected.get("symbolThreshold").is_none());
-        for value in ["", "   ", "_::.!🙂"] {
+        for flag in ["-q", "--symbol-query"] {
+            let mut invalid = argv.clone();
+            invalid.push(flag);
+            assert!(
+                Cli::try_parse_from(std::iter::once("slopdex").chain(invalid)).is_err(),
+                "{command}: {flag}"
+            );
+        }
+        for value in ["", "   ", "_::.!🙂", "-", "--"] {
             let mut invalid = argv.clone();
             invalid.extend(["-q", value]);
             assert!(
@@ -448,6 +474,46 @@ fn symbol_selection_defaults_and_scalar_threshold_validation() {
     assert_eq!(args.query.query, "content query");
     assert_eq!(args.query.filters.options()["minSimilarity"], 0.2);
     assert_eq!(args.query.filters.options()["symbolThreshold"], 0.7);
+}
+
+#[test]
+fn map_symbol_queries_accept_leading_hyphens() {
+    let Command::Map(args) = parse(&[
+        "map",
+        "-g",
+        "**/*.rs",
+        "-i",
+        "-e",
+        "glob|globset|include",
+        "-q",
+        "-g glob filter matching",
+        "-q",
+        "typescript file patterns",
+        "--private",
+        "--callers",
+        "2",
+        "--callees",
+        "2",
+        "src",
+        "tests",
+    ])
+    .command
+    else {
+        panic!()
+    };
+    assert_eq!(
+        args.options(),
+        json!({
+            "paths": ["src", "tests"],
+            "glob": ["**/*.rs"],
+            "ignoreCase": true,
+            "regexp": ["glob|globset|include"],
+            "symbolQuery": ["-g glob filter matching", "typescript file patterns"],
+            "private": true,
+            "callers": 2,
+            "callees": 2
+        })
+    );
 }
 
 #[test]

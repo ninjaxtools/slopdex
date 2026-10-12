@@ -212,7 +212,7 @@ pub(super) struct SelectionArgs {
     #[arg(short = 'e', long, alias = "regex", value_parser = valid_regex)]
     pub(super) regexp: Vec<String>,
     /// Semantic query over symbols, descriptions, and heading titles; repeat for OR; cross-search selects sources
-    #[arg(short = 'q', long, value_parser = valid_symbol_query)]
+    #[arg(short = 'q', long, allow_hyphen_values = true, value_parser = valid_symbol_query)]
     pub(super) symbol_query: Vec<String>,
     /// Minimum semantic selector similarity in [-1,1], independent of --threshold (default: 0.5)
     #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
