@@ -8,6 +8,89 @@ fn clap_definition_is_consistent() {
 }
 
 #[test]
+fn embedding_setup_accepts_global_flags_before_and_after_commands() {
+    for args in [
+        vec![
+            "update",
+            "--setup",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-embedding:0.6b",
+            "--pull",
+        ],
+        vec![
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-embedding:4b",
+            "--dimensions",
+            "256",
+            "--pull",
+            "update",
+            "--setup",
+        ],
+        vec![
+            "config",
+            "embeddings",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen3-embedding:8b",
+            "--pull",
+        ],
+        vec!["--provider", "ollama", "--pull", "config", "embeddings"],
+    ] {
+        let cli = parse(&args);
+        cli.validate().unwrap();
+        assert_eq!(cli.global.provider.as_deref(), Some("ollama"));
+        assert!(cli.global.pull);
+        if let Command::Update(args) = cli.command {
+            assert!(args.setup);
+        } else if let Command::Config { args } = cli.command {
+            assert_eq!(args, ["embeddings"]);
+        } else {
+            panic!("unexpected command");
+        }
+    }
+    assert!(Cli::try_parse_from(["slopdex", "config", "--setup"]).is_err());
+    assert!(Cli::try_parse_from(["slopdex", "search", "query", "--setup"]).is_err());
+}
+
+#[test]
+fn pull_is_only_accepted_for_explicit_embedding_setup_and_ollama() {
+    for args in [
+        vec!["update", "--pull"],
+        vec!["search", "query", "--provider", "ollama", "--pull"],
+        vec!["config", "--pull"],
+        vec!["config", "set", "model", "custom", "--pull"],
+        vec!["config", "embeddings", "extra", "--pull"],
+        vec!["update", "--setup", "--provider", "openai", "--pull"],
+        vec!["config", "embeddings", "--provider", "jina", "--pull"],
+    ] {
+        let cli =
+            Cli::try_parse_from(std::iter::once("slopdex").chain(args.iter().copied())).unwrap();
+        assert!(
+            cli.validate().unwrap_err().to_string().contains("--pull"),
+            "{args:?}"
+        );
+    }
+    // The selected saved provider is checked after loading config, not by Clap.
+    parse(&[
+        "update",
+        "--setup",
+        "--model",
+        "qwen3-embedding:0.6b",
+        "--pull",
+    ])
+    .validate()
+    .unwrap();
+    parse(&["update", "--provider", "ollama"])
+        .validate()
+        .unwrap();
+}
+
+#[test]
 fn output_flag_is_canonical_and_format_flag_is_rejected() {
     for (value, expected) in [
         ("text", Format::Summary),

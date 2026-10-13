@@ -1,11 +1,15 @@
 //! Interactive configuration prompts and staged wizard updates.
 
-use super::{normalize_config_aliases, validate_config};
+use super::{
+    embedding_defaults, known_dimensions, normalize_config_aliases, select_embeddings,
+    validate_config,
+};
 use crate::cli::args::positive;
 use crate::limits::{self, ResultLimit};
 use crate::providers::Providers;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
@@ -27,12 +31,44 @@ pub(super) fn configure(saved: &mut Value, prefix: Option<&str>) -> Result<()> {
     configure_interactively_filtered(saved, &mut CliclackPrompts, prefix)
 }
 
+pub(super) fn configure_embeddings(saved: &mut Value) -> Result<()> {
+    configure_embeddings_with(saved, &mut CliclackPrompts)
+}
+
+pub(super) fn setup_destination(selected: &Path, repository: &Path) -> Result<PathBuf> {
+    setup_destination_with(selected, repository, &mut CliclackPrompts)
+}
+
+fn setup_destination_with(
+    selected: &Path,
+    repository: &Path,
+    prompts: &mut impl Prompts,
+) -> Result<PathBuf> {
+    if selected == repository {
+        return Ok(selected.to_owned());
+    }
+    let selected_label = selected.to_string_lossy();
+    let repository_label = repository.to_string_lossy();
+    let choice = prompts.choice(
+        "Save embeddings to repository settings or currently selected settings?",
+        &repository_label,
+        &[&repository_label, &selected_label],
+    )?;
+    Ok(if choice == repository_label {
+        repository
+    } else {
+        selected
+    }
+    .to_owned())
+}
+
 trait Prompts {
     fn ask(&mut self, label: &str, default: &str) -> Result<String>;
     fn yes(&mut self, label: &str, default: bool) -> Result<bool>;
     fn number(&mut self, label: &str, default: u64, max: Option<usize>) -> Result<usize>;
     fn required(&mut self, label: &str, default: &str) -> Result<String>;
     fn catalog(&mut self, provider: &str) -> Result<Value>;
+    fn installed(&mut self, config: &Value) -> Result<Vec<String>>;
     fn select(
         &mut self,
         label: &str,
@@ -92,7 +128,24 @@ impl Prompts for CliclackPrompts {
     ) -> Result<String> {
         let mut prompt = cliclack::select(label).max_rows(10);
         for choice in choices {
-            prompt = prompt.item(choice.to_string(), choice, "");
+            let hint = match *choice {
+                "openai" if label == "Embedding provider" => {
+                    "Remote API; requires OpenAI credentials"
+                }
+                "jina" if label == "Embedding provider" => "Remote API; requires Jina credentials",
+                "ollama" => "Local inference; no cloud fallback",
+                "qwen3-embedding:0.6b" => {
+                    "Small / fastest · about 0.6 GB download · 1024 dimensions"
+                }
+                "qwen3-embedding:4b" => "Balanced · about 2.5 GB download · 2560 dimensions",
+                "qwen3-embedding:8b" => "Largest · about 4.7 GB download · 4096 dimensions",
+                "Custom model" => "Enter an Ollama embedding model tag",
+                "Installed embedding models" => {
+                    "Query Ollama for installed embedding-capable models"
+                }
+                _ => "",
+            };
+            prompt = prompt.item(choice.to_string(), choice, hint);
         }
         prompt = prompt.initial_value(default.to_owned());
         if searchable {
@@ -139,6 +192,18 @@ impl Prompts for CliclackPrompts {
             Providers::models(Some(provider))
         })
     }
+
+    fn installed(&mut self, config: &Value) -> Result<Vec<String>> {
+        match crate::providers::installed_embedding_models(config) {
+            Ok(models) => Ok(models),
+            Err(error) => {
+                cliclack::log::warning(format!(
+                    "Cannot list installed Ollama models: {error:#}; presets and custom tags remain available"
+                ))?;
+                Ok(Vec::new())
+            }
+        }
+    }
 }
 
 pub(super) const CONFIG_KEYS: &[&str] = &[
@@ -164,6 +229,100 @@ pub(super) const CONFIG_KEYS: &[&str] = &[
 
 fn selected(prefix: Option<&str>, key: &str) -> bool {
     prefix.is_none_or(|prefix| key.starts_with(prefix))
+}
+
+fn ollama_model(config: &Value, prompts: &mut impl Prompts) -> Result<String> {
+    let mut choices = vec![
+        "qwen3-embedding:0.6b".to_owned(),
+        "qwen3-embedding:4b".to_owned(),
+        "qwen3-embedding:8b".to_owned(),
+    ];
+    let current = config["model"].as_str().unwrap_or("qwen3-embedding:0.6b");
+    if !choices.iter().any(|choice| choice == current) {
+        choices.push(current.to_owned());
+    }
+    choices.push("Installed embedding models".to_owned());
+    choices.push("Custom model".to_owned());
+    let model = prompts.select(
+        "Ollama embedding model",
+        current,
+        &choices.iter().map(String::as_str).collect::<Vec<_>>(),
+        true,
+    )?;
+    if model == "Installed embedding models" {
+        let models = prompts.installed(config)?;
+        ensure!(
+            !models.is_empty(),
+            "No installed embedding models available; start Ollama and install an embedding model, or choose a preset/custom tag"
+        );
+        let choices: Vec<_> = models.iter().map(String::as_str).collect();
+        let default = if choices.contains(&current) {
+            current
+        } else {
+            choices[0]
+        };
+        prompts.select("Installed Ollama embedding model", default, &choices, true)
+    } else if model == "Custom model" {
+        prompts.required("Ollama embedding model tag", current)
+    } else {
+        Ok(model)
+    }
+}
+
+fn prompt_embeddings(
+    config: &mut Value,
+    prompts: &mut impl Prompts,
+    prefix: Option<&str>,
+    focused: bool,
+) -> Result<()> {
+    let provider = if selected(prefix, "provider") {
+        prompts.choice(
+            "Embedding provider",
+            config["provider"].as_str().unwrap_or("openai"),
+            &["openai", "jina", "ollama"],
+        )?
+    } else {
+        config["provider"].as_str().unwrap_or("openai").to_owned()
+    };
+    if selected(prefix, "provider") {
+        select_embeddings(config, Some(&provider), None);
+    }
+    if selected(prefix, "model") {
+        let model = if provider == "ollama" {
+            ollama_model(config, prompts)?
+        } else {
+            prompts.required(
+                "Embedding model",
+                config["model"]
+                    .as_str()
+                    .unwrap_or(embedding_defaults(&provider).0),
+            )?
+        };
+        select_embeddings(config, None, Some(&model));
+    }
+    if selected(prefix, "dimensions") && (provider != "ollama" || prefix.is_some()) {
+        let dimensions = config["dimensions"]
+            .as_u64()
+            .or_else(|| known_dimensions(&provider, text(config, "model")))
+            .unwrap_or(embedding_defaults(&provider).1);
+        config["dimensions"] = json!(prompts.number("Embedding dimensions", dimensions, None)?);
+    }
+    if provider == "ollama" && (focused || selected(prefix, "provider")) {
+        config["ollamaAutoPull"] = json!(prompts.yes(
+            "Download missing Ollama models automatically?",
+            config["ollamaAutoPull"].as_bool().unwrap_or(true),
+        )?);
+    }
+    Ok(())
+}
+
+fn configure_embeddings_with(saved: &mut Value, prompts: &mut impl Prompts) -> Result<()> {
+    let mut config = saved.clone();
+    normalize_config_aliases(&mut config);
+    prompt_embeddings(&mut config, prompts, None, true)?;
+    validate_config(&config)?;
+    *saved = config;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -331,40 +490,7 @@ fn configure_interactively_filtered(
             config.as_object_mut().unwrap().remove("rerankerCandidates");
         }
     }
-    let provider = if selected(prefix, "provider") {
-        prompts.choice(
-            "Embedding provider",
-            existing["provider"].as_str().unwrap_or("openai"),
-            &["openai", "jina"],
-        )?
-    } else {
-        existing["provider"].as_str().unwrap_or("openai").to_owned()
-    };
-    let same = existing["provider"].as_str().unwrap_or("openai") == provider;
-    let (model, dimensions) = if provider == "jina" {
-        ("jina-embeddings-v4", 1024)
-    } else {
-        ("text-embedding-3-large", 3072)
-    };
-    let model = if same {
-        existing["model"].as_str().unwrap_or(model)
-    } else {
-        model
-    };
-    let dimensions = if same {
-        existing["dimensions"].as_u64().unwrap_or(dimensions)
-    } else {
-        dimensions
-    };
-    if selected(prefix, "provider") {
-        config["provider"] = json!(provider);
-    }
-    if selected(prefix, "model") {
-        config["model"] = json!(prompts.required("Embedding model", model)?);
-    }
-    if selected(prefix, "dimensions") {
-        config["dimensions"] = json!(prompts.number("Embedding dimensions", dimensions, None)?);
-    }
+    prompt_embeddings(&mut config, prompts, prefix, false)?;
     if selected(prefix, "indexPath") {
         let index = prompts.ask(
             "Index path (enter '-' for default)",
@@ -402,10 +528,28 @@ fn configure_interactively_filtered(
             "Maximum source file size in bytes",
             1_048_576,
         ),
-        ("embeddingBatchSize", "Embedding batch size", 32),
+        (
+            "embeddingBatchSize",
+            "Embedding batch size",
+            if config["provider"] == "ollama" {
+                8
+            } else {
+                32
+            },
+        ),
         ("parallelism", "Concurrent provider request limit", 10),
     ] {
         if !selected(prefix, key) {
+            continue;
+        }
+        if key == "parallelism" && prefix.is_none() && config["provider"] == "ollama" {
+            let default = existing
+                .get("embeddingParallelism")
+                .or_else(|| existing.get("parallelism"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            config["embeddingParallelism"] =
+                json!(prompts.number("Concurrent embedding request limit", default, None)?);
             continue;
         }
         config[key] =

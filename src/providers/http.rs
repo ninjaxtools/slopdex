@@ -4,13 +4,23 @@ use anyhow::{Result, anyhow};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::Value;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::thread;
 use std::time::Duration;
 
 use super::positive;
 
 const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+
+fn client(timeout: Duration) -> Result<Client> {
+    Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("slopdex")
+        .build()
+        .map_err(|_| anyhow!("Could not initialize provider HTTP client"))
+}
 
 #[derive(Debug)]
 pub(super) struct Failure {
@@ -46,6 +56,49 @@ pub(super) struct Http {
 }
 
 impl Http {
+    /// Long-running model downloads use a separate timeout and bounded NDJSON
+    /// events. Never retry a partially consumed stream or expose remote errors.
+    pub(super) fn stream_json(
+        &self,
+        url: &str,
+        body: &Value,
+        timeout_ms: usize,
+        mut event: impl FnMut(&Value) -> Result<bool>,
+    ) -> Result<()> {
+        let client = client(Duration::from_millis(timeout_ms as u64))?;
+        let response = client
+            .post(url)
+            .json(body)
+            .send()
+            .map_err(|_| anyhow!("Ollama model download transport error or timeout"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Ollama model download failed: HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        let mut reader = BufReader::new(response);
+        loop {
+            let mut bytes = Vec::new();
+            let count = reader
+                .by_ref()
+                .take(1024 * 1024 + 1)
+                .read_until(b'\n', &mut bytes)
+                .map_err(|_| anyhow!("Could not read Ollama download progress"))?;
+            if count == 0 {
+                return Err(anyhow!("Ollama download ended without success"));
+            }
+            if bytes.len() > 1024 * 1024 {
+                return Err(anyhow!("Ollama download event exceeds size limit"));
+            }
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow!("Ollama returned malformed download progress"))?;
+            if event(&value)? {
+                return Ok(());
+            }
+        }
+    }
+
     pub(super) fn new(config: &Value) -> Result<Self> {
         let timeout = positive(config, &["providerTimeoutMs"], 60_000)?.min(300_000);
         let retries = match config.get("providerMaxRetries") {
@@ -63,13 +116,7 @@ impl Http {
                 .min(5000),
             None => 250,
         };
-        let client = Client::builder()
-            .timeout(Duration::from_millis(timeout as u64))
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("slopdex")
-            .build()
-            .map_err(|_| anyhow!("Could not initialize provider HTTP client"))?;
+        let client = client(Duration::from_millis(timeout as u64))?;
         Ok(Self {
             client,
             retries,

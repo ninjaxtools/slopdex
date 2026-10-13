@@ -9,6 +9,272 @@ use serde_json::{Value, json};
 use std::{fs, path::Path};
 
 #[test]
+fn embedding_setup_saves_only_embedding_flags_and_resolved_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("selected/config.json");
+    let original = json!({"provider": "openai", "model": "old", "dimensions": 8,
+        "embeddingBaseUrl": "https://old.invalid/v1", "descriptionModel": "keep",
+        "artifactCachePath": temp.path().join("artifacts.sqlite"), "custom": {"keep": true}});
+    write_config(&path, &original).unwrap();
+    for command in [vec!["update", "--setup"], vec!["config", "embeddings"]] {
+        let args = [
+            command,
+            vec![
+                "--provider",
+                "ollama",
+                "--model",
+                "qwen3-embedding:4b",
+                "--pull",
+                "--no-reindex",
+                "--verbose",
+                "--description-model",
+                "transient",
+            ],
+        ]
+        .concat();
+        let cli = parse(&args);
+        cli.validate().unwrap();
+        super::save_embeddings(
+            &cli.global,
+            &path,
+            |_| panic!("explicit flags must not prompt"),
+            |config, pull| {
+                assert!(pull);
+                assert_eq!(config["provider"], "ollama");
+                assert_eq!(config["model"], "qwen3-embedding:4b");
+                assert_eq!(config["dimensions"], 2560);
+                assert_eq!(config["ollamaAutoPull"], true);
+                assert!(config.get("embeddingBaseUrl").is_none());
+                config["ollamaModelDigest"] = json!("sha256:resolved");
+                config["ollamaNativeDimensions"] = json!(2560);
+                config["ollamaModelFamily"] = json!("qwen3");
+                config["ollamaContextLength"] = json!(8192);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let saved = read_config(&path).unwrap();
+        assert_eq!(saved["ollamaModelDigest"], "sha256:resolved");
+        assert_eq!(saved["descriptionModel"], "keep");
+        assert_eq!(saved["custom"], original["custom"]);
+        assert_eq!(saved["artifactCachePath"], original["artifactCachePath"]);
+        for key in ["verbose", "noReindex", "forceReindex", "ignoreErrors"] {
+            assert!(saved.get(key).is_none(), "unrelated flag saved: {key}");
+        }
+        write_config(&path, &original).unwrap();
+    }
+}
+
+#[test]
+fn embedding_setup_failure_and_cancellation_never_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let original = json!({"embeddingProvider": "jina", "custom": "keep"});
+    fs::write(&path, original.to_string()).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let global = parse(&["update", "--setup"]).global;
+    assert!(
+        super::save_embeddings(
+            &global,
+            &path,
+            |config| {
+                config["provider"] = json!("ollama");
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into())
+            },
+            |_, _| panic!("cancelled wizard must not prepare")
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let global = parse(&["update", "--setup", "--provider", "ollama", "--pull"]).global;
+    assert!(
+        super::save_embeddings(
+            &global,
+            &path,
+            |_| panic!("unexpected wizard"),
+            |config, _| {
+                config["ollamaModelDigest"] = json!("partial");
+                anyhow::bail!("injected smoke embedding failure")
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(
+        super::save_embeddings(
+            &global,
+            &path,
+            |_| panic!("unexpected wizard"),
+            |config, _| {
+                config["dimensions"] = json!(0);
+                Ok(())
+            }
+        )
+        .is_err(),
+        "invalid prepared metadata must not be saved"
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let missing = temp.path().join("not-created/config.json");
+    assert!(
+        super::save_embeddings(
+            &global,
+            &missing,
+            |_| panic!("unexpected wizard"),
+            |_, _| { anyhow::bail!("injected server error") }
+        )
+        .is_err()
+    );
+    assert!(!missing.parent().unwrap().exists());
+}
+
+#[test]
+fn embedding_setup_preserves_explicit_dimensions_refreshes_pin_and_skips_hosted_preparation() {
+    let global = parse(&[
+        "config",
+        "embeddings",
+        "--provider",
+        "ollama",
+        "--model",
+        "qwen3-embedding:8b",
+        "--dimensions",
+        "256",
+    ])
+    .global;
+    let saved = json!({"provider": "ollama", "model": "qwen3-embedding:0.6b",
+        "dimensions": 1024, "embeddingBaseUrl": "http://localhost:11434/api",
+        "ollamaModelDigest": "old", "ollamaNativeDimensions": 1024,
+        "ollamaModelFamily": "qwen3", "ollamaContextLength": 2048});
+    let config = super::stage_embeddings(
+        &saved,
+        &global,
+        |_| panic!("unexpected wizard"),
+        |config, pull| {
+            assert!(!pull);
+            assert_eq!(config["dimensions"], 256);
+            assert_eq!(config["embeddingBaseUrl"], saved["embeddingBaseUrl"]);
+            for key in [
+                "ollamaModelDigest",
+                "ollamaNativeDimensions",
+                "ollamaModelFamily",
+                "ollamaContextLength",
+            ] {
+                assert!(config.get(key).is_none(), "stale field: {key}");
+            }
+            config["ollamaModelDigest"] = json!("new");
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(config["ollamaModelDigest"], "new");
+    let global = parse(&["config", "embeddings", "--provider", "ollama"]).global;
+    let refreshed = super::stage_embeddings(
+        &config,
+        &global,
+        |_| panic!("unexpected wizard"),
+        |config, _| {
+            config["ollamaModelDigest"] = json!("refreshed");
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(refreshed["ollamaModelDigest"], "refreshed");
+    let global = parse(&["config", "embeddings", "--provider", "jina"]).global;
+    let hosted = super::stage_embeddings(
+        &saved,
+        &global,
+        |_| panic!("unexpected wizard"),
+        |_, _| panic!("hosted setup must not prepare or require credentials"),
+    )
+    .unwrap();
+    assert_eq!(hosted["model"], "jina-embeddings-v4");
+    assert_eq!(hosted["dimensions"], 1024);
+    assert!(hosted.get("embeddingBaseUrl").is_none());
+    assert!(hosted.get("ollamaModelDigest").is_none());
+}
+
+#[test]
+fn config_embeddings_noninteractive_consumes_global_flags_without_an_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let result = config_action_json(
+        &path,
+        &[
+            "config",
+            "embeddings",
+            "--provider",
+            "jina",
+            "--model",
+            "custom-jina",
+            "--dimensions",
+            "16",
+        ],
+    );
+    assert_eq!(result["provider"], "jina");
+    assert_eq!(result["model"], "custom-jina");
+    assert_eq!(result["dimensions"], 16);
+    assert!(!temp.path().join("index.sqlite").exists());
+    assert_eq!(read_config(&path).unwrap()["model"], "custom-jina");
+}
+
+#[test]
+fn ollama_advanced_fields_are_validated_and_selection_edits_invalidate_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    config_action_json(&path, &["config", "set", "provider", "ollama"]);
+    for (key, value, invalid) in [
+        ("ollamaAutoPull", "true", "\"true\""),
+        ("ollamaKeepAlive", "5m", "0"),
+        ("ollamaModelDigest", "sha256:abc", "\"\""),
+        ("ollamaModelFamily", "qwen3", "false"),
+        ("embeddingParallelism", "2", "0"),
+        ("ollamaNativeDimensions", "1024", "-1"),
+        ("ollamaContextLength", "8192", "1.5"),
+        ("ollamaPullTimeoutMs", "1800000", "\"3000\""),
+    ] {
+        config_action_json(&path, &["config", "set", key, value]);
+        let bytes = fs::read(&path).unwrap();
+        let cli = parse(&["config", "set", key, "--", invalid]);
+        let Command::Config { args } = cli.command else {
+            panic!()
+        };
+        assert!(
+            run_config(&cli.global, &path, &args, &mut Vec::new()).is_err(),
+            "{key}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    config_action_json(&path, &["config", "set", "dimensions", "16"]);
+    config_action_json(&path, &["config", "set", "model", "other"]);
+    let saved = read_config(&path).unwrap();
+    for key in [
+        "dimensions",
+        "ollamaModelDigest",
+        "ollamaNativeDimensions",
+        "ollamaModelFamily",
+        "ollamaContextLength",
+    ] {
+        assert!(saved.get(key).is_none(), "stale model field: {key}");
+    }
+    assert_eq!(saved["ollamaKeepAlive"], "5m");
+    assert_eq!(saved["embeddingParallelism"], 2);
+    config_action_json(
+        &path,
+        &[
+            "config",
+            "set",
+            "embeddingBaseUrl",
+            "http://localhost:11434/api",
+        ],
+    );
+    config_action_json(&path, &["config", "set", "provider", "openai"]);
+    let saved = read_config(&path).unwrap();
+    assert_eq!(saved["model"], "text-embedding-3-large");
+    assert_eq!(saved["dimensions"], 3072);
+    assert!(saved.get("embeddingBaseUrl").is_none());
+    assert!(saved.get("ollamaAutoPull").is_none());
+}
+
+#[test]
 fn selected_root_does_not_rebase_explicit_config_or_saved_index_paths() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("repo with spaces");
@@ -83,7 +349,7 @@ fn explicit_embedding_cli_options_override_config_aliases() {
         ),
         (
             vec!["status", "--provider", "openai"],
-            json!({"provider": "openai", "model": "old-model", "dimensions": 1024}),
+            json!({"provider": "openai", "model": "text-embedding-3-large", "dimensions": 3072}),
         ),
         (
             vec!["status", "--model", "new-model"],

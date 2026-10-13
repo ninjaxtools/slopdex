@@ -46,9 +46,11 @@ can also follow the command. Quote multiword queries.
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
+| `update --setup` | Configure and prepare embeddings only, save the selected settings, then update. Embedding flags make setup noninteractive. | JSON refresh statistics |
 | `generate descriptions` | Refresh normally, then explicitly generate missing or stale file and callable descriptions from indexed source. | JSON statistics |
 | `help models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
 | `config [prefix]` | Configure matching settings interactively without opening an index. | Updated-setting summary |
+| `config embeddings` | Focused embedding setup without opening an index; `--provider`, `--model`, and `--dimensions` are saved rather than temporary. | Updated-setting summary |
 | `config set <key> <value>` | Set a configuration value directly; JSON literals support booleans, numbers, arrays and objects. | Updated-setting summary |
 
 Configuration examples:
@@ -77,6 +79,73 @@ inputs validate inline, and Esc/Ctrl-C cancels without saving partial changes.
 The wizard and its saved-settings summary render on stderr, so `--output json`
 can write the resulting configuration to redirected stdout.
 Advanced endpoint/HTTP settings can be set with `config set`.
+
+### Local embeddings with Ollama
+
+Install and start [Ollama](https://ollama.com/) first (for example, `ollama serve`).
+Choose **Ollama** in the focused wizard, or configure it noninteractively:
+
+```bash
+# Interactive embedding-only setup; saves settings, then builds the index
+slopdex update --setup
+
+# Explicit repository config avoids changing user-wide settings
+slopdex --config .slopdex/config.json update --setup \
+  --provider ollama --model qwen3-embedding:0.6b --pull
+
+# Save and verify embeddings without opening an index
+slopdex --config .slopdex/config.json config embeddings \
+  --provider ollama --model qwen3-embedding:4b --pull
+slopdex update
+```
+
+Interactive setup offers the currently selected settings file or
+`<root>/.slopdex/config.json` when they differ; the repository file is the default
+choice. Explicit `--config` is always respected and is never redirected by the
+wizard. Noninteractive setup writes the normally selected file. Repository and
+user settings are not merged. Only embedding CLI overrides are saved; unrelated
+global flags remain temporary. Without `--setup` or `config embeddings`, ordinary
+`--provider`, `--model`, and `--dimensions` overrides remain temporary.
+
+The wizard offers remote OpenAI/Jina, local Ollama, installed embedding-capable
+Ollama models, and a custom model tag. Qwen3 presets are:
+
+| Model | Approximate download | Native dimensions |
+| --- | --- | --- |
+| `qwen3-embedding:0.6b` (default) | 0.6 GB; smallest/fastest | 1024 |
+| `qwen3-embedding:4b` | 2.5 GB; balanced | 2560 |
+| `qwen3-embedding:8b` | 4.7 GB; largest | 4096 |
+
+Setup chooses these dimensions automatically; `--dimensions` may explicitly
+request a supported reduced size. Custom models are checked for embedding support
+and resolved to their native size. Installed-model lookup happens only when the
+installed-model option is chosen. Presets and custom tags can be selected without
+listing models; preparation reports any server/model problem before saving.
+
+`--pull` is allowed only with `update --setup` or `config embeddings`, and only for
+Ollama. It downloads a missing model and saves `ollamaAutoPull: true`; otherwise a
+missing model requires a manual `ollama pull <model>` or previously enabled
+auto-pull. Setup checks the server, model capabilities, and a smoke embedding,
+then saves the model digest and resolved dimensions/family/context length.
+Cancellation or preparation failure leaves the settings file unchanged; a model
+already downloaded into Ollama may remain there. Hosted embedding setup requires
+no API key or hosted request until embeddings are actually needed.
+
+Saved digests pin model identity. If an installed tag changes, embedding requests
+fail with re-setup guidance rather than mixing old and new vectors. Rerun setup to
+refresh the digest. Switching embedding providers resets inherited model,
+dimensions, endpoint, and Ollama metadata; switching models resets dimensions
+and resolved identity. Explicit CLI dimensions take priority. `config set provider`
+and `config set model` also invalidate dependent settings, but remain offline and
+do not prepare or download models.
+
+Ollama inference is local-only, requires no cloud credentials, and never falls
+back to a hosted embedding service. Model downloads still need network access;
+`embeddingBaseUrl` can also point at a separately managed Ollama server. This does
+not disable independently configured description generation, reranking, or S3
+artifact sharing. To keep source entirely local, leave `artifactS3` disabled and
+avoid hosted description/reranking operations. `update` never generates
+descriptions automatically.
 
 Help, version, configuration, and model-catalog commands do not refresh the index.
 Search commands and cross-search require an existing resolved index; run
@@ -1106,8 +1175,9 @@ select their config using their own root and the same user-config fallback
 When neither description provider nor model is specified, the index's saved
 description profile supplies both. Description generation is always explicit;
 the removed description enablement setting is rejected. All configuration
-updates, including interactive setup, `config set`, and exclusion edits, write
-the selected file. Writes preserve other unknown properties and replace the
+updates, including `config set` and exclusion edits, write the selected file.
+Embedding-only interactive setup may explicitly select repository settings instead;
+an explicit `--config` always wins. Writes preserve other unknown properties and replace the
 JSON file through a synced temporary file. To create repository-specific settings,
 use `slopdex --config .slopdex/config.json config`; subsequent commands select
 that existing file automatically.
@@ -1133,8 +1203,8 @@ Example `config.json` (user or repository settings):
 
 | JSON settings | Native behavior/default |
 | --- | --- |
-| `provider`, `model`, `dimensions` | OpenAI / `text-embedding-3-large` / `3072`; Jina defaults to `jina-embeddings-v4` / `1024`. OpenAI small/ada models default to `1536`. CLI: `--provider`, `--model`, `--dimensions`. |
-| `symbolDimensions` | Optional native dimension for name-only symbol embeddings; default `min(256, dimensions)`. OpenAI ada uses full dimensions. Separate from content embeddings. |
+| `provider`, `model`, `dimensions` | `openai` / `text-embedding-3-large` / `3072`; `jina` defaults to `jina-embeddings-v4` / `1024`; `ollama` defaults to `qwen3-embedding:0.6b` / `1024`. OpenAI small/ada models default to `1536`. CLI: `--provider`, `--model`, `--dimensions`. |
+| `symbolDimensions` | Optional native dimension for name-only symbol embeddings; default `min(256, dimensions)`. OpenAI ada and Ollama models without a known dimension-reduction contract use full dimensions. Separate from content embeddings. |
 | `descriptionProvider`, `descriptionModel` | OpenAI / `gpt-5.6-luna`; OpenCode Zen (`opencode`) and Go (`opencode-go`) default to `muse-spark-1.3-contributor`. Corresponding `--description-*` options override them. |
 | `descriptionFallbackModel` | Optional same-provider fallback; CLI `--description-fallback-model`. Successful fallback stays active within that provider instance until it fails. |
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel` | Disabled by default; models default to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, OpenAI `gpt-5.6-luna`. |
@@ -1142,8 +1212,15 @@ Example `config.json` (user or repository settings):
 | `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, describe, map direct matches, and cross-search output. `--limit` overrides it. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
 | `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
-| `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`; larger configured values are capped. Interactive setup defaults to `32`. |
-| `embeddingBaseUrl`, `descriptionBaseUrl`, `rerankerBaseUrl` | Operation-specific HTTP(S) endpoint overrides; JSON only. Include the API version, e.g. `http://localhost:8080/v1`. |
+| `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`, Ollama `8` (maximum `64`); larger configured values are capped. The full config wizard defaults to `8` for Ollama and `32` otherwise; embedding-only setup leaves batching defaults to the provider. |
+| `embeddingBaseUrl`, `descriptionBaseUrl`, `rerankerBaseUrl` | Operation-specific HTTP(S) endpoint overrides; JSON only. Hosted APIs include the API version, e.g. `http://localhost:8080/v1`. Ollama uses the API base, default `http://localhost:11434/api`, not a bare server URL. |
+| `ollamaAutoPull` | Boolean, default `false`. Allows a missing local embedding model to be downloaded during preparation. Explicit setup `--pull` saves `true`. |
+| `ollamaKeepAlive` | Non-empty string, default `"5m"`; Ollama model residency setting. |
+| `ollamaModelDigest`, `ollamaModelFamily` | Non-empty strings resolved and saved by setup; the digest pins cache/model identity. Re-setup refreshes them. |
+| `ollamaNativeDimensions` | Positive integer resolved by a smoke embedding; distinct from requested output `dimensions`. |
+| `ollamaContextLength` | Positive integer; setup defaults to the smaller of the model's reported maximum and `8192`, and rejects a value above that maximum. |
+| `ollamaPullTimeoutMs` | Positive download timeout in milliseconds, default `1800000` (30 minutes). Separate from ordinary provider request timeout. |
+| `embeddingParallelism` | Positive embedding-request concurrency override; defaults to `1` for Ollama and `10` for hosted providers, with `parallelism` as a legacy fallback. Does not change description concurrency. |
 | `providerTimeoutMs` | Positive request timeout, default `60000`, capped at `300000`; connect timeout is 10 seconds. |
 | `providerMaxRetries` | Integer `0..5`, default `2`, for ordinary retryable HTTP failures. |
 | `retryDelayMs` | Nonnegative exponential-backoff base, default `250`; delays and numeric `Retry-After` are capped at 5 seconds. |
@@ -1152,13 +1229,22 @@ Example `config.json` (user or repository settings):
 
 Aliases `embeddingProvider`, `embeddingModel`, `embeddingDimensions`, and
 `fallbackModel` normalize to their canonical properties; canonical values win.
-Embedding profiles include `strategyVersion: "rust-v1"`. Description profiles
+Hosted embedding profiles include `strategyVersion: "rust-v1"`; Ollama uses
+`"ollama-v1"` and includes its pinned digest, endpoint, native/output dimensions,
+context length, and family-specific input strategy. Description profiles
 identify the configured primary with `strategyVersion: "file-conversation-v3"`,
 even while fallback serves requests, and include configured endpoint/fallback
 information. Generation reuse includes settings, system instruction, and the
 complete ordered effective conversation.
 Credentials are not profile inputs. Content embedding profiles are independent
 of the description-generator profile.
+
+Minimal hand-written Ollama configurations can omit resolved identity fields.
+Semantic preparation discovers them on first use, and subsequent warm updates
+recover the matching identity from the index without loading the model. When a
+new embedding is required, the installed model digest is checked before inference.
+Non-loopback Ollama endpoints produce a warning: local-model selection does not
+make a custom server on another machine local to this process.
 
 Embedding URLs may already end in `/embeddings`; Cohere/Jina reranking URLs may
 end in `/rerank`. Description and OpenAI reranking bases receive the required

@@ -249,9 +249,12 @@ impl Engine {
         config: Value,
         readonly: bool,
     ) -> Result<Self> {
-        let providers = Providers::new(&config)?;
         let mut engine = Self::open_internal(root, index, config, true, readonly)?;
-        engine.providers = providers;
+        crate::providers::resolve_embeddings(
+            &mut engine.config,
+            engine.db.meta("active_embedding_profile")?.as_deref(),
+        )?;
+        engine.providers = Providers::new(&engine.config)?;
         Ok(engine)
     }
 
@@ -317,8 +320,15 @@ impl Engine {
             config["descriptionProvider"] = profile["provider"].clone();
             config["descriptionModel"] = profile["model"].clone();
         }
-        // Construction makes no requests. Map does not validate or select a model profile.
         let map_config = json!({});
+        if !structural_only {
+            crate::providers::resolve_embeddings(
+                &mut config,
+                db.meta("active_embedding_profile")?.as_deref(),
+            )?;
+        }
+        // Provider construction is offline. Structural map does not validate or
+        // resolve a semantic model selection.
         let providers = Providers::new(if structural_only {
             &map_config
         } else {
@@ -1495,7 +1505,7 @@ impl Engine {
         run_jobs(
             "Generating embeddings",
             &batches,
-            self.parallelism()?,
+            self.embedding_parallelism()?,
             |entries| entries.len(),
             |entries| {
                 // Acquire in key order, then recheck: concurrent workspaces can
@@ -1555,6 +1565,24 @@ impl Engine {
         let parallelism = self.config["parallelism"].as_u64().unwrap_or(10) as usize;
         ensure!(parallelism > 0, "parallelism must be positive");
         Ok(parallelism)
+    }
+
+    fn embedding_parallelism(&self) -> Result<usize> {
+        let default = if self.config["provider"] == "ollama"
+            || self.config["embeddingProvider"] == "ollama"
+        {
+            1
+        } else {
+            10
+        };
+        let value = self
+            .config
+            .get("embeddingParallelism")
+            .or_else(|| self.config.get("parallelism"))
+            .and_then(Value::as_u64)
+            .unwrap_or(default) as usize;
+        ensure!(value > 0, "embeddingParallelism must be positive");
+        Ok(value)
     }
 
     fn embed_one(&self, input: &str, query: bool) -> Result<String> {

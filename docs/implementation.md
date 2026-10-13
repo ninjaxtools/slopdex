@@ -28,7 +28,7 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/parse/markdown.rs` | Structural heading hierarchy and separate bounded Markdown search chunks, fence and comment handling. |
 | `src/parse/data.rs` | Configuration/markup structure and bounded document search chunks. |
 | `src/parse/descriptions.rs` | Shared source-comment attachment, Python function/class docstrings, and file/symbol description extraction. |
-| `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits and hosted implementations, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
+| `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits, hosted implementations and local Ollama embeddings, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
 | `src/storage.rs` | Worktree SQLite bindings, attached global artifacts, immutable snapshot manifests, transactional live-state reconciliation, schema validation. |
 | `src/cache.rs` | Authoritative global SQLite store and validated, best-effort S3 provider artifacts. |
 | `src/git.rs`, `src/registry.rs` | Git candidate discovery/checkpoints, repository relatedness evidence, and per-artifact single-flight locks. |
@@ -68,8 +68,50 @@ No former default index or cache is copied, migrated, imported, or used as a see
 Explicit relative
 config/index paths, including JSON `indexPath`, resolve against the working
 directory. CLI overrides are applied after canonicalizing supported config aliases.
-All config updates write the selected file, using a same-directory temporary
-file, `sync_all`, and rename.
+Config updates use a same-directory temporary file, `sync_all`, and rename.
+Embedding-only interactive setup offers the selected config versus repository
+`.slopdex/config.json`, defaulting to repository settings when they differ;
+explicit `--config` bypasses destination selection. Noninteractive setup retains
+normal config selection. Settings files are never merged.
+
+`update --setup` saves embedding setup before opening the engine and then follows
+the ordinary update path. `config embeddings` invokes the same staged setup
+without opening an index. Explicit global embedding flags select noninteractive
+setup; only provider/model/dimensions overrides are persisted, not unrelated global
+flags. Without setup, embedding flags still apply only to the current invocation.
+The focused wizard never prompts for descriptions or reranking and never fetches
+their model catalogs. The full wizard also accepts Ollama and prepares embeddings
+before saving whenever embedding fields are configured. Both wizards stage alias
+normalization and answers so cancellation cannot partially save settings.
+
+Embedding provider/model selection clears stale dependent configuration. Provider
+switches reset model/dimensions/embedding endpoint and provider-specific Ollama
+settings; model switches invalidate dimensions and resolved digest/native-size/
+family/context metadata. Known Qwen3 sizes are 1024/2560/4096 for 0.6b/4b/8b;
+explicit CLI dimensions override these defaults. `config set provider/model`
+uses the same invalidation rules without calling a provider. Other direct
+configuration edits retain generic JSON/dotted-key behavior.
+
+Ollama setup calls `providers::prepare_embeddings(&mut Value, pull)` before any
+file write. It checks `/api/tags` and `/api/show`, optionally pulls a missing model,
+validates a smoke embedding, and records `dimensions`, `ollamaModelDigest`,
+`ollamaNativeDimensions`, `ollamaModelFamily`, and `ollamaContextLength`. Explicit
+`--pull` is restricted to embedding setup with Ollama and persists auto-pull.
+Hosted setup does not make network requests or resolve credentials. Installed
+embedding-model listing is deferred until the installed-model option is chosen;
+presets/custom entry require no listing request. CLI unit tests inject wizard responses and
+preparation closures, asserting cancellation/failure never writes config without
+using a real server, downloading models, or opening the per-user artifact store.
+
+Ollama provider construction remains offline. Semantic engine opens resolve
+missing model identity before cache/profile use; saved digest metadata permits
+offline cache reuse. Before its first live embedding request, the provider checks
+that the installed model still matches the pinned digest; a changed tag requires
+re-setup, not a silent cache identity change. Its `ollama-v1` profile includes
+digest, API endpoint, native/output dimensions, context length, and input strategy.
+Local inference has no hosted fallback. Description providers and optional S3
+artifact sharing remain independent, so local embeddings alone are not a promise
+that all configured operations keep source off the network.
 
 Search variants and cross-search validate that the resolved source index exists
 before opening an engine; a missing index fails promptly with `slopdex update`

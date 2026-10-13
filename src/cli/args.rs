@@ -36,14 +36,17 @@ pub(super) struct Global {
     #[arg(long, global = true)]
     pub(super) index: Option<PathBuf>,
     /// Embedding provider (default: openai)
-    #[arg(long, id = "embedding_provider", global = true, value_parser = ["openai", "jina"])]
+    #[arg(long, id = "embedding_provider", global = true, value_parser = ["openai", "jina", "ollama"])]
     pub(super) provider: Option<String>,
-    /// Embedding model (default: text-embedding-3-large / jina-embeddings-v4)
+    /// Embedding model (default: text-embedding-3-large / jina-embeddings-v4 / qwen3-embedding:0.6b)
     #[arg(long, id = "embedding_model", global = true, value_parser = nonempty)]
     pub(super) model: Option<String>,
-    /// Embedding dimensions (default: OpenAI 3072 / Jina 1024)
+    /// Embedding dimensions (default: OpenAI 3072 / Jina 1024 / Ollama model native size)
     #[arg(long, global = true, value_parser = positive)]
     pub(super) dimensions: Option<usize>,
+    /// Download a missing Ollama model during update --setup or config embeddings; saves ollamaAutoPull
+    #[arg(long, global = true)]
+    pub(super) pull: bool,
     /// Description provider (default: openai, or the saved profile)
     #[arg(long, global = true, value_parser = ["openai", "opencode", "opencode-go"])]
     pub(super) description_provider: Option<String>,
@@ -149,7 +152,7 @@ pub(super) enum Command {
     },
     /// Edit configuration without opening an index; optional prefix filters interactive prompts
     ///
-    /// Use `config set <key> <value>` or `config exclude-cross-search <file>:<symbol> ...`.
+    /// Use `config embeddings`, `config set <key> <value>` or `config exclude-cross-search <file>:<symbol> ...`.
     Config { args: Vec<String> },
 }
 
@@ -538,6 +541,9 @@ impl CrossArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct UpdateArgs {
+    /// Configure and prepare embeddings, save selected settings, then update
+    #[arg(long)]
+    pub(super) setup: bool,
     /// This update command currently supports HEAD only
     #[arg(long, default_value = "HEAD", value_parser = ["HEAD"])]
     pub(super) target: String,
@@ -665,6 +671,20 @@ fn valid_kind(input: &str) -> std::result::Result<String, String> {
 
 impl Cli {
     pub(super) fn validate(&self) -> Result<()> {
+        if self.global.pull {
+            ensure!(
+                matches!(&self.command, Command::Update(args) if args.setup)
+                    || matches!(&self.command, Command::Config { args } if args.first().is_some_and(|arg| arg == "embeddings") && args.len() == 1),
+                "--pull requires update --setup or config embeddings"
+            );
+            ensure!(
+                self.global
+                    .provider
+                    .as_deref()
+                    .is_none_or(|provider| provider == "ollama"),
+                "--pull is only available for the ollama embedding provider"
+            );
+        }
         if self.global.format == Some(Format::Clusters) {
             ensure!(
                 matches!(&self.command, Command::CrossSearch(args) if !args.cohesion),

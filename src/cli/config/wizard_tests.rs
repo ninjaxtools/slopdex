@@ -18,6 +18,8 @@ struct ScriptedPrompts {
     catalog: Value,
     fetches: Vec<String>,
     selections: Vec<ScriptedSelection>,
+    installed: Vec<String>,
+    installed_fetches: usize,
 }
 
 impl ScriptedPrompts {
@@ -28,6 +30,8 @@ impl ScriptedPrompts {
             catalog: Value::Null,
             fetches: Vec::new(),
             selections: Vec::new(),
+            installed: Vec::new(),
+            installed_fetches: 0,
         }
     }
 }
@@ -100,6 +104,36 @@ impl Prompts for ScriptedPrompts {
         ensure!(!self.catalog.is_null(), "no scripted catalog supplied");
         Ok(self.catalog.clone())
     }
+
+    fn installed(&mut self, _config: &Value) -> Result<Vec<String>> {
+        self.installed_fetches += 1;
+        Ok(self.installed.clone())
+    }
+}
+
+#[test]
+fn ollama_setup_defaults_download_consent_but_preserves_explicit_refusal() {
+    for explicit in [None, Some(false)] {
+        let mut config = json!({"provider": "ollama"});
+        if let Some(allowed) = explicit {
+            config["ollamaAutoPull"] = json!(allowed);
+        }
+        super::configure_embeddings_with(&mut config, &mut ScriptedPrompts::new("\n\n\n")).unwrap();
+        assert_eq!(config["ollamaAutoPull"], explicit.unwrap_or(true));
+    }
+}
+
+#[test]
+fn full_ollama_configuration_uses_local_batching_without_throttling_descriptions() {
+    let mut config = json!({});
+    configure_interactively(
+        &mut config,
+        &mut ScriptedPrompts::new("openai\n\nno\nno\nollama\n\n\n\n\n\n\n\n\n\n\n"),
+    )
+    .unwrap();
+    assert_eq!(config["embeddingBatchSize"], 8);
+    assert_eq!(config["embeddingParallelism"], 1);
+    assert!(config.get("parallelism").is_none());
 }
 
 #[test]
@@ -329,4 +363,126 @@ fn wizard_default_limit_is_configurable_and_validation_is_staged() {
         );
         assert_eq!(config, original);
     }
+}
+
+#[test]
+fn focused_embeddings_offer_presets_installed_and_custom_without_description_catalogs() {
+    for (answer, model, dimensions) in [
+        ("qwen3-embedding:0.6b", "qwen3-embedding:0.6b", Some(1024)),
+        ("qwen3-embedding:4b", "qwen3-embedding:4b", Some(2560)),
+        ("qwen3-embedding:8b", "qwen3-embedding:8b", Some(4096)),
+        (
+            "Installed embedding models\ninstalled-embed",
+            "installed-embed",
+            None,
+        ),
+        ("Custom model\ncustom-embed:tag", "custom-embed:tag", None),
+        (
+            "Custom model\nembeddinggemma:300m",
+            "embeddinggemma:300m",
+            Some(768),
+        ),
+    ] {
+        let mut config = json!({"provider": "openai", "model": "old", "dimensions": 8,
+            "embeddingBaseUrl": "https://old.invalid/v1", "descriptionProvider": "opencode-go",
+            "descriptionModel": "keep", "custom": true});
+        let mut prompts = ScriptedPrompts::new(&format!("ollama\n{answer}\nyes\n"));
+        prompts.installed = vec!["installed-embed".into(), "qwen3-embedding:4b".into()];
+        super::configure_embeddings_with(&mut config, &mut prompts).unwrap();
+        assert_eq!(config["provider"], "ollama");
+        assert_eq!(config["model"], model);
+        assert_eq!(config["dimensions"].as_u64(), dimensions);
+        assert_eq!(config["ollamaAutoPull"], true);
+        assert_eq!(config["descriptionModel"], "keep");
+        assert_eq!(config["custom"], true);
+        assert!(config.get("embeddingBaseUrl").is_none());
+        assert!(prompts.fetches.is_empty());
+        let selection = &prompts.selections[1];
+        assert_eq!(
+            selection.choices,
+            [
+                "qwen3-embedding:0.6b",
+                "qwen3-embedding:4b",
+                "qwen3-embedding:8b",
+                "Installed embedding models",
+                "Custom model"
+            ]
+        );
+        assert!(selection.searchable);
+        assert_eq!(
+            prompts.installed_fetches,
+            usize::from(model == "installed-embed")
+        );
+    }
+}
+
+#[test]
+fn focused_embedding_cancellation_at_every_prompt_is_staged() {
+    let original = json!({"embeddingProvider": "jina", "embeddingModel": "saved",
+        "embeddingDimensions": 16, "descriptionModel": "keep"});
+    let answers = ["ollama", "Custom model", "my-embedding:tag", "yes"];
+    for end in 0..answers.len() {
+        let mut config = original.clone();
+        let input = answers[..end].join("\n") + if end == 0 { "" } else { "\n" };
+        let error =
+            super::configure_embeddings_with(&mut config, &mut ScriptedPrompts::new(&input))
+                .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(config, original, "cancelled at prompt {end}");
+    }
+    let mut config = original.clone();
+    let error = super::configure_embeddings_with(
+        &mut config,
+        &mut ScriptedPrompts::new("ollama\nInstalled embedding models\n"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("No installed embedding models"));
+    assert_eq!(config, original);
+}
+
+#[test]
+fn full_wizard_supports_ollama_and_provider_prefix_resets_stale_fields() {
+    let mut config = json!({"provider": "jina", "model": "old", "dimensions": 16,
+        "embeddingBaseUrl": "https://old.invalid/v1"});
+    let mut prompts = ScriptedPrompts::new(&format!(
+        "openai\n\nno\nno\nollama\nqwen3-embedding:4b\nyes\n{}",
+        "\n".repeat(8)
+    ));
+    configure_interactively(&mut config, &mut prompts).unwrap();
+    assert_eq!(config["provider"], "ollama");
+    assert_eq!(config["dimensions"], 2560);
+    assert_eq!(config["ollamaAutoPull"], true);
+    let mut prompts = ScriptedPrompts::new("openai\n");
+    configure_interactively_filtered(&mut config, &mut prompts, Some("provider")).unwrap();
+    assert_eq!(config["model"], "text-embedding-3-large");
+    assert_eq!(config["dimensions"], 3072);
+    assert!(config.get("embeddingBaseUrl").is_none());
+    assert!(config.get("ollamaAutoPull").is_none());
+}
+
+#[test]
+fn setup_destination_defaults_to_repository_without_surprise_global_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let selected = base.join("user/config.json");
+    let repository = base.join("repo/.slopdex/config.json");
+    let mut prompts = ScriptedPrompts::new("\n");
+    assert_eq!(
+        super::setup_destination_with(&selected, &repository, &mut prompts).unwrap(),
+        repository
+    );
+    assert_eq!(prompts.selections[0].default, repository.to_string_lossy());
+    let mut prompts = ScriptedPrompts::new(&format!("{}\n", selected.display()));
+    assert_eq!(
+        super::setup_destination_with(&selected, &repository, &mut prompts).unwrap(),
+        selected
+    );
+    assert_eq!(
+        super::setup_destination_with(&repository, &repository, &mut ScriptedPrompts::new(""))
+            .unwrap(),
+        repository
+    );
 }

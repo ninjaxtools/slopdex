@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{self, IsTerminal, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 mod wizard;
@@ -49,9 +49,8 @@ fn normalize_config_aliases(config: &mut Value) {
 
 pub(super) fn effective_config(global: &Global, path: &Path) -> Result<Value> {
     let mut config = read_config(path)?;
+    apply_embedding_overrides(&mut config, global);
     for (key, value) in [
-        ("provider", &global.provider),
-        ("model", &global.model),
         ("descriptionProvider", &global.description_provider),
         ("descriptionModel", &global.description_model),
         (
@@ -62,9 +61,6 @@ pub(super) fn effective_config(global: &Global, path: &Path) -> Result<Value> {
         if let Some(value) = value {
             config[key] = json!(value);
         }
-    }
-    if let Some(value) = global.dimensions {
-        config["dimensions"] = json!(value);
     }
     if let Some(value) = global.reranker_candidates {
         config["rerankerCandidates"] = json!(value);
@@ -83,6 +79,89 @@ pub(super) fn effective_config(global: &Global, path: &Path) -> Result<Value> {
     Ok(config)
 }
 
+fn embedding_defaults(provider: &str) -> (&'static str, u64) {
+    match provider {
+        "jina" => ("jina-embeddings-v4", 1024),
+        "ollama" => (
+            crate::providers::OLLAMA_DEFAULT_MODEL,
+            crate::providers::ollama_model_dimensions(crate::providers::OLLAMA_DEFAULT_MODEL)
+                .expect("default Ollama model has known dimensions") as u64,
+        ),
+        _ => ("text-embedding-3-large", 3072),
+    }
+}
+
+fn known_dimensions(provider: &str, model: &str) -> Option<u64> {
+    if provider == "ollama" {
+        return crate::providers::ollama_model_dimensions(model)
+            .map(|dimensions| dimensions as u64);
+    }
+    match (provider, model) {
+        ("openai", "text-embedding-3-small") => Some(1536),
+        ("openai", "text-embedding-3-large") => Some(3072),
+        ("openai", "text-embedding-ada-002") => Some(1536),
+        ("jina", "jina-embeddings-v4") => Some(1024),
+        _ => None,
+    }
+}
+
+fn select_embeddings(config: &mut Value, provider: Option<&str>, model: Option<&str>) {
+    let previous = config["provider"].as_str().unwrap_or("openai");
+    let provider_changed = provider.is_some_and(|provider| provider != previous);
+    if provider_changed {
+        let object = config.as_object_mut().unwrap();
+        for key in [
+            "model",
+            "dimensions",
+            "embeddingBaseUrl",
+            "embeddingApiKey",
+            "ollamaAutoPull",
+            "ollamaKeepAlive",
+            "embeddingParallelism",
+            "ollamaPullTimeoutMs",
+        ] {
+            object.remove(key);
+        }
+    }
+    let model_changed = model.is_some_and(|model| config["model"].as_str() != Some(model));
+    if provider_changed || model_changed {
+        let object = config.as_object_mut().unwrap();
+        for key in [
+            "dimensions",
+            "ollamaModelDigest",
+            "ollamaNativeDimensions",
+            "ollamaModelFamily",
+            "ollamaContextLength",
+        ] {
+            object.remove(key);
+        }
+    }
+    if let Some(provider) = provider {
+        config["provider"] = json!(provider);
+        if provider_changed {
+            config["model"] = json!(embedding_defaults(provider).0);
+        }
+    }
+    if let Some(model) = model {
+        config["model"] = json!(model);
+    }
+    if (provider_changed || model_changed)
+        && let Some(dimensions) = known_dimensions(
+            config["provider"].as_str().unwrap_or("openai"),
+            config["model"].as_str().unwrap_or(""),
+        )
+    {
+        config["dimensions"] = json!(dimensions);
+    }
+}
+
+fn apply_embedding_overrides(config: &mut Value, global: &Global) {
+    select_embeddings(config, global.provider.as_deref(), global.model.as_deref());
+    if let Some(dimensions) = global.dimensions {
+        config["dimensions"] = json!(dimensions);
+    }
+}
+
 fn validate_config(config: &Value) -> Result<()> {
     ensure!(config.is_object(), "config must be a JSON object");
     crate::limits::validate_config(config)?;
@@ -92,7 +171,7 @@ fn validate_config(config: &Value) -> Result<()> {
         "descriptionsEnabled has been removed; remove it from config and run `slopdex generate descriptions` to generate descriptions explicitly"
     );
     for (key, allowed) in [
-        ("provider", &["openai", "jina"][..]),
+        ("provider", &["openai", "jina", "ollama"][..]),
         (
             "descriptionProvider",
             &["openai", "opencode", "opencode-go"][..],
@@ -111,6 +190,9 @@ fn validate_config(config: &Value) -> Result<()> {
         "artifactCachePath",
         "descriptionModel",
         "descriptionFallbackModel",
+        "ollamaKeepAlive",
+        "ollamaModelDigest",
+        "ollamaModelFamily",
     ] {
         if let Some(value) = config.get(key) {
             ensure!(
@@ -124,6 +206,10 @@ fn validate_config(config: &Value) -> Result<()> {
         "maxFileSize",
         "embeddingBatchSize",
         "parallelism",
+        "embeddingParallelism",
+        "ollamaNativeDimensions",
+        "ollamaContextLength",
+        "ollamaPullTimeoutMs",
     ] {
         if let Some(value) = config.get(key) {
             ensure!(
@@ -132,7 +218,7 @@ fn validate_config(config: &Value) -> Result<()> {
             );
         }
     }
-    for key in ["rerankingEnabled", "verbose"] {
+    for key in ["rerankingEnabled", "verbose", "ollamaAutoPull"] {
         if let Some(value) = config.get(key) {
             ensure!(value.is_boolean(), "{key} must be a boolean");
         }
@@ -287,12 +373,142 @@ fn exclude_cross_search(global: &Global, config: &mut Value, args: &[String]) ->
     Ok(json!({"total": hashes.len(), "added": hashes.len() - previous_count}))
 }
 
+fn embedding_setup_interactive(global: &Global) -> bool {
+    global.provider.is_none() && global.model.is_none() && global.dimensions.is_none()
+}
+
+// Both wizard responses and preparation are injected in tests: no model download,
+// server access, index open, or per-user artifact store is needed to test staging.
+fn stage_embeddings(
+    saved: &Value,
+    global: &Global,
+    configure: impl FnOnce(&mut Value) -> Result<()>,
+    prepare: impl FnOnce(&mut Value, bool) -> Result<()>,
+) -> Result<Value> {
+    let mut config = saved.clone();
+    normalize_config_aliases(&mut config);
+    apply_embedding_overrides(&mut config, global);
+    if embedding_setup_interactive(global) {
+        configure(&mut config)?;
+    }
+    if config["provider"].is_null() {
+        config["provider"] = json!("openai");
+    }
+    if config["model"].is_null() {
+        let provider = config["provider"]
+            .as_str()
+            .context("provider must be a string")?;
+        config["model"] = json!(embedding_defaults(provider).0);
+    }
+    ensure!(
+        !global.pull || config["provider"] == "ollama",
+        "--pull is only available for the ollama embedding provider"
+    );
+    if global.pull {
+        config["ollamaAutoPull"] = json!(true);
+    }
+    validate_config(&config)?;
+    if config["provider"] == "ollama" {
+        prepare(&mut config, global.pull)?;
+    }
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn save_embeddings(
+    global: &Global,
+    path: &Path,
+    configure: impl FnOnce(&mut Value) -> Result<()>,
+    prepare: impl FnOnce(&mut Value, bool) -> Result<()>,
+) -> Result<()> {
+    let config = stage_embeddings(&read_config(path)?, global, configure, prepare)?;
+    write_config(path, &config)
+}
+
+fn cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof
+        )
+    })
+}
+
+/// Save embedding-only setup before an update, or return None after cancellation.
+pub(super) fn setup_embeddings(
+    global: &Global,
+    root: &Path,
+    selected: &Path,
+) -> Result<Option<PathBuf>> {
+    let interactive = embedding_setup_interactive(global);
+    if interactive {
+        ensure!(
+            io::stdin().is_terminal() && ui::terminal(),
+            "interactive embedding setup requires a terminal; pass --provider and --model for noninteractive setup"
+        );
+        cliclack::intro("slopdex embedding setup")?;
+    }
+    let result = (|| {
+        let path = if interactive && global.config.is_none() {
+            wizard::setup_destination(selected, &root.join(".slopdex/config.json"))?
+        } else {
+            selected.to_owned()
+        };
+        save_embeddings(
+            global,
+            &path,
+            wizard::configure_embeddings,
+            |config, pull| {
+                ui::spin("Preparing embeddings", || {
+                    crate::providers::prepare_embeddings(config, pull)
+                })
+            },
+        )?;
+        Ok(path)
+    })();
+    match result {
+        Ok(path) => {
+            if interactive {
+                cliclack::outro(format!("Updated {}", path.display()))?;
+            }
+            Ok(Some(path))
+        }
+        Err(error) if interactive && cancelled(&error) => {
+            cliclack::outro_cancel("Embedding setup cancelled; no settings saved")?;
+            Ok(None)
+        }
+        Err(error) => {
+            if interactive {
+                cliclack::outro_cancel("Embedding setup failed; no settings saved")?;
+            }
+            Err(error)
+        }
+    }
+}
+
 pub(super) fn run_config(
     global: &Global,
     path: &Path,
     args: &[String],
     out: &mut impl Write,
 ) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "embeddings") {
+        ensure!(
+            args.len() == 1,
+            "usage: slopdex config embeddings [--provider <provider>] [--model <model>] [--dimensions <count>] [--pull]"
+        );
+        let root = root_path(global.root.as_deref())?;
+        if let Some(path) = setup_embeddings(global, &root, path)? {
+            if global.format == Some(Format::Json) {
+                let mut config = read_config(&path)?;
+                config["configPath"] = json!(path);
+                print_json(out, &config)?;
+            } else if !embedding_setup_interactive(global) {
+                writeln!(out, "Updated {}: embedding settings", path.display())?;
+            }
+        }
+        return Ok(());
+    }
     let mut config = read_config(path)?;
     let action = args.first().map(String::as_str);
     let interactive = !matches!(action, Some("set" | "exclude-cross-search"));
@@ -306,6 +522,13 @@ pub(super) fn run_config(
             "config set expects a non-empty key path"
         );
         let value = serde_json::from_str::<Value>(&args[2]).unwrap_or_else(|_| json!(args[2]));
+        if let Some(value) = value.as_str() {
+            match key.as_str() {
+                "provider" => select_embeddings(&mut config, Some(value), None),
+                "model" => select_embeddings(&mut config, None, Some(value)),
+                _ => {}
+            }
+        }
         let mut target = &mut config;
         let mut parts = key.split('.').peekable();
         while let Some(part) = parts.next() {
@@ -338,14 +561,21 @@ pub(super) fn run_config(
             "interactive config requires a terminal"
         );
         cliclack::intro("slopdex configuration")?;
-        if let Err(error) = wizard::configure(&mut config, prefix) {
+        let configured = wizard::configure(&mut config, prefix).and_then(|()| {
+            if config["provider"] == "ollama"
+                && prefix.is_none_or(|prefix| {
+                    ["provider", "model", "dimensions"]
+                        .iter()
+                        .any(|key| key.starts_with(prefix))
+                })
+            {
+                crate::providers::prepare_embeddings(&mut config, false)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = configured {
             // cliclack 0.5.6 returns Interrupted for Esc/Ctrl-C; it does not exit.
-            if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                matches!(
-                    error.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof
-                )
-            }) {
+            if cancelled(&error) {
                 cliclack::outro_cancel("Configuration cancelled; no settings saved")?;
                 return Ok(());
             }
@@ -372,6 +602,7 @@ pub(super) fn run_config(
             "exclude",
             "maxFileSize",
             "embeddingBatchSize",
+            "embeddingParallelism",
             "parallelism",
             "defaultLimit",
             "verbose",

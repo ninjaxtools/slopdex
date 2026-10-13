@@ -12,6 +12,7 @@ pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Vector>> {
     match string(&context.config, &["provider", "embeddingProvider"])?.unwrap_or("openai") {
         "openai" => Ok(Box::new(super::vector_openai::OpenAiVector::new(context)?)),
         "jina" => Ok(Box::new(super::vector_jina::JinaVector::new(context)?)),
+        "ollama" => Ok(Box::new(super::vector_ollama::OllamaVector::new(context)?)),
         _ => bail!("Unsupported embedding provider"),
     }
 }
@@ -22,6 +23,17 @@ pub(super) fn model(config: &Value, provider: &str, default: &str) -> Result<Str
         provider,
     )?
     .to_owned())
+}
+
+pub(super) fn check_batch(count: usize, limit: usize) -> Result<()> {
+    // Never hide multiple batches behind one fallible return value.
+    ensure!(
+        count <= limit,
+        "Embedding input count {} exceeds batch limit {}; split and persist batches in the caller",
+        count,
+        limit
+    );
+    Ok(())
 }
 
 pub(super) struct Configuration {
@@ -67,14 +79,7 @@ impl Configuration {
     }
 
     pub(super) fn check_batch(&self, count: usize) -> Result<()> {
-        // Never hide multiple paid batches behind one fallible return value.
-        ensure!(
-            count <= self.batch_size,
-            "Embedding input count {} exceeds batch limit {}; split and persist batches in the caller",
-            count,
-            self.batch_size
-        );
-        Ok(())
+        check_batch(count, self.batch_size)
     }
 
     pub(super) fn parse(&self, response: &Value, count: usize) -> Result<Vec<Vec<f32>>> {

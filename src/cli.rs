@@ -218,9 +218,22 @@ fn run_workspace(
         return Ok(());
     }
     let root = &workspace.root;
-    let config_file = config_path(root, cli.global.config.as_deref())?;
+    let mut config_file = config_path(root, cli.global.config.as_deref())?;
     if let Command::Config { args } = &cli.command {
         return run_config(&cli.global, &config_file, args, &mut out);
+    }
+
+    if let Command::Update(args) = &cli.command
+        && args.setup
+    {
+        let Some(path) = config::setup_embeddings(&cli.global, root, &config_file)? else {
+            return Ok(());
+        };
+        ui::info(format!(
+            "slopdex: saved embedding settings to {}",
+            path.display()
+        ));
+        config_file = path;
     }
 
     let mut config = effective_config(&cli.global, &config_file)?;

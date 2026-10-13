@@ -9,6 +9,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "ollama_tests.rs"]
+mod ollama_tests;
+
 fn adapter_protocol(provider: &str, model: &str) -> Protocol {
     match provider {
         "openai" => <llm_openai::OpenAi as llm::Adapter>::protocol(model),

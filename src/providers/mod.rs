@@ -1,4 +1,4 @@
-//! Blocking hosted providers. Construction is offline; credentials are resolved on use.
+//! Blocking hosted and local providers. Construction is offline; credentials are resolved on use.
 //!
 //! Implementations of the provider-independent traits in [`crate::models`] live
 //! in `<capability>_<provider>.rs` modules (for example, `llm_opencode_go.rs`).
@@ -42,6 +42,7 @@ mod llm;
 mod llm_openai;
 mod llm_opencode;
 mod llm_opencode_go;
+mod ollama;
 mod protocol;
 mod rerank;
 mod rerank_cohere;
@@ -49,7 +50,14 @@ mod rerank_jina;
 mod rerank_openai;
 mod vector;
 mod vector_jina;
+mod vector_ollama;
 mod vector_openai;
+
+pub(crate) use ollama::resolve_embeddings;
+pub use ollama::{
+    OLLAMA_DEFAULT_MODEL, default_dimensions as ollama_model_dimensions,
+    installed_embedding_models, prepare_embeddings,
+};
 
 #[cfg(test)]
 mod tests;
@@ -89,6 +97,7 @@ pub struct Providers {
 struct Context {
     config: Value,
     http: Http,
+    ollama_verified: Arc<Mutex<bool>>,
 }
 
 impl Providers {
@@ -100,6 +109,7 @@ impl Providers {
         let context = Arc::new(Context {
             config: config.clone(),
             http: Http::new(config)?,
+            ollama_verified: Arc::new(Mutex::new(false)),
         });
         Ok(Self {
             vector: vector::create(context.clone())?,
@@ -119,9 +129,11 @@ impl Providers {
         if self.symbol_vector.get().is_none() {
             let mut config = self.context.config.clone();
             let dimensions = positive(&config, &["symbolDimensions"], self.dimensions().min(256))?;
-            // Ada cannot request reduced dimensions; retain the original space.
+            // Models without a dimension-reduction contract retain their space.
             config["dimensions"] = json!(if self.vector.profile()["model"]
                 == "text-embedding-ada-002"
+                || (string(&config, &["provider", "embeddingProvider"])? == Some("ollama")
+                    && !ollama::supports_reduction(&config))
             {
                 self.dimensions()
             } else {
@@ -130,6 +142,7 @@ impl Providers {
             let context = Arc::new(Context {
                 http: Http::new(&config)?,
                 config,
+                ollama_verified: self.context.ollama_verified.clone(),
             });
             let vector = Box::new(SymbolVector {
                 inner: vector::create(context)?,
@@ -228,19 +241,23 @@ impl Vector for SymbolVector {
 
 impl Context {
     fn report_call(&self, kind: &str, provider: &str, model: &str) {
-        if should_report_call(
-            REPORTED_CALLS.get_or_init(ReportedCalls::default),
-            self.config["verbose"].as_bool() == Some(true),
-            kind,
-            provider,
-            model,
-        ) {
-            crate::ui::info(format!(
-                "slopdex: notice: external model call: kind={kind} provider={} model={}",
-                json!(provider),
-                json!(model),
-            ));
-        }
+        report_call(&self.config, kind, provider, model);
+    }
+}
+
+fn report_call(config: &Value, kind: &str, provider: &str, model: &str) {
+    if should_report_call(
+        REPORTED_CALLS.get_or_init(ReportedCalls::default),
+        config["verbose"].as_bool() == Some(true),
+        kind,
+        provider,
+        model,
+    ) {
+        crate::ui::info(format!(
+            "slopdex: notice: external model call: kind={kind} provider={} model={}",
+            json!(provider),
+            json!(model),
+        ));
     }
 }
 
@@ -316,7 +333,7 @@ fn unqualify<'a>(model: &'a str, provider: &str) -> Result<&'a str> {
     if let Some((prefix, id)) = model.split_once('/').filter(|(prefix, _)| {
         matches!(
             *prefix,
-            "openai" | "jina" | "cohere" | "opencode" | "opencode-go"
+            "openai" | "jina" | "cohere" | "opencode" | "opencode-go" | "ollama"
         )
     }) {
         ensure!(
