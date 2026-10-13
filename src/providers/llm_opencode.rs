@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
@@ -91,7 +91,8 @@ pub(super) fn session_headers(key: &str, protocol: Protocol, session: &str) -> R
     let mut headers = auth_headers(key, protocol)?;
     headers.insert(
         "x-opencode-session",
-        HeaderValue::from_str(session).unwrap(),
+        HeaderValue::from_str(session)
+            .map_err(|_| anyhow!("Session ID is not a valid HTTP header value"))?,
     );
     Ok(headers)
 }

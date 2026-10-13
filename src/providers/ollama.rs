@@ -1,8 +1,10 @@
 //! Explicit model preparation and pinned model identity for local Ollama inference.
 
-use super::{Context, endpoint, http::Http, normalize, positive, string};
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use super::http::{Http, RequestError};
+use super::{Context, endpoint, normalize, positive, string};
+use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
+use std::sync::PoisonError;
 
 pub const OLLAMA_DEFAULT_MODEL: &str = "qwen3-embedding:0.6b";
 const DEFAULT_BASE: &str = "http://localhost:11434/api";
@@ -68,9 +70,26 @@ pub(super) fn url(config: &Value, suffix: &str) -> Result<String> {
     )
 }
 
+/// The embed endpoint as recorded in profiles: without query parameters.
+pub(super) fn profile_url(config: &Value) -> Result<String> {
+    Ok(super::profile_endpoint(&url(config, "embed")?))
+}
+
 fn tags(config: &Value, http: &Http) -> Result<Vec<Value>> {
-    let response = http.request(&url(config, "tags")?, None, &Default::default())
-        .context("Cannot reach Ollama; install/start Ollama (for example `ollama serve`) or check embeddingBaseUrl")?;
+    let response = http
+        .request(&url(config, "tags")?, None, &Default::default())
+        .map_err(|error| {
+            // Only connectivity failures mean the server is absent; HTTP errors and
+            // malformed replies keep their own diagnostics.
+            if error
+                .downcast_ref::<RequestError>()
+                .is_some_and(|request| request.transport)
+            {
+                error.context("Cannot reach Ollama; install/start Ollama (for example `ollama serve`) or check embeddingBaseUrl")
+            } else {
+                error
+            }
+        })?;
     response["models"]
         .as_array()
         .cloned()
@@ -221,7 +240,11 @@ pub fn prepare_embeddings(config: &mut Value, pull: bool) -> Result<()> {
     prepared["dimensions"] = json!(dimensions);
     prepared["ollamaNativeDimensions"] = json!(native);
     prepared["ollamaModelDigest"] = entry["digest"].clone();
-    prepared["ollamaModelFamily"] = json!(family(&name));
+    // The input strategy derives from the model name at construction; no saved family.
+    prepared
+        .as_object_mut()
+        .expect("prepared config is an object")
+        .remove("ollamaModelFamily");
     prepared["ollamaContextLength"] = json!(context_length);
     if pull {
         prepared["ollamaAutoPull"] = json!(true);
@@ -238,9 +261,12 @@ pub(crate) fn resolve_embeddings(config: &mut Value, saved_profile: Option<&str>
     {
         if let Some(saved) = saved_profile {
             let profile: Value = serde_json::from_str(saved)?;
+            // `model` already applies the default, so an unconfigured model matches
+            // only a profile that embeds with that default; other inference settings
+            // (dimensions mean native when missing) are never inherited.
             if profile["provider"] == "ollama"
                 && profile["model"] == model(config)?
-                && profile["endpoint"] == url(config, "embed")?
+                && profile["endpoint"] == profile_url(config)?
                 && profile["strategyVersion"] == "ollama-v1"
                 && profile["modelDigest"]
                     .as_str()
@@ -251,11 +277,6 @@ pub(crate) fn resolve_embeddings(config: &mut Value, saved_profile: Option<&str>
                 config["ollamaNativeDimensions"] = profile["nativeDimensions"].clone();
                 if config.get("ollamaContextLength").is_none() {
                     config["ollamaContextLength"] = profile["contextLength"].clone();
-                }
-                // Inference settings are not implicitly inherited from a
-                // temporary CLI selection; missing dimensions mean native.
-                if string(config, &["model", "embeddingModel"])?.is_none() {
-                    config["model"] = profile["model"].clone();
                 }
                 return Ok(());
             }
@@ -298,10 +319,11 @@ pub fn installed_embedding_models(config: &Value) -> Result<Vec<String>> {
 }
 
 pub(super) fn verify(context: &Context) -> Result<()> {
+    // A panic while verifying leaves the flag false; later callers simply verify again.
     let mut verified = context
         .ollama_verified
         .lock()
-        .map_err(|_| anyhow!("Ollama verification lock poisoned"))?;
+        .unwrap_or_else(PoisonError::into_inner);
     if *verified {
         return Ok(());
     }

@@ -286,3 +286,90 @@ fn unindexed_multi_workspace_map_builtin_limit_is_global() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn cache_prune_reports_the_configured_store_without_opening_an_index() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root)?;
+    let store = dir.path().join("artifacts.sqlite");
+    let config = dir.path().join("config.json");
+    std::fs::write(&config, json!({"artifactCachePath": store}).to_string())?;
+    let run = |extra: &[&str]| -> Result<Value> {
+        let mut argv = vec![
+            "--root",
+            root.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "cache",
+            "prune",
+        ];
+        argv.extend(extra);
+        let mut out = Vec::new();
+        run_cli(&parse(&argv), &mut out)?;
+        Ok(serde_json::from_slice(&out)?)
+    };
+    // Maintenance never creates a store, an index, or anything in the root.
+    assert!(
+        run(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("No global artifact store")
+    );
+    assert!(!store.exists());
+    drop(crate::cache::Artifacts::open(
+        &json!({"artifactCachePath": store}),
+    )?);
+    let report = run(&[])?;
+    assert_eq!(
+        Path::new(report["store"].as_str().unwrap()).canonicalize()?,
+        store.canonicalize()?
+    );
+    assert_eq!(report["snapshotRowsDeleted"], 0);
+    assert_eq!(report["vacuumed"], false);
+    assert_eq!(run(&["--vacuum"])?["vacuumed"], true);
+    assert_eq!(std::fs::read_dir(&root)?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn unindexed_map_symbol_query_warning_stays_off_stdout() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("code.rs"), "pub fn alpha() {}\n")?;
+    let index = dir.path().join("missing.sqlite");
+    let config_file = dir.path().join("config.json");
+    std::fs::write(
+        &config_file,
+        json!({"artifactCachePath": dir.path().join("artifacts.sqlite")}).to_string(),
+    )?;
+    for format in ["json", "text"] {
+        let mut ordinary = Vec::new();
+        let mut queried = Vec::new();
+        for (out, extra) in [(&mut ordinary, vec![]), (&mut queried, vec!["-q", "alpha"])] {
+            let argv = [
+                vec![
+                    "--root",
+                    dir.path().to_str().unwrap(),
+                    "--index",
+                    index.to_str().unwrap(),
+                    "--config",
+                    config_file.to_str().unwrap(),
+                    "--output",
+                    format,
+                    "map",
+                ],
+                extra,
+            ]
+            .concat();
+            run_cli(&parse(&argv), out)?;
+        }
+        assert_eq!(queried, ordinary, "{format}");
+        assert!(!String::from_utf8_lossy(&queried).contains("warning"));
+        if format == "json" {
+            let rows: Value = serde_json::from_slice(&queried)?;
+            assert_eq!(rows[0]["nodes"][0]["name"], "alpha");
+        }
+    }
+    assert!(!index.exists());
+    Ok(())
+}

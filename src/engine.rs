@@ -1,8 +1,9 @@
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::{OnceCell, Ref, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -96,6 +97,9 @@ pub struct Engine {
     sources: HashMap<String, OnceCell<String>>,
     vectors: RefCell<HashMap<String, Vec<f32>>>,
     indexes: RefCell<HashMap<String, SharedIndex>>,
+    // Derived from committed records; cleared whenever they are reloaded.
+    structures: RefCell<HashMap<String, Option<Arc<parse::FileStructure>>>>,
+    symbol_index: RefCell<Option<SymbolIndex>>,
     structural_only: bool,
     // Readers share a lock; writers hold it across SQLite and USearch publication.
     _lock: fs::File,
@@ -348,6 +352,8 @@ impl Engine {
             sources: HashMap::new(),
             vectors: RefCell::new(HashMap::new()),
             indexes: RefCell::new(HashMap::new()),
+            structures: RefCell::new(HashMap::new()),
+            symbol_index: RefCell::new(None),
             structural_only,
             _lock: lock,
             readonly,
@@ -452,7 +458,8 @@ impl Engine {
             Some(changes) => changes.dirty.clone(),
             None => git::dirty_paths(&self.root)?,
         };
-        dirty.retain(|path| !self.own_artifact(path));
+        let eligibility = Eligibility::new(&self.config)?;
+        self.retain_relevant_dirty(&mut dirty, &eligibility);
         let previous_dirty: HashSet<String> = self
             .db
             .meta("dirty_paths")?
@@ -471,27 +478,40 @@ impl Engine {
             self.db.meta("repository_identity")?.as_deref(),
             &directories,
         )?;
+        let policy_current = self.db.meta("discovery_policy")?.as_deref() == Some(&policy);
+        // Parse diagnostics are a function of content and parser version, both
+        // covered below. A failed read has no content hash, so only its saved
+        // metadata can show that retrying might now succeed.
+        let read_failures: Vec<&str> = self
+            .files
+            .values()
+            .filter(|file| has_read_error(file))
+            .map(|file| file.path.as_str())
+            .collect();
         if changes.is_some()
             && previous_checkpoint == checkpoint
             && dirty.is_empty()
             && previous_dirty.is_empty()
-            && self.db.meta("discovery_policy")?.as_deref() == Some(&policy)
+            && policy_current
             && self
                 .db
                 .missing_structure_paths(STRUCTURE_PARSER_VERSION)?
                 .is_empty()
-            && self.files.values().all(|file| file.errors.is_empty())
+            && (read_failures.is_empty() || {
+                let saved = self.saved_fingerprints()?;
+                let mut unchanged = true;
+                for path in &read_failures {
+                    unchanged &=
+                        saved.get(*path) == Some(&file_fingerprint(&self.root.join(path))?);
+                }
+                unchanged
+            })
         {
             return Ok(
                 json!({"filesUpdated":0,"filesDeleted":0,"functionCount":self.items.iter().filter(|item| item.kind=="function").count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
             );
         }
-        let previous_fingerprints: BTreeMap<String, Value> = self
-            .db
-            .meta("file_fingerprints")?
-            .map(|value| serde_json::from_str(&value))
-            .transpose()?
-            .unwrap_or_default();
+        let previous_fingerprints = self.saved_fingerprints()?;
         let mut fingerprints = previous_fingerprints.clone();
         let mut changed_policy = false;
         for path in dirty
@@ -504,7 +524,7 @@ impl Engine {
             fingerprints.insert(path.clone(), fingerprint);
         }
         let full_scan = changes.is_none()
-            || self.db.meta("discovery_policy")?.as_deref() != Some(&policy)
+            || !policy_current
             || changed_policy
             || (previous_checkpoint != checkpoint
                 && changes.as_ref().is_some_and(|c| c.policy_changed));
@@ -515,12 +535,9 @@ impl Engine {
             .unwrap_or_default();
         candidates.extend(previous_dirty.iter().cloned());
         candidates.extend(self.db.missing_structure_paths(STRUCTURE_PARSER_VERSION)?);
-        candidates.extend(
-            self.files
-                .values()
-                .filter(|f| !f.errors.is_empty())
-                .map(|f| f.path.clone()),
-        );
+        // Failed reads stay candidates so a metadata change retries them; files
+        // with parse diagnostics are ordinary unchanged files.
+        candidates.extend(read_failures.iter().map(|path| (*path).to_owned()));
         let paths = if full_scan {
             directories.clear();
             source_paths_subset(
@@ -529,17 +546,26 @@ impl Engine {
                 &self.config,
                 None,
                 Some(&mut directories),
+                true,
             )?
-        } else if candidates.is_empty() {
-            Vec::new()
         } else {
-            source_paths_subset(
-                &self.root,
-                &self.db.path,
-                &self.config,
-                Some(&candidates),
-                Some(&mut directories),
-            )?
+            let paths = if candidates.is_empty() {
+                Vec::new()
+            } else {
+                source_paths_subset(
+                    &self.root,
+                    &self.db.path,
+                    &self.config,
+                    Some(&candidates),
+                    Some(&mut directories),
+                    true,
+                )?
+            };
+            // Candidate walks only add directories. Forget deleted ones so their
+            // policy files are not probed forever; absent files never contribute
+            // to the policy, so this cannot change it.
+            directories.retain(|directory| self.root.join(directory).is_dir());
+            paths
         };
         let policy = indexing_policy(
             &self.root,
@@ -578,15 +604,22 @@ impl Engine {
             let fingerprint = file_fingerprint(&self.root.join(&path))?;
             fingerprints.insert(path.clone(), fingerprint.clone());
             let previous = self.files.get(&path);
-            if !full_scan
+            // Metadata and structure currency do not depend on how the file was
+            // discovered, so full scans (every non-Git refresh, and any policy
+            // change) reuse them too. The size limit is the one policy input
+            // that changes the outcome for unchanged metadata.
+            if let Some(previous) = previous
                 && previous_checkpoint == checkpoint
-                && previous.is_some_and(|f| f.source_mode == source_mode && f.errors.is_empty())
+                && previous.source_mode == source_mode
                 && previous_fingerprints.get(&path) == Some(&fingerprint)
-                && self.db.structure_current(
-                    &path,
-                    &previous.unwrap().hash,
-                    STRUCTURE_PARSER_VERSION,
-                )?
+                && if has_read_error(previous) {
+                    policy_current
+                } else {
+                    fingerprint[0].as_u64().is_some_and(|size| size <= max_size)
+                }
+                && self
+                    .db
+                    .structure_current(&path, &previous.hash, STRUCTURE_PARSER_VERSION)?
             {
                 indexing.inc(1);
                 continue;
@@ -594,6 +627,18 @@ impl Engine {
             let source = match read_source(&self.root, &path, max_size) {
                 Ok(source) => source,
                 Err(error) => {
+                    let errors = vec![
+                        json!({"path":path,"code":"read-error","message":error.to_string(),"sourceMode":source_mode}),
+                    ];
+                    // The same failure is already published: nothing to rewrite.
+                    if previous.is_some_and(|f| f.source_mode == source_mode && f.errors == errors)
+                        && self
+                            .db
+                            .structure_current(&path, &hash(""), STRUCTURE_PARSER_VERSION)?
+                    {
+                        indexing.inc(1);
+                        continue;
+                    }
                     if self.readonly {
                         return Err(NeedsWrite.into());
                     }
@@ -606,9 +651,7 @@ impl Engine {
                         description: None,
                         description_hash: None,
                         description_embedding: None,
-                        errors: vec![
-                            json!({"path":path,"code":"read-error","message":error.to_string(),"sourceMode":source_mode}),
-                        ],
+                        errors,
                     };
                     changed.push((file, parse::ParsedFile::default()));
                     indexing.inc(1);
@@ -616,8 +659,10 @@ impl Engine {
                 }
             };
             let source_hash = hash(&source);
+            // Saved parse diagnostics belong to this exact content. A failed read
+            // shares the empty-content hash and must still be replaced.
             if previous.is_some_and(|f| {
-                f.hash == source_hash && f.source_mode == source_mode && f.errors.is_empty()
+                f.hash == source_hash && f.source_mode == source_mode && !has_read_error(f)
             }) && self
                 .db
                 .structure_current(&path, &source_hash, STRUCTURE_PARSER_VERSION)?
@@ -677,7 +722,7 @@ impl Engine {
         } else {
             git::dirty_paths(&self.root)?
         };
-        current_dirty.retain(|path| !self.own_artifact(path));
+        self.retain_relevant_dirty(&mut current_dirty, &eligibility);
         ensure!(
             current_dirty == dirty,
             "Git working tree changed during indexing; rerun"
@@ -697,6 +742,7 @@ impl Engine {
             &self.config,
             if full_scan { None } else { Some(&candidates) },
             None,
+            false,
         )?;
         ensure!(
             verified_paths == paths,
@@ -760,6 +806,28 @@ impl Engine {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    fn saved_fingerprints(&self) -> Result<BTreeMap<String, Value>> {
+        Ok(self
+            .db
+            .meta("file_fingerprints")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// Git status also reports paths discovery can never select (modified
+    /// submodules, unsupported or excluded files). They must not keep the
+    /// working tree "dirty" forever and defeat the unchanged fast path. Indexed
+    /// paths and ignore-policy files always stay relevant.
+    fn retain_relevant_dirty(&self, dirty: &mut HashSet<String>, eligibility: &Eligibility) {
+        dirty.retain(|path| {
+            !self.own_artifact(path)
+                && (self.files.contains_key(path)
+                    || policy_path(path)
+                    || eligibility.selects_git_path(path))
+        });
     }
 
     fn own_artifact(&self, path: &str) -> bool {
@@ -902,12 +970,12 @@ impl Engine {
         Ok(selection.with_semantic_matches(matched, matched_symbols, matched_paths))
     }
 
-    fn symbol_structures(&self) -> Result<BTreeMap<String, parse::FileStructure>> {
+    fn symbol_structures(&self) -> Result<BTreeMap<String, Arc<parse::FileStructure>>> {
         self.db
             .paths()?
             .into_iter()
             .map(|path| {
-                let structure = self.presentation_structure(&path)?.with_context(|| {
+                let structure = self.cached_structure(&path)?.with_context(|| {
                     format!("Structure for {path} requires refresh; run without --no-reindex")
                 })?;
                 Ok((path, structure))
@@ -915,7 +983,19 @@ impl Engine {
             .collect()
     }
 
-    fn symbol_index(&self) -> Result<SymbolIndex> {
+    /// One vocabulary index per loaded snapshot: selectors and symbol results in
+    /// the same command share it instead of reopening the shared base.
+    fn symbol_index(&self) -> Result<Ref<'_, SymbolIndex>> {
+        if self.symbol_index.borrow().is_none() {
+            let index = self.open_symbol_index()?;
+            *self.symbol_index.borrow_mut() = Some(index);
+        }
+        Ok(Ref::map(self.symbol_index.borrow(), |index| {
+            index.as_ref().expect("initialized symbol index")
+        }))
+    }
+
+    fn open_symbol_index(&self) -> Result<SymbolIndex> {
         let vector = self.providers.symbol_vector()?;
         let profile = vector.profile();
         let names: std::collections::BTreeSet<_> = self
@@ -1001,8 +1081,8 @@ impl Engine {
             if !selection.path_matches(&path) {
                 continue;
             }
-            for node in structure.nodes {
-                if !selection.kind_matches(&node.kind) || !selection.symbol_matches_at(&path, &node)
+            for node in &structure.nodes {
+                if !selection.kind_matches(&node.kind) || !selection.symbol_matches_at(&path, node)
                 {
                     continue;
                 }
@@ -1011,7 +1091,7 @@ impl Engine {
                     .filter_map(|name| scores.get(&symbols::normalize(name)).copied())
                     .max_by(f64::total_cmp);
                 if let Some(similarity) = similarity.filter(|score| *score >= min && *score < max) {
-                    let mut symbol = serde_json::to_value(&node)?;
+                    let mut symbol = serde_json::to_value(node)?;
                     symbol.as_object_mut().unwrap().remove("calls");
                     symbol["path"] = json!(path);
                     symbol["sourceMode"] = json!(self.files[&path].source_mode);
@@ -1029,16 +1109,30 @@ impl Engine {
     /// offline indexes can still return hits without current structure; callers
     /// can fall back to the search unit's declaration metadata in that case.
     pub fn presentation_structure(&self, path: &str) -> Result<Option<parse::FileStructure>> {
-        let Some(file) = self.files.get(path) else {
-            return Ok(None);
-        };
-        if !self
-            .db
-            .structure_current(path, &file.hash, STRUCTURE_PARSER_VERSION)?
-        {
-            return Ok(None);
+        Ok(self
+            .cached_structure(path)?
+            .map(|structure| (*structure).clone()))
+    }
+
+    /// Committed structure for one file, loaded at most once per snapshot load.
+    fn cached_structure(&self, path: &str) -> Result<Option<Arc<parse::FileStructure>>> {
+        if let Some(cached) = self.structures.borrow().get(path) {
+            return Ok(cached.clone());
         }
-        Ok(Some(self.db.structure(path)?))
+        let structure = match self.files.get(path) {
+            Some(file)
+                if self
+                    .db
+                    .structure_current(path, &file.hash, STRUCTURE_PARSER_VERSION)? =>
+            {
+                Some(Arc::new(self.db.structure(path)?))
+            }
+            _ => None,
+        };
+        self.structures
+            .borrow_mut()
+            .insert(path.to_owned(), structure.clone());
+        Ok(structure)
     }
 
     pub fn call_graph(&self) -> Result<crate::callgraph::CallGraph> {
@@ -1050,7 +1144,7 @@ impl Engine {
         );
         let key = hash(
             json!([
-                "callgraph-v1",
+                "callgraph-v2",
                 STRUCTURE_PARSER_VERSION,
                 self.db.meta("snapshot")?
             ])
@@ -1163,6 +1257,14 @@ impl Engine {
             });
         }
 
+        // The first record wins, as a linear search over the loaded units would.
+        let mut existing = HashMap::<&str, &Item>::new();
+        if !prepared.is_empty() {
+            existing.reserve(self.items.len());
+            for item in &self.items {
+                existing.entry(item.identity.as_str()).or_insert(item);
+            }
+        }
         for prepared in &mut prepared {
             let mut occurrences = HashMap::<String, usize>::new();
             for callable in &prepared.parsed.callables {
@@ -1182,7 +1284,7 @@ impl Engine {
                 let mut data = serde_json::to_value(callable)?;
                 data["path"] = json!(prepared.file.path);
                 data["sourceMode"] = json!(prepared.file.source_mode);
-                let old = self.items.iter().find(|item| item.identity == identity);
+                let old = existing.get(identity.as_str()).copied();
                 data["sourceDescription"] = json!(callable.description.is_some());
                 let unchanged = old.is_some_and(|item| {
                     item.data["sourceHash"] == data["sourceHash"]
@@ -1256,12 +1358,14 @@ impl Engine {
                     Some(Database::embedding_key(&vector_profile, false, description));
             }
             let mut items = crate::storage::parsed_items(&prepared.file, &prepared.parsed)?;
+            let mut callables = HashMap::<&str, &PreparedCallable>::new();
+            for callable in &prepared.callables {
+                callables
+                    .entry(callable.identity.as_str())
+                    .or_insert(callable);
+            }
             for item in &mut items {
-                if let Some(callable) = prepared
-                    .callables
-                    .iter()
-                    .find(|c| c.identity == item.identity)
-                {
+                if let Some(callable) = callables.get(item.identity.as_str()) {
                     item.data = callable.data.clone();
                 }
                 if let Some(input) = item.data["embeddingInput"].as_str() {
@@ -1510,10 +1614,11 @@ impl Engine {
             |entries| {
                 // Acquire in key order, then recheck: concurrent workspaces can
                 // discover the same missing paid inputs before either publishes.
-                let mut locks = Vec::with_capacity(entries.len());
-                for (key, _) in entries {
-                    locks.push(registry::lock_path(global_path, "embedding", key)?);
-                }
+                let locks = registry::lock_paths(
+                    global_path,
+                    "embedding",
+                    entries.iter().map(|(key, _)| key.as_str()),
+                )?;
                 let conn = crate::cache::open_store(global_path, true)?;
                 let mut found = BTreeMap::new();
                 let mut missing = Vec::new();
@@ -1629,6 +1734,8 @@ impl Engine {
             .collect();
         self.vectors.get_mut().clear();
         self.indexes.get_mut().clear();
+        self.structures.get_mut().clear();
+        *self.symbol_index.get_mut() = None;
         for item in &mut self.items {
             item.data["id"] = json!(item.id);
         }
@@ -1796,6 +1903,7 @@ impl Engine {
             .to_string()
         };
         let mut matches: BTreeMap<String, Value> = BTreeMap::new();
+        let mut capped = false;
         for query in queries {
             let mut query_options = options.clone();
             query_options["limit"] = limit.value();
@@ -1803,7 +1911,8 @@ impl Engine {
                 // A query's best count + 1 distinct matches suffice for both the
                 // global top count and omission detection, even if queries overlap.
                 // Keep using search_rows so individual queries reuse their caches.
-                let rows = self.search_rows(query, kind, &query_options)?;
+                let mut rows = self.search_rows(query, kind, &query_options)?;
+                capped |= take_omission_marker(&mut rows);
                 let Some(count) = limit.count() else {
                     break rows;
                 };
@@ -1833,7 +1942,9 @@ impl Engine {
         }
         let mut rows: Vec<_> = matches.into_values().collect();
         rows.sort_by(order);
-        let omitted = limit.count().is_some_and(|count| rows.len() > count);
+        let omitted = limit
+            .count()
+            .is_some_and(|count| capped || rows.len() > count);
         if let Some(count) = limit.count() {
             rows.truncate(count);
         }
@@ -1855,7 +1966,10 @@ impl Engine {
         let limit = limits::resolve(&self.config, &options)?;
         options["limit"] = limit.value();
         let mut rows = self.search_rows(query, kind, &options)?;
-        let omitted = limit.count().is_some_and(|count| rows.len() > count);
+        let capped = take_omission_marker(&mut rows);
+        let omitted = limit
+            .count()
+            .is_some_and(|count| capped || rows.len() > count);
         if let Some(count) = limit.count() {
             rows.truncate(count);
         }
@@ -1867,6 +1981,10 @@ impl Engine {
         })
     }
 
+    /// Ranked rows plus at most one probe beyond the output limit. When a
+    /// reranker's candidate cap hides further candidates that the row count
+    /// cannot reveal, the last row is an omission marker instead; callers must
+    /// remove it with `take_omission_marker`.
     fn search_rows(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>> {
         let formats = Selection::compile(options)?;
         let SearchPlan {
@@ -1933,15 +2051,14 @@ impl Engine {
             // omission from exactly filling the requested output limit.
             limit.map(|count| count.saturating_add(1))
         };
-        let mut results = Vec::new();
-        let structures = if content {
-            self.files
-                .keys()
-                .map(|path| Ok((path.clone(), self.presentation_structure(path)?)))
-                .collect::<Result<HashMap<_, _>>>()?
+        // A reranker only ever sees `candidate_limit` documents. Retrieve one
+        // more, never sent to it, to learn whether that cap hid any candidates.
+        let fetch_limit = if rerank {
+            candidate_limit.map(|count| count.saturating_add(1))
         } else {
-            HashMap::new()
+            candidate_limit
         };
+        let mut results = Vec::new();
         let searching = ui::counted(
             "Searching vector indexes",
             groups.len() + usize::from(descriptions) + usize::from(symbols),
@@ -1953,24 +2070,27 @@ impl Engine {
             .chain(descriptions.then_some("descriptions"))
         {
             ui::progress(format_args!("Searching {index_kind} index"));
-            let allowed = self
-                .items
-                .iter()
-                .filter(|i| {
-                    (if index_kind == "descriptions" {
-                        i.data["description"].is_string() && i.description_embedding.is_some()
-                    } else {
-                        content_group(i).is_some_and(|group| group.as_str() == index_kind)
-                    }) && selection.unit_matches(
+            let mut allowed = HashSet::new();
+            for i in &self.items {
+                let in_channel = if index_kind == "descriptions" {
+                    i.data["description"].is_string() && i.description_embedding.is_some()
+                } else {
+                    content_group(i).is_some_and(|group| group.as_str() == index_kind)
+                };
+                // Structure is only consulted for units whose path is selected.
+                if in_channel
+                    && selection.path_matches(&i.path)
+                    && selection.unit_matches(
                         &i.path,
                         &i.data,
-                        structures.get(&i.path).and_then(Option::as_ref),
+                        self.cached_structure(&i.path)?.as_deref(),
                     )
-                })
-                .map(|i| i.id)
-                .collect();
+                {
+                    allowed.insert(i.id);
+                }
+            }
             for (id, similarity) in
-                self.neighbors(index_kind, &vector, &allowed, candidate_limit, options)?
+                self.neighbors(index_kind, &vector, &allowed, fetch_limit, options)?
             {
                 let item = self.item(id)?;
                 let mut result = if item.kind == "symbol-description" {
@@ -1983,7 +2103,7 @@ impl Engine {
                     json!({"type":item.kind,"chunk":item.data,"similarity":similarity})
                 };
                 if matches!(item.kind.as_str(), "function" | "symbol-description") {
-                    self.add_scores(&mut result, item, &vector, None, index_kind)?;
+                    self.add_scores(&mut result, item, &vector, None)?;
                 }
                 item_results
                     .entry(id)
@@ -2030,7 +2150,9 @@ impl Engine {
                 .total_cmp(&score(a, "similarity"))
                 .then_with(|| a.to_string().cmp(&b.to_string()))
         });
+        let mut capped = false;
         if let Some(limit) = candidate_limit {
+            capped = rerank && results.len() > limit;
             results.truncate(limit);
         }
         if rerank && !results.is_empty() {
@@ -2095,6 +2217,11 @@ impl Engine {
         }
         if let Some(limit) = limit {
             results.truncate(limit.saturating_add(1));
+            // Rows beyond the limit already prove omission. Otherwise record
+            // that candidates beyond the reranker's cap were never ranked.
+            if capped && results.len() <= limit {
+                results.push(json!({"type": OMISSION_MARKER}));
+            }
         }
         self.db
             .put_search_cache(&self.query_key(query, kind, options)?, &results)?;
@@ -2118,7 +2245,7 @@ impl Engine {
             .collect();
         Ok(hash(
             json!([
-                "query-v8-output-limit-probe",
+                "query-v9-rerank-cap-probe",
                 crate::formats::VERSION,
                 self.db.meta("snapshot")?,
                 self.db.generation()?,
@@ -2205,7 +2332,6 @@ impl Engine {
         item: &Item,
         code: &[f32],
         other: Option<DescriptionQueries<'_>>,
-        _kind: &str,
     ) -> Result<()> {
         if !item.embedding.is_empty() {
             result["codeSimilarity"] = json!(cosine(code, &self.vector(&item.embedding)?));
@@ -2309,11 +2435,6 @@ impl Engine {
                 .as_str()
                 .is_some_and(|hash| exclusions.contains(hash))
         };
-        let structures = self
-            .files
-            .keys()
-            .map(|path| Ok((path.clone(), self.presentation_structure(path)?)))
-            .collect::<Result<HashMap<_, _>>>()?;
         let source_path = options["sourcePath"]
             .as_str()
             .map(|path| self.normalize_path(path))
@@ -2335,24 +2456,25 @@ impl Engine {
             })
             .map(|i| (i.id, target.root.join(&i.path)))
             .collect();
-        let sources: Vec<_> = self
-            .items
-            .iter()
-            .filter(|source| {
-                content_group(source) == Some(FormatGroup::Code)
-                    && lines_match(source)
-                    && !excluded(source)
-                    && selection.unit_matches(
-                        &source.path,
-                        &source.data,
-                        structures.get(&source.path).and_then(Option::as_ref),
-                    )
-                    && source_path.as_ref().is_none_or(|p| under(&source.path, p))
-                    && (!flag(options, "uncommitted")
-                        || source.data["sourceMode"] == "working-tree")
-                    && changed.as_ref().is_none_or(|ids| ids.contains(&source.id))
-            })
-            .collect();
+        let mut sources = Vec::new();
+        for source in &self.items {
+            // Structure is only consulted for units whose path is selected.
+            if content_group(source) == Some(FormatGroup::Code)
+                && lines_match(source)
+                && !excluded(source)
+                && selection.path_matches(&source.path)
+                && selection.unit_matches(
+                    &source.path,
+                    &source.data,
+                    self.cached_structure(&source.path)?.as_deref(),
+                )
+                && source_path.as_ref().is_none_or(|p| under(&source.path, p))
+                && (!flag(options, "uncommitted") || source.data["sourceMode"] == "working-tree")
+                && changed.as_ref().is_none_or(|ids| ids.contains(&source.id))
+            {
+                sources.push(source);
+            }
+        }
         let searching = ui::counted("Searching source functions", sources.len());
         for source in sources {
             let source_file = self.root.join(&source.path);
@@ -2393,13 +2515,7 @@ impl Engine {
                         .and_then(|key| stored_vectors.get(key))
                         .map(Vec::as_slice),
                 ));
-                target.add_scores(
-                    &mut row,
-                    item,
-                    &stored_vectors[&source.embedding],
-                    other,
-                    kind,
-                )?;
+                target.add_scores(&mut row, item, &stored_vectors[&source.embedding], other)?;
                 if flag(options, "cohesion") {
                     row["physicalDistance"] = json!(distance(
                         &self.root.join(&source.path),
@@ -2538,10 +2654,21 @@ impl Engine {
         let profile = self.description_generation_profile().to_string();
         let settings_changed =
             self.db.meta("description_generation_profile")?.as_deref() != Some(&profile);
+        let needs_callables: HashSet<&str> = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.kind == "function"
+                    && !flag(&item.data, "sourceDescription")
+                    && (settings_changed || !item.data["description"].is_string())
+            })
+            .map(|item| item.path.as_str())
+            .collect();
         let mut inputs = Vec::new();
         for file in self.files.values() {
-            if FormatGroup::for_path(&file.path) == Some(FormatGroup::Docs)
-                || !file.errors.is_empty()
+            // A file that could not be read has no source to describe. Parse
+            // diagnostics only mark damaged regions: its other callables are fine.
+            if FormatGroup::for_path(&file.path) == Some(FormatGroup::Docs) || has_read_error(file)
             {
                 continue;
             }
@@ -2551,12 +2678,7 @@ impl Engine {
                 .is_some_and(|h| h.starts_with("source:"));
             let regenerate_file = !source_description
                 && (settings_changed || file.description_hash.as_deref() != Some(&file.hash));
-            let needs_callable = self.items.iter().any(|item| {
-                item.path == file.path
-                    && item.kind == "function"
-                    && !flag(&item.data, "sourceDescription")
-                    && (settings_changed || !item.data["description"].is_string())
-            });
+            let needs_callable = needs_callables.contains(file.path.as_str());
             if regenerate_file || needs_callable {
                 inputs.push(PrepareInput {
                     path: file.path.clone(),
@@ -2655,7 +2777,54 @@ impl crate::map::StructureSource for Engine {
 }
 
 pub(crate) fn source_paths(root: &Path, index: &Path, config: &Value) -> Result<Vec<String>> {
-    source_paths_subset(root, index, config, None, None)
+    source_paths_subset(root, index, config, None, None, true)
+}
+
+/// File-level selection shared by discovery and Git status filtering.
+struct Eligibility {
+    include: GlobSet,
+    exclude: GlobSet,
+    lock_files: GlobSet,
+}
+
+impl Eligibility {
+    fn new(config: &Value) -> Result<Self> {
+        Ok(Self {
+            include: globs(&config["include"])?,
+            exclude: globs(&config["exclude"])?,
+            lock_files: globs(&json!(EXCLUDED_LOCK_FILES))?,
+        })
+    }
+
+    fn selects_file(&self, path: &str) -> bool {
+        parse::language_for_path(path).is_some()
+            && !self.lock_files.is_match(path)
+            && !self.exclude.is_match(path)
+            && (self.include.is_empty() || self.include.is_match(path))
+    }
+
+    /// Whether a root-relative path reported by Git could be walked and
+    /// selected. Ignore files are not consulted: this may keep an ignored path,
+    /// never drop a selectable one.
+    fn selects_git_path(&self, path: &str) -> bool {
+        self.selects_file(path)
+            && !path
+                .rsplit('/')
+                .skip(1)
+                .any(|directory| EXCLUDED.contains(&directory))
+    }
+}
+
+/// A vanished or unreadable entry below the root is skipped; the root itself
+/// must be walkable.
+fn skippable_walk_error(error: &ignore::Error) -> bool {
+    error.depth().is_some_and(|depth| depth > 0)
+        && error.io_error().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+            )
+        })
 }
 
 fn source_paths_subset(
@@ -2664,10 +2833,9 @@ fn source_paths_subset(
     config: &Value,
     candidates: Option<&HashSet<String>>,
     mut directories: Option<&mut HashSet<String>>,
+    warn: bool,
 ) -> Result<Vec<String>> {
-    let include = globs(&config["include"])?;
-    let exclude = globs(&config["exclude"])?;
-    let lock_files = globs(&json!(EXCLUDED_LOCK_FILES))?;
+    let eligibility = Eligibility::new(config)?;
     ensure!(
         config["maxFileSize"].as_u64().unwrap_or(1_048_576) > 0,
         "maxFileSize must be positive"
@@ -2708,25 +2876,46 @@ fn source_paths_subset(
             })
         });
     let mut paths = Vec::new();
+    let mut unreadable = 0usize;
+    let mut undecodable = 0usize;
     for entry in walker.build() {
-        let entry = entry.context("Cannot walk repository")?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if skippable_walk_error(&error) => {
+                unreadable += 1;
+                continue;
+            }
+            Err(error) => return Err(error).context("Cannot walk repository"),
+        };
+        // Indexed paths are UTF-8 strings. Other names cannot be source paths.
+        let path = relative_utf8(root, entry.path())?;
         if entry.file_type().is_some_and(|t| t.is_dir()) {
-            if let Some(directories) = &mut directories {
-                directories.insert(relative(root, entry.path())?);
+            if let (Some(directories), Some(path)) = (&mut directories, path) {
+                directories.insert(path);
             }
             continue;
         }
         if !entry.file_type().is_some_and(|t| t.is_file()) || index_artifact(entry.path(), index) {
             continue;
         }
-        let path = relative(root, entry.path())?;
-        if parse::language_for_path(&path).is_some()
-            && !lock_files.is_match(&path)
-            && !exclude.is_match(&path)
-            && (include.is_empty() || include.is_match(&path))
-        {
+        let Some(path) = path else {
+            undecodable += usize::from(eligibility.selects_file(&entry.path().to_string_lossy()));
+            continue;
+        };
+        if eligibility.selects_file(&path) {
             paths.push(path);
         }
+    }
+    if warn && unreadable > 0 {
+        ui::warning(format_args!(
+            "slopdex: skipped {unreadable} unreadable or vanished path(s) while scanning {}",
+            root.display()
+        ));
+    }
+    if warn && undecodable > 0 {
+        ui::warning(format_args!(
+            "slopdex: skipped {undecodable} source file(s) whose path is not valid UTF-8"
+        ));
     }
     paths.sort();
     Ok(paths)
@@ -2751,10 +2940,49 @@ fn policy_path(path: &str) -> bool {
     )
 }
 
+fn has_read_error(file: &File) -> bool {
+    file.errors
+        .iter()
+        .any(|error| error["code"] == "read-error")
+}
+
+const OMISSION_MARKER: &str = "omitted-candidates";
+
+/// Remove the marker `search_rows` appends when a reranker's candidate cap hid
+/// candidates that the number of returned rows cannot reveal.
+fn take_omission_marker(rows: &mut Vec<Value>) -> bool {
+    let marked = rows
+        .last()
+        .is_some_and(|row| row["type"] == OMISSION_MARKER);
+    if marked {
+        rows.pop();
+    }
+    marked
+}
+
+/// Ignore-policy probe for a remembered directory. An unreadable directory
+/// cannot contribute rules, but regaining access must be noticed as a change.
+fn policy_fingerprint(path: &Path) -> Result<Value> {
+    match fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(json!("unreadable"))
+        }
+        _ => file_fingerprint(path),
+    }
+}
+
 fn file_fingerprint(path: &Path) -> Result<Value> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+        // A parent replaced by a file is as absent as a deleted file.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(Value::Null);
+        }
         Err(error) => return Err(error.into()),
     };
     let modified = metadata
@@ -2815,7 +3043,7 @@ fn indexing_policy(
     for directory in directories {
         for name in [".gitignore", ".ignore", ".rgignore"] {
             let path = root.join(directory).join(name);
-            external.insert(path.clone(), file_fingerprint(&path)?);
+            external.insert(path.clone(), policy_fingerprint(&path)?);
         }
     }
     for parent in root.ancestors() {
@@ -2857,7 +3085,15 @@ fn indexing_policy(
     Ok(json!([selection_contract(config), external]).to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Source reads attempted on this thread, to prove refreshes skip them.
+    static SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn read_source(root: &Path, path: &str, max_size: u64) -> Result<String> {
+    #[cfg(test)]
+    SOURCE_READS.with(|reads| reads.set(reads.get() + 1));
     let path = root.join(path);
     ensure!(
         fs::metadata(&path)?.len() <= max_size,
@@ -2996,6 +3232,18 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
         .context("Non-UTF-8 source path")?
         .replace('\\', "/"))
 }
+/// None for a path that cannot be represented as an indexed (UTF-8) path.
+fn relative_utf8(root: &Path, path: &Path) -> Result<Option<String>> {
+    Ok(path
+        .strip_prefix(root)
+        .context("Path is outside repository")?
+        .to_str()
+        .map(|path| path.replace('\\', "/")))
+}
+/// Config `include`/`exclude` patterns. These are plain globset globs matched
+/// against the whole root-relative path: `*` and `?` also match `/`, a pattern
+/// without a slash is not a basename pattern, and there is no negation. `-g`
+/// selectors use gitignore semantics instead (see `filter::Selection`).
 fn globs(value: &Value) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     if let Some(patterns) = value.as_array() {
@@ -3250,6 +3498,7 @@ mod tests {
                         &config,
                         subset,
                         None,
+                        false,
                     )?,
                     expected
                 );
@@ -3328,6 +3577,7 @@ mod tests {
             &json!({"artifactCachePath":temp.path().join("global.sqlite")}),
             Some(&candidates),
             None,
+            false,
         )?;
         assert_eq!(paths, ["nested/deeper/source.rs", "nested/new.rs"]);
         Ok(())
@@ -3493,6 +3743,430 @@ mod tests {
             source_paths(temp.path(), &index, &json!({"include":["**"]}))?,
             ["visible.json"]
         );
+        Ok(())
+    }
+
+    fn source_reads() -> usize {
+        SOURCE_READS.with(|reads| reads.replace(0))
+    }
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn engine_stays_send_with_derived_caches() {
+        assert_send::<Engine>();
+    }
+
+    #[test]
+    fn non_git_refresh_reuses_fingerprints_and_respects_size_policy() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("plain");
+        fs::create_dir(&root)?;
+        fs::write(root.join("first.rs"), "pub fn first() {}\n")?;
+        fs::write(root.join("second.rs"), "pub fn second() {}\n")?;
+        let index = temp.path().join("index.sqlite");
+        let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
+        let mut engine = Engine::open_map(&root, &index, config.clone())?;
+        assert_eq!(engine.refresh_structure()?["filesUpdated"], 2);
+        assert!(engine.db.meta("checkpoint")?.is_none());
+        let generation = engine.db.generation()?;
+        source_reads();
+        for _ in 0..2 {
+            let refreshed = engine.refresh_structure()?;
+            assert_eq!(refreshed["filesUpdated"], 0);
+            assert_eq!(engine.db.generation()?, generation);
+        }
+        assert_eq!(source_reads(), 0, "unchanged non-Git files were re-read");
+
+        // A different length always changes the fingerprint, whatever the clock.
+        fs::write(root.join("second.rs"), "pub fn second_edited() {}\n")?;
+        assert_eq!(engine.refresh_structure()?["filesUpdated"], 1);
+        assert_eq!(source_reads(), 1, "only the edited file is read");
+        drop(engine);
+
+        // Discovery policy changes rescan without re-reading unchanged files.
+        let mut excluded = config.clone();
+        excluded["exclude"] = json!(["first.rs"]);
+        let mut engine = Engine::open_map(&root, &index, excluded)?;
+        let refreshed = engine.refresh_structure()?;
+        assert_eq!(
+            (&refreshed["filesUpdated"], &refreshed["filesDeleted"]),
+            (&json!(0), &json!(1))
+        );
+        assert_eq!(source_reads(), 0);
+        drop(engine);
+
+        // The size limit is policy that changes the result for unchanged metadata.
+        let mut small = config.clone();
+        small["maxFileSize"] = json!(20);
+        let mut engine = Engine::open_map(&root, &index, small)?;
+        engine.refresh_structure()?;
+        let errors = engine.errors()?;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["path"], "second.rs");
+        assert_eq!(errors[0]["code"], "read-error");
+        drop(engine);
+        let mut engine = Engine::open_map(&root, &index, config)?;
+        engine.refresh_structure()?;
+        assert!(engine.errors()?.is_empty());
+        assert_eq!(engine.db.paths()?, ["first.rs", "second.rs"]);
+        Ok(())
+    }
+
+    #[test]
+    fn ineligible_dirty_paths_do_not_defeat_the_unchanged_fast_path() -> Result<()> {
+        let (_temp, mut engine) = git_fixture()?;
+        engine.refresh_structure()?;
+        let root = engine.root.clone();
+        // Untracked files discovery never selects: an unsupported type, and a
+        // supported type below an always-excluded directory.
+        fs::write(root.join("scratch.bin"), "binary")?;
+        fs::create_dir(root.join("target"))?;
+        fs::write(root.join("target/built.rs"), "pub fn built() {}\n")?;
+        let generation = engine.db.generation()?;
+        engine.refresh_structure()?;
+        assert_eq!(engine.db.meta("dirty_paths")?.as_deref(), Some("[]"));
+        assert_eq!(engine.db.generation()?, generation);
+        assert_eq!(engine.db.paths()?, ["source.rs"]);
+
+        // Selectable changes and ignore-policy files remain triggers.
+        fs::write(root.join("added.rs"), "pub fn added() {}\n")?;
+        assert_eq!(engine.refresh_structure()?["filesUpdated"], 1);
+        assert_eq!(
+            engine.db.meta("dirty_paths")?.as_deref(),
+            Some(r#"["added.rs"]"#)
+        );
+        fs::write(root.join(".gitignore"), "added.rs\n")?;
+        assert_eq!(engine.refresh_structure()?["filesDeleted"], 1);
+        assert_eq!(
+            engine.db.meta("dirty_paths")?.as_deref(),
+            Some(r#"[".gitignore"]"#)
+        );
+        assert_eq!(engine.db.paths()?, ["source.rs"]);
+        // Indexed paths stay dirty even when configuration would not select them.
+        fs::write(root.join("source.rs"), "pub fn edited() {}\n")?;
+        let eligibility = Eligibility::new(&json!({"exclude":["source.rs"]}))?;
+        let mut dirty = HashSet::from(["source.rs".to_owned(), "scratch.bin".to_owned()]);
+        engine.retain_relevant_dirty(&mut dirty, &eligibility);
+        assert_eq!(dirty, HashSet::from(["source.rs".to_owned()]));
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_directories_are_forgotten_by_candidate_refreshes() -> Result<()> {
+        let (_temp, mut engine) = git_fixture()?;
+        let root = engine.root.clone();
+        fs::create_dir_all(root.join("gone/deeper"))?;
+        fs::write(root.join("gone/deeper/old.rs"), "pub fn old() {}\n")?;
+        git_command(&root, &["add", "."])?;
+        git_command(&root, &["commit", "-qm", "nested"])?;
+        engine.refresh_structure()?;
+        let directories = |engine: &Engine| -> Result<BTreeSet<String>> {
+            Ok(serde_json::from_str(
+                &engine.db.meta("source_directories")?.unwrap(),
+            )?)
+        };
+        assert!(directories(&engine)?.contains("gone/deeper"));
+        // Establish a checkpoint so the next refresh is a candidate walk.
+        fs::remove_dir_all(root.join("gone"))?;
+        git_command(&root, &["add", "--all"])?;
+        git_command(&root, &["commit", "-qm", "removed"])?;
+        assert_eq!(engine.refresh_structure()?["filesDeleted"], 1);
+        assert_eq!(directories(&engine)?, BTreeSet::from([String::new()]));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_undecodable_names_and_unreadable_directories() -> Result<()> {
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("plain");
+        fs::create_dir_all(root.join("locked"))?;
+        fs::create_dir_all(root.join(std::ffi::OsStr::from_bytes(b"caf\xe9")))?;
+        fs::write(root.join("kept.rs"), "pub fn kept() {}\n")?;
+        fs::write(root.join("locked/hidden.rs"), "pub fn hidden() {}\n")?;
+        // Latin-1 names: a supported source file, a nested one, and other data.
+        for name in [&b"na\xefve.rs"[..], b"caf\xe9/inner.rs", b"data\xff.bin"] {
+            fs::write(
+                root.join(std::ffi::OsStr::from_bytes(name)),
+                "pub fn x() {}\n",
+            )?;
+        }
+        let index = temp.path().join("index.sqlite");
+        let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
+        // This is exactly what an unindexed map walks.
+        assert_eq!(
+            source_paths(&root, &index, &config)?,
+            ["kept.rs", "locked/hidden.rs"]
+        );
+
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000))?;
+        let restore =
+            || fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755));
+        if fs::read_dir(root.join("locked")).is_ok() {
+            // Privileged users bypass directory permissions.
+            return Ok(restore()?);
+        }
+        let walked = source_paths(&root, &index, &config);
+        let indexed = Engine::open_map(&root, &index, config).and_then(|mut engine| {
+            let first = engine.refresh_structure()?;
+            // The remembered directory's policy probes are unreadable as well.
+            let second = engine.refresh_structure()?;
+            Ok((first, second, engine.db.paths()?))
+        });
+        restore()?;
+        assert_eq!(walked?, ["kept.rs"]);
+        let (first, second, paths) = indexed?;
+        assert_eq!(first["filesUpdated"], 1);
+        assert_eq!(second["filesUpdated"], 0);
+        assert_eq!(paths, ["kept.rs"]);
+
+        // The selected root itself must still be walkable.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000))?;
+        let walked = source_paths(
+            &root,
+            &index,
+            &json!({"artifactCachePath":temp.path().join("global.sqlite")}),
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
+        assert!(walked.is_err());
+        Ok(())
+    }
+
+    /// Offline OpenAI-compatible provider: unit vectors, fixed prose, and
+    /// identity rankings. Records how many documents each rerank request held.
+    fn provider() -> Result<(String, std::sync::Arc<std::sync::Mutex<Vec<usize>>>)> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let base = format!("http://{}/v1", listener.local_addr()?);
+        let reranked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = reranked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let respond = |stream: &mut std::net::TcpStream| -> Result<()> {
+                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    let mut reader = BufReader::new(&mut *stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                    let mut length = 0;
+                    loop {
+                        line.clear();
+                        ensure!(reader.read_line(&mut line)? > 0, "truncated headers");
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse()?;
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body)?;
+                    let body: Value = serde_json::from_slice(&body)?;
+                    let response = if path.ends_with("/embeddings") {
+                        let dimensions = body["dimensions"].as_u64().unwrap_or(2) as usize;
+                        let mut vector = vec![0.0; dimensions];
+                        vector[0] = 1.0;
+                        let data: Vec<_> = (0..body["input"].as_array().map_or(0, Vec::len))
+                            .map(|index| json!({"index":index,"embedding":vector}))
+                            .collect();
+                        json!({"data":data})
+                    } else if body["text"]["format"]["name"] == "function_ranking" {
+                        let count =
+                            body["text"]["format"]["schema"]["properties"]["ranking"]["minItems"]
+                                .as_u64()
+                                .unwrap_or(0) as usize;
+                        seen.lock().unwrap().push(count);
+                        let ranking: Vec<_> = (0..count)
+                            .map(|index| json!({"index":index,"score":1.0 - index as f64 / 1000.0}))
+                            .collect();
+                        json!({"output_text":json!({"ranking":ranking}).to_string()})
+                    } else {
+                        json!({"output_text":"Generated summary."})
+                    };
+                    let bytes = serde_json::to_vec(&response)?;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    )?;
+                    stream.write_all(&bytes)?;
+                    Ok(())
+                };
+                let _ = respond(&mut stream);
+            }
+        });
+        Ok((base, reranked))
+    }
+
+    fn provider_config(temp: &tempfile::TempDir, base: &str) -> Value {
+        json!({
+            "embeddingProvider":"openai", "embeddingModel":"unit-embedding",
+            "embeddingDimensions":2, "symbolDimensions":2,
+            "descriptionProvider":"openai", "descriptionModel":"unit-description",
+            "rerankerProvider":"openai", "rerankerModel":"unit-reranker",
+            "embeddingBaseUrl":base, "descriptionBaseUrl":base, "rerankerBaseUrl":base,
+            "embeddingApiKey":"unit", "descriptionApiKey":"unit", "rerankerApiKey":"unit",
+            "providerMaxRetries":0, "retryDelayMs":0, "providerTimeoutMs":5000,
+            "artifactCachePath":temp.path().join("global.sqlite")
+        })
+    }
+
+    #[test]
+    fn reranker_candidate_cap_reports_omitted_results() -> Result<()> {
+        let (base, reranked) = provider()?;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("plain");
+        fs::create_dir(&root)?;
+        let source: String = (0..12)
+            .map(|index| format!("pub fn candidate_{index}() -> usize {{\n    {index}\n}}\n\n"))
+            .collect();
+        fs::write(root.join("many.rs"), source)?;
+        let mut config = provider_config(&temp, &base);
+        config["rerankingEnabled"] = json!(true);
+        let mut engine = Engine::open(&root, &temp.path().join("index.sqlite"), config)?;
+        engine.refresh()?;
+        assert_eq!(
+            engine
+                .items
+                .iter()
+                .filter(|item| item.kind == "function")
+                .count(),
+            12
+        );
+        // The default candidate count equals this limit, so the row count alone
+        // cannot show that two more functions matched.
+        for _ in 0..2 {
+            let limited =
+                engine.search_limited("candidate", "search-code", &json!({"limit":10}))?;
+            assert_eq!(limited.rows.len(), 10);
+            assert!(
+                limited.omitted,
+                "candidates beyond the reranker cap were not reported"
+            );
+            assert!(limited.rows.iter().all(|row| row["type"] == "function"));
+            assert!(
+                limited
+                    .rows
+                    .iter()
+                    .all(|row| row["rerankScore"].is_number())
+            );
+        }
+        // The probe is never sent to the reranker, and the answer was cached.
+        assert_eq!(*reranked.lock().unwrap(), [10]);
+        assert_eq!(
+            engine
+                .search("candidate", "search-code", &json!({"limit":10}))?
+                .len(),
+            10
+        );
+        let exact = engine.search_limited("candidate", "search-code", &json!({"limit":12}))?;
+        assert_eq!(exact.rows.len(), 12);
+        assert!(!exact.omitted);
+        let merged = engine.search_queries_limited(
+            &["candidate".to_owned(), "other".to_owned()],
+            "search-code",
+            &json!({"limit":10}),
+        )?;
+        assert_eq!(merged.rows.len(), 10);
+        assert!(merged.omitted);
+        assert!(merged.rows.iter().all(|row| row["type"] == "function"));
+        Ok(())
+    }
+
+    #[test]
+    fn descriptions_cover_healthy_callables_beside_parse_errors() -> Result<()> {
+        let (base, _) = provider()?;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("plain");
+        fs::create_dir(&root)?;
+        fs::write(
+            root.join("damaged.rs"),
+            "pub fn healthy() -> usize {\n    1\n}\n\npub fn broken( {\n",
+        )?;
+        fs::write(root.join("binary.rs"), [0xff, 0xfe, 0xfd])?;
+        let config = provider_config(&temp, &base);
+        let mut engine = Engine::open(&root, &temp.path().join("index.sqlite"), config)?;
+        engine.refresh()?;
+        let codes: BTreeSet<_> = engine
+            .errors()?
+            .iter()
+            .map(|error| (error["path"].to_string(), error["code"].to_string()))
+            .collect();
+        assert!(codes.contains(&(r#""damaged.rs""#.into(), r#""parse-error""#.into())));
+        assert!(codes.contains(&(r#""binary.rs""#.into(), r#""read-error""#.into())));
+        let diagnostics = engine.errors()?.len();
+        engine.generate_descriptions()?;
+        let healthy = engine
+            .items
+            .iter()
+            .find(|item| item.kind == "function" && item.data["name"] == "healthy")
+            .context("healthy callable is indexed")?;
+        assert_eq!(healthy.data["description"], "Generated summary.");
+        assert_eq!(
+            engine.files["damaged.rs"].description.as_deref(),
+            Some("Generated summary.")
+        );
+        assert!(engine.files["binary.rs"].description.is_none());
+        // The diagnostics survive description publication.
+        assert_eq!(engine.errors()?.len(), diagnostics);
+        Ok(())
+    }
+
+    /// Pins the dialect differences documented in docs/reference.md.
+    #[test]
+    fn config_globs_and_selector_globs_keep_their_documented_dialects() -> Result<()> {
+        let config = |pattern: &str, path: &str| -> Result<bool> {
+            Ok(globs(&json!([pattern]))?.is_match(path))
+        };
+        let selector = |pattern: &str, path: &str| -> Result<bool> {
+            Ok(Selection::compile(&json!({"glob":[pattern]}))?.path_matches(path))
+        };
+        for (pattern, path, in_config, in_selector) in [
+            // `*` crosses directories only in config globs.
+            ("src/*.rs", "src/a.rs", true, true),
+            ("src/*.rs", "src/a/b.rs", true, false),
+            ("*.rs", "a/b.rs", true, true),
+            ("src/?.rs", "src//.rs", true, false),
+            // A slash-free pattern is a basename pattern only for selectors.
+            ("test.rs", "test.rs", true, true),
+            ("test.rs", "a/test.rs", false, true),
+            // Anchors.
+            ("/a.rs", "a.rs", false, true),
+            ("/a.rs", "b/a.rs", false, false),
+            // Directory patterns.
+            ("src/", "src/a.rs", false, false),
+            ("src", "src/a.rs", false, false),
+            ("src/**", "src/a/b.rs", true, true),
+            ("**/fixtures/**", "a/fixtures/b/c.rs", true, true),
+            ("**/fixtures/**", "fixtures/c.rs", true, true),
+            ("a/**/b.rs", "a/b.rs", true, true),
+            // Alternation and classes exist in both.
+            ("*.{rs,go}", "a.go", true, true),
+            ("[ab].rs", "b.rs", true, true),
+            // Matching is case-sensitive in both.
+            ("*.RS", "a.rs", false, false),
+        ] {
+            assert_eq!(
+                config(pattern, path)?,
+                in_config,
+                "config {pattern} on {path}"
+            );
+            assert_eq!(
+                selector(pattern, path)?,
+                in_selector,
+                "selector {pattern} on {path}"
+            );
+        }
+        // Negation exists only for selectors; config treats `!` literally.
+        assert!(!config("!a.rs", "b.rs")?);
+        assert!(config("!a.rs", "!a.rs")?);
+        assert!(selector("!a.rs", "b.rs")?);
+        assert!(!selector("!a.rs", "a.rs")?);
         Ok(())
     }
 }

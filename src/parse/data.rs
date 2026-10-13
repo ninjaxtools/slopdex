@@ -241,6 +241,13 @@ fn comments(root: Node<'_>, language: &str, source: &str) -> Vec<Range<usize>> {
     result
 }
 
+/// Deferred traversal steps. An array item is declared only when it is
+/// reached, so its id precedes its own descendants and follows its siblings'.
+enum Work<'tree> {
+    Visit(Node<'tree>, Option<usize>),
+    Item(Node<'tree>, Option<usize>, usize),
+}
+
 struct Collector<'a> {
     language: &'static str,
     source: &'a str,
@@ -287,7 +294,28 @@ impl Collector<'_> {
         id
     }
 
-    fn walk(&mut self, node: Node<'_>, parent: Option<usize>) {
+    /// Depth-first in source order with an explicit work stack: data files
+    /// nest arbitrarily deep, and node ids must follow the visiting order.
+    fn walk(&mut self, root: Node<'_>, parent: Option<usize>) {
+        let mut stack = vec![Work::Visit(root, parent)];
+        while let Some(work) = stack.pop() {
+            match work {
+                Work::Visit(node, parent) => self.visit(node, parent, &mut stack),
+                Work::Item(node, parent, index) => {
+                    let name = format!("[{index}]");
+                    let id = self.push(node, parent, "item", name.clone(), name);
+                    stack.push(Work::Visit(node, Some(id)));
+                }
+            }
+        }
+    }
+
+    fn visit<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        parent: Option<usize>,
+        stack: &mut Vec<Work<'tree>>,
+    ) {
         if node.is_missing()
             || literal(self.language, node.kind())
             || matches!(node.kind(), "comment" | "Comment" | "js_comment")
@@ -296,7 +324,7 @@ impl Collector<'_> {
         }
         let syntax = node.kind();
         if self.language == "toml" && matches!(syntax, "table" | "table_array_element") {
-            self.toml_table(node);
+            self.toml_table(node, stack);
             return;
         }
         if matches!(
@@ -305,18 +333,16 @@ impl Collector<'_> {
                 | ("yaml", "block_sequence" | "flow_sequence")
                 | ("terraform", "tuple")
         ) {
-            for (index, child) in children(node)
+            let items: Vec<_> = children(node)
                 .into_iter()
                 .filter(|child| {
                     !matches!(child.kind(), "comment" | "tuple_start" | "tuple_end")
                         && !child.is_missing()
                 })
                 .enumerate()
-            {
-                let name = format!("[{index}]");
-                let id = self.push(child, parent, "item", name.clone(), name);
-                self.walk(child, Some(id));
-            }
+                .map(|(index, child)| Work::Item(child, parent, index))
+                .collect();
+            stack.extend(items.into_iter().rev());
             return;
         }
         let source = self.source;
@@ -508,22 +534,28 @@ impl Collector<'_> {
             return;
         }
         if let Some(value) = descendants {
-            self.walk(value, parent);
+            stack.push(Work::Visit(value, parent));
         } else {
-            for child in children(node) {
-                self.walk(child, parent);
-            }
+            stack.extend(
+                children(node)
+                    .into_iter()
+                    .rev()
+                    .map(|child| Work::Visit(child, parent)),
+            );
         }
     }
 
-    fn toml_table(&mut self, node: Node<'_>) {
+    fn toml_table<'tree>(&mut self, node: Node<'tree>, stack: &mut Vec<Work<'tree>>) {
         let header = children(node)
             .into_iter()
             .find(|child| matches!(child.kind(), "bare_key" | "quoted_key" | "dotted_key"));
         let Some(header) = header.filter(|header| !header.has_error()) else {
-            for child in children(node) {
-                self.walk(child, None);
-            }
+            stack.extend(
+                children(node)
+                    .into_iter()
+                    .rev()
+                    .map(|child| Work::Visit(child, None)),
+            );
             return;
         };
         let path = strings::toml_key(self.source, header);
@@ -561,12 +593,15 @@ impl Collector<'_> {
             self.array_tables.insert(id);
         }
         self.tables.insert(path, id);
-        for child in children(node)
-            .into_iter()
-            .filter(|child| child.id() != header.id())
-        {
-            self.walk(child, Some(id));
-        }
+        stack.extend(
+            children(node)
+                .into_iter()
+                .filter(|child| child.id() != header.id())
+                .rev()
+                .map(|child| Work::Visit(child, Some(id))),
+        );
+        // Extending ancestors depends only on this table's range, so it can
+        // happen before the deferred visits of its pairs.
         let mut ancestor = parent_id;
         while let Some(parent) = ancestor {
             if self.nodes[parent].end_byte < node.end_byte() {

@@ -2,7 +2,10 @@
 
 use super::args::{Format, Global};
 use super::io::print_json;
-use super::workspace::{absolute, root_path};
+use super::workspace::{absolute, root_path, user_config_path};
+use crate::providers::{
+    CONFIG_ORIGIN_KEY, CONFIG_ORIGIN_REPOSITORY, TRUST_REPOSITORY_ENDPOINTS_KEY,
+};
 use crate::{engine::cross_search_exclusions, parse, ui};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -13,6 +16,167 @@ use std::{
 };
 
 mod wizard;
+
+/// Documented settings beyond the interactive wizard's keys. `config set` accepts
+/// exactly these, the wizard keys, documented aliases, and dotted `artifactS3.*`.
+const ADVANCED_KEYS: &[&str] = &[
+    "embeddingProvider",
+    "embeddingModel",
+    "embeddingDimensions",
+    "fallbackModel",
+    "embeddingBaseUrl",
+    "descriptionBaseUrl",
+    "rerankerBaseUrl",
+    "embeddingApiKey",
+    "descriptionApiKey",
+    "rerankerApiKey",
+    "openaiApiKey",
+    "jinaApiKey",
+    "cohereApiKey",
+    "opencodeApiKey",
+    "artifactCachePath",
+    "artifactS3",
+    "symbolDimensions",
+    "jinaTask",
+    "providerTimeoutMs",
+    "providerMaxRetries",
+    "retryDelayMs",
+    "ollamaAutoPull",
+    "ollamaKeepAlive",
+    "ollamaModelDigest",
+    "ollamaNativeDimensions",
+    "ollamaContextLength",
+    "ollamaPullTimeoutMs",
+    "crossSearchExclusions",
+    "trustedEndpointHosts",
+    "allowInsecureEndpoints",
+];
+
+fn is_secret_key(key: &str) -> bool {
+    key.ends_with("ApiKey")
+}
+
+/// Configuration as every CLI rendering shows it: credential values are masked.
+pub(super) fn redacted(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let shown = if is_secret_key(key) && !value.is_null() {
+                        json!("<redacted>")
+                    } else {
+                        redacted(value)
+                    };
+                    (key.clone(), shown)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redacted).collect()),
+        other => other.clone(),
+    }
+}
+
+fn contains_secret(config: &Value) -> bool {
+    config.as_object().is_some_and(|object| {
+        object
+            .iter()
+            .any(|(key, value)| is_secret_key(key) && !value.is_null())
+    })
+}
+
+fn known_top_level_key(key: &str) -> bool {
+    wizard::CONFIG_KEYS.contains(&key) || ADVANCED_KEYS.contains(&key)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.to_ascii_lowercase().chars().collect();
+    let right: Vec<char> = right.to_ascii_lowercase().chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, l) in left.iter().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, r) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(l != r);
+            current.push(substitution.min(previous[j + 1] + 1).min(current[j] + 1));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn closest_keys(key: &str) -> Vec<&'static str> {
+    let lowered = key.to_ascii_lowercase();
+    let mut candidates: Vec<(usize, &str)> = wizard::CONFIG_KEYS
+        .iter()
+        .chain(ADVANCED_KEYS)
+        .copied()
+        .filter_map(|candidate| {
+            let distance = edit_distance(key, candidate);
+            let related = candidate.to_ascii_lowercase().contains(&lowered)
+                || lowered.contains(&candidate.to_ascii_lowercase());
+            (distance <= 3 || related).then_some((distance, candidate))
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().take(3).map(|(_, key)| key).collect()
+}
+
+fn check_settable_key(key: &str) -> Result<()> {
+    let top = key.split('.').next().unwrap_or(key);
+    ensure!(
+        top != "descriptionsEnabled",
+        "descriptionsEnabled has been removed; remove it from config and run `slopdex generate descriptions` to generate descriptions explicitly"
+    );
+    if !known_top_level_key(top) {
+        let suggestions = closest_keys(top);
+        let hint = if suggestions.is_empty() {
+            String::new()
+        } else {
+            format!("; did you mean {}?", suggestions.join(", "))
+        };
+        anyhow::bail!(
+            "unknown configuration key {top}{hint} (see docs/reference.md for documented settings)"
+        );
+    }
+    ensure!(
+        !key.contains('.') || top == "artifactS3",
+        "{top} does not take nested keys; set {top} to a JSON value instead"
+    );
+    Ok(())
+}
+
+/// Mark settings loaded from `<root>/.slopdex/config.json` so provider policy can
+/// refuse to send the user's own credentials to repository-chosen endpoints. Only
+/// the user config may grant trust; a repository's own list is discarded.
+pub(super) fn mark_repository_config(config: &mut Value, global: &Global) -> Result<()> {
+    mark_repository_config_from(config, global, &user_config_path()?)
+}
+
+fn mark_repository_config_from(config: &mut Value, global: &Global, user: &Path) -> Result<()> {
+    let object = config.as_object_mut().context("config must be an object")?;
+    object.insert(CONFIG_ORIGIN_KEY.into(), json!(CONFIG_ORIGIN_REPOSITORY));
+    object.remove("trustedEndpointHosts");
+    object.remove(TRUST_REPOSITORY_ENDPOINTS_KEY);
+    if global.trust_repo_endpoints {
+        object.insert(TRUST_REPOSITORY_ENDPOINTS_KEY.into(), json!(true));
+    }
+    let user = read_config(user).with_context(|| format!("read user config {}", user.display()))?;
+    if let Some(hosts) = user.get("trustedEndpointHosts") {
+        validate_trusted_hosts(hosts)?;
+        config["trustedEndpointHosts"] = hosts.clone();
+    }
+    Ok(())
+}
+
+fn validate_trusted_hosts(value: &Value) -> Result<()> {
+    ensure!(
+        value.as_array().is_some_and(|hosts| hosts
+            .iter()
+            .all(|host| host.as_str().is_some_and(|s| !s.trim().is_empty()))),
+        "trustedEndpointHosts must be an array of non-empty host strings"
+    );
+    Ok(())
+}
 
 fn read_config(path: &Path) -> Result<Value> {
     let bytes = match fs::read(path) {
@@ -110,11 +274,12 @@ fn select_embeddings(config: &mut Value, provider: Option<&str>, model: Option<&
     let provider_changed = provider.is_some_and(|provider| provider != previous);
     if provider_changed {
         let object = config.as_object_mut().unwrap();
+        // Credentials (`embeddingApiKey`) survive a provider switch; only
+        // provider-shaped settings and resolved identity are reset.
         for key in [
             "model",
             "dimensions",
             "embeddingBaseUrl",
-            "embeddingApiKey",
             "ollamaAutoPull",
             "ollamaKeepAlive",
             "embeddingParallelism",
@@ -192,7 +357,7 @@ fn validate_config(config: &Value) -> Result<()> {
         "descriptionFallbackModel",
         "ollamaKeepAlive",
         "ollamaModelDigest",
-        "ollamaModelFamily",
+        "jinaTask",
     ] {
         if let Some(value) = config.get(key) {
             ensure!(
@@ -200,6 +365,9 @@ fn validate_config(config: &Value) -> Result<()> {
                 "{key} must be a non-empty string"
             );
         }
+    }
+    if let Some(hosts) = config.get("trustedEndpointHosts") {
+        validate_trusted_hosts(hosts)?;
     }
     for key in [
         "dimensions",
@@ -218,7 +386,12 @@ fn validate_config(config: &Value) -> Result<()> {
             );
         }
     }
-    for key in ["rerankingEnabled", "verbose", "ollamaAutoPull"] {
+    for key in [
+        "rerankingEnabled",
+        "verbose",
+        "ollamaAutoPull",
+        "allowInsecureEndpoints",
+    ] {
         if let Some(value) = config.get(key) {
             ensure!(value.is_boolean(), "{key} must be a boolean");
         }
@@ -278,6 +451,24 @@ fn validate_config(config: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The replacement file's permission bits: an existing file keeps its mode, and a
+/// file holding any `*ApiKey` is owner-only (never wider than it already was).
+/// `None` leaves a brand-new, secret-free file to the process umask.
+#[cfg(unix)]
+fn config_mode(path: &Path, config: &Value) -> Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    let existing = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions().mode() & 0o777),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    Ok(if contains_secret(config) {
+        Some(existing.map_or(0o600, |mode| mode & 0o600))
+    } else {
+        existing
+    })
+}
+
 fn write_config(path: &Path, config: &Value) -> Result<()> {
     validate_config(config)?;
     let parent = path.parent().context("config path has no parent")?;
@@ -289,12 +480,24 @@ fn write_config(path: &Path, config: &Value) -> Result<()> {
             .to_string_lossy(),
         std::process::id()
     ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    let mode = config_mode(path, config)?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    }
+    let mut file = options
         .open(&temp)
         .with_context(|| format!("create temporary config {}", temp.display()))?;
     let result = (|| -> Result<()> {
+        // The creation mode is subject to umask; apply the exact mode explicitly.
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         serde_json::to_writer_pretty(&mut file, config)?;
         writeln!(file)?;
         file.sync_all()?;
@@ -500,7 +703,7 @@ pub(super) fn run_config(
         let root = root_path(global.root.as_deref())?;
         if let Some(path) = setup_embeddings(global, &root, path)? {
             if global.format == Some(Format::Json) {
-                let mut config = read_config(&path)?;
+                let mut config = redacted(&read_config(&path)?);
                 config["configPath"] = json!(path);
                 print_json(out, &config)?;
             } else if !embedding_setup_interactive(global) {
@@ -521,6 +724,7 @@ pub(super) fn run_config(
             key.split('.').all(|part| !part.is_empty()),
             "config set expects a non-empty key path"
         );
+        check_settable_key(key)?;
         let value = serde_json::from_str::<Value>(&args[2]).unwrap_or_else(|_| json!(args[2]));
         if let Some(value) = value.as_str() {
             match key.as_str() {
@@ -617,6 +821,8 @@ pub(super) fn run_config(
             return Ok(());
         }
     }
+    // Every rendering of saved settings masks credential values.
+    let changed = redacted(&changed);
     if global.format == Some(Format::Json) {
         let mut result = changed;
         result["configPath"] = json!(path);

@@ -4,7 +4,7 @@
 use std::{
     fmt::Display,
     io::{self, IsTerminal, Write},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, PoisonError, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -366,7 +366,7 @@ pub(crate) struct Progress {
 }
 
 pub(crate) fn counted(label: impl Display, total: usize) -> Progress {
-    let mut active = ACTIVE.lock().unwrap();
+    let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
     let id = active.as_mut().map(|active| {
         let id = active.state.push(label.to_string(), total);
         active.render();
@@ -378,7 +378,10 @@ pub(crate) fn counted(label: impl Display, total: usize) -> Progress {
 impl Progress {
     pub(crate) fn inc(&self, delta: usize) {
         if let Some(id) = &self.id
-            && let Some(active) = ACTIVE.lock().unwrap().as_mut()
+            && let Some(active) = ACTIVE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
         {
             active.state.inc(id, delta);
             active.render();
@@ -391,7 +394,10 @@ impl Progress {
 
     fn end(&mut self, success: bool) {
         if let Some(id) = self.id.take()
-            && let Some(active) = ACTIVE.lock().unwrap().as_mut()
+            && let Some(active) = ACTIVE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
         {
             if success
                 && let Some(scope) = active.state.scopes.first()
@@ -425,7 +431,7 @@ impl DisplayGuard {
         if !terminal() {
             return Self(None);
         }
-        let mut active = ACTIVE.lock().unwrap();
+        let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
         if active.is_some() {
             return Self(None);
         }
@@ -441,7 +447,7 @@ impl DisplayGuard {
         let worker = thread::spawn(move || {
             while let Err(mpsc::RecvTimeoutError::Timeout) = receiver.recv_timeout(REFRESH_INTERVAL)
             {
-                let mut active = ACTIVE.lock().unwrap();
+                let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Some(active) = active.as_mut()
                     && Arc::ptr_eq(&active.id, &id)
                 {
@@ -459,7 +465,7 @@ impl DisplayGuard {
             return;
         };
         let _ = stop.send(());
-        let mut active = ACTIVE.lock().unwrap();
+        let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(active) = active.take()
             && let Some(display) = active.display
         {
@@ -493,7 +499,11 @@ pub(crate) fn spin<T>(label: &str, work: impl FnOnce() -> Result<T>) -> Result<T
 
 /// Engine/library calls remain silent unless a CLI operation owns the display.
 pub(crate) fn progress(message: impl Display) {
-    if let Some(active) = ACTIVE.lock().unwrap().as_mut() {
+    if let Some(active) = ACTIVE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()
+    {
         active.state.message(message.to_string());
         active.render();
     }
@@ -507,7 +517,7 @@ enum Level {
 
 fn log(level: Level, message: impl Display) {
     let message = message.to_string();
-    let active = ACTIVE.lock().unwrap();
+    let active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(display) = active.as_ref().and_then(|active| active.display.as_ref()) {
         // MultiProgress serializes notices from HTTP workers above the animation.
         display.group.println(&message);

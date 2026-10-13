@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -21,6 +21,11 @@ impl OpenAiVector {
         };
         // The byte cap and batch cap also keep requests under the aggregate token budget.
         let config = Configuration::new(&context.config, model, dimensions, 32, OPENAI)?;
+        // ada-002 has no dimension parameter; a mismatch would only surface after a paid call.
+        ensure!(
+            config.model != "text-embedding-ada-002" || config.dimensions == 1536,
+            "text-embedding-ada-002 always returns 1536 dimensions; remove dimensions or choose a text-embedding-3 model"
+        );
         Ok(Self { context, config })
     }
 }

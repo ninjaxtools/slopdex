@@ -310,6 +310,9 @@ impl Fixture {
         let stdout = tempfile::NamedTempFile::new_in(&self.home)?;
         let stderr = tempfile::NamedTempFile::new_in(&self.home)?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_slopdex"));
+        // Start from an empty environment (like Repo::child in
+        // rust_integration.rs) so no ambient credential, proxy, endpoint, or
+        // cache variable can reach the child, including ones added later.
         command
             .current_dir(&self.root)
             .args(["--root"])
@@ -318,28 +321,23 @@ impl Fixture {
             .arg(&self.index)
             .args(["--output", "json"])
             .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.home)
             .env("XDG_CACHE_HOME", self.home.join("cache"))
+            .env("XDG_DATA_HOME", self.home.join("data"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("NO_PROXY", "*")
             .env("no_proxy", "*")
             .stdin(Stdio::null())
             .stdout(stdout.reopen()?)
             .stderr(stderr.reopen()?);
-        for key in [
-            "OPENAI_API_KEY",
-            "JINA_API_KEY",
-            "OLLAMA_API_KEY",
-            "OPENCODE_API_KEY",
-            "OPENCODE_GO_API_KEY",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            command.env_remove(key);
+        // Winsock needs SystemRoot to load networking DLLs in Windows children.
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
         }
         let mut child = command.spawn()?;
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -397,7 +395,7 @@ fn preparation_pulls_pins_identity_and_engine_verifies_once() -> Result<()> {
     assert_eq!(config["dimensions"], 4);
     assert_eq!(config["ollamaNativeDimensions"], 4);
     assert_eq!(config["ollamaModelDigest"], DIGEST);
-    assert_eq!(config["ollamaModelFamily"], "generic");
+    assert!(config.get("ollamaModelFamily").is_none());
     assert_eq!(config["ollamaContextLength"], 4096);
     assert_eq!(config["ollamaAutoPull"], true);
     assert_eq!(mock.requests("/api/pull").len(), 1);

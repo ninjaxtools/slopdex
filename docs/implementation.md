@@ -23,15 +23,18 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/symbols.rs` | Stable normalization of bare names and queries for name-only symbol embeddings. |
 | `src/map.rs` | Compact structure summaries from canonical metadata; display-only truncation. |
 | `src/parse/mod.rs` | Shared parsing result types, file-language detection, and dispatch to code, Markdown, or configuration/markup parsing. |
-| `src/parse/code.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery. |
+| `src/parse/code.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery, one-sweep call-site ownership (callables sorted by start byte become active during the pre-order walk; per-owner set deduplication). |
 | `src/parse/structure.rs`, `src/parse/imports.rs` | Canonical declarations, signatures, hierarchy, source ranges, and imported bindings/aliases. |
-| `src/parse/markdown.rs` | Structural heading hierarchy and separate bounded Markdown search chunks, fence and comment handling. |
-| `src/parse/data.rs` | Configuration/markup structure and bounded document search chunks. |
+| `src/parse/syntax.rs` | Shared AST helpers, quote-safe key text, and the `Descent` guard (512 levels or a 768 KiB stack budget, whichever comes first): the recursive code/structure walkers stop descending and record one diagnostic instead of overflowing the stack; simple helpers use explicit stacks. |
+| `src/parse/markdown.rs` | Structural heading hierarchy and separate bounded Markdown search chunks, fence and comment handling; heading names collapse whitespace and fall back to `<anonymous@line:col>`. |
+| `src/parse/data.rs` | Configuration/markup structure (iterative work-stack walk, no depth limit) and bounded document search chunks. |
+| `src/parse/shell.rs` | Bash heredoc/function recovery; expansion boundaries are matched by parsing exponentially growing windows so bodies with thousands of expansions stay linear. |
+| `src/callgraph.rs` | Snapshot call resolution: language-aware bare-name scoping, `impl`/static receiver matching, namespace-only `.` receivers through imports, Rust `super::` and Go package import paths. |
 | `src/parse/descriptions.rs` | Shared source-comment attachment, Python function/class docstrings, and file/symbol description extraction. |
 | `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits, hosted implementations and local Ollama embeddings, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
-| `src/storage.rs` | Worktree SQLite bindings, attached global artifacts, immutable snapshot manifests, transactional live-state reconciliation, schema validation. |
+| `src/storage.rs` | Worktree SQLite bindings, attached global artifacts, streamed snapshot digests, transactional live-state reconciliation, schema validation. |
 | `src/cache.rs` | Authoritative global SQLite store and validated, best-effort S3 provider artifacts. |
-| `src/git.rs`, `src/registry.rs` | Git candidate discovery/checkpoints, repository relatedness evidence, and per-artifact single-flight locks. |
+| `src/git.rs`, `src/registry.rs` | Git candidate discovery/checkpoints, repository relatedness evidence, and self-retiring per-artifact single-flight locks. |
 | `src/vectors.rs`, `src/vectors/shared.rs` | Checked F32 cosine USearch primitives and immutable shared bases with exact worktree deltas/membership masks. |
 | `tests/rust_integration.rs` | Engine/CLI integration coverage using temporary repositories, real SQLite/USearch, and local mock HTTP providers. |
 | `target/release/slopdex` | Locally built executable (`slopdex.exe` on Windows). |
@@ -95,7 +98,8 @@ configuration edits retain generic JSON/dotted-key behavior.
 Ollama setup calls `providers::prepare_embeddings(&mut Value, pull)` before any
 file write. It checks `/api/tags` and `/api/show`, optionally pulls a missing model,
 validates a smoke embedding, and records `dimensions`, `ollamaModelDigest`,
-`ollamaNativeDimensions`, `ollamaModelFamily`, and `ollamaContextLength`. Explicit
+`ollamaNativeDimensions`, and `ollamaContextLength` (the input strategy derives
+from the model name at construction; no family is saved). Explicit
 `--pull` is restricted to embedding setup with Ollama and persists auto-pull.
 Hosted setup does not make network requests or resolve credentials. Installed
 embedding-model listing is deferred until the installed-model option is chosen;
@@ -134,8 +138,9 @@ If the resolved index is missing, `map` directly parses eligible files and rende
 structure without creating SQLite, locks, cache directories, or sidecars. This
 fallback applies with `--no-reindex` and without Git; it preserves selectors,
 call expansion, expanded source/Markdown rendering, and discovery/size rules.
-When `-q` is supplied, the CLI first writes a warning to stdout that there is no
-active index and `-q` is ignored. It removes `symbolQuery` and `symbolThreshold`
+When `-q` is supplied, the CLI first emits a stderr warning (`ui::warning`) that
+there is no active index and `-q` is ignored, keeping stdout machine-readable. It
+removes `symbolQuery` and `symbolThreshold`
 from the local options before parsing, selection, and expanded heading rendering.
 With an existing index, ordinary `map` uses the structure-only open/refresh path,
 without provider requests or USearch sidecars; `--no-reindex` reads stored structure.
@@ -273,7 +278,7 @@ paths are never imported or used as compatibility seeds. See the
 | Worktree `diagnostics`, `metadata`, `search_cache` | Saved failures, root/store binding, checkpoint/generation/policies, profiles, snapshot digest, and derived query results. |
 | Global `sources`, `embeddings` | Content-addressed source text and little-endian F32 document/query vectors. |
 | Global `cache`, `description_content` | Parse, resolved call-graph, search-unit source/input, and provider artifacts; interned description text, prompts, settings, profiles, and conversation messages. |
-| Global `snapshots` | Immutable content-addressed manifests of published bindings and parser/profile/policy contracts. |
+| Global `snapshots` | Unused. Retained, and still validated on open, only so binaries that persisted snapshot manifests can share the schema-1 store; nothing writes or reads it now, and `cache prune` empties it. |
 | Global registry/upload tables | Repository relatedness evidence and best-effort remote upload bookkeeping. |
 
 The worktree connection attaches the global store as `global`. Both databases are
@@ -282,6 +287,20 @@ creating an index; its canonical path is persisted in the worktree binding.
 Omitting the override subsequently retains that binding. A conflicting explicit
 override requires a new worktree index path, even with `--force-reindex`.
 Unavailable/incompatible global stores are errors, not workspace-cache fallbacks.
+
+Reopening an initialized worktree index is read-only setup: schema, identity,
+store binding, and incarnation are only written when tables are missing, the root
+is being force-rebuilt, or a stored value differs, so a warm open neither waits for
+nor competes with a live writer. Cold initialization (WAL activation and schema
+creation) is serialized across processes by an `index-initialize` artifact lock
+keyed by the canonical index path, taken before an empty file's schema is read.
+
+The snapshot digest in worktree `metadata.snapshot` is the SHA-256 of a canonical
+JSON document of every published binding (`files`, `symbols`, `names`, `units`,
+`embeddings`, `descriptions`, `diagnostics`), the selection policy, and the parse
+bindings. The document is serialized row by row straight into the hasher; it is
+never held in memory or stored. Section order, queries, and column order are part
+of the digest contract, because result-cache keys include the digest.
 
 Callable occurrence identity includes path, qualified name, kind, and same-name
 ordinal; Markdown identity includes path and chunk ordinal. Reconciliation retains
@@ -307,10 +326,23 @@ precedence. Each file's turns are sequential, while a window of files can procee
 in parallel. Identical effective requests are grouped before provider work. Parse,
 embedding, description, reranking, and explanation misses acquire per-artifact locks under
 `<global-store>.locks`, recheck the global cache, and retain the locks through local
-persistence. Embedding batches acquire keys in sorted order. Unrelated keys and
+persistence. Embedding batches acquire their deduplicated keys in sorted order
+through `registry::lock_paths`. Unrelated keys and
 worktrees can proceed concurrently; these are not repository-lifetime locks.
 Lock waits are bounded to 30 seconds. Completed artifacts survive failed live
 publication and can be reused on retry.
+
+A lock file `<sha256(kind,key)>.lock` exists only while its key is held or awaited.
+Releasing unlinks the file under its own lock and then marks the orphaned file
+nonempty; a waiter that acquires a marked file, or (on Unix) one whose inode is no
+longer the one at its path, retries on the current file. The lock directory is
+therefore bounded by in-flight work instead of by every key ever used. The
+`store`/`initialize` lock is the one permanent file: it guards WAL activation and
+is shared with binaries that never unlink lock files. Per-key granularity is
+deliberate. Hashing keys into a fixed set of bucket files would also bound the
+directory, but ten parallel embedding batches of 32-64 keys would then almost
+always share a bucket, serialize behind each other's provider calls, and exceed
+the 30-second wait.
 
 Optional S3 is consulted after a global provider-artifact miss. Remote hits are
 validated and written to that same store, never imported into duplicate worktree
@@ -318,11 +350,19 @@ artifact tables. Missing referenced description content makes a remote answer a
 miss. GET concurrency is bounded to 10; uploads are best effort, with conditional
 creation for content objects. The `v3` zstd frames contain a checksum and payload;
 decompressed size is bounded before checksum validation. Older remote namespaces
-are not read. Source/parse storage, snapshot manifests, registry/Git metadata,
+are not read. Source/parse storage, registry/Git metadata,
 query results, and USearch files are not uploaded. Ordinary map does not fetch S3.
 Backfill exports only artifacts belonging to the requesting worktree, not unrelated
 repositories' entries in the global store.
-Automatic garbage collection is not implemented.
+Automatic garbage collection is not implemented. `cache::prune` (`slopdex cache
+prune`) is the explicit maintenance entry point: it deletes every obsolete
+`snapshots` row in small transactions, removes lock files it can lock exclusively
+(left by binaries that never retired them), and truncates the WAL. It waits at
+most 10 seconds for another writer and then reports the store busy. Freed pages
+are reported from `freelist_count * page_size` and reused by later artifacts.
+`--vacuum` runs `VACUUM` only after checking free space: twice the live data on
+the store's filesystem (temporary copy plus WAL) and the live data in SQLite's
+temporary directory; otherwise it refuses before rewriting anything.
 
 ### Refresh snapshots and locking
 
@@ -334,19 +374,33 @@ also attach the global store read-only. Config-only actions acquire no index loc
 
 1. Git refresh combines current status, the checkpoint-to-HEAD tree diff, previous
    dirty paths (including restored edits), missing parser structures, and saved
-   failures. Candidate-subset walking prunes unrelated directories while retaining
-   ignore/glob/extension policy. Missing checkpoints, non-Git/unborn roots, or
-   discovery-policy changes require a full scan; branch switches need no ancestry.
-2. Saved metadata fingerprints skip unchanged candidates; changed candidates are
-   read, content-hashed, and parsed through global artifacts. Unchanged repeated
-   queries do not hash every indexed file. Ignore/config/sparse-checkout policy is
+   read failures. Status paths discovery could never select (unsupported types,
+   built-in excluded directories and lock files, config `include`/`exclude`,
+   modified submodules) are dropped unless already indexed, so they neither count
+   as dirty nor defeat the unchanged fast path; ignore-policy files always count.
+   Undecodable (non-UTF-8) Git paths are outside every scope. Candidate-subset
+   walking prunes unrelated directories while retaining ignore/glob/extension
+   policy and forgets remembered directories that no longer exist. Missing
+   checkpoints, non-Git/unborn roots, or discovery-policy changes require a full
+   scan; branch switches need no ancestry. The walker skips non-UTF-8 names and
+   unreadable or vanished entries below the root with one warning per scan.
+2. Saved metadata fingerprints skip unchanged candidates in candidate walks and
+   full scans alike (the check is independent of discovery policy, so non-Git
+   roots and policy changes do not re-read unchanged files); changed candidates
+   are read, content-hashed, and parsed through global artifacts. Unchanged
+   repeated queries do not hash every indexed file. Saved diagnostics do not
+   force work: parser diagnostics are a function of content and parser version,
+   so such a file is skipped like any other, while a failed read (no content
+   hash) is skipped while its fingerprint and the discovery policy (which
+   carries `maxFileSize`) are unchanged and is not republished when a retry
+   fails identically. Ignore/config/sparse-checkout policy is
    tracked separately, including Git-ignored policy files in remembered directories;
    there is no filesystem watcher.
 3. Normal refresh rechecks HEAD, dirty-path provenance, file selection, policy,
    candidate metadata, and prepared file hashes before publication. This is
    optimistic validation, not an atomic filesystem snapshot. It reconciles structure,
    search units, diagnostics, checkpoint, snapshot digest, and result-cache changes
-   transactionally in the worktree database. Global artifacts and snapshot manifests
+   transactionally in the worktree database. Global artifacts
    commit first on an independent connection: attached WAL databases do not provide
    cross-database crash atomicity. Rejected publication can leave reusable artifacts,
    never workspace references to uncommitted content. Dirty-path state is conservatively saved before publication so
@@ -355,7 +409,9 @@ also attach the global store read-only. Config-only actions acquire no index loc
 4. Semantic refresh prepares missing active-profile associations from saved source,
    including existing descriptions, without generating prose. Completed provider
    artifacts persist before the semantic publication transaction. Loading committed
-   records clears in-memory derived indexes; channels open only when queried.
+   records clears in-memory derived indexes, cached file structures, and the
+   symbol vocabulary index; channels open only when queried, and one command
+   loads each file's structure and the symbol index at most once.
 
 Repository relatedness is separate from validity. `registry.rs` relates linked
 worktrees through canonical common Git directory identity and records observed
@@ -376,7 +432,7 @@ direct local parsing; search/cross-search require an existing index.
 Changing embedding profiles prepares another projection without resetting
 structure. A schema-4 root mismatch can be explicitly rebuilt with
 `--force-reindex --yes-really-rebuild-the-index`, retaining the global binding and
-artifacts/snapshots. The flag does not reset a compatible root, bypass schema
+artifacts. The flag does not reset a compatible root, bypass schema
 rejection, or change the store binding. Refresh has no divergence/ancestry gate.
 
 ### Shared vector bases and search
@@ -409,7 +465,11 @@ base ID. Less than 50% active base overlap or a delta exceeding
 pointer or base rewrite.
 
 Base publication holds only a per-base lock, rechecks for an existing valid base,
-and writes the `.base.json` publication marker last. Native binaries/manifests
+and writes the `.base.json` publication marker last. The lock wait is bounded to
+30 seconds; a publisher that times out builds the base in memory, as a read-only
+open does, and leaves publication to the holder or a later open. Bases are never
+reconciled in place: the native manifest's `generation` is always 0 and remains
+only as part of the sidecar format. Native binaries/manifests
 retain full checksum, configuration/count/key validation and bounds-checked copied
 loads into owned memory, not mmap. Missing/corrupt derived files rebuild from SQLite
 vectors without provider calls. Read-only shared-index opens publish no files and
@@ -461,9 +521,22 @@ Description failover/empty-output recovery has a separate six-attempt total cap,
 without nesting the HTTP retry loop. A successful fallback remains active in that
 provider instance; a later eligible failure can switch back. Permanent model
 failures are skipped within the current call, and shared-authentication 401 or
-redirect failures stop failover. Without fallback/empty output, ordinary configured
-retry limits apply. Cache hits bypass provider calls, and a failed refresh can be
-rerun to reuse its already committed artifacts.
+redirect failures stop failover. Output truncation (`length`/`max_tokens`/
+`MAX_TOKENS`/Responses `incomplete`) and Gemini prompt blocks are permanent for
+that model: the same body is never resent, the fallback model gets one attempt,
+and without one the call fails immediately. Without fallback/empty output, ordinary
+configured retry limits apply. Cache hits bypass provider calls, and a failed
+refresh can be rerun to reuse its already committed artifacts.
+
+Hosted endpoint policy lives in `providers/mod.rs`: `check_hosted_endpoint` runs at
+construction for embeddings, descriptions, and (lazily) reranking, enforcing TLS
+for non-loopback custom hosts and emitting the deduplicated custom-host warning;
+`guard_foreign_credential` runs inside credential resolution and refuses
+environment/stored keys for repository-configured remote hosts unless trusted.
+The CLI loader marks repository-selected settings with the reserved
+`configOrigin` key (`cli/config.rs::mark_repository_config`), discarding any
+`trustedEndpointHosts` from that file and adopting the user config's list.
+Profiles record endpoints through `profile_endpoint`, which drops query strings.
 
 ## npm installation
 
@@ -485,8 +558,10 @@ manifest or lockfile.
 ## Development and checks
 
 Source builds require Rust (`rustc` and Cargo), a C/C++ compiler and platform
-build tools for native dependencies. Use current stable Rust unless `Cargo.toml`
-specifies a newer minimum. Typical setups are Rust via
+build tools for native dependencies. `Cargo.toml` declares the minimum supported
+toolchain as `rust-version = "1.90"`: the sources need let-chains (Rust 1.88,
+edition 2024) and the locked `tree-sitter-language` requires 1.90. Current stable
+Rust is what CI builds with. Typical setups are Rust via
 [rustup](https://rustup.rs/) plus GCC/G++ and Make on Linux, Xcode Command Line
 Tools on macOS, or the MSVC toolchain and Visual Studio Build Tools with the
 **Desktop development with C++** workload and Windows SDK on Windows.
@@ -514,17 +589,41 @@ publishing, cargo-release releases and cargo-dist distribution.
 | `cargo release-check` | `cargo run --locked --package xtask -- release-check` |
 
 `cargo verify` validates the npm package name and checks its version, description,
-and license against Cargo metadata, checks formatting and all workspace targets, runs Clippy and
+and license against Cargo metadata, confirms with `cargo package --list` that the
+crate ships `README.md`, `LICENSE` and the sources but none of the paths excluded
+in `Cargo.toml` (`evals/`, artwork, `.github/`, `npm/`), checks formatting and all
+workspace targets, runs Clippy and
 workspace tests, then builds the release CLI and smoke-tests `--version` and
 `--help`. The CLI smoke checks need no provider credentials or network calls.
-`.github/workflows/rust.yml` runs `cargo verify` directly, without Node.
+`.github/workflows/rust.yml` runs `cargo verify` directly, without Node; a newer
+push to the same ref cancels the run it supersedes.
+
+### Tests
+
+`cargo test --locked --workspace` (part of `cargo verify`) needs no network,
+credentials or running services: providers are loopback mocks, and every test
+keeps its index and artifact store inside its own temporary directory. The
+integration fixtures refuse an in-process open that would fall back to the
+per-user artifact store.
+
+Tests that need an external service are marked `#[ignore]`, so a normal run
+lists them as ignored instead of reporting a pass that exercised nothing. Run
+them explicitly with `-- --ignored` and the variable they name; without it they
+fail with a message saying what to set:
+
+| Test | Requirement | Command |
+| --- | --- | --- |
+| `minio_shares_artifacts_across_machine_local_caches_and_survives_outage` | A MinIO server with `minioadmin`/`minioadmin` credentials | `SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 cargo test --locked --test rust_integration minio_shares_artifacts -- --ignored` |
+
+`cargo test --locked --workspace -- --ignored` runs every such test at once.
 
 Run `cargo verify` before finishing code changes. `AGENTS.md` also instructs
 coding agents to run it as their final verification step.
 
 `cargo release-check` runs verification followed by `dist generate --check` and
-`dist plan`. Install the pinned cargo-dist version below before running release
-checks.
+`dist plan`. It first checks that cargo-dist's `dist` executable is on `PATH`
+and otherwise stops immediately, naming the install command for the pinned
+version below.
 
 ## Building and publishing packages
 

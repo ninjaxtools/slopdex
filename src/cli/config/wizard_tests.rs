@@ -159,7 +159,7 @@ fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
         (
             "openai\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n",
             "jina",
-            "custom-jina",
+            "jina-embeddings-v3",
             16,
         ),
         (
@@ -169,7 +169,7 @@ fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
             8,
         ),
     ] {
-        let mut config = json!({"embeddingProvider": "jina", "embeddingModel": "custom-jina",
+        let mut config = json!({"embeddingProvider": "jina", "embeddingModel": "jina-embeddings-v3",
             "embeddingDimensions": 16, "custom": "keep"});
         let mut prompts = ScriptedPrompts::new(&(answers.to_owned() + "\n"));
         configure_interactively(&mut config, &mut prompts).unwrap();

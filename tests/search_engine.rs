@@ -432,96 +432,63 @@ fn multiple_queries_choose_and_sort_best_rerank_scores_without_provider_calls() 
 fn default_result_limits_apply_to_search_and_map_and_can_be_disabled() -> Result<()> {
     // Repeated callable inputs share one vector with distinct occurrences, so
     // this checks output limits without depending on approximate-search recall.
-    let source = "pub fn item() {}\n".repeat(4097);
+    //
+    // The corpus is deliberately tiny and the default is configured: limit
+    // resolution is the same code path for any count, while indexing and
+    // searching thousands of same-file callables is quadratic. The built-in
+    // value (4096) is pinned by the `limits` unit tests and by
+    // `unindexed_map_cli_builtin_limit_is_4096_declarations` in src/cli/tests.rs;
+    // here it only has to leave a smaller corpus untruncated.
+    const TOTAL: usize = 7;
+    const DEFAULT: usize = 3;
+    let source = "pub fn item() {}\n".repeat(TOTAL);
     let mut fixture = Fixture::with_sources(false, &[("many.rs", &source)])?;
     let options = json!({"minSimilarity":-1});
-    let engine = fixture.engine()?;
-    assert_eq!(
-        engine
-            .search("copper token", "search-code", &options)?
-            .len(),
-        4096
-    );
-    assert_eq!(
-        engine.map(&json!({}))?[0]["nodes"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4096
-    );
     let unlimited = json!({"minSimilarity":-1, "limit":"none"});
-    assert_eq!(
-        engine
-            .search("copper token", "search-code", &unlimited)?
-            .len(),
-        4097
-    );
-    assert_eq!(
-        engine.map(&json!({"limit":"none"}))?[0]["nodes"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4097
-    );
+    let found = |engine: &Engine, options: &Value| -> Result<usize> {
+        Ok(engine.search("copper token", "search-code", options)?.len())
+    };
+    let mapped = |engine: &Engine, options: &Value| -> Result<usize> {
+        Ok(engine.map(options)?[0]["nodes"].as_array().unwrap().len())
+    };
+
+    // Without `defaultLimit` the built-in default applies and is not reached.
+    let engine = fixture.engine()?;
+    assert_eq!(found(&engine, &options)?, TOTAL);
+    assert_eq!(mapped(&engine, &json!({}))?, TOTAL);
     drop(engine);
 
-    fixture.config["defaultLimit"] = json!(2);
+    // A configured default bounds both commands when no limit is requested.
+    fixture.config["defaultLimit"] = json!(DEFAULT);
     let engine = fixture.engine()?;
     let selected = engine.search("copper token", "search-code", &options)?;
-    assert_eq!(selected.len(), 2);
+    assert_eq!(selected.len(), DEFAULT);
     assert_eq!(
         engine.search("copper token", "search-code", &options)?,
         selected
     );
-    assert_eq!(
-        engine.map(&json!({}))?[0]["nodes"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    for count in [1, 5] {
+    assert_eq!(mapped(&engine, &json!({}))?, DEFAULT);
+    // An explicit limit wins over the default in both directions.
+    for count in [1, DEFAULT + 2] {
         assert_eq!(
-            engine
-                .search(
-                    "copper token",
-                    "search-code",
-                    &json!({"minSimilarity":-1, "limit":count})
-                )?
-                .len(),
+            found(&engine, &json!({"minSimilarity":-1, "limit":count}))?,
             count
         );
-        assert_eq!(
-            engine.map(&json!({"limit":count}))?[0]["nodes"]
-                .as_array()
-                .unwrap()
-                .len(),
-            count
-        );
+        assert_eq!(mapped(&engine, &json!({"limit":count}))?, count);
     }
-    assert_eq!(
-        engine
-            .search("copper token", "search-code", &unlimited)?
-            .len(),
-        4097
-    );
+    // So does disabling it for one request.
+    assert_eq!(found(&engine, &unlimited)?, TOTAL);
+    assert_eq!(mapped(&engine, &json!({"limit":"none"}))?, TOTAL);
     drop(engine);
 
+    // The default itself can be disabled in configuration.
     fixture.config["defaultLimit"] = json!("none");
     let engine = fixture.engine()?;
-    assert_eq!(
-        engine
-            .search("copper token", "search-code", &options)?
-            .len(),
-        4097
-    );
-    assert_eq!(
-        engine.map(&json!({}))?[0]["nodes"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4097
-    );
+    assert_eq!(found(&engine, &options)?, TOTAL);
+    assert_eq!(mapped(&engine, &json!({}))?, TOTAL);
+    // Per-request limits still apply when the default is disabled.
+    assert_eq!(found(&engine, &json!({"minSimilarity":-1, "limit":2}))?, 2);
+    assert_eq!(mapped(&engine, &json!({"limit":2}))?, 2);
     Ok(())
 }
 

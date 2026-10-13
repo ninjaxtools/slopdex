@@ -23,6 +23,54 @@ use tempfile::TempDir;
 
 const TEST_KEY: &str = "local-integration-placeholder";
 
+/// Upper bound for one loopback exchange or one fail-fast CLI child. These are
+/// hang guards, not performance assertions: loaded CI runners (notably Windows
+/// and macOS under a parallel test run) can stall a process for seconds, so the
+/// bound is far above any healthy duration while still ending a real hang.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// Bound for mock-side waits on engine progress. It stays below `HANG_GUARD`
+/// (also the provider timeout) so a stalled engine is reported by the mock's
+/// specific message rather than as a generic provider timeout.
+const PROGRESS_GUARD: Duration = Duration::from_secs(20);
+
+/// The default per-user artifact store of the *test process*. AGENTS.md
+/// forbids tests from touching it, and the library's own guard is compiled
+/// only into unit tests, so integration fixtures enforce it here.
+fn per_user_store() -> Option<PathBuf> {
+    slopdex::cache::store_path(&json!({})).ok()
+}
+
+/// Fail fast when an in-process Engine/Database open could reach the real
+/// per-user artifact store: a fresh index binds to whatever store its config
+/// names, and without `artifactCachePath` that is the developer's own cache.
+/// An existing index is already bound, so it may be reopened without the key.
+#[track_caller]
+fn assert_isolated_open(index: &Path, config: &Value) {
+    let Some(configured) = config.get("artifactCachePath").filter(|v| !v.is_null()) else {
+        assert!(
+            index.exists(),
+            "in-process open of fresh index {} needs an artifactCachePath inside the fixture TempDir",
+            index.display()
+        );
+        return;
+    };
+    let configured = slopdex::cache::store_path(&json!({ "artifactCachePath": configured }))
+        .expect("artifactCachePath must be a usable path");
+    assert_ne!(
+        Some(configured),
+        per_user_store(),
+        "tests must not open the default per-user artifact store"
+    );
+}
+
+/// Checked pass-through for call sites that open an Engine directly.
+#[track_caller]
+fn isolated(index: &Path, config: Value) -> Value {
+    assert_isolated_open(index, &config);
+    config
+}
+
 #[derive(Clone, Debug)]
 struct Request {
     path: String,
@@ -120,7 +168,8 @@ impl Mock {
             "embeddingApiKey": TEST_KEY, "descriptionApiKey": TEST_KEY,
             "rerankerApiKey": TEST_KEY,
             "artifactCachePath": self.cache.path().join("artifacts.sqlite"),
-            "providerMaxRetries": 0, "retryDelayMs": 0, "providerTimeoutMs": 5000
+            "providerMaxRetries": 0, "retryDelayMs": 0,
+            "providerTimeoutMs": HANG_GUARD.as_millis() as u64
         })
     }
 
@@ -193,8 +242,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
     // Windows accepted sockets inherit the listener's nonblocking mode.
     // Request parsing needs blocking I/O, bounded by the timeouts below.
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(HANG_GUARD))?;
+    stream.set_write_timeout(Some(HANG_GUARD))?;
     let mut reader = BufReader::new(&mut stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -411,7 +460,7 @@ impl ConcurrentRequests {
         // Hold the first window until all configured workers have reached HTTP.
         let (progress_after_wait, timeout) = self
             .changed
-            .wait_timeout_while(progress, Duration::from_secs(3), |p| p.arrived < self.limit)
+            .wait_timeout_while(progress, PROGRESS_GUARD, |p| p.arrived < self.limit)
             .unwrap();
         progress = progress_after_wait;
         ensure!(
@@ -422,7 +471,7 @@ impl ConcurrentRequests {
         if fail && ordinal > 0 {
             let (next, timeout) = self
                 .changed
-                .wait_timeout_while(progress, Duration::from_secs(3), |p| {
+                .wait_timeout_while(progress, PROGRESS_GUARD, |p| {
                     !p.completed.iter().any(|(_, status)| *status == 503)
                 })
                 .unwrap();
@@ -435,7 +484,7 @@ impl ConcurrentRequests {
             // visible through a separate SQLite connection. This also catches
             // collecting the whole window before persisting any of its results.
             let db = workspace_connection(&self.index)?;
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + PROGRESS_GUARD;
             while self.work.paid_count(&db)? == 0 {
                 ensure!(
                     Instant::now() < deadline,
@@ -518,22 +567,24 @@ impl Repo {
         Ok(())
     }
 
-    fn open(&self, config: &Value) -> Result<Engine> {
-        // Concurrent tests launch Git/CLI children. A fork can briefly inherit a
-        // just-dropped flock until exec closes CLOEXEC descriptors. Retry only
-        // this lock-contention error; persistent contention still fails the test.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match Engine::open(&self.root, &self.index, config.clone()) {
-                Err(error)
-                    if error.to_string().starts_with("Index is in use")
-                        && Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                result => return result,
-            }
+    /// Every in-process open goes through here: a fresh index is bound to a
+    /// store inside this fixture (the same file an `isolated_cli` child
+    /// resolves from its XDG_CACHE_HOME) unless the test chose another one.
+    fn isolated_config(&self, config: &Value) -> Value {
+        let mut config = config.clone();
+        if !self.index.exists() && config.get("artifactCachePath").is_none_or(Value::is_null) {
+            config["artifactCachePath"] = json!(self.home.join("cache/slopdex/global-v1.sqlite"));
         }
+        assert_isolated_open(&self.index, &config);
+        config
+    }
+
+    fn open(&self, config: &Value) -> Result<Engine> {
+        // No retry on "Index is in use": a child forked by a concurrent test
+        // can hold a duplicate of a just-dropped lock descriptor until its exec,
+        // but the engine itself polls the lock for 10 s before reporting that
+        // error, which already absorbs that millisecond-scale window.
+        Engine::open(&self.root, &self.index, self.isolated_config(config))
     }
 
     fn db(&self) -> Result<Connection> {
@@ -541,22 +592,7 @@ impl Repo {
     }
 
     fn open_map(&self, config: &Value) -> Result<Engine> {
-        let mut config = config.clone();
-        if !self.index.exists() && config.get("artifactCachePath").is_none_or(Value::is_null) {
-            config["artifactCachePath"] = json!(self.home.join("cache/slopdex/global-v1.sqlite"));
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match Engine::open_map(&self.root, &self.index, config.clone()) {
-                Err(error)
-                    if error.to_string().starts_with("Index is in use")
-                        && Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                result => return result,
-            }
-        }
+        Engine::open_map(&self.root, &self.index, self.isolated_config(config))
     }
 
     fn child(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -816,7 +852,11 @@ fn git_clean_repeated_refresh_and_cached_reopen_do_not_read_sources_or_shared_ba
         );
     }
     drop(engine);
-    let reader = Engine::open_readonly(&repo.root, &repo.index, config.clone())?;
+    let reader = Engine::open_readonly(
+        &repo.root,
+        &repo.index,
+        isolated(&repo.index, config.clone()),
+    )?;
     assert_eq!(reader.search("east", "search-code", &all())?, expected);
     assert!(
         !watch.accessed()?,
@@ -1018,6 +1058,7 @@ fn global_parses_reuse_renamed_same_dialect_paths_and_isolate_languages() -> Res
 }
 
 fn file_record(repo: &Repo, path: &str) -> Result<Value> {
+    assert_isolated_open(&repo.index, &Value::Null);
     let db = slopdex::storage::Database::open_readonly(&repo.index, &repo.root.canonicalize()?)?;
     let file = db
         .files()?
@@ -1091,18 +1132,21 @@ fn isolated_cli(repo: &Repo, index: Option<&Path>) -> Command {
 
 /// Bound failures that must precede engine locking or provider work. Killing a
 /// regressed child keeps the locked-source case from hanging the test suite.
+/// The deadline is only a hang guard: a child that wrongly waits for a held
+/// index lock exits by itself after the engine's 10 s lock wait with a
+/// different message, which callers reject through `assert_missing_index`.
 fn quick_output(command: &mut Command) -> Result<Output> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + HANG_GUARD;
     while child.try_wait()?.is_none() {
         if Instant::now() >= deadline {
             child.kill()?;
             let output = child.wait_with_output()?;
             anyhow::bail!(
-                "CLI did not fail promptly: {}",
+                "CLI did not fail within {HANG_GUARD:?}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -3555,7 +3599,8 @@ fn cli_missing_resolved_source_indexes_fail_without_artifacts_or_provider_calls(
                     ))
                     .join("index.sqlite")
             };
-            Engine::open_map(&repo.root, &decoy, config.clone())?.refresh_structure()?;
+            Engine::open_map(&repo.root, &decoy, isolated(&decoy, config.clone()))?
+                .refresh_structure()?;
             if selection == "explicit" {
                 config["indexPath"] = json!(decoy);
                 repo.write(".slopdex/config.json", &config.to_string())?;
@@ -3852,17 +3897,52 @@ fn open_waits_for_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot
     };
     let second_root = repo.root.clone();
     let second_config = config.clone();
-    let waiter =
-        std::thread::spawn(move || Engine::open(&second_root, &second_index, second_config));
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    assert!(
-        !waiter.is_finished(),
-        "a writer must wait while another owns the index"
-    );
+    // The waiter reports when it is about to open and when the open returned,
+    // so "still blocked" is observed after it really started, and "acquired
+    // only after release" is checked on timestamps instead of on a sleep.
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _ = started_tx.send(());
+        let opened = Engine::open(&second_root, &second_index, second_config);
+        let _ = opened_tx.send(Instant::now());
+        opened
+    });
+    let started = started_rx.recv_timeout(HANG_GUARD);
+    // Stay well inside the engine's 10 s lock wait, after which the waiter
+    // would give up with "Index is in use" rather than keep waiting.
+    let blocked_until = Instant::now() + Duration::from_secs(1);
+    let mut early = None;
+    while started.is_ok() && early.is_none() && Instant::now() < blocked_until {
+        early = opened_rx.recv_timeout(Duration::from_millis(10)).ok();
+    }
+    let released = Instant::now();
     drop(engine);
-    drop(waiter.join().unwrap()?);
+    let acquired = match early {
+        Some(acquired) => Ok(acquired),
+        None => opened_rx.recv_timeout(HANG_GUARD),
+    };
+    // Join before propagating anything. If the bounded wait expired the thread
+    // can only still be inside the engine's own bounded lock wait.
+    let opened = waiter.join().expect("waiting writer panicked");
+    started.context("waiting writer never started")?;
+    assert!(
+        early.is_none(),
+        "a writer must wait while another owns the index, but its open returned early: {:?}",
+        opened.as_ref().err()
+    );
+    let acquired = acquired.context("writer did not acquire the released index in time")?;
+    assert!(
+        acquired >= released,
+        "the writer acquired the index before its owner released it"
+    );
+    drop(opened?);
 
-    let shared_search = Engine::open_readonly(&repo.root, &repo.index, config.clone())?;
+    let shared_search = Engine::open_readonly(
+        &repo.root,
+        &repo.index,
+        isolated(&repo.index, config.clone()),
+    )?;
     assert_eq!(
         shared_search.search("east", "search-code", &all())?,
         expected
@@ -3874,8 +3954,16 @@ fn open_waits_for_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot
     );
     drop(shared_search);
 
-    let first_reader = Engine::open_map_readonly(&repo.root, &repo.index, config.clone())?;
-    let second_reader = Engine::open_map_readonly(&repo.root, &repo.index, config.clone())?;
+    let first_reader = Engine::open_map_readonly(
+        &repo.root,
+        &repo.index,
+        isolated(&repo.index, config.clone()),
+    )?;
+    let second_reader = Engine::open_map_readonly(
+        &repo.root,
+        &repo.index,
+        isolated(&repo.index, config.clone()),
+    )?;
     assert_eq!(first_reader.status()?, second_reader.status()?);
     drop(first_reader);
     drop(second_reader);
@@ -3911,7 +3999,8 @@ fn current_map_reads_share_the_lock_and_stale_maps_wait_for_writers() -> Result<
     writer.refresh_structure()?;
     drop(writer);
 
-    let mut reader = Engine::open_map_readonly(&repo.root, &repo.index, json!({}))?;
+    let mut reader =
+        Engine::open_map_readonly(&repo.root, &repo.index, isolated(&repo.index, json!({})))?;
     let generation = reader.status()?["generation"].clone();
     assert_eq!(reader.refresh_structure()?["filesUpdated"], 0);
     let output = repo
@@ -4696,7 +4785,8 @@ fn cli_external_map_explicit_config_and_index_override_source_defaults() -> Resu
         (&explicit_index, "explicit_snapshot"),
     ] {
         external.write("nested/api.rs", &function(name, "saved"))?;
-        Engine::open_map(&external.root, index, config.clone())?.refresh_structure()?;
+        Engine::open_map(&external.root, index, isolated(index, config.clone()))?
+            .refresh_structure()?;
     }
     external.write("nested/api.rs", &function("live_snapshot", "edited"))?;
     let mut alternate = config.clone();
@@ -7664,7 +7754,11 @@ fn search_symbols_native_dimensions_share_map_vectors_and_support_cached_readonl
     }
     drop(engine);
     for _ in 0..2 {
-        let reader = Engine::open_readonly(&first.root, &first.index, config.clone())?;
+        let reader = Engine::open_readonly(
+            &first.root,
+            &first.index,
+            isolated(&first.index, config.clone()),
+        )?;
         let before = filesystem_snapshot(first._temp.path())?;
         assert_eq!(
             reader.search("http_2_vector_north", "search-symbols", &all())?,
@@ -8258,6 +8352,7 @@ fn symbol_selection_cache_is_cleared_when_live_snapshot_is_reset() -> Result<()>
         strings(&["VectorNorthOld"])
     );
     // Match the canonical root identity stored by Engine, including Windows' verbatim prefix.
+    assert_isolated_open(&repo.index, &Value::Null);
     let db = slopdex::storage::Database::open(
         &repo.index,
         &repo.root.canonicalize()?,
@@ -8409,7 +8504,7 @@ fn symbol_native_dimensions_profiles_and_shared_cache_are_isolated_and_reusable(
 }
 
 #[test]
-fn symbol_map_without_index_warns_on_stdout_and_ignores_queries_without_provider() -> Result<()> {
+fn symbol_map_without_index_warns_on_stderr_and_ignores_queries_without_provider() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let mut config = mock.config();
@@ -8419,7 +8514,7 @@ fn symbol_map_without_index_warns_on_stdout_and_ignores_queries_without_provider
     }
     repo.write(".slopdex/config.json", &config.to_string())?;
     repo.write("api.ts", "export function VectorNorth() {}\n")?;
-    let warning = "slopdex: warning: no active index; -q is ignored.\n";
+    let warning = "slopdex: warning: no active index; -q is ignored.";
     let before = filesystem_snapshot(repo._temp.path())?;
     for (prefix, format) in [
         (vec![], "json"),
@@ -8443,11 +8538,9 @@ fn symbol_map_without_index_warns_on_stdout_and_ignores_queries_without_provider
             let output =
                 repo.cli_format(&[prefix.clone(), vec!["map"], queries].concat(), format)?;
             assert!(output.status.success(), "{:?}", output.stderr);
-            assert_eq!(
-                output.stdout.strip_prefix(warning.as_bytes()),
-                Some(ordinary.stdout.as_slice())
-            );
-            assert!(!String::from_utf8_lossy(&output.stderr).contains("no active index"));
+            // The warning is a diagnostic: stdout stays identical (and JSON parseable).
+            assert_eq!(output.stdout, ordinary.stdout);
+            assert!(String::from_utf8_lossy(&output.stderr).contains(warning));
         }
         assert!(!repo.index.exists());
         assert_eq!(mock.count(), 0);
@@ -8500,7 +8593,7 @@ fn symbol_map_without_index_preserves_other_selectors_and_expanded_heading_bodie
         "-i",
         "--private",
     ];
-    let warning = "slopdex: warning: no active index; -q is ignored.\n";
+    let warning = "slopdex: warning: no active index; -q is ignored.";
     for format in ["json", "summary"] {
         let ordinary = repo.cli_format(&args, format)?;
         assert!(ordinary.status.success(), "{:?}", ordinary.stderr);
@@ -8513,10 +8606,8 @@ fn symbol_map_without_index_preserves_other_selectors_and_expanded_heading_bodie
             format,
         )?;
         assert!(output.status.success(), "{:?}", output.stderr);
-        assert_eq!(
-            output.stdout.strip_prefix(warning.as_bytes()),
-            Some(ordinary.stdout.as_slice())
-        );
+        assert_eq!(output.stdout, ordinary.stdout);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(warning));
         if format == "summary" {
             let text = String::from_utf8(output.stdout)?;
             assert!(
@@ -8537,10 +8628,7 @@ fn symbol_map_without_index_preserves_other_selectors_and_expanded_heading_bodie
     }
     let missing = repo.cli(&["map", "missing", "-q", "absent"])?;
     assert!(missing.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(missing.stdout.strip_prefix(warning.as_bytes()).unwrap())?,
-        json!([])
-    );
+    assert_eq!(serde_json::from_slice::<Value>(&missing.stdout)?, json!([]));
     assert!(!repo.index.exists());
     assert_eq!(mock.count(), 0);
     Ok(())
@@ -8888,7 +8976,7 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
     }
     let first = roots[0].join("index.sqlite");
     let second = roots[1].join("index.sqlite");
-    let mut engine = Engine::open(&roots[0], &first, config.clone())?;
+    let mut engine = Engine::open(&roots[0], &first, isolated(&first, config.clone()))?;
     engine.refresh()?;
     engine.generate_descriptions()?;
     let calls = mock.count();
@@ -8898,7 +8986,7 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
     );
     drop(engine);
 
-    let mut engine = Engine::open(&roots[1], &second, config.clone())?;
+    let mut engine = Engine::open(&roots[1], &second, isolated(&second, config.clone()))?;
     engine.refresh()?;
     engine.generate_descriptions()?;
     assert_eq!(
@@ -8955,7 +9043,7 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
         );
         assert_eq!(db.query_row("SELECT count(*) FROM main.sqlite_master WHERE name IN ('sources','embeddings','cache','description_content')", [], |row| row.get::<_, i64>(0))?, 0);
     }
-    let engine = Engine::open(&roots[0], &first, config.clone())?;
+    let engine = Engine::open(&roots[0], &first, isolated(&first, config.clone()))?;
     assert_eq!(
         names(&engine.search("east", "search-code", &all())?),
         names(&results)
@@ -8979,7 +9067,7 @@ fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Re
     let mut other_config = other.config();
     other_config["artifactCachePath"] = json!(cache);
     let third = roots[1].join("other-index.sqlite");
-    let mut engine = Engine::open(&roots[1], &third, other_config)?;
+    let mut engine = Engine::open(&roots[1], &third, isolated(&third, other_config))?;
     engine.refresh()?;
     assert!(
         !other.embedding_inputs().is_empty(),
@@ -9007,7 +9095,7 @@ fn concurrent_workspaces_share_provider_requests_and_snapshot_artifacts() -> Res
             let barrier = barrier.clone();
             std::thread::spawn(move || -> Result<Value> {
                 barrier.wait();
-                let mut engine = Engine::open(&root, &index, config)?;
+                let mut engine = Engine::open(&root, &index, isolated(&index, config))?;
                 engine.refresh()?;
                 engine.generate_descriptions()?;
                 engine.status()
@@ -9059,12 +9147,20 @@ fn concurrent_workspaces_share_provider_requests_and_snapshot_artifacts() -> Res
     Ok(())
 }
 
-/// Run with SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 against MinIO.
+/// Needs a MinIO server with the default `minioadmin` credentials:
+/// `SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 cargo test --locked --test
+/// rust_integration minio -- --ignored`. Ignored by default so an ordinary run
+/// reports it as skipped rather than as a pass that exercised nothing.
 #[test]
+#[ignore = "requires SLOPDEX_MINIO_ENDPOINT (MinIO)"]
 fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> Result<()> {
-    let Ok(endpoint) = std::env::var("SLOPDEX_MINIO_ENDPOINT") else {
-        return Ok(());
-    };
+    let endpoint = std::env::var("SLOPDEX_MINIO_ENDPOINT")
+        .ok()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .context(
+            "SLOPDEX_MINIO_ENDPOINT is not set; start MinIO and rerun with e.g. \
+             SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000",
+        )?;
     let region = s3::Region::Custom {
         region: "us-east-1".into(),
         endpoint: endpoint.clone(),

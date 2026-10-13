@@ -60,6 +60,7 @@ impl Configuration {
         let batch_size = positive(config, &["embeddingBatchSize"], maximum)?.min(maximum);
         let base = string(config, &["embeddingBaseUrl"])?.unwrap_or(default_base);
         let url = endpoint(base, "embeddings")?;
+        super::check_hosted_endpoint(config, "embedding", "embeddingBaseUrl", default_base)?;
         Ok(Self {
             model,
             dimensions,
@@ -69,11 +70,13 @@ impl Configuration {
         })
     }
 
+    /// Default endpoints are omitted so existing profiles and caches stay valid;
+    /// custom endpoints are recorded without their query string.
     pub(super) fn profile(&self, provider: &str) -> Value {
         let mut profile = json!({"provider": provider, "model": self.model,
             "dimensions": self.dimensions, "strategyVersion": "rust-v1"});
         if self.custom_endpoint {
-            profile["endpoint"] = json!(self.url);
+            profile["endpoint"] = json!(super::profile_endpoint(&self.url));
         }
         profile
     }

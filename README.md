@@ -80,7 +80,7 @@ See the [selector reference](docs/reference.md#shared-selectors).
 
 ## Search
 
-Vector search requires an embedding-provider API key from OpenAI or Jina.
+Vector search needs an embedding provider: an API key for OpenAI or Jina, or a local Ollama model, which needs no API key (`slopdex config embeddings --provider ollama`).
 
 ```console
 $ export OPENAI_API_KEY="your-api-key"
@@ -91,7 +91,7 @@ $ slopdex search "validate an authenticated session"
 
 To create a vector index, the `update` command needs to be run once in a Git repository. Any subsequent attempts to use the index will determine what needs to be updated using Git and update the index incrementally (use `--no-reindex` to skip this).
 
-Each worktree has its own index in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). There is also a global cache that is reused across worktrees, so hash-identical code will not cause unneeded model provider requests. Configuaration is stored in `$XDG_CONFIG_HOME/slopdex/config.json`. Global configuration can be overridden with a repository local `.slopdex/config.json` file. See also [cache configuration](docs/reference.md#shared-provider-artifacts).
+Each worktree has its own index in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). There is also a global cache that is reused across worktrees, so hash-identical code will not cause unneeded model provider requests. Configuration is stored in `$XDG_CONFIG_HOME/slopdex/config.json`. If a repository contains a `.slopdex/config.json` file, that file is used instead of the global configuration (the two are not merged). A repository file cannot send your environment API keys to its own remote endpoints unless you trust them; see [repository settings and remote endpoints](docs/reference.md#repository-settings-and-remote-endpoints) and [cache configuration](docs/reference.md#shared-provider-artifacts).
 
 By default code and docs indexes are searched and ranked together, see `--formats` to enable other file types.
 
@@ -302,7 +302,7 @@ If some functions can't be indexed a warning is printed. Index errors can be inv
 
 ```console
 $ slopdex status
-$ slopdex index errors --output summary
+$ slopdex index errors --output text
 $ slopdex --version
 ```
 

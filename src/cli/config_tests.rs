@@ -47,7 +47,6 @@ fn embedding_setup_saves_only_embedding_flags_and_resolved_identity() {
                 assert!(config.get("embeddingBaseUrl").is_none());
                 config["ollamaModelDigest"] = json!("sha256:resolved");
                 config["ollamaNativeDimensions"] = json!(2560);
-                config["ollamaModelFamily"] = json!("qwen3");
                 config["ollamaContextLength"] = json!(8192);
                 Ok(())
             },
@@ -143,7 +142,7 @@ fn embedding_setup_preserves_explicit_dimensions_refreshes_pin_and_skips_hosted_
     let saved = json!({"provider": "ollama", "model": "qwen3-embedding:0.6b",
         "dimensions": 1024, "embeddingBaseUrl": "http://localhost:11434/api",
         "ollamaModelDigest": "old", "ollamaNativeDimensions": 1024,
-        "ollamaModelFamily": "qwen3", "ollamaContextLength": 2048});
+        "ollamaModelFamily": "legacy", "ollamaContextLength": 2048});
     let config = super::stage_embeddings(
         &saved,
         &global,
@@ -225,7 +224,6 @@ fn ollama_advanced_fields_are_validated_and_selection_edits_invalidate_identity(
         ("ollamaAutoPull", "true", "\"true\""),
         ("ollamaKeepAlive", "5m", "0"),
         ("ollamaModelDigest", "sha256:abc", "\"\""),
-        ("ollamaModelFamily", "qwen3", "false"),
         ("embeddingParallelism", "2", "0"),
         ("ollamaNativeDimensions", "1024", "-1"),
         ("ollamaContextLength", "8192", "1.5"),
@@ -339,25 +337,25 @@ fn config_round_trip_preserves_unknown_fields_and_resolves_cwd_paths() {
 fn explicit_embedding_cli_options_override_config_aliases() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.json");
-    let saved = json!({"embeddingProvider": "jina", "embeddingModel": "old-model",
+    let saved = json!({"embeddingProvider": "jina", "embeddingModel": "jina-embeddings-v3",
         "embeddingDimensions": 1024, "custom": "keep"});
     fs::write(&path, saved.to_string()).unwrap();
     for (args, expected) in [
         (
             vec!["status"],
-            json!({"provider": "jina", "model": "old-model", "dimensions": 1024}),
+            json!({"provider": "jina", "model": "jina-embeddings-v3", "dimensions": 1024}),
         ),
         (
             vec!["status", "--provider", "openai"],
             json!({"provider": "openai", "model": "text-embedding-3-large", "dimensions": 3072}),
         ),
         (
-            vec!["status", "--model", "new-model"],
-            json!({"provider": "jina", "model": "new-model", "dimensions": 1024}),
+            vec!["status", "--model", "jina-embeddings-v4"],
+            json!({"provider": "jina", "model": "jina-embeddings-v4", "dimensions": 1024}),
         ),
         (
             vec!["status", "--dimensions", "8"],
-            json!({"provider": "jina", "model": "old-model", "dimensions": 8}),
+            json!({"provider": "jina", "model": "jina-embeddings-v3", "dimensions": 8}),
         ),
         (
             vec![
@@ -541,14 +539,7 @@ fn config_read_distinguishes_missing_files_from_invalid_or_unreadable_files() {
 fn invalid_config_settings_cannot_partially_persist_a_config_action() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.json");
-    let cli = parse(&[
-        "config",
-        "set",
-        "custom.updated",
-        "true",
-        "--output",
-        "json",
-    ]);
+    let cli = parse(&["config", "set", "defaultLimit", "5", "--output", "json"]);
     let Command::Config { args } = cli.command else {
         panic!()
     };
@@ -977,4 +968,201 @@ fn cross_search_exclusions_require_an_array_of_code_hashes() {
         assert!(error.to_string().contains("crossSearchExclusions"));
         assert_eq!(fs::read(&path).unwrap(), original);
     }
+}
+
+#[test]
+fn config_set_rejects_unknown_keys_with_suggestions_and_accepts_documented_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    write_config(&path, &json!({"custom": "keep"})).unwrap();
+    let original = fs::read(&path).unwrap();
+    for (key, suggestion) in [
+        ("descriptonModel", "descriptionModel"),
+        ("embeddingapikey", "embeddingApiKey"),
+        ("verbosity", "verbose"),
+        ("parallelism.limit", "parallelism"),
+    ] {
+        let cli = parse(&["config", "set", key, "value"]);
+        let Command::Config { args } = cli.command else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        let error = run_config(&cli.global, &path, &args, &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(suggestion), "{key}: {error}");
+        assert!(out.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), original, "{key}");
+    }
+    let error = super::check_settable_key("zzzzzzzz")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown configuration key zzzzzzzz"));
+    assert!(!error.contains("did you mean"), "{error}");
+    for key in wizard_keys().iter().chain(super::ADVANCED_KEYS) {
+        super::check_settable_key(key).unwrap_or_else(|e| panic!("{key}: {e}"));
+    }
+    super::check_settable_key("artifactS3.pathStyle").unwrap();
+    assert!(super::check_settable_key("configOrigin").is_err());
+    assert!(super::check_settable_key("trustRepositoryEndpoints").is_err());
+    assert_eq!(
+        config_action_json(
+            &path,
+            &["config", "set", "trustedEndpointHosts", "[\"gw.invalid\"]"]
+        )["trustedEndpointHosts"],
+        json!(["gw.invalid"])
+    );
+    let cli = parse(&["config", "set", "trustedEndpointHosts", "[\"\"]"]);
+    let Command::Config { args } = cli.command else {
+        panic!()
+    };
+    assert!(run_config(&cli.global, &path, &args, &mut Vec::new()).is_err());
+}
+
+fn wizard_keys() -> &'static [&'static str] {
+    super::wizard::CONFIG_KEYS
+}
+
+#[test]
+fn provider_switch_keeps_the_embedding_api_key_and_resets_documented_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    write_config(
+        &path,
+        &json!({"provider": "openai", "model": "text-embedding-3-small", "dimensions": 1536,
+            "embeddingApiKey": "keep-secret", "openaiApiKey": "also-keep",
+            "embeddingBaseUrl": "https://old.invalid/v1", "embeddingParallelism": 3,
+            "ollamaKeepAlive": "1m", "ollamaAutoPull": true, "ollamaPullTimeoutMs": 5,
+            "ollamaModelDigest": "d", "ollamaNativeDimensions": 4, "ollamaContextLength": 8}),
+    )
+    .unwrap();
+    config_action_json(&path, &["config", "set", "provider", "jina"]);
+    let saved = read_config(&path).unwrap();
+    assert_eq!(saved["embeddingApiKey"], "keep-secret");
+    assert_eq!(saved["openaiApiKey"], "also-keep");
+    assert_eq!(saved["provider"], "jina");
+    assert_eq!(saved["model"], "jina-embeddings-v4");
+    assert_eq!(saved["dimensions"], 1024);
+    for key in [
+        "embeddingBaseUrl",
+        "embeddingParallelism",
+        "ollamaKeepAlive",
+        "ollamaAutoPull",
+        "ollamaPullTimeoutMs",
+        "ollamaModelDigest",
+        "ollamaNativeDimensions",
+        "ollamaContextLength",
+    ] {
+        assert!(saved.get(key).is_none(), "{key} should reset");
+    }
+}
+
+#[test]
+fn config_renderings_redact_api_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let result = config_action_json(
+        &path,
+        &["config", "set", "embeddingApiKey", "sk-live-secret"],
+    );
+    assert_eq!(result["embeddingApiKey"], "<redacted>");
+    assert_eq!(
+        read_config(&path).unwrap()["embeddingApiKey"],
+        "sk-live-secret"
+    );
+    let cli = parse(&["config", "set", "openaiApiKey", "sk-other-secret"]);
+    let Command::Config { args } = cli.command else {
+        panic!()
+    };
+    let mut out = Vec::new();
+    run_config(&cli.global, &path, &args, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("openaiApiKey=<redacted>"), "{text}");
+    assert!(!text.contains("secret"), "{text}");
+    let dumped = config_action_json(
+        &path,
+        &[
+            "config",
+            "embeddings",
+            "--provider",
+            "openai",
+            "--model",
+            "text-embedding-3-small",
+        ],
+    );
+    assert_eq!(dumped["embeddingApiKey"], "<redacted>");
+    assert_eq!(dumped["openaiApiKey"], "<redacted>");
+    assert_eq!(dumped["model"], "text-embedding-3-small");
+    assert!(!dumped.to_string().contains("secret"));
+    assert_eq!(
+        read_config(&path).unwrap()["openaiApiKey"],
+        "sk-other-secret"
+    );
+    assert_eq!(
+        super::redacted(
+            &json!({"a": {"xApiKey": "s", "n": null}, "list": [{"rerankerApiKey": 1}], "ApiKeyName": "visible", "nullApiKey": null})
+        ),
+        json!({"a": {"xApiKey": "<redacted>", "n": null}, "list": [{"rerankerApiKey": "<redacted>"}], "ApiKeyName": "visible", "nullApiKey": null})
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_files_keep_their_mode_and_secrets_become_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    write_config(&path, &json!({"parallelism": 2})).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    write_config(&path, &json!({"parallelism": 3})).unwrap();
+    assert_eq!(mode(&path), 0o640, "existing mode is preserved");
+    write_config(&path, &json!({"parallelism": 3, "openaiApiKey": "secret"})).unwrap();
+    assert_eq!(mode(&path), 0o600, "secrets tighten to owner-only");
+    write_config(&path, &json!({"parallelism": 4})).unwrap();
+    assert_eq!(mode(&path), 0o600, "a tightened mode stays");
+    let fresh = temp.path().join("fresh/config.json");
+    write_config(&fresh, &json!({"embeddingApiKey": "secret"})).unwrap();
+    assert_eq!(mode(&fresh), 0o600);
+    fs::set_permissions(&fresh, fs::Permissions::from_mode(0o400)).unwrap();
+    write_config(&fresh, &json!({"embeddingApiKey": "rotated"})).unwrap();
+    assert_eq!(mode(&fresh), 0o400, "never wider than before");
+    assert_eq!(read_config(&fresh).unwrap()["embeddingApiKey"], "rotated");
+}
+
+#[test]
+fn repository_config_marking_adopts_only_the_user_trust_list() {
+    use crate::providers::{CONFIG_ORIGIN_KEY, TRUST_REPOSITORY_ENDPOINTS_KEY};
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("user/config.json");
+    let repository = json!({"embeddingBaseUrl": "https://gw.invalid/v1",
+        "trustedEndpointHosts": ["gw.invalid"], TRUST_REPOSITORY_ENDPOINTS_KEY: true});
+    let mut config = repository.clone();
+    super::mark_repository_config_from(&mut config, &parse(&["status"]).global, &user).unwrap();
+    assert_eq!(config[CONFIG_ORIGIN_KEY], "repository");
+    assert!(config.get("trustedEndpointHosts").is_none(), "{config}");
+    assert!(config.get(TRUST_REPOSITORY_ENDPOINTS_KEY).is_none());
+    assert_eq!(config["embeddingBaseUrl"], repository["embeddingBaseUrl"]);
+
+    write_config(&user, &json!({"trustedEndpointHosts": ["other.invalid"]})).unwrap();
+    let mut config = repository.clone();
+    super::mark_repository_config_from(
+        &mut config,
+        &parse(&["--trust-repo-endpoints", "status"]).global,
+        &user,
+    )
+    .unwrap();
+    assert_eq!(config["trustedEndpointHosts"], json!(["other.invalid"]));
+    assert_eq!(config[TRUST_REPOSITORY_ENDPOINTS_KEY], true);
+
+    fs::write(&user, r#"{"trustedEndpointHosts": "gw.invalid"}"#).unwrap();
+    let mut config = repository.clone();
+    let error = super::mark_repository_config_from(&mut config, &parse(&["status"]).global, &user)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("trustedEndpointHosts"), "{error}");
+    assert!(
+        effective_config(&parse(&["status"]).global, &user).is_err(),
+        "the user config itself rejects an invalid trust list"
+    );
 }

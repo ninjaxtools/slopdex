@@ -4,8 +4,8 @@
 //! indexes, and workspace pointers contain identifiers and hashes, never vectors.
 
 use super::*;
-use fs2::FileExt;
 use serde_json::Value;
+use std::time::{Duration, Instant};
 
 const SHARED_VERSION: u32 = 1;
 
@@ -308,7 +308,7 @@ impl SharedIndex {
                 let index = if readonly {
                     build_base(&base, &snapshot)?
                 } else {
-                    publish_base(&directory, &base, &snapshot)?
+                    publish_base(&directory, &base, &snapshot, crate::registry::LOCK_TIMEOUT)?
                 };
                 (index, base)
             }
@@ -551,7 +551,16 @@ fn build_base(base: &BaseManifest, snapshot: &Snapshot<'_>) -> Result<Index> {
     build(base.dimensions, &native_vectors(base, snapshot))
 }
 
-fn publish_base(directory: &Path, base: &BaseManifest, snapshot: &Snapshot<'_>) -> Result<Index> {
+/// Publish a base under its per-base lock. A publisher that cannot get the lock
+/// within `timeout` (a stalled or very slow peer) does not fail the search: it
+/// builds the same base in memory, exactly as a read-only open does, and leaves
+/// publication to the lock holder or to a later open.
+fn publish_base(
+    directory: &Path,
+    base: &BaseManifest,
+    snapshot: &Snapshot<'_>,
+    timeout: Duration,
+) -> Result<Index> {
     fs::create_dir_all(directory)?;
     let lock = OpenOptions::new()
         .read(true)
@@ -559,8 +568,17 @@ fn publish_base(directory: &Path, base: &BaseManifest, snapshot: &Snapshot<'_>) 
         .create(true)
         .truncate(false)
         .open(directory.join(format!("{}.lock", base.id)))?;
-    lock.lock_exclusive()
-        .context("lock shared vector base publication")?;
+    if !crate::registry::lock_exclusive_until(&lock, Instant::now() + timeout)
+        .context("lock shared vector base publication")?
+    {
+        // The holder may have finished publishing exactly as we gave up.
+        if let Ok(existing) = read_base(directory, &base.id, &base.contract, base.dimensions)
+            && let Ok(index) = load_base(directory, &existing)
+        {
+            return Ok(index);
+        }
+        return build_base(base, snapshot);
+    }
     // A concurrent publisher may already have finished. Never mutate a valid base.
     if let Ok(existing) = read_base(directory, &base.id, &base.contract, base.dimensions)
         && let Ok(index) = load_base(directory, &existing)
@@ -1172,6 +1190,69 @@ mod tests {
             false,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn contended_base_publication_falls_back_in_memory_within_a_bounded_wait() {
+        let dir = tempdir().unwrap();
+        let directory = dir.path().join("global").join("contract");
+        let vectors = vec![row(1, "a", &[1.0, 0.0]), row(2, "b", &[0.0, 1.0])];
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let barrier = std::sync::Barrier::new(2);
+        let (waited, published) = std::thread::scope(|scope| {
+            let (directory, vectors, barrier) = (&directory, &vectors, &barrier);
+            let worker = scope.spawn(move || {
+                // Start barrier before any fallible setup.
+                barrier.wait();
+                let result = (|| -> Result<(usize, Duration)> {
+                    let snapshot = Snapshot::new(vectors, 2)?;
+                    let base = snapshot.manifest("contract", 2)?;
+                    ready_tx.send(base.id.clone())?;
+                    let started = Instant::now();
+                    let index =
+                        publish_base(directory, &base, &snapshot, Duration::from_millis(300))?;
+                    Ok((index.size(), started.elapsed()))
+                })();
+                done_tx.send(result).expect("publication result receiver");
+            });
+            // A peer holds the per-base lock for the whole attempt.
+            let snapshot = Snapshot::new(vectors, 2).unwrap();
+            let base = snapshot.manifest("contract", 2).unwrap();
+            fs::create_dir_all(directory).unwrap();
+            let held = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.join(format!("{}.lock", base.id)))
+                .unwrap();
+            let locked = crate::registry::lock_exclusive_until(&held, Instant::now());
+            barrier.wait();
+            let id = ready_rx.recv_timeout(Duration::from_secs(10));
+            let waited = done_rx.recv_timeout(Duration::from_secs(10));
+            let unpublished = !base_manifest_path(directory, &base.id).exists();
+            // Release and join before judging any outcome.
+            drop(held);
+            worker.join().expect("publisher");
+            assert!(locked.unwrap());
+            assert_eq!(id.unwrap(), base.id);
+            assert!(unpublished, "a timed-out publisher must not publish");
+            let published =
+                publish_base(directory, &base, &snapshot, Duration::from_secs(10)).map(|index| {
+                    (
+                        index.size(),
+                        base_manifest_path(directory, &base.id).exists(),
+                    )
+                });
+            (waited, published)
+        });
+        let (size, elapsed) = waited
+            .expect("Base publication waited for the lock holder")
+            .unwrap();
+        assert_eq!(size, 2);
+        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+        assert_eq!(published.unwrap(), (2, true));
     }
 
     #[test]

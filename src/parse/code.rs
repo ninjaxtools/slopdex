@@ -1,10 +1,10 @@
 //! Tree-sitter callable extraction and recoverable syntax diagnostics.
 
-use super::syntax::{children, text, unwrap_value as unwrap};
+use super::syntax::{Descent, children, text, unwrap_value as unwrap};
 use super::{CallSite, Callable, Diagnostic, ParsedFile};
 use crate::hash;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Language, Node, Parser, Tree};
 
 pub(super) fn parse(
@@ -45,6 +45,7 @@ pub(super) fn parse(
         source,
         language,
         candidates: Vec::new(),
+        descent: Descent::default(),
     };
     if javascript {
         collector.walk_js(tree.root_node(), &[]);
@@ -52,9 +53,18 @@ pub(super) fn parse(
         collector.walk_native(tree.root_node(), &[]);
     }
     collector.candidates.sort_by_key(|c| c.node.start_byte());
+    let mut errors = diagnostics(tree.root_node(), source, &collector.candidates);
+    let structure = super::structure::extract(language, tree.root_node(), source, &mut errors);
+    if let Some(truncated) = collector.descent.truncated
+        && !errors
+            .iter()
+            .any(|error| error.message == truncated.message)
+    {
+        errors.push(truncated);
+    }
     let mut result = ParsedFile {
-        errors: diagnostics(tree.root_node(), source, &collector.candidates),
-        structure: super::structure::extract(language, tree.root_node(), source),
+        errors,
+        structure,
         ..ParsedFile::default()
     };
     collect_calls(tree.root_node(), source, language, &mut result.structure);
@@ -75,12 +85,12 @@ pub(super) fn parse(
     Ok(result)
 }
 
-fn collect_calls(
+/// The syntactic callee of a call node, with its receiver when static.
+fn call_target<'a>(
     node: Node<'_>,
-    source: &str,
+    source: &'a str,
     language: &str,
-    structure: &mut super::FileStructure,
-) {
+) -> Option<(Option<&'a str>, &'a str)> {
     let callee = match node.kind() {
         "call_expression" | "call" => node.child_by_field_name("function"),
         "method_call_expression" => node.child_by_field_name("method"),
@@ -91,71 +101,118 @@ fn collect_calls(
         "object_creation_expression" => node.child_by_field_name("type"),
         "command" if language == "bash" => node.named_child(0),
         _ => None,
+    }?;
+    let name = text(source, callee).trim_start_matches('#');
+    let (receiver, name) = if matches!(node.kind(), "method_call_expression" | "method_invocation")
+    {
+        (
+            node.child_by_field_name("receiver")
+                .or_else(|| node.child_by_field_name("object"))
+                .map(|n| text(source, n)),
+            name,
+        )
+    } else if let Some((receiver, name)) = name.rsplit_once("::") {
+        (Some(receiver), name)
+    } else if let Some((receiver, name)) = name.rsplit_once('.') {
+        (Some(receiver), name)
+    } else {
+        (None, name)
     };
-    if let Some(callee) = callee {
-        let name = text(source, callee).trim_start_matches('#');
-        let (receiver, name) =
-            if matches!(node.kind(), "method_call_expression" | "method_invocation") {
-                (
-                    node.child_by_field_name("receiver")
-                        .or_else(|| node.child_by_field_name("object"))
-                        .map(|n| text(source, n)),
-                    name,
-                )
-            } else if let Some((receiver, name)) = name.rsplit_once("::") {
-                (Some(receiver), name)
-            } else if let Some((receiver, name)) = name.rsplit_once('.') {
-                (Some(receiver), name)
-            } else {
-                (None, name)
-            };
-        let (receiver, name) = if node.kind() == "new_expression" {
-            (Some(name), "constructor")
-        } else if node.kind() == "object_creation_expression" {
-            (Some(name), name)
-        } else {
-            (receiver, name)
-        };
-        let identifier = |word: &str| {
-            !word.is_empty()
-                && word
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '#'))
-        };
-        if identifier(name)
-            && receiver.is_none_or(|r| identifier(r) || r.split("::").all(identifier))
-        {
-            let shell_owner = if language == "bash" {
-                super::syntax::shell_owner(node)
-                    .map(|owner| super::syntax::shell_range(owner).start_byte())
-            } else {
-                None
-            };
-            let owner = structure
-                .nodes
-                .iter_mut()
-                .filter(|n| {
-                    matches!(
-                        n.kind.as_str(),
-                        "function" | "method" | "constructor" | "generator"
-                    ) && n.start_byte <= node.start_byte()
-                        && node.end_byte() <= n.end_byte
-                        && (language != "bash" || shell_owner == Some(n.start_byte))
-                })
-                .min_by_key(|n| n.end_byte - n.start_byte);
-            if let Some(owner) = owner {
-                let site = CallSite {
-                    name: name.to_owned(),
-                    receiver: receiver.map(str::to_owned),
-                };
-                if !owner.calls.contains(&site) {
-                    owner.calls.push(site);
-                }
-            }
-        }
+    let (receiver, name) = if node.kind() == "new_expression" {
+        (Some(name), "constructor")
+    } else if node.kind() == "object_creation_expression" {
+        (Some(name), name)
+    } else {
+        (receiver, name)
+    };
+    // A Rust `.` call is a method call on a value, never a path; its receiver
+    // is only statically meaningful for `self`. Keeping another identifier
+    // would let a local shadowing a module (`let config = config::load();
+    // config.validate()`) resolve as that module's function.
+    if language == "rust"
+        && callee.kind() == "field_expression"
+        && receiver.is_some_and(|r| r != "self")
+    {
+        return None;
     }
-    for child in children(node) {
-        collect_calls(child, source, language, structure);
+    let identifier = |word: &str| {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '#'))
+    };
+    (identifier(name) && receiver.is_none_or(|r| identifier(r) || r.split("::").all(identifier)))
+        .then_some((receiver, name))
+}
+
+/// Attaches each static call site to its innermost enclosing callable.
+///
+/// A pre-order walk visits nodes by non-decreasing start byte, so callables
+/// sorted by start become active in one sweep and are dropped once the walk
+/// has passed their end. Call order within an owner is the walk order.
+fn collect_calls(
+    root: Node<'_>,
+    source: &str,
+    language: &str,
+    structure: &mut super::FileStructure,
+) {
+    let nodes = &mut structure.nodes;
+    let mut owners: Vec<usize> = (0..nodes.len())
+        .filter(|&id| {
+            matches!(
+                nodes[id].kind.as_str(),
+                "function" | "method" | "constructor" | "generator"
+            )
+        })
+        .collect();
+    owners.sort_by_key(|&id| {
+        (
+            nodes[id].start_byte,
+            std::cmp::Reverse(nodes[id].end_byte),
+            id,
+        )
+    });
+    let mut next = 0;
+    let mut active: Vec<usize> = Vec::new();
+    let mut seen: HashMap<usize, HashSet<(String, Option<String>)>> = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        stack.extend(children(node).into_iter().rev());
+        let Some((receiver, name)) = call_target(node, source, language) else {
+            continue;
+        };
+        while next < owners.len() && nodes[owners[next]].start_byte <= node.start_byte() {
+            active.push(owners[next]);
+            next += 1;
+        }
+        active.retain(|&id| nodes[id].end_byte >= node.start_byte());
+        let shell_owner = if language == "bash" && !active.is_empty() {
+            super::syntax::shell_owner(node)
+                .map(|owner| super::syntax::shell_range(owner).start_byte())
+        } else {
+            None
+        };
+        let owner = active
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let n = &nodes[id];
+                n.start_byte <= node.start_byte()
+                    && node.end_byte() <= n.end_byte
+                    && (language != "bash" || shell_owner == Some(n.start_byte))
+            })
+            .min_by_key(|&id| (nodes[id].end_byte - nodes[id].start_byte, id));
+        if let Some(id) = owner
+            && seen
+                .entry(id)
+                .or_default()
+                .insert((name.to_owned(), receiver.map(str::to_owned)))
+        {
+            nodes[id].calls.push(CallSite {
+                name: name.to_owned(),
+                receiver: receiver.map(str::to_owned),
+            });
+        }
     }
 }
 
@@ -186,6 +243,8 @@ struct Collector<'source, 'tree> {
     source: &'source str,
     language: &'static str,
     candidates: Vec<Candidate<'tree>>,
+    /// Bounds recursion; holds the diagnostic for a skipped region.
+    descent: Descent,
 }
 
 fn js_kind(node: Node<'_>, name: &str) -> &'static str {
@@ -281,6 +340,13 @@ impl<'tree> Collector<'_, 'tree> {
     }
 
     fn walk_js(&mut self, node: Node<'tree>, scope: &[String]) {
+        if self.descent.enter(node) {
+            self.walk_js_inner(node, scope);
+            self.descent.leave();
+        }
+    }
+
+    fn walk_js_inner(&mut self, node: Node<'tree>, scope: &[String]) {
         let source = self.source;
         match node.kind() {
             "class_declaration"
@@ -463,6 +529,13 @@ impl<'tree> Collector<'_, 'tree> {
     }
 
     fn walk_native(&mut self, node: Node<'tree>, scope: &[String]) {
+        if self.descent.enter(node) {
+            self.walk_native_inner(node, scope);
+            self.descent.leave();
+        }
+    }
+
+    fn walk_native_inner(&mut self, node: Node<'tree>, scope: &[String]) {
         let source = self.source;
         if self.language == "bash"
             && node.kind() == "redirected_statement"
@@ -728,12 +801,16 @@ impl<'tree> Collector<'_, 'tree> {
     }
 }
 
-fn contains_yield(node: Node<'_>) -> bool {
-    match node.kind() {
-        "yield" => true,
-        "function_definition" | "class_definition" | "lambda" => false,
-        _ => children(node).into_iter().any(contains_yield),
+fn contains_yield(body: Node<'_>) -> bool {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "yield" => return true,
+            "function_definition" | "class_definition" | "lambda" => {}
+            _ => stack.extend(children(node)),
+        }
     }
+    false
 }
 
 fn python_docstring<'a>(source: &'a str, body: Node<'_>) -> Option<&'a str> {

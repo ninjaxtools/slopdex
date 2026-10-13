@@ -41,6 +41,12 @@ fn run() -> Result<()> {
         }
     }
 
+    // Cheap preconditions first, so they fail before the long checks.
+    check_package_contents()?;
+    if release {
+        require_dist()?;
+    }
+
     command("cargo", &["fmt", "--all", "--", "--check"])?;
     command(
         "cargo",
@@ -103,6 +109,64 @@ fn run() -> Result<()> {
             "Cargo checks and native smoke"
         }
     );
+    Ok(())
+}
+
+/// cargo-dist is installed separately; a bare spawn failure does not say how.
+fn require_dist() -> Result<()> {
+    let install = "cargo install cargo-dist --locked --version 0.32.0";
+    match Command::new("dist").arg("--version").output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "`dist --version` failed ({}); reinstall it with `{install}`",
+            output.status
+        )
+        .into()),
+        Err(error) => Err(format!(
+            "release checks need cargo-dist's `dist` executable on PATH ({error}); install it with `{install}`"
+        )
+        .into()),
+    }
+}
+
+/// The published crate carries sources, tests, and docs; never the evaluation
+/// harnesses, artwork, or release plumbing excluded in Cargo.toml.
+fn check_package_contents() -> Result<()> {
+    let listing = capture(
+        "cargo",
+        &[
+            "package",
+            "--list",
+            "--locked",
+            "--allow-dirty",
+            "--package",
+            "slopdex",
+        ],
+    )?;
+    let files: Vec<_> = listing
+        .lines()
+        .map(|line| line.replace('\\', "/"))
+        .collect();
+    let unwanted: Vec<_> = files
+        .iter()
+        .filter(|file| {
+            ["evals/", ".github/", "npm/"]
+                .iter()
+                .any(|prefix| file.starts_with(prefix))
+                || file.ends_with(".png")
+        })
+        .collect();
+    if !unwanted.is_empty() {
+        return Err(format!(
+            "cargo package would ship excluded files (check `exclude` in Cargo.toml): {unwanted:?}"
+        )
+        .into());
+    }
+    for required in ["README.md", "LICENSE", "src/lib.rs"] {
+        if !files.iter().any(|file| file == required) {
+            return Err(format!("cargo package is missing {required}").into());
+        }
+    }
     Ok(())
 }
 

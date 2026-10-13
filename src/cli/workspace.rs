@@ -112,19 +112,39 @@ pub(super) fn config_path(root: &Path, explicit: Option<&Path>) -> Result<PathBu
     if let Some(path) = explicit {
         return absolute(path);
     }
-    let local = root.join(".slopdex/config.json");
+    let local = repository_config_path(root)?;
     if local
         .try_exists()
         .with_context(|| format!("Cannot inspect config {}", local.display()))?
     {
-        return absolute(&local);
+        return Ok(local);
     }
+    user_config_path()
+}
+
+/// `$XDG_CONFIG_HOME/slopdex/config.json`, falling back to `~/.config/slopdex/config.json`.
+pub(super) fn user_config_path() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
         .context("Cannot locate the user's config directory")?;
     Ok(base.join("slopdex/config.json"))
+}
+
+fn repository_config_path(root: &Path) -> Result<PathBuf> {
+    absolute(&root.join(".slopdex/config.json"))
+}
+
+/// Whether `selected` (from `config_path`) is the repository's own settings file
+/// rather than an explicit override or the user config. Repository settings come
+/// from whoever committed them, so provider policy treats them as untrusted.
+pub(super) fn repository_config_selected(
+    root: &Path,
+    explicit: Option<&Path>,
+    selected: &Path,
+) -> Result<bool> {
+    Ok(explicit.is_none() && selected == repository_config_path(root)?)
 }
 
 pub(super) fn index_path(root: &Path, explicit: Option<&Path>, config: &Value) -> Result<PathBuf> {

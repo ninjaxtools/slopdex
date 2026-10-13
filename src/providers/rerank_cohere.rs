@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::models::Rerank;
 
-use super::Context;
 use super::rerank::Configuration;
+use super::{COHERE, Context};
 
 pub(super) struct CohereRerank {
     context: Arc<Context>,
@@ -14,12 +14,7 @@ pub(super) struct CohereRerank {
 
 impl CohereRerank {
     pub(super) fn new(context: Arc<Context>) -> Result<Self> {
-        let config = Configuration::new(
-            &context.config,
-            "cohere",
-            "rerank-v4.0-pro",
-            "https://api.cohere.com/v2",
-        )?;
+        let config = Configuration::new(&context.config, "cohere", "rerank-v4.0-pro", COHERE)?;
         Ok(Self { context, config })
     }
 }

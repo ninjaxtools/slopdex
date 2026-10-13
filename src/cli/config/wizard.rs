@@ -222,6 +222,7 @@ pub(super) const CONFIG_KEYS: &[&str] = &[
     "exclude",
     "maxFileSize",
     "embeddingBatchSize",
+    "embeddingParallelism",
     "parallelism",
     "defaultLimit",
     "verbose",

@@ -48,10 +48,12 @@ can also follow the command. Quote multiword queries.
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
 | `update --setup` | Configure and prepare embeddings only, save the selected settings, then update. Embedding flags make setup noninteractive. | JSON refresh statistics |
 | `generate descriptions` | Refresh normally, then explicitly generate missing or stale file and callable descriptions from indexed source. | JSON statistics |
+| `cache prune [--vacuum]` | Delete obsolete snapshot manifests and unused lock files from the global artifact store without opening an index; `--vacuum` also returns freed space to the filesystem. | JSON maintenance report |
+| `help [<command>...]` | Print the long help for the program or for one command path, e.g. `help search` or `help index errors`. | Help text |
 | `help models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
 | `config [prefix]` | Configure matching settings interactively without opening an index. | Updated-setting summary |
 | `config embeddings` | Focused embedding setup without opening an index; `--provider`, `--model`, and `--dimensions` are saved rather than temporary. | Updated-setting summary |
-| `config set <key> <value>` | Set a configuration value directly; JSON literals support booleans, numbers, arrays and objects. | Updated-setting summary |
+| `config set <key> <value>` | Set a documented configuration key directly; JSON literals support booleans, numbers, arrays and objects. Unknown keys are rejected with the closest documented names. | Updated-setting summary |
 
 Configuration examples:
 
@@ -67,8 +69,17 @@ slopdex config set rerankingEnabled true
 slopdex config set parallelism 10
 ```
 
-`config set` validates configuration values before writing; values that are not JSON
-literals are saved as strings. The global `--model` selects the embedding model.
+`config set` accepts only documented top-level keys (the interactive keys, the
+advanced keys in the table below, the documented aliases, and dotted
+`artifactS3.<field>` paths); an unknown key is rejected before anything is written,
+naming the closest documented keys. Values are validated before writing; values
+that are not JSON literals are saved as strings. Every CLI rendering of saved
+settings (`config set` output, `config embeddings --output json`, the wizard
+summary) shows `<redacted>` for any key ending in `ApiKey`; the file itself keeps
+the value. The global `--model` selects the embedding model.
+Argument and option problems detected after parsing (for example `--pull` without
+embedding setup, or `help <unknown command>`) exit with status 2 like other usage
+errors; runtime failures exit with status 1.
 Description configuration selects the models used by explicit
 `generate descriptions` and task explanations; saving it does not generate descriptions.
 Interactive configuration requires terminal stdin/stderr; it asks
@@ -133,11 +144,16 @@ no API key or hosted request until embeddings are actually needed.
 
 Saved digests pin model identity. If an installed tag changes, embedding requests
 fail with re-setup guidance rather than mixing old and new vectors. Rerun setup to
-refresh the digest. Switching embedding providers resets inherited model,
-dimensions, endpoint, and Ollama metadata; switching models resets dimensions
-and resolved identity. Explicit CLI dimensions take priority. `config set provider`
-and `config set model` also invalidate dependent settings, but remain offline and
-do not prepare or download models.
+refresh the digest. Switching embedding providers (`--provider`, the wizard, or
+`config set provider`) removes exactly `model`, `dimensions`, `embeddingBaseUrl`,
+`embeddingParallelism`, `ollamaAutoPull`, `ollamaKeepAlive`, `ollamaPullTimeoutMs`,
+and the resolved identity (`ollamaModelDigest`, `ollamaNativeDimensions`,
+`ollamaContextLength`), then sets the new provider's default model and known
+dimensions. Credentials (`embeddingApiKey` and provider `*ApiKey` keys) and all
+other settings are kept. Switching models resets `dimensions` and the resolved
+identity only. Explicit CLI dimensions take priority. `config set provider` and
+`config set model` use the same rules, but remain offline and do not prepare or
+download models.
 
 Ollama inference is local-only, requires no cloud credentials, and never falls
 back to a hosted embedding service. Model downloads still need network access;
@@ -153,7 +169,7 @@ Search commands and cross-search require an existing resolved index; run
 `map` refreshes only local structure when indexed, or parses directly when the
 index is missing. With an existing index, `map -q` lazily prepares symbol-name
 vectors and query vectors using the embedding provider or cache. Without an
-index, map warns on stdout that `-q` is ignored and proceeds with local mapping.
+index, map warns on stderr that `-q` is ignored and proceeds with local mapping.
 Semantic refresh prepares missing embeddings and reuses available descriptions,
 without generating descriptions. Only `generate descriptions` generates indexed
 file/callable descriptions.
@@ -207,8 +223,9 @@ output. It creates no database, lock files, cache directories, or sidecars, even
 with `--no-reindex`, and works without Git. Ignore/include/exclude rules and
 `maxFileSize` still apply.
 If `-q` is supplied, map prints `slopdex: warning: no active index; -q is ignored.`
-to stdout before the map output, including with `--output json`. All symbol
-queries are ignored; other selectors, paths, and detail settings still apply.
+to stderr; stdout carries only the map output, so `--output json` stays
+parseable. All symbol queries are ignored; other selectors, paths, and detail
+settings still apply.
 
 With an existing index, map normally refreshes local file snapshots, declarations,
 headings, search units, and diagnostics in SQLite. `map --no-reindex` reads stored
@@ -252,6 +269,22 @@ extracted from indexed source; only uniquely resolved static targets, including
 supported explicit imports, form edges. Dynamic receivers and unresolved calls
 do not create speculative links. Run without `--no-reindex` once after upgrading
 to build the new call metadata.
+
+Resolution is language-aware. A bare name reaches enclosing functions and
+namespaces and the file's top level; in Python, JavaScript, and TypeScript it
+never reaches a method of an enclosing class or object, while Java, Go, C, and
+Rust keep their nested member rules. `Type::name()` and `Type.name()` resolve to a
+static member of a class, struct, interface, enum, module, or Rust `impl` block
+(generic arguments and `impl Trait for Type` are matched by type name); a Rust
+method without a `self` receiver counts as static. Rust `.` calls are method calls
+on values and are recorded only for `self`, so a local shadowing an imported
+module (`let config = config::load(); config.validate()`) creates no edge.
+Through imports, `receiver.name()` reaches a module-level function only when the
+receiver is a namespace binding: Rust/Python/Java/Go paths, JavaScript `import *
+as`, or `import x = require()`; a JavaScript named or default import is a value.
+Rust `super::` paths resolve relative to the importing file's module (`b.rs` and
+`b/mod.rs` layouts), and Go imports resolve package functions in the directory
+named by the import path's last segment.
 
 `--expand-callers N` and `--expand-callees N` also traverse up to N edges, and
 include the full indexed code of related callables at those depths in text output,
@@ -341,6 +374,17 @@ file objects with `path` and `nodes`, retaining full selected metadata: file-loc
 `id`/`parentId`, kind, names, `qualifiedName`, signature, attributes, import
 bindings, heading level, and source ranges. Byte offsets are zero-based and
 half-open; lines and UTF-8 byte columns are one-based with exclusive ends.
+Heading names collapse internal whitespace (a setext title spanning lines is one
+line in `name` and `qualifiedName`); an empty heading such as a bare `#` is named
+`<anonymous@line:column>` like an anonymous code declaration, while `signature`
+keeps the heading text verbatim.
+
+Extremely deep syntax nesting (more than 512 levels, or fewer when the parser's
+stack budget is reached first; for example thousands of nested parentheses or
+brackets in generated code) is not descended: declarations below that point are
+skipped and the file receives a diagnostic instead of crashing the indexer. Call
+sites are still collected, and configuration and markup structure is walked
+iteratively without a depth limit.
 
 ```bash
 slopdex map src docs -g '*.rs' -g '*.md'
@@ -572,8 +616,9 @@ HEAD, every indexed file uses working-tree provenance.
 `--uncommitted` selects **all callables in those working-tree files**, including
 unchanged siblings. `--changed-since` (engine option `changedSince`) resolves the
 reference to a commit and requires it to be an ancestor of the saved checkpoint.
-It parses each current callable's path at that commit and compares the pair
-`(qualifiedName, sourceHash)`. New paths, renamed symbols, and edited callable
+It parses each current callable's path at that commit, converted as a checkout
+would write it (`core.autocrlf`, `eol`/`ident` attributes, and smudge filters;
+requires Git 2.11+), and compares the pair `(qualifiedName, sourceHash)`. New paths, renamed symbols, and edited callable
 source are selected; line-number-only shifts are not. Missing/unreadable base
 paths count as having no matching symbols. Removed callables cannot be sources
 because they are absent from the current index. Combined source filters intersect.
@@ -748,6 +793,9 @@ five times the effective result limit, or all retrieved threshold-passing candid
 without a limit. OpenAI receives up to
 `min(100, max(limit or 100, rerankerCandidates))`; the configured candidate count
 defaults to `10`. With `--limit none` the OpenAI retrieval cap is still **100**.
+When a finite limit is at least that candidate cap and more candidates passed
+the thresholds than were reranked, the output is reported as limited even
+though fewer rows than the limit are shown.
 Query JSON retains `similarity` and adds `rerankScore`.
 For multi-query general `search`, reranking and its candidate budget apply to
 each query independently before the best rows are merged and the overall output
@@ -844,8 +892,8 @@ caches. Native schema **4** has normalized `files`, `symbols`, `symbol_names`,
 `search_units`, `unit_embeddings`, `descriptions`, and `diagnostics` tables, plus
 `metadata` and `search_cache`. File records bind paths to source hashes; embedding
 and description records bind live occurrences to global artifact keys. Source
-text, parse artifacts, document/query vectors, provider artifacts, description
-content, and immutable snapshot manifests are authoritative in the attached global
+text, parse artifacts, document/query vectors, provider artifacts, and description
+content are authoritative in the attached global
 SQLite store, not duplicated paid-artifact caches in each worktree. Both databases
 are needed to read the saved snapshot; a workspace database alone is not a portable
 index. Structural metadata retains JSON where appropriate.
@@ -859,7 +907,9 @@ work is persisted before final live publication, so retries after an interrupted
 refresh can reuse it. Live changes update the generation and invalidate search
 results without discarding those reusable artifacts. Published content has an
 immutable snapshot digest covering bindings and relevant parser/profile/policy
-contracts. Automatic garbage collection is not implemented.
+contracts. Only the digest is saved, in the worktree index; the document it hashes
+is never stored. Automatic garbage collection is not implemented; see
+[pruning the global store](#pruning-the-global-store).
 
 Repository relatedness is tracked separately. Linked worktrees are related through
 their canonical common Git directory; observed history roots and full commit IDs
@@ -872,7 +922,7 @@ never establish cache validity: reuse still depends on exact content and contrac
 The per-user store at `$XDG_CACHE_HOME/slopdex/global-v1.sqlite` is the one
 authoritative local artifact store shared across worktrees and repositories. It
 holds source and parse artifacts, embeddings, description content and generation
-records, rerankings, explanations, and immutable snapshot manifests. A provider
+records, rerankings, and explanations. A provider
 artifact lookup checks this store, then S3 (if configured), before calling a
 provider. Remote hits are validated and written to the same global store; live
 worktree records reference their keys rather than copying their payloads. A failed
@@ -889,8 +939,8 @@ before using the answer; a missing object is a cache miss. S3 content objects
 are created conditionally, so repeated uploads do not create new versions of
 an existing prompt. The prompt contains
 source text (a whole file for file descriptions), so anyone with bucket access
-can read these content objects and vectors. Source/parse storage and snapshot
-manifests are local; Git metadata, search results, and USearch files are not uploaded.
+can read these content objects and vectors. Source/parse storage
+is local; Git metadata, search results, and USearch files are not uploaded.
 
 S3 is best effort: missing objects, outages, and failed uploads cannot prevent
 provider work. Missing keys are fetched with bounded concurrency (up to 10), one
@@ -919,7 +969,9 @@ workspace indexes, `artifacts-v2.sqlite`, or legacy description caches.
 Parse, embedding, and description misses use per-artifact locks and recheck the
 global store after acquiring them, preventing duplicate work across concurrent
 worktrees. Locks remain held through local persistence, with a bounded 30-second
-wait; unrelated artifact keys can proceed independently.
+wait; unrelated artifact keys can proceed independently. A lock file under
+`<global-store>.locks` exists only while its artifact is being computed or awaited
+and is removed on release.
 
 Example config fields (credentials come from standard AWS
 environment variables or credentials files, not this JSON):
@@ -945,9 +997,11 @@ is omitted. An explicit override that conflicts with an existing binding require
 a new index path; `--force-reindex` does not change the binding. The workspace and
 global SQLite paths must differ. An unavailable or incompatible store is not
 silently replaced, migrated, or seeded from a workspace index.
-To run the MinIO integration test against a local server with
-`minioadmin`/`minioadmin` credentials, set `SLOPDEX_MINIO_ENDPOINT` (for example,
-`SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 cargo test --test rust_integration minio_shares_artifacts`).
+The MinIO integration test is ignored by default. To run it against a local
+server with `minioadmin`/`minioadmin` credentials, set `SLOPDEX_MINIO_ENDPOINT`
+and pass `--ignored` (for example,
+`SLOPDEX_MINIO_ENDPOINT=http://127.0.0.1:9000 cargo test --locked --test rust_integration minio_shares_artifacts -- --ignored`);
+it fails if the variable is unset.
 
 Derived vector indexes are opened lazily per channel. Each content group has its
 own worktree pointer beside the database: `<index>.code.shared.json`,
@@ -975,6 +1029,52 @@ exclusive for writers. Contention waits up to 10 seconds before an index-in-use
 error; retry after it finishes. Operations needing writes can reopen writable and
 retry. SQLite uses WAL and a 30-second busy timeout. See [architecture](implementation.md#architecture-and-code-map)
 for transaction and sidecar publication details.
+
+### Pruning the global store
+
+```bash
+slopdex cache prune            # delete obsolete rows and lock files, report sizes
+slopdex cache prune --vacuum   # also shrink the database file
+```
+
+`cache prune` maintains the global artifact store selected by `artifactCachePath`
+(otherwise the per-user default). It opens no index, calls no provider, and never
+runs implicitly. It fails if the store does not exist rather than creating one.
+
+Earlier versions saved a complete snapshot manifest in the store's `snapshots`
+table on every changed refresh; current versions save only the digest in the
+worktree index. Prune deletes all of those rows, removes lock files under
+`<global-store>.locks` that no process holds (earlier versions never deleted
+them), and truncates the write-ahead log. Embeddings, descriptions, sources, parse
+artifacts, and every worktree index are untouched, so nothing needs re-indexing.
+
+The JSON report contains:
+
+| Field | Meaning |
+| --- | --- |
+| `store` | Canonical store path. |
+| `snapshotRowsDeleted` | Snapshot manifest rows removed by this run. |
+| `lockFilesRemoved`, `lockFilesBusy` | Lock files deleted, and those skipped because a process holds them. |
+| `walTruncated` | `false` when a concurrent reader prevented resetting the write-ahead log; rerun later. |
+| `databaseBytes` | Size of the main database file after the run. |
+| `reclaimableBytes` | Free space inside the database. New artifacts reuse it; only a vacuum returns it to the filesystem. |
+| `vacuumed` | Whether this run vacuumed. |
+| `vacuumRequiredFreeBytes`, `availableBytes` | Free disk space `--vacuum` needs, and what the store's filesystem has. |
+
+Without `--vacuum` the database file keeps its size and the freed pages are reused
+as the store grows. `--vacuum` rewrites the database, which needs free space of
+about twice the remaining live data on the store's filesystem (SQLite's temporary
+copy and its write-ahead log) plus the live data in SQLite's temporary directory
+(`SQLITE_TMPDIR`, `TMPDIR`, `/var/tmp`, `/usr/tmp`, `/tmp`). The space is checked
+first; with too little, the command fails with the required and available byte
+counts and rewrites nothing. Run plain `cache prune` first to see
+`vacuumRequiredFreeBytes`.
+
+Prune is safe while other slopdex processes use the store: rows are deleted in
+small transactions and held lock files are skipped. It waits at most 10 seconds
+for another writer and then reports that the store is busy; rerun it. A vacuum
+holds the store's writer lock for its whole duration, so run `--vacuum` when no
+other process is indexing.
 
 ### Descriptions
 
@@ -1046,7 +1146,7 @@ the flag's value on every invocation.
 index it parses current files directly; with an existing index it uses saved structure.
 With an existing index, adding `-q` may populate name/description/query vectors and repair
 the separate symbol channel pointer/base, using a provider when artifacts are missing.
-Without an index, map warns on stdout that `-q` is ignored and parses current
+Without an index, map warns on stderr that `-q` is ignored and parses current
 files directly, including with `--no-reindex`.
 A structure-only index can have search units without vectors; `--no-reindex`
 does not prepare those missing vectors. Run a semantic command with normal
@@ -1061,7 +1161,7 @@ does not reset structural data, and cached vectors from older profiles remain
 available for reuse. Within schema 4, changing the root requires
 `--force-reindex --yes-really-rebuild-the-index`. This clears native live records,
 non-identity metadata, and search results while retaining the global-store binding
-and global artifacts/vectors/snapshots.
+and global artifacts/vectors.
 A compatible index follows normal refresh even with that flag. It conflicts with
 `--no-reindex`. `--rebuild-on-divergence` is accepted with the same confirmation,
 but the current engine refreshes the working tree without a divergence gate;
@@ -1120,7 +1220,28 @@ and declarations for these formats.
 
 The ignore walker uses current root/nested `.gitignore`, Git exclude/global
 rules, and ignore-file rules, including without a Git repository. Config
-`include`/`exclude` globs further narrow repository-relative paths. Built-in
+`include`/`exclude` globs further narrow repository-relative paths; a path is
+indexed when it matches no `exclude` pattern and, if `include` is non-empty, at
+least one `include` pattern.
+
+Config globs and `-g`/`--glob` use **different pattern dialects**:
+
+| | Config `include`/`exclude` | `-g`, `--glob` |
+| --- | --- | --- |
+| Syntax | Plain glob over the whole root-relative path | gitignore-style override rule |
+| `*`, `?` | Also match `/`: `src/*.rs` matches `src/a/b.rs` | Stop at `/`: `src/*.rs` does not match `src/a/b.rs` |
+| Pattern without `/` | Must match the entire path: `*.rs` still matches at any depth only because `*` crosses `/`; `test.rs` matches only a root-level `test.rs` | Matches the basename at any depth: `test.rs` matches `a/test.rs` |
+| Leading `/` | Literal; never matches (indexed paths have no leading `/`) | Anchors the pattern to the root |
+| Directory name (`src`, `src/`) | Never matches a file below it; write `src/**` | Never matches a file below it either (selectors test file paths only); write `src/**` |
+| `**` | Any number of directories as a whole path component (`**/x`, `a/**/b`, `a/**`) | Same |
+| Negation | None: `!` is a literal character; use `exclude` | `!pattern` excludes; the last matching rule wins |
+
+To get config behaviour that does not cross directories, spell out the directory
+part: `src/*.rs` in `-g` corresponds to no single config glob, while config
+`**/fixtures/**` and `-g '**/fixtures/**'` select the same files. Both dialects
+are case-sensitive and support `[abc]` classes and `{a,b}` alternation.
+
+Built-in
 excluded directories are `.git`, `.slopdex`, `node_modules`, `dist`, `build`,
 `coverage`, `vendor`, `generated`, `.venv`, `venv`, `__pycache__`, `.tox`,
 `.mypy_cache`, `.pytest_cache`, and `target`. Generated dependency lock files are
@@ -1136,7 +1257,13 @@ these files or pruned directories. Refresh removes deleted/newly excluded entrie
 including lock files indexed by an older version.
 
 Read/UTF-8/size failures and parser diagnostics are saved; healthy callable
-siblings remain searchable where parsing permits. `maxFileSize` defaults to
+siblings remain searchable where parsing permits, and description generation
+skips only files that could not be read. Saved diagnostics do not make an
+unchanged file stale: parser diagnostics are reused for identical content, and
+a failed read is retried when the file's metadata or `maxFileSize` changes.
+Indexed paths are UTF-8: files and directories whose names are not valid UTF-8
+are skipped with a warning, as are subdirectories that cannot be read; the
+selected root itself must be readable. `maxFileSize` defaults to
 1 MiB. `index errors` reports path, message, source mode, and available line
 locations. `status` reports `indexingErrorCount` and `failedFileCount`.
 Index-using commands warn about saved errors, including with `--no-reindex` and
@@ -1178,7 +1305,9 @@ the removed description enablement setting is rejected. All configuration
 updates, including `config set` and exclusion edits, write the selected file.
 Embedding-only interactive setup may explicitly select repository settings instead;
 an explicit `--config` always wins. Writes preserve other unknown properties and replace the
-JSON file through a synced temporary file. To create repository-specific settings,
+JSON file through a synced temporary file. On Unix the replacement keeps the
+existing file's permission bits; a file that contains any `*ApiKey` value is
+written owner-only (`0600`, or narrower if it already was). To create repository-specific settings,
 use `slopdex --config .slopdex/config.json config`; subsequent commands select
 that existing file automatically.
 
@@ -1213,10 +1342,13 @@ Example `config.json` (user or repository settings):
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
 | `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`, Ollama `8` (maximum `64`); larger configured values are capped. The full config wizard defaults to `8` for Ollama and `32` otherwise; embedding-only setup leaves batching defaults to the provider. |
-| `embeddingBaseUrl`, `descriptionBaseUrl`, `rerankerBaseUrl` | Operation-specific HTTP(S) endpoint overrides; JSON only. Hosted APIs include the API version, e.g. `http://localhost:8080/v1`. Ollama uses the API base, default `http://localhost:11434/api`, not a bare server URL. |
+| `embeddingBaseUrl`, `descriptionBaseUrl`, `rerankerBaseUrl` | Operation-specific HTTP(S) endpoint overrides; JSON only. Hosted APIs include the API version, e.g. `http://localhost:8080/v1`. Ollama uses the API base, default `http://localhost:11434/api`, not a bare server URL. For hosted providers, a host other than the provider default and loopback must use `https` and is named once per process on stderr; see [repository settings and remote endpoints](#repository-settings-and-remote-endpoints). |
+| `allowInsecureEndpoints` | Boolean, default `false`. Permits plain `http` hosted endpoints on non-loopback hosts (for example an internal gateway). The custom-host warning still applies. |
+| `trustedEndpointHosts` | Array of host names (optionally `host:port`), read from the **user** config only. Lets a repository `.slopdex/config.json` route environment/stored API keys to those remote endpoints; `--trust-repo-endpoints` allows every host for one invocation. |
+| `jinaTask` | Jina `task` family: `code` (default for `jina-embeddings-v4`), `retrieval` (default for v3), `none` (default for v2, omits the field), `text-matching`, or another family such as `nl2code`; families expand to `<family>.query`/`<family>.passage`. Models of an unknown generation require it. A configured value becomes part of the embedding profile. |
 | `ollamaAutoPull` | Boolean, default `false`. Allows a missing local embedding model to be downloaded during preparation. Explicit setup `--pull` saves `true`. |
 | `ollamaKeepAlive` | Non-empty string, default `"5m"`; Ollama model residency setting. |
-| `ollamaModelDigest`, `ollamaModelFamily` | Non-empty strings resolved and saved by setup; the digest pins cache/model identity. Re-setup refreshes them. |
+| `ollamaModelDigest` | Non-empty string resolved and saved by setup; pins cache/model identity. Re-setup refreshes it. The input strategy derives from the model name; a legacy `ollamaModelFamily` value is ignored and removed on the next provider/model switch. |
 | `ollamaNativeDimensions` | Positive integer resolved by a smoke embedding; distinct from requested output `dimensions`. |
 | `ollamaContextLength` | Positive integer; setup defaults to the smaller of the model's reported maximum and `8192`, and rejects a value above that maximum. |
 | `ollamaPullTimeoutMs` | Positive download timeout in milliseconds, default `1800000` (30 minutes). Separate from ordinary provider request timeout. |
@@ -1236,8 +1368,13 @@ identify the configured primary with `strategyVersion: "file-conversation-v3"`,
 even while fallback serves requests, and include configured endpoint/fallback
 information. Generation reuse includes settings, system instruction, and the
 complete ordered effective conversation.
-Credentials are not profile inputs. Content embedding profiles are independent
-of the description-generator profile.
+Credentials are not profile inputs. A configured endpoint enters profiles (and
+therefore `status` output and shared-index identity) without its query string,
+so routing or tenant parameters are never persisted or printed; the request
+itself keeps them. Hosted profiles omit default endpoints entirely, so existing
+indexes and caches built with default endpoints keep their identity; an index
+built with a custom endpoint that carried a query string receives a new profile
+once. Content embedding profiles are independent of the description-generator profile.
 
 Minimal hand-written Ollama configurations can omit resolved identity fields.
 Semantic preparation discovers them on first use, and subsequent warm updates
@@ -1265,5 +1402,41 @@ Credentials are resolved only when needed, in this order:
 Prefer environment/stored credentials to committing keys in root config.
 Description failover and empty-output recovery allow at most six total attempts,
 without nested HTTP retries; invalid shared credentials (401) and redirects stop
-failover. See [implementation](implementation.md) for retry details and developer
-checks.
+failover. A description truncated at the model's output limit (`finish_reason:
+length`, `stop_reason: max_tokens`, Gemini `MAX_TOKENS`, or Responses `status:
+incomplete`) or a Gemini `promptFeedback.blockReason` is never retried with the
+same request: the configured fallback model is tried once, otherwise the request
+fails immediately with a message naming the cause. Genuinely empty outputs keep
+the bounded retry. See [implementation](implementation.md) for retry details and
+developer checks.
+
+### Repository settings and remote endpoints
+
+A repository's committed `.slopdex/config.json` is selected automatically, so its
+author decides where requests go. slopdex therefore treats it as untrusted for
+provider policy:
+
+- Any hosted provider operation whose base URL points at a host other than the
+  provider default (and not loopback) prints one stderr warning per process
+  naming the host, and `(set by the repository config)` when that file supplied
+  it. Loopback hosts (`localhost`, `127.0.0.1`, `::1`) are local proxies and are
+  never reported.
+- Such hosts must be reached over `https`; set `allowInsecureEndpoints: true` to
+  permit plain `http` deliberately.
+- When the selected settings are the repository file (not `--config`, not the user
+  config) and it supplies such an endpoint, slopdex refuses to combine that
+  endpoint with credentials the file did not supply itself: environment variables
+  (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`) and the
+  stored OpenCode `auth.json`. The error names the host and the credential
+  source. To allow it, either add the host to `trustedEndpointHosts` in your user
+  config (`slopdex --config "$XDG_CONFIG_HOME/slopdex/config.json" config set
+  trustedEndpointHosts '["gateway.example.com"]'`; `host:port` entries match an
+  explicit port), pass `--trust-repo-endpoints` for one invocation, or put the key
+  into the repository config, where it travels with the endpoint. A
+  `trustedEndpointHosts` list inside the repository file is ignored.
+- Ollama endpoints are local inference and keep their separate non-loopback
+  warning; they never carry credentials.
+
+The loader marks repository settings with the reserved `configOrigin:
+"repository"` key (and `trustRepositoryEndpoints` for the flag) in the effective
+configuration only; `config set` rejects these keys and they are never written.

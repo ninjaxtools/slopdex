@@ -5,6 +5,18 @@ edition = "2024"
 license = "MIT"
 description = "Semantic code and Markdown search with SQLite and USearch"
 repository = "https://github.com/ninjaxtools/slopdex"
+# Let-chains need 1.88; the locked tree-sitter-language 0.1.8 needs 1.90.
+rust-version = "1.90"
+# Keep evaluation harnesses, artwork, and release plumbing out of the crate.
+exclude = [
+    "/evals/",
+    "/*.png",
+    "/.github/",
+    "/npm/",
+    "/dist-workspace.toml",
+    "/release.toml",
+    "/.gitmodules",
+]
 
 [workspace]
 members = ["xtask"]

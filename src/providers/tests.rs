@@ -1213,13 +1213,8 @@ fn description_protocols_join_only_public_text_in_order() {
 }
 
 #[test]
-fn incomplete_descriptions_retry_even_when_transport_retries_are_disabled() {
+fn unfinished_descriptions_retry_even_when_transport_retries_are_disabled() {
     for (model, incomplete, complete) in [
-        (
-            "gpt-5",
-            json!({"status": "incomplete", "output_text": "partial"}),
-            response("complete"),
-        ),
         (
             "gpt-5",
             json!({"status": "failed", "output_text": "partial"}),
@@ -1228,6 +1223,30 @@ fn incomplete_descriptions_retry_even_when_transport_retries_are_disabled() {
         (
             "gpt-5",
             json!({"status": "cancelled", "output_text": "partial"}),
+            response("complete"),
+        ),
+    ] {
+        let mock = Mock::new(vec![(200, incomplete), (200, complete)]);
+        let mut config = mock.config();
+        config["descriptionProvider"] = json!("opencode");
+        config["descriptionModel"] = json!(model);
+        config["providerMaxRetries"] = json!(0);
+        assert_eq!(
+            Providers::new(&config).unwrap().describe("s", "p").unwrap(),
+            "complete",
+            "{model}"
+        );
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
+    }
+}
+
+fn truncated_description_cases() -> Vec<(&'static str, Value, Value)> {
+    vec![
+        (
+            "gpt-5",
+            json!({"status": "incomplete", "output_text": "partial"}),
             response("complete"),
         ),
         (
@@ -1245,12 +1264,42 @@ fn incomplete_descriptions_retry_even_when_transport_retries_are_disabled() {
             json!({"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "partial"}]}}]}),
             json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "complete"}]}}]}),
         ),
-    ] {
-        let mock = Mock::new(vec![(200, incomplete), (200, complete)]);
+        (
+            "gemini-3.8-flash",
+            json!({"promptFeedback": {"blockReason": "SAFETY"}, "candidates": []}),
+            json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "complete"}]}}]}),
+        ),
+    ]
+}
+
+#[test]
+fn truncated_descriptions_fail_once_without_repeating_the_same_body() {
+    for (model, truncated, _) in truncated_description_cases() {
+        let mock = Mock::new(vec![(200, truncated), (200, response("never requested"))]);
         let mut config = mock.config();
         config["descriptionProvider"] = json!("opencode");
         config["descriptionModel"] = json!(model);
-        config["providerMaxRetries"] = json!(0);
+        let error = Providers::new(&config)
+            .unwrap()
+            .describe("s", "p")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot complete") || error.contains("cannot succeed"),
+            "{model}: {error}"
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 1, "{model}");
+    }
+}
+
+#[test]
+fn truncated_descriptions_fail_over_to_the_configured_fallback_model() {
+    for (model, truncated, complete) in truncated_description_cases() {
+        let mock = Mock::new(vec![(200, truncated), (200, complete)]);
+        let mut config = mock.config();
+        config["descriptionProvider"] = json!("opencode");
+        config["descriptionModel"] = json!(model);
+        config["descriptionFallbackModel"] = json!(model.to_owned() + "-backup");
         assert_eq!(
             Providers::new(&config).unwrap().describe("s", "p").unwrap(),
             "complete",
@@ -1258,8 +1307,245 @@ fn incomplete_descriptions_retry_even_when_transport_retries_are_disabled() {
         );
         let requests = mock.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].body, requests[1].body);
+        // Gemini names the model in the path, the other protocols in the body.
+        assert_ne!(
+            (&requests[0].path, &requests[0].body),
+            (&requests[1].path, &requests[1].body)
+        );
     }
+    // Truncation on both models stops after one attempt each.
+    let mock = Mock::new(vec![
+        (
+            200,
+            json!({"choices": [{"finish_reason": "length", "message": {"content": "a"}}]}),
+        );
+        DESCRIPTION_ATTEMPTS
+    ]);
+    let mut config = mock.config();
+    config["descriptionProvider"] = json!("opencode");
+    config["descriptionModel"] = json!("deepseek-v4");
+    config["descriptionFallbackModel"] = json!("deepseek-v4-backup");
+    assert!(Providers::new(&config).unwrap().describe("s", "p").is_err());
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn null_retry_settings_mean_defaults() {
+    let mock = Mock::new(vec![]);
+    let mut config = mock.config();
+    config["providerMaxRetries"] = Value::Null;
+    config["retryDelayMs"] = Value::Null;
+    let http = Http::new(&config).unwrap();
+    assert_eq!(http.retries, 2);
+    assert!(Providers::new(&config).is_ok());
+}
+
+#[test]
+fn profiles_record_custom_endpoints_without_query_strings() {
+    let mock = Mock::new(vec![]);
+    let mut config = mock.config();
+    config["embeddingBaseUrl"] = json!(format!("{}/embeddings?route=tenant&token=x", mock.base));
+    config["descriptionBaseUrl"] = json!(format!("{}?token=y", mock.base));
+    let p = Providers::new(&config).unwrap();
+    assert_eq!(
+        p.embedding_profile()["endpoint"],
+        format!("{}/embeddings", mock.base)
+    );
+    assert_eq!(p.description_profile()["endpoint"], mock.base);
+    assert!(!p.embedding_profile().to_string().contains("token"));
+    assert!(!p.description_profile().to_string().contains("token"));
+    let plain = Providers::new(&mock.config()).unwrap();
+    assert_eq!(
+        plain.embedding_profile()["endpoint"],
+        format!("{}/embeddings", mock.base)
+    );
+    // Default endpoints are not part of the profile, so existing caches stay valid.
+    let default = Providers::new(&json!({"dimensions": 2})).unwrap();
+    assert!(default.embedding_profile().get("endpoint").is_none());
+    assert!(default.description_profile().get("endpoint").is_none());
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn remote_custom_endpoints_require_https_unless_explicitly_allowed() {
+    for key in ["embeddingBaseUrl", "descriptionBaseUrl"] {
+        let insecure = json!({key: "http://gateway.example.invalid/v1", "dimensions": 2});
+        let error = Providers::new(&insecure)
+            .err()
+            .expect("plain http remote endpoint accepted")
+            .to_string();
+        assert!(error.contains("https") && error.contains(key), "{error}");
+        let mut allowed = insecure.clone();
+        allowed["allowInsecureEndpoints"] = json!(true);
+        assert!(Providers::new(&allowed).is_ok());
+        let secure = json!({key: "https://gateway.example.invalid/v1", "dimensions": 2});
+        assert!(Providers::new(&secure).is_ok());
+    }
+    // Loopback and the provider defaults are exempt.
+    for base in [
+        "http://127.0.0.1:9/v1",
+        "http://localhost:9/v1",
+        "http://[::1]:9/v1",
+        OPENAI,
+        "https://api.openai.com/v1/",
+    ] {
+        assert!(
+            Providers::new(&json!({"embeddingBaseUrl": base, "dimensions": 2})).is_ok(),
+            "{base}"
+        );
+    }
+    let mut config = json!({"rerankerProvider": "cohere", "rerankerBaseUrl": "http://gateway.example.invalid/v2"});
+    assert!(Providers::new(&config).unwrap().reranker().is_err());
+    config["allowInsecureEndpoints"] = json!(true);
+    assert!(Providers::new(&config).unwrap().reranker().is_ok());
+    assert_eq!(
+        remote_custom_endpoint(
+            &json!({"rerankerBaseUrl": COHERE}),
+            "rerankerBaseUrl",
+            COHERE
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        remote_custom_endpoint(
+            &json!({"rerankerBaseUrl": "https://Gateway.Example.invalid:8443/v2?x=1"}),
+            "rerankerBaseUrl",
+            COHERE
+        )
+        .unwrap()
+        .map(|url| host_label(&url)),
+        Some("gateway.example.invalid:8443".into())
+    );
+}
+
+#[test]
+fn repository_configs_cannot_route_foreign_credentials_to_their_own_endpoints() {
+    let environment = |name: &str| match name {
+        "OPENAI_API_KEY" => Some("env-secret".to_owned()),
+        "OPENCODE_API_KEY" => None,
+        _ => None,
+    };
+    let stored = |provider: &str| (provider == "opencode").then(|| "stored-secret".to_owned());
+    let remote = json!({
+        CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY,
+        "embeddingBaseUrl": "https://gateway.example.invalid/v1",
+        "descriptionBaseUrl": "https://gateway.example.invalid:8443/zen/v1",
+    });
+    for (operation, provider, source) in [
+        ("embeddingApiKey", "openai", "OPENAI_API_KEY"),
+        ("descriptionApiKey", "opencode", "stored opencode/auth.json"),
+    ] {
+        let error = resolve_api_key(&remote, operation, provider, environment, stored)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repository config"), "{error}");
+        assert!(error.contains(source), "{error}");
+        assert!(error.contains("trustedEndpointHosts"), "{error}");
+        assert!(error.contains("--trust-repo-endpoints"), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+    }
+    // Keys supplied by the same file travel with its endpoints.
+    let mut own = remote.clone();
+    own["openaiApiKey"] = json!("repo-secret");
+    assert_eq!(
+        resolve_api_key(&own, "embeddingApiKey", "openai", environment, stored).unwrap(),
+        "repo-secret"
+    );
+    // Trust from the user config (host, with or without port) or the CLI flag.
+    for hosts in [
+        json!(["gateway.example.invalid"]),
+        json!([" Gateway.Example.Invalid:8443 ", "other.invalid"]),
+    ] {
+        let mut trusted = remote.clone();
+        trusted["trustedEndpointHosts"] = hosts;
+        assert_eq!(
+            resolve_api_key(
+                &trusted,
+                "descriptionApiKey",
+                "opencode",
+                environment,
+                stored
+            )
+            .unwrap(),
+            "stored-secret"
+        );
+    }
+    let mut trusted = remote.clone();
+    trusted["trustedEndpointHosts"] = json!(["gateway.example.invalid"]);
+    assert!(resolve_api_key(&trusted, "embeddingApiKey", "openai", environment, stored).is_ok());
+    let mut flagged = remote.clone();
+    flagged[TRUST_REPOSITORY_ENDPOINTS_KEY] = json!(true);
+    assert_eq!(
+        resolve_api_key(&flagged, "embeddingApiKey", "openai", environment, stored).unwrap(),
+        "env-secret"
+    );
+    // Default, loopback, and non-repository endpoints are unaffected.
+    for config in [
+        json!({CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY}),
+        json!({CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY, "embeddingBaseUrl": "http://127.0.0.1:9/v1"}),
+        json!({CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY, "embeddingBaseUrl": "https://api.openai.com/v1/custom"}),
+        json!({"embeddingBaseUrl": "https://gateway.example.invalid/v1"}),
+    ] {
+        assert_eq!(
+            resolve_api_key(&config, "embeddingApiKey", "openai", environment, stored).unwrap(),
+            "env-secret",
+            "{config}"
+        );
+    }
+}
+
+#[test]
+fn jina_tasks_follow_the_model_generation_or_explicit_configuration() {
+    use vector_jina::tasks;
+    assert_eq!(
+        tasks(&json!({}), "jina-embeddings-v4").unwrap(),
+        Some(("code.query".into(), "code.passage".into()))
+    );
+    assert_eq!(
+        tasks(&json!({}), "jina-embeddings-v3").unwrap(),
+        Some(("retrieval.query".into(), "retrieval.passage".into()))
+    );
+    assert_eq!(
+        tasks(&json!({}), "jina-embeddings-v2-base-code").unwrap(),
+        None
+    );
+    assert!(tasks(&json!({}), "jina-code-embeddings-1.5b").is_err());
+    assert_eq!(
+        tasks(&json!({"jinaTask": "nl2code"}), "jina-code-embeddings-1.5b").unwrap(),
+        Some(("nl2code.query".into(), "nl2code.passage".into()))
+    );
+    assert_eq!(
+        tasks(&json!({"jinaTask": "text-matching"}), "jina-embeddings-v4").unwrap(),
+        Some(("text-matching".into(), "text-matching".into()))
+    );
+    assert_eq!(
+        tasks(&json!({"jinaTask": "none"}), "jina-embeddings-v4").unwrap(),
+        None
+    );
+    assert!(tasks(&json!({"jinaTask": "Code Query"}), "jina-embeddings-v4").is_err());
+    let unknown =
+        json!({"provider": "jina", "model": "jina-code-embeddings-1.5b", "dimensions": 2});
+    assert!(Providers::new(&unknown).is_err());
+    let mut configured = unknown.clone();
+    configured["jinaTask"] = json!("nl2code");
+    let p = Providers::new(&configured).unwrap();
+    assert_eq!(p.embedding_profile()["task"], "nl2code");
+    let default = Providers::new(&json!({"provider": "jina", "dimensions": 2})).unwrap();
+    assert!(default.embedding_profile().get("task").is_none());
+}
+
+#[test]
+fn ada_dimension_mismatch_fails_at_construction() {
+    let error = Providers::new(&json!({"model": "text-embedding-ada-002", "dimensions": 256}))
+        .err()
+        .expect("ada-002 dimension mismatch accepted")
+        .to_string();
+    assert!(error.contains("1536"), "{error}");
+    assert!(Providers::new(&json!({"model": "text-embedding-ada-002"})).is_ok());
+    assert!(
+        Providers::new(&json!({"model": "text-embedding-ada-002", "dimensions": 1536})).is_ok()
+    );
 }
 
 #[test]

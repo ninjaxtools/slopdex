@@ -28,6 +28,8 @@ pub(super) struct Failure {
     pub(super) retryable: bool,
     pub(super) can_failover: bool,
     pub(super) empty_output: bool,
+    /// The request never produced a server response (connect, send, or timeout).
+    pub(super) transport: bool,
     pub(super) retry_after: Option<Duration>,
 }
 
@@ -38,6 +40,7 @@ impl Failure {
             retryable,
             can_failover: true,
             empty_output: false,
+            transport: false,
             retry_after: None,
         }
     }
@@ -47,7 +50,28 @@ impl Failure {
             ..Self::new(message, true)
         }
     }
+    /// Repeating the identical request cannot help (truncated or blocked output);
+    /// another configured model may still succeed.
+    pub(super) fn permanent(message: &str) -> Self {
+        Self::new(message, false)
+    }
 }
+
+/// Error returned by the shared request loop; `transport` lets callers add
+/// connectivity hints without matching message text.
+#[derive(Debug)]
+pub(super) struct RequestError {
+    message: String,
+    pub(super) transport: bool,
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Provider request failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for RequestError {}
 
 pub(super) struct Http {
     client: Client,
@@ -101,7 +125,8 @@ impl Http {
 
     pub(super) fn new(config: &Value) -> Result<Self> {
         let timeout = positive(config, &["providerTimeoutMs"], 60_000)?.min(300_000);
-        let retries = match config.get("providerMaxRetries") {
+        // Null means unset, as for the other optional settings.
+        let retries = match config.get("providerMaxRetries").filter(|v| !v.is_null()) {
             Some(value) => value
                 .as_u64()
                 .filter(|n| *n <= 5)
@@ -109,7 +134,7 @@ impl Http {
                 as usize,
             None => 2,
         };
-        let delay = match config.get("retryDelayMs") {
+        let delay = match config.get("retryDelayMs").filter(|v| !v.is_null()) {
             Some(value) => value
                 .as_u64()
                 .ok_or_else(|| anyhow!("retryDelayMs must be a nonnegative integer"))?
@@ -155,7 +180,11 @@ impl Http {
                 Ok(value) => return Ok(value),
                 Err(failure) => {
                     if !failure.retryable || attempt == self.retries {
-                        return Err(anyhow!("Provider request failed: {}", failure.message));
+                        return Err(RequestError {
+                            message: failure.message,
+                            transport: failure.transport,
+                        }
+                        .into());
                     }
                     self.wait(attempt, failure.retry_after);
                 }
@@ -178,8 +207,9 @@ impl Http {
             .headers(headers.clone())
             .header("accept", "application/json")
             .send()
-            .map_err(|e| {
-                Failure::new(
+            .map_err(|e| Failure {
+                transport: true,
+                ..Failure::new(
                     if e.is_timeout() {
                         "Provider request timed out"
                     } else {

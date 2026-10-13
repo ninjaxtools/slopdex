@@ -4,8 +4,8 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::ErrorKind,
-    path::Path,
+    io::{ErrorKind, Write},
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -25,7 +25,10 @@ CREATE INDEX IF NOT EXISTS global.repositories_family ON repositories(family);
 CREATE TABLE IF NOT EXISTS global.family_evidence(evidence TEXT PRIMARY KEY,family TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS global.family_evidence_family ON family_evidence(family);
 ";
-const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Kinds whose lock file is a fixed, never-retired path. Store initialization
+/// is a correctness lock shared with binaries that never unlink lock files.
+const PERSISTENT_KINDS: [&str; 1] = ["store"];
 
 /// Register once per checkout incarnation. Cached calls use filesystem identity
 /// and one indexed family lookup, without invoking Git or traversing history.
@@ -281,17 +284,124 @@ fn fingerprint(root: &Path, identity: &Value) -> Result<String> {
     ]))?))
 }
 
+/// A held per-artifact lock. Dropping it releases the lock and retires its file,
+/// so `<store>.locks` holds only locks that are currently held or awaited.
+pub(crate) struct ArtifactLock {
+    file: fs::File,
+    path: PathBuf,
+    persistent: bool,
+}
+
+impl Drop for ArtifactLock {
+    fn drop(&mut self) {
+        if !self.persistent {
+            retire(&self.file, &self.path);
+        }
+        release(&self.file);
+    }
+}
+
+/// Unlink a lock file while its lock is held, then mark the orphaned file so a
+/// waiter that already opened it retries on a fresh file instead of sharing a
+/// name with nobody. Unlinking only ever happens under the file's own lock.
+fn retire(file: &fs::File, path: &Path) -> bool {
+    if fs::remove_file(path).is_err() {
+        // Still reachable and unmarked: it simply remains a usable lock file.
+        return false;
+    }
+    let mut file = file;
+    let _ = file.write_all(b"retired");
+    true
+}
+
+/// Unlock explicitly rather than by closing. A child process forked by another
+/// thread briefly inherits every open descriptor, and a lock that is only
+/// released by the last close would outlive its guard until that child execs.
+fn release(file: &fs::File) {
+    let _ = FileExt::unlock(file);
+}
+
+/// Whether a locked file is still the one its path names. A retired file is
+/// nonempty; on Unix the identity check also covers a holder that died between
+/// unlinking and marking, and files removed by anything else.
+fn live(file: &fs::File, path: &Path) -> bool {
+    let Ok(held) = file.metadata() else {
+        return false;
+    };
+    if held.len() != 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path)
+            .is_ok_and(|current| current.dev() == held.dev() && current.ino() == held.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// Poll for an exclusive advisory lock until `deadline`. `Ok(false)` reports a
+/// timeout; the caller decides whether that is an error or a fallback.
+pub(crate) fn lock_exclusive_until(file: &fs::File, deadline: Instant) -> std::io::Result<bool> {
+    loop {
+        match FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(true),
+            // Windows reports ERROR_LOCK_VIOLATION, which is not necessarily
+            // mapped to WouldBlock. Compare fs2's native contention code too.
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock
+                    || error.raw_os_error().is_some_and(|code| {
+                        Some(code) == fs2::lock_contended_error().raw_os_error()
+                    }) =>
+            {
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn lock_directory(global_path: &Path) -> PathBuf {
+    let mut directory = global_path.as_os_str().to_owned();
+    directory.push(".locks");
+    PathBuf::from(directory)
+}
+
+fn lock_file_name(kind: &str, key: &str) -> Result<String> {
+    Ok(format!("{}.lock", hash(serde_json::to_vec(&[kind, key])?)))
+}
+
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .open(path)
+}
+
 /// Acquire only around the provider request/artifact computation. After acquiring,
 /// recheck the artifact cache: another process may have filled it while we waited.
-/// Dropping the returned file releases the lock. Lock files must not be unlinked
-/// during GC, since waiters could otherwise lock a different inode for the same key.
-pub(crate) fn artifact_lock(db: &Database, kind: &str, key: &str) -> Result<fs::File> {
+/// Dropping the returned guard releases the lock and retires its file.
+pub(crate) fn artifact_lock(db: &Database, kind: &str, key: &str) -> Result<ArtifactLock> {
     lock_path(db.global_path(), kind, key)
 }
 
 /// Database-independent accessor for parallel workers: capture the global path,
 /// not a borrowed SQLite connection. It must be the store's canonical path.
-pub(crate) fn lock_path(global_path: &Path, kind: &str, key: &str) -> Result<fs::File> {
+///
+/// Locks are per exact `(kind, key)`, so unrelated artifacts never contend. A
+/// thread that needs several keys of one kind must use [`lock_paths`]: taking
+/// them one by one in caller order can deadlock against another batch.
+pub(crate) fn lock_path(global_path: &Path, kind: &str, key: &str) -> Result<ArtifactLock> {
     ensure!(
         !kind.is_empty()
             && kind.len() <= 64
@@ -304,41 +414,114 @@ pub(crate) fn lock_path(global_path: &Path, kind: &str, key: &str) -> Result<fs:
         !key.is_empty() && key.len() <= 4096 && !key.chars().any(char::is_control),
         "Invalid artifact key"
     );
-    let mut directory = global_path.as_os_str().to_owned();
-    directory.push(".locks");
-    let directory = std::path::PathBuf::from(directory);
+    let directory = lock_directory(global_path);
     fs::create_dir_all(&directory)?;
     ensure!(directory.is_dir(), "Artifact lock path is not a directory");
-    let path = directory.join(format!("{}.lock", hash(serde_json::to_vec(&[kind, key])?)));
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("Open artifact lock {}", path.display()))?;
-    let started = Instant::now();
+    let path = directory.join(lock_file_name(kind, key)?);
+    let persistent = PERSISTENT_KINDS.contains(&kind);
+    let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
-        match FileExt::try_lock_exclusive(&file) {
-            Ok(()) => return Ok(file),
-            // Windows reports ERROR_LOCK_VIOLATION, which is not necessarily
-            // mapped to WouldBlock. Compare fs2's native contention code too.
+        let file = match open_lock_file(&path, true) {
+            Ok(file) => file,
+            // Windows keeps a retired file's name reserved until its last
+            // handle closes; creating the replacement is refused meanwhile.
             Err(error)
-                if error.kind() == ErrorKind::WouldBlock
-                    || error.raw_os_error().is_some_and(|code| {
-                        Some(code) == fs2::lock_contended_error().raw_os_error()
-                    }) =>
+                if cfg!(windows)
+                    && error.kind() == ErrorKind::PermissionDenied
+                    && Instant::now() < deadline =>
             {
-                ensure!(
-                    started.elapsed() < LOCK_TIMEOUT,
-                    "Timed out waiting for artifact lock {kind}:{key}"
-                );
                 thread::sleep(Duration::from_millis(20));
+                continue;
             }
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error).context("Acquire artifact lock"),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Open artifact lock {}", path.display()));
+            }
+        };
+        ensure!(
+            lock_exclusive_until(&file, deadline).context("Acquire artifact lock")?,
+            "Timed out waiting for artifact lock {kind}:{key}"
+        );
+        if persistent || live(&file, &path) {
+            return Ok(ArtifactLock {
+                file,
+                path,
+                persistent,
+            });
         }
+        // The previous holder retired this file while we waited on it. The
+        // lock we just took protects nothing; retry on the current file.
+        ensure!(
+            Instant::now() < deadline,
+            "Timed out waiting for artifact lock {kind}:{key}"
+        );
     }
+}
+
+/// Acquire several keys of one kind for a single batch. Keys are deduplicated,
+/// because locking one file through two descriptors of the same process would
+/// wait on itself, and taken in sorted key order, so overlapping batches in any
+/// thread or process cannot deadlock each other.
+pub(crate) fn lock_paths<'a>(
+    global_path: &Path,
+    kind: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<ArtifactLock>> {
+    keys.into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|key| lock_path(global_path, kind, key))
+        .collect()
+}
+
+/// Remove lock files nobody holds, including those left by binaries that never
+/// retired them. Returns `(removed, busy)`. A file is removed only under its own
+/// exclusive lock and with the same retirement marking as a normal release, so
+/// concurrent lockers of this version stay correct. The store initialization
+/// lock is permanent and is never removed.
+pub(crate) fn prune_locks(global_path: &Path) -> Result<(u64, u64)> {
+    let directory = lock_directory(global_path);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Read {}", directory.display()));
+        }
+    };
+    let mut persistent = Vec::new();
+    for kind in PERSISTENT_KINDS {
+        persistent.push(lock_file_name(kind, "initialize")?);
+    }
+    let (mut removed, mut busy) = (0, 0);
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".lock") else {
+            continue;
+        };
+        if stem.len() != 64
+            || !stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || persistent.iter().any(|keep| keep == name)
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        let path = entry.path();
+        // Never create: a file retired since the listing must stay gone.
+        let Ok(file) = open_lock_file(&path, false) else {
+            continue;
+        };
+        if !lock_exclusive_until(&file, Instant::now()).unwrap_or(false) {
+            busy += 1;
+            continue;
+        }
+        if live(&file, &path) && retire(&file, &path) {
+            removed += 1;
+        }
+        release(&file);
+    }
+    Ok((removed, busy))
 }
 
 #[cfg(test)]
@@ -655,14 +838,209 @@ mod tests {
                 Ok(())
             });
             ready_rx.recv_timeout(Duration::from_secs(5))?;
-            assert!(matches!(
-                done_rx.recv_timeout(Duration::from_millis(100)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ));
+            let waited = done_rx.recv_timeout(Duration::from_millis(100));
             drop(held);
-            done_rx.recv_timeout(Duration::from_secs(5))?;
+            // Release and join before judging, so a regression cannot strand
+            // the worker for the full lock timeout.
+            let finished = done_rx.recv_timeout(Duration::from_secs(5));
             worker.join().unwrap()?;
+            assert!(matches!(waited, Err(mpsc::RecvTimeoutError::Timeout)));
+            finished?;
             Ok(())
         })
+    }
+
+    fn lock_files(global: &Path) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(lock_directory(global))? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    #[test]
+    fn released_locks_leave_no_files_however_many_distinct_keys_are_used() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let global = fixture.path("global.sqlite");
+        for round in 0..400 {
+            let key = hash(format!("key-{round}"));
+            let single = lock_path(&global, "embedding", &key)?;
+            assert_eq!(lock_files(&global)?.len(), 1);
+            drop(single);
+        }
+        let keys: Vec<_> = (0..300).map(|key| hash(format!("batch-{key}"))).collect();
+        let batch = lock_paths(&global, "embedding", keys.iter().map(String::as_str))?;
+        assert_eq!(lock_files(&global)?.len(), keys.len());
+        drop(batch);
+        assert!(lock_files(&global)?.is_empty());
+        // The permanent initialization lock is the only file that may remain.
+        drop(lock_path(&global, "store", "initialize")?);
+        drop(lock_path(&global, "store", "initialize")?);
+        assert_eq!(
+            lock_files(&global)?,
+            [lock_file_name("store", "initialize")?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_with_repeated_keys_does_not_wait_on_itself() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let global = fixture.path("global.sqlite");
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = lock_paths(&global, "embedding", ["b", "a", "b", "a", "c", "b"])
+                .map(|locks| locks.len());
+            done_tx.send(result).expect("batch result receiver");
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(10));
+        // On a regression the worker self-blocks until its own lock timeout;
+        // it is still joined before the failure is reported.
+        worker.join().unwrap();
+        assert_eq!(
+            result.context("A batch waited on its own repeated key")??,
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_batches_and_single_keys_exclude_without_deadlock() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let global = fixture.path("global.sqlite");
+        let keys = ["a", "b", "c", "d", "e"];
+        let held: Vec<_> = keys
+            .iter()
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect();
+        let barrier = std::sync::Barrier::new(8);
+        let results: Vec<Result<()>> = thread::scope(|scope| {
+            let workers: Vec<_> = (0..8usize)
+                .map(|worker| {
+                    let (global, held, barrier) = (&global, &held, &barrier);
+                    scope.spawn(move || -> Result<()> {
+                        barrier.wait();
+                        for round in 0..60usize {
+                            // Batches request overlapping keys in conflicting
+                            // caller orders; every third request is one key.
+                            let mut wanted: Vec<usize> = if (worker + round) % 3 == 0 {
+                                vec![(worker + round) % keys.len()]
+                            } else {
+                                (0..3).map(|i| (worker + round + i) % keys.len()).collect()
+                            };
+                            if worker % 2 == 0 {
+                                wanted.reverse();
+                            }
+                            let locks = if wanted.len() == 1 {
+                                vec![lock_path(global, "embedding", keys[wanted[0]])?]
+                            } else {
+                                lock_paths(global, "embedding", wanted.iter().map(|&i| keys[i]))?
+                            };
+                            for &index in &wanted {
+                                ensure!(
+                                    !held[index].swap(true, std::sync::atomic::Ordering::SeqCst),
+                                    "Two holders of key {}",
+                                    keys[index]
+                                );
+                            }
+                            thread::yield_now();
+                            for &index in &wanted {
+                                held[index].store(false, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            drop(locks);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            // Join every worker before propagating any failure.
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("lock worker"))
+                .collect()
+        });
+        results.into_iter().collect::<Result<Vec<_>>>()?;
+        assert!(lock_files(&global)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_removes_only_unheld_legacy_lock_files() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let global = fixture.path("global.sqlite");
+        assert_eq!(prune_locks(&global)?, (0, 0));
+        let directory = lock_directory(&global);
+        fs::create_dir_all(&directory)?;
+        // Files as older binaries left them: empty, never unlinked.
+        let legacy: Vec<_> = (0..20)
+            .map(|index| directory.join(format!("{}.lock", hash(format!("legacy-{index}")))))
+            .collect();
+        for path in &legacy {
+            fs::write(path, "")?;
+        }
+        let unrelated = [
+            directory.join("notes.txt"),
+            directory.join("short.lock"),
+            directory.join(format!("{}.lock", "z".repeat(64))),
+        ];
+        for path in &unrelated {
+            fs::write(path, "")?;
+        }
+        fs::create_dir(directory.join(format!("{}.lock", hash("directory"))))?;
+        drop(lock_path(&global, "store", "initialize")?);
+        // An old binary holds one legacy file; a current one holds a live key.
+        let old_holder = open_lock_file(&legacy[0], false)?;
+        assert!(lock_exclusive_until(&old_holder, Instant::now())?);
+        let current = lock_path(&global, "embedding", "live")?;
+        assert_eq!(prune_locks(&global)?, (19, 2));
+        assert!(legacy[0].exists());
+        assert!(legacy[1..].iter().all(|path| !path.exists()));
+        assert!(unrelated.iter().all(|path| path.exists()));
+        assert!(
+            directory
+                .join(lock_file_name("store", "initialize")?)
+                .exists()
+        );
+        // The surviving holders still exclude new lockers of the same file.
+        assert!(!lock_exclusive_until(
+            &open_lock_file(&legacy[0], false)?,
+            Instant::now()
+        )?);
+        // An explicit unlock is immediate even if a child forked by a parallel
+        // test still holds an inherited copy of the descriptor.
+        release(&old_holder);
+        drop((old_holder, current));
+        assert_eq!(prune_locks(&global)?, (1, 0));
+        assert_eq!(prune_locks(&global)?, (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_waiter_on_a_retired_file_moves_to_the_current_lock() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let global = fixture.path("global.sqlite");
+        let held = lock_path(&global, "description", "key")?;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::scope(|scope| -> Result<()> {
+            let worker = scope.spawn(|| -> Result<()> {
+                ready_tx.send(())?;
+                // Opens the file `held` is about to retire, then waits on it.
+                let lock = lock_path(&global, "description", "key")?;
+                done_tx.send(())?;
+                drop(lock);
+                Ok(())
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5))?;
+            thread::sleep(Duration::from_millis(100));
+            drop(held);
+            let finished = done_rx.recv_timeout(Duration::from_secs(5));
+            worker.join().unwrap()?;
+            finished?;
+            Ok(())
+        })?;
+        assert!(lock_files(&global)?.is_empty());
+        Ok(())
     }
 }

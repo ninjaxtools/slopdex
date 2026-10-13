@@ -9,16 +9,18 @@ mod workspace;
 pub(crate) use output::describe_search_context;
 
 use self::{
-    args::{Cli, Command, Format, GenerateAction, HelpTopic, IndexAction},
-    config::{effective_config, run_config},
+    args::{
+        CacheAction, Cli, Command, Format, GenerateAction, HelpTopic, IndexAction, help_command,
+    },
+    config::{effective_config, mark_repository_config, run_config},
     io::{print_json, with_stdout},
     output::{
         CrossOutput, Presentation, print_cross, print_errors, print_limit_notice, print_map,
         print_search,
     },
     workspace::{
-        SourceWorkspace, absolute, config_path, index_path, map_workspaces, require_index,
-        root_path, same_path, source_workspace,
+        SourceWorkspace, absolute, config_path, index_path, map_workspaces,
+        repository_config_selected, require_index, root_path, same_path, source_workspace,
     },
 };
 use crate::{
@@ -122,7 +124,17 @@ pub fn report_error(error: &anyhow::Error) {
 /// Execute the CLI; main owns reporting runtime errors and selecting the failure exit code.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    cli.validate()?;
+    if let Err(error) = cli.validate() {
+        // Post-parse argument problems are usage errors: report them like clap
+        // (message plus usage on stderr) and exit with status 2.
+        use clap::CommandFactory;
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ValueValidation,
+                format!("{error:#}"),
+            )
+            .exit();
+    }
     let stdout = stdio::stdout();
     with_stdout(stdout.lock(), |out| run_cli(&cli, out))
 }
@@ -217,6 +229,13 @@ fn run_workspace(
         Cli::command().write_long_help(&mut out)?;
         return Ok(());
     }
+    if let Command::Help {
+        topic: Some(HelpTopic::Command(path)),
+    } = &cli.command
+    {
+        help_command(path)?.write_long_help(&mut out)?;
+        return Ok(());
+    }
     let root = &workspace.root;
     let mut config_file = config_path(root, cli.global.config.as_deref())?;
     if let Command::Config { args } = &cli.command {
@@ -237,6 +256,10 @@ fn run_workspace(
     }
 
     let mut config = effective_config(&cli.global, &config_file)?;
+    // Settings committed to the repository are untrusted for provider policy.
+    if repository_config_selected(root, cli.global.config.as_deref(), &config_file)? {
+        mark_repository_config(&mut config, &cli.global)?;
+    }
     if let Command::Map(args) = &cli.command {
         // The first selected workspace supplies the default for this command;
         // later workspace defaults cannot reset the shared declaration budget.
@@ -252,6 +275,15 @@ fn run_workspace(
                 config[key] = json!(directory.join(path));
             }
         }
+    }
+    if let Command::Cache {
+        action: CacheAction::Prune { vacuum },
+    } = &cli.command
+    {
+        let report = ui::spin("Pruning global artifact store", || {
+            crate::cache::prune(&config, *vacuum)
+        })?;
+        return print_json(&mut out, &serde_json::to_value(report)?);
     }
     let index = index_path(root, cli.global.index.as_deref(), &config)?;
     if let Command::CrossSearch(args) = &cli.command
@@ -278,7 +310,8 @@ fn run_workspace(
             .context("Repository root does not exist")?;
         ensure!(root.is_dir(), "Repository root is not a directory");
         if !args.selection.symbol_query.is_empty() {
-            writeln!(out, "slopdex: warning: no active index; -q is ignored.")?;
+            // Diagnostics stay off stdout so `--output json` remains parseable.
+            ui::warning("slopdex: warning: no active index; -q is ignored.");
         }
         let Some(mut options) =
             args.existing_options(&root, &workspace.paths, cli.global.detail)?
@@ -481,6 +514,13 @@ fn run_workspace(
                 } else {
                     let target_path = config_path(&target_root, args.target_config.as_deref())?;
                     let mut target_config = effective_config(&cli.global, &target_path)?;
+                    if repository_config_selected(
+                        &target_root,
+                        args.target_config.as_deref(),
+                        &target_path,
+                    )? {
+                        mark_repository_config(&mut target_config, &cli.global)?;
+                    }
                     target_config["indexPath"] = json!(target_index);
                     let mut opened = ui::spin("Opening target index", || {
                         Engine::open(&target_root, &target_index, target_config.clone())
@@ -553,7 +593,7 @@ fn run_workspace(
             })?;
             print_json(&mut out, &result)?
         }
-        Command::Config { .. } | Command::Help { .. } => unreachable!(),
+        Command::Cache { .. } | Command::Config { .. } | Command::Help { .. } => unreachable!(),
     }
     Ok(())
 }

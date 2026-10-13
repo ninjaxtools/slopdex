@@ -274,6 +274,192 @@ pub(crate) fn open_store(path: &Path, readonly: bool) -> Result<Connection> {
     Ok(conn)
 }
 
+/// How long maintenance waits for another writer before reporting the store busy.
+const PRUNE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Rows per deletion transaction: keeps each writer lock brief for live users.
+const PRUNE_BATCH_ROWS: i64 = 16;
+const VACUUM_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Result of [`prune`]. All sizes are bytes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneReport {
+    pub store: PathBuf,
+    /// Obsolete snapshot manifest rows removed by this run.
+    pub snapshot_rows_deleted: u64,
+    pub lock_files_removed: u64,
+    /// Lock files left alone because another process holds them.
+    pub lock_files_busy: u64,
+    /// False when a concurrent reader prevented resetting the write-ahead log.
+    pub wal_truncated: bool,
+    /// Size of the main database after this run.
+    pub database_bytes: u64,
+    /// Free pages inside the database: reused by future artifacts, and returned
+    /// to the filesystem only by a vacuum.
+    pub reclaimable_bytes: u64,
+    pub vacuumed: bool,
+    /// Free disk space a vacuum needs, and what the store's filesystem has.
+    pub vacuum_required_free_bytes: u64,
+    pub available_bytes: u64,
+}
+
+struct StoreSize {
+    database: u64,
+    reclaimable: u64,
+}
+
+fn store_size(conn: &Connection) -> Result<StoreSize> {
+    let (page, pages, free): (i64, i64, i64) = conn.query_row(
+        "SELECT page_size,page_count,freelist_count FROM pragma_page_size,pragma_page_count,pragma_freelist_count",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let (page, pages, free) = (
+        u64::try_from(page)?,
+        u64::try_from(pages)?,
+        u64::try_from(free)?,
+    );
+    Ok(StoreSize {
+        database: page * pages,
+        reclaimable: page * free,
+    })
+}
+
+/// Where SQLite places the temporary database a vacuum builds.
+fn sqlite_temporary_directory() -> PathBuf {
+    #[cfg(unix)]
+    {
+        let named = ["SQLITE_TMPDIR", "TMPDIR"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from);
+        let fixed = ["/var/tmp", "/usr/tmp", "/tmp"]
+            .into_iter()
+            .map(PathBuf::from);
+        named
+            .chain(fixed)
+            .find(|path| path.is_dir())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+    #[cfg(not(unix))]
+    std::env::temp_dir()
+}
+
+/// Explicit, user-invoked maintenance of the global artifact store selected by
+/// `config`. It never runs implicitly.
+///
+/// Snapshot manifests are no longer written or read, so every `snapshots` row is
+/// removed; lock files nobody holds are deleted; the write-ahead log is reset.
+/// Deleted rows become free pages that later artifacts reuse. Returning them to
+/// the filesystem needs `vacuum`, which rewrites the whole database and is
+/// refused, before anything is rewritten, unless enough disk space is free.
+///
+/// Concurrent users are safe: deletion runs in small transactions, waits a
+/// bounded time for other writers, and reports a busy store instead of hanging.
+/// A vacuum holds the writer lock for its whole duration and is best run while
+/// no other slopdex process is indexing.
+pub fn prune(config: &Value, vacuum: bool) -> Result<PruneReport> {
+    prune_within(config, vacuum, PRUNE_BUSY_TIMEOUT)
+}
+
+fn prune_within(config: &Value, vacuum: bool, busy_timeout: Duration) -> Result<PruneReport> {
+    let path = store_path(config)?;
+    anyhow::ensure!(
+        path.is_file(),
+        "No global artifact store at {}",
+        path.display()
+    );
+    // Validates the layout under the store's initialization lock.
+    let conn = open_store(&path, false)
+        .with_context(|| format!("Cannot open global artifact store {}", path.display()))?;
+    let path = std::fs::canonicalize(path)?;
+    conn.busy_timeout(busy_timeout)?;
+    let busy = |error: rusqlite::Error| {
+        let contended = matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        );
+        let error = anyhow::Error::from(error);
+        if contended {
+            error.context(format!(
+                "The global artifact store {} is busy; retry when no other slopdex process is writing to it",
+                path.display()
+            ))
+        } else {
+            error
+        }
+    };
+    let mut snapshot_rows_deleted = 0;
+    loop {
+        let deleted = conn
+            .execute(
+                "DELETE FROM snapshots WHERE digest IN (SELECT digest FROM snapshots LIMIT ?)",
+                [PRUNE_BATCH_ROWS],
+            )
+            .map_err(busy)?;
+        if deleted == 0 {
+            break;
+        }
+        snapshot_rows_deleted += deleted as u64;
+    }
+    let (lock_files_removed, lock_files_busy) = registry::prune_locks(&path)?;
+    // The pragma reports contention in its first column rather than failing.
+    let checkpoint = |conn: &Connection| {
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .is_ok_and(|blocked| blocked == 0)
+    };
+    let mut wal_truncated = checkpoint(&conn);
+    let mut size = store_size(&conn)?;
+    // A vacuum writes a complete temporary copy and then the complete result
+    // through the write-ahead log beside the store.
+    let live = size.database - size.reclaimable;
+    let vacuum_required_free_bytes = live.saturating_mul(2).saturating_add(VACUUM_MARGIN_BYTES);
+    let directory = path
+        .parent()
+        .context("Global artifact store has no parent")?;
+    let available_bytes = fs2::available_space(directory)?;
+    if vacuum {
+        anyhow::ensure!(
+            available_bytes >= vacuum_required_free_bytes,
+            "Not enough free disk space to vacuum {}: about {} bytes must be free in {} (twice the {} bytes of live data, for SQLite's temporary copy and write-ahead log), but only {} are available. Nothing was rewritten; the {} freed bytes stay reusable by new artifacts without a vacuum.",
+            path.display(),
+            vacuum_required_free_bytes,
+            directory.display(),
+            live,
+            available_bytes,
+            size.reclaimable
+        );
+        let temporary = sqlite_temporary_directory();
+        let temporary_required = live.saturating_add(VACUUM_MARGIN_BYTES);
+        let temporary_available = fs2::available_space(&temporary)?;
+        anyhow::ensure!(
+            temporary_available >= temporary_required,
+            "Not enough free disk space to vacuum {}: SQLite's temporary directory {} needs about {} bytes free but has {}. Set SQLITE_TMPDIR to a directory with enough space. Nothing was rewritten.",
+            path.display(),
+            temporary.display(),
+            temporary_required,
+            temporary_available
+        );
+        conn.execute_batch("VACUUM;").map_err(busy)?;
+        wal_truncated = checkpoint(&conn);
+        size = store_size(&conn)?;
+    }
+    Ok(PruneReport {
+        store: path,
+        snapshot_rows_deleted,
+        lock_files_removed,
+        lock_files_busy,
+        wal_truncated,
+        database_bytes: size.database,
+        reclaimable_bytes: size.reclaimable,
+        vacuumed: vacuum,
+        vacuum_required_free_bytes,
+        available_bytes,
+    })
+}
+
 /// The shared cache is independent of any workspace's root, generation, or item IDs.
 pub struct Artifacts {
     local: Connection,
@@ -929,6 +1115,119 @@ mod tests {
         drop(tx);
         worker.join().expect("store opener");
         result.context("Opening an initialized WAL store waited for the artifact writer")??;
+        Ok(())
+    }
+
+    fn store_file_bytes(path: &Path) -> Result<u64> {
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    #[test]
+    fn prune_drops_snapshot_manifests_and_stale_locks_and_vacuum_shrinks_the_store() -> Result<()> {
+        let (dir, config, db, _artifacts) = fixture()?;
+        let store = db.global_path().to_owned();
+        db.put_embedding(&hash("kept"), &[1.0, 0.0])?;
+        db.cache_put("parse", &hash("kept"), "kept artifact")?;
+        // Rows as binaries that still persisted manifests left them.
+        let manifest = "m".repeat(256 * 1024);
+        for row in 0..40 {
+            db.conn.execute(
+                "INSERT INTO global.snapshots VALUES(?,?)",
+                params![hash(format!("snapshot-{row}")), manifest],
+            )?;
+        }
+        let locks = PathBuf::from(format!("{}.locks", store.display()));
+        let stale = locks.join(format!("{}.lock", hash("stale")));
+        std::fs::write(&stale, "")?;
+        let held = registry::lock_path(&store, "embedding", "held")?;
+        assert!(
+            prune(
+                &serde_json::json!({"artifactCachePath":dir.path().join("missing.sqlite")}),
+                false
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("No global artifact store")
+        );
+        assert!(!dir.path().join("missing.sqlite").exists());
+
+        let report = prune(&config, false)?;
+        assert_eq!(report.store, store);
+        assert_eq!(report.snapshot_rows_deleted, 40);
+        assert_eq!((report.lock_files_removed, report.lock_files_busy), (1, 1));
+        assert!(!stale.exists());
+        assert!(!report.vacuumed);
+        assert!(report.wal_truncated);
+        assert!(report.reclaimable_bytes >= 40 * 200 * 1024, "{report:?}");
+        assert!(
+            report.vacuum_required_free_bytes
+                >= 2 * (report.database_bytes - report.reclaimable_bytes)
+        );
+        // Without a vacuum the file keeps its size; the pages are only free.
+        assert_eq!(store_file_bytes(&store)?, report.database_bytes);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT count(*) FROM global.snapshots", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        drop(held);
+
+        let again = prune(&config, true)?;
+        assert_eq!(again.snapshot_rows_deleted, 0);
+        assert_eq!((again.lock_files_removed, again.lock_files_busy), (0, 0));
+        assert!(again.vacuumed && again.wal_truncated);
+        assert_eq!(again.reclaimable_bytes, 0);
+        assert!(
+            again.database_bytes < report.database_bytes - report.reclaimable_bytes / 2,
+            "{again:?}"
+        );
+        assert_eq!(store_file_bytes(&store)?, again.database_bytes);
+        // Artifacts survive and the live connection keeps working.
+        assert_eq!(db.embedding(&hash("kept"))?, Some(vec![1.0, 0.0]));
+        assert_eq!(
+            db.cache("parse", &hash("kept"))?.as_deref(),
+            Some("kept artifact")
+        );
+        db.cache_put("parse", &hash("after"), "written after pruning")?;
+        open_store(&store, false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prune_reports_a_busy_store_without_hanging_or_deleting() -> Result<()> {
+        let (_dir, config, db, _artifacts) = fixture()?;
+        db.conn.execute(
+            "INSERT INTO global.snapshots VALUES(?,?)",
+            params![hash("snapshot"), "manifest"],
+        )?;
+        let writer = open_store(db.global_path(), false)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &writer,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        tx.execute("INSERT INTO sources VALUES('pending','not committed')", [])?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = prune_within(&config, false, Duration::from_millis(300));
+            sender
+                .send(result.map(|report| report.snapshot_rows_deleted))
+                .expect("prune result receiver");
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(20));
+        // Release the writer and join before judging the outcome.
+        drop(tx);
+        worker.join().expect("pruner");
+        let error = result
+            .context("Pruning waited beyond its bounded busy timeout")?
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("is busy"), "{error:#}");
+        assert_eq!(
+            db.conn
+                .query_row("SELECT count(*) FROM global.snapshots", [], |r| r
+                    .get::<_, i64>(0))?,
+            1
+        );
         Ok(())
     }
 

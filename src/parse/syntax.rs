@@ -58,10 +58,70 @@ pub(super) fn declarator_inner(node: Node<'_>) -> Option<Node<'_>> {
 
 pub(super) fn js_key(source: &str, node: Node<'_>) -> String {
     let value = source.get(node.byte_range()).unwrap_or("");
-    if node.kind() == "string" && value.len() >= 2 {
-        value[1..value.len() - 1].to_owned()
+    if node.kind() == "string" {
+        // An unterminated string (MISSING closing quote) ends in arbitrary
+        // content, possibly mid-character; only strip a matching ASCII pair.
+        let bytes = value.as_bytes();
+        if bytes.len() >= 2
+            && matches!(
+                (bytes[0], bytes[bytes.len() - 1]),
+                (b'"', b'"') | (b'\'', b'\'') | (b'`', b'`')
+            )
+        {
+            return value[1..value.len() - 1].to_owned();
+        }
+        value.to_owned()
     } else {
         value.trim_start_matches('#').to_owned()
+    }
+}
+
+/// Maximum AST depth a recursive extractor descends.
+const MAX_DEPTH: usize = 512;
+/// Maximum stack a recursive extractor may consume. Frames of unoptimized
+/// builds are several kilobytes, so the level count alone cannot protect a
+/// default 2 MiB thread stack.
+const MAX_STACK_BYTES: usize = 768 * 1024;
+
+const DEPTH_MESSAGE: &str =
+    "Nesting deeper than the supported syntax depth; declarations below this point were skipped.";
+
+/// Recursion guard for the declaration walkers. Tree-sitter trees are heap
+/// allocated, but the walkers recurse once per syntax level; a region nested
+/// too deeply is skipped and reported once instead of overflowing the stack.
+#[derive(Default)]
+pub(super) struct Descent {
+    depth: usize,
+    base: usize,
+    /// The first region that was skipped.
+    pub(super) truncated: Option<super::Diagnostic>,
+}
+
+impl Descent {
+    /// Returns whether `node` may be visited; pair every `true` with `leave`.
+    #[inline(never)]
+    pub(super) fn enter(&mut self, node: Node<'_>) -> bool {
+        let probe = 0u8;
+        let here = std::hint::black_box(std::ptr::addr_of!(probe)) as usize;
+        if self.depth == 0 {
+            self.base = here;
+        }
+        if self.depth >= MAX_DEPTH || self.base.abs_diff(here) >= MAX_STACK_BYTES {
+            if self.truncated.is_none() {
+                self.truncated = Some(super::Diagnostic {
+                    message: DEPTH_MESSAGE.to_owned(),
+                    start_line: node.start_position().row + 1,
+                    end_line: node.end_position().row + 1,
+                });
+            }
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    pub(super) fn leave(&mut self) {
+        self.depth -= 1;
     }
 }
 
@@ -162,6 +222,32 @@ mod tests {
 
         assert_eq!(text(source, name), "café");
         assert_eq!(text(source, value), "???");
+    }
+
+    #[test]
+    fn js_key_strips_only_matching_ascii_quotes() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        for (source, expected) in [
+            ("const o = { \"\u{e9}\n: 1 };", "\"\u{e9}"),
+            ("const o = { \"caf\u{e9}\": 1 };", "caf\u{e9}"),
+            ("const o = { 'k': 1 };", "k"),
+            ("const o = { \"\n: 1 };", "\""),
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            let mut stack = vec![tree.root_node()];
+            let mut keys = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.kind() == "string" {
+                    keys.push(js_key(source, node));
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+            }
+            assert_eq!(keys, [expected], "{source:?}");
+        }
     }
 
     #[test]

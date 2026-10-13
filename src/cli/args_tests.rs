@@ -1084,3 +1084,89 @@ fn argument_errors_cover_global_constraints_and_conflicting_model_selections() {
     };
     assert_eq!(args.query, "--literal query");
 }
+
+#[test]
+fn every_argument_has_help_text() {
+    fn check(command: &clap::Command, path: &str) {
+        for arg in command.get_arguments() {
+            let id = arg.get_id().as_str();
+            if matches!(id, "help" | "version") {
+                continue;
+            }
+            let help = arg.get_help().map(ToString::to_string).unwrap_or_default();
+            assert!(!help.trim().is_empty(), "{path} --{id} has no help text");
+        }
+        for subcommand in command.get_subcommands() {
+            check(subcommand, &format!("{path} {}", subcommand.get_name()));
+        }
+    }
+    check(&Cli::command(), "slopdex");
+}
+
+#[test]
+fn help_resolves_command_paths_and_aliases_before_running() {
+    for path in [
+        vec!["search"],
+        vec!["search-md"],
+        vec!["index", "errors"],
+        vec!["generate", "descriptions"],
+        vec!["cross-search"],
+    ] {
+        let path: Vec<String> = path.into_iter().map(String::from).collect();
+        let mut command = help_command(&path).unwrap();
+        let mut rendered = Vec::new();
+        command.write_long_help(&mut rendered).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.contains("Usage: slopdex "), "{path:?}: {rendered}");
+        let cli = parse(
+            &[
+                &["help"],
+                path.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            cli.command,
+            Command::Help {
+                topic: Some(HelpTopic::Command(ref found))
+            } if *found == path
+        ));
+    }
+    assert!(help_command(&["nonexistent".to_owned()]).is_err());
+    assert!(help_command(&["index".to_owned(), "missing".to_owned()]).is_err());
+    let cli = Cli::try_parse_from(["slopdex", "help", "nonexistent"]).unwrap();
+    assert!(
+        cli.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nonexistent")
+    );
+    assert!(matches!(
+        parse(&["help", "models"]).command,
+        Command::Help {
+            topic: Some(HelpTopic::Models { provider: None })
+        }
+    ));
+    assert!(matches!(
+        parse(&["help"]).command,
+        Command::Help { topic: None }
+    ));
+}
+
+#[test]
+fn repository_endpoint_trust_is_an_explicit_global_flag() {
+    assert!(!parse(&["status"]).global.trust_repo_endpoints);
+    assert!(
+        parse(&["--trust-repo-endpoints", "status"])
+            .global
+            .trust_repo_endpoints
+    );
+    assert!(
+        parse(&["search", "q", "--trust-repo-endpoints"])
+            .global
+            .trust_repo_endpoints
+    );
+}

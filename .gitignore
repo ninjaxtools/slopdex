@@ -1,9 +1,5 @@
-node_modules/
-dist/
 target/
 native/
-*.tgz
-coverage/
 .slopdex/
 *.sqlite-shm
 *.sqlite-wal

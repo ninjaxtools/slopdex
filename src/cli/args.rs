@@ -50,6 +50,7 @@ pub(super) struct Global {
     /// Description provider (default: openai, or the saved profile)
     #[arg(long, global = true, value_parser = ["openai", "opencode", "opencode-go"])]
     pub(super) description_provider: Option<String>,
+    /// Description model, optionally provider-qualified (default: provider default, or the saved profile)
     #[arg(long, global = true, value_parser = nonempty)]
     pub(super) description_model: Option<String>,
     /// Optional same-provider fallback description model
@@ -85,6 +86,9 @@ pub(super) struct Global {
     /// Report every external model request on stderr
     #[arg(long, global = true)]
     pub(super) verbose: bool,
+    /// Let a repository .slopdex/config.json route environment/stored API keys to its own remote endpoints for this run
+    #[arg(long, global = true)]
+    pub(super) trust_repo_endpoints: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -145,7 +149,12 @@ pub(super) enum Command {
     },
     /// Refresh the current working tree and Git HEAD
     Update(UpdateArgs),
-    /// Show command help or fetch published model catalogs
+    /// Maintain the global artifact store without opening an index
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+    /// Show command help (`help <command>`) or fetch published model catalogs
     Help {
         #[command(subcommand)]
         topic: Option<HelpTopic>,
@@ -153,13 +162,26 @@ pub(super) enum Command {
     /// Edit configuration without opening an index; optional prefix filters interactive prompts
     ///
     /// Use `config embeddings`, `config set <key> <value>` or `config exclude-cross-search <file>:<symbol> ...`.
-    Config { args: Vec<String> },
+    Config {
+        /// Interactive key prefix, or an action: `embeddings`, `set <key> <value>`, `exclude-cross-search <file>:<symbol>...`
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub(super) enum IndexAction {
     /// Refresh and inspect saved file/function indexing failures
     Errors,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum CacheAction {
+    /// Delete obsolete snapshot manifests and unused lock files; report reclaimable space
+    Prune {
+        /// Also rewrite the store to return freed space to the filesystem (needs free disk space)
+        #[arg(long)]
+        vacuum: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -172,9 +194,29 @@ pub(super) enum GenerateAction {
 pub(super) enum HelpTopic {
     /// Fetch published OpenCode model catalogs without opening an index
     Models {
+        /// Catalog to fetch (default: both)
         #[arg(value_parser = ["opencode", "opencode-go"])]
         provider: Option<String>,
     },
+    /// Any other command path, e.g. `help search` or `help index errors`
+    #[command(external_subcommand)]
+    Command(Vec<String>),
+}
+
+/// The built clap definition for a `help <command>...` path, with usage lines
+/// that include the parent command names.
+pub(super) fn help_command(path: &[String]) -> Result<clap::Command> {
+    use clap::CommandFactory;
+    let mut root = Cli::command();
+    root.build();
+    let mut command = root;
+    for name in path {
+        command = command
+            .find_subcommand(name)
+            .with_context(|| format!("unknown command for help: {}", path.join(" ")))?
+            .clone();
+    }
+    Ok(command)
 }
 
 #[derive(Debug, Args)]
@@ -396,6 +438,7 @@ impl MapArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct QueryArgs {
+    /// Natural-language query; quote multiword queries
     #[arg(value_parser = nonempty)]
     pub(super) query: String,
     #[command(flatten)]
@@ -506,8 +549,10 @@ pub(super) struct CrossArgs {
     /// Order each source's matches by descending filesystem distance; summary by default
     #[arg(long)]
     pub(super) cohesion: bool,
+    /// Second repository root to compare against; requires --target-index
     #[arg(long, requires = "target_index")]
     pub(super) target_root: Option<PathBuf>,
+    /// Existing index file of the second repository (its embedding profile must match); requires --target-root
     #[arg(long, requires = "target_root")]
     pub(super) target_index: Option<PathBuf>,
     /// Target settings override; otherwise uses its existing repo config or the user config, without merging
@@ -691,11 +736,18 @@ impl Cli {
                 "--output clusters is only available for cross-search without --cohesion; use --output text or --output json"
             );
         }
-        if let Command::Help {
-            topic: Some(HelpTopic::Models { provider }),
-        } = &self.command
-        {
-            self.models_provider(provider.as_deref())?;
+        match &self.command {
+            Command::Help {
+                topic: Some(HelpTopic::Models { provider }),
+            } => {
+                self.models_provider(provider.as_deref())?;
+            }
+            Command::Help {
+                topic: Some(HelpTopic::Command(path)),
+            } => {
+                help_command(path)?;
+            }
+            _ => {}
         }
         Ok(())
     }

@@ -16,7 +16,9 @@ const MARKDOWN_HEADING_BYTES: usize = 2048;
 
 struct Heading {
     level: usize,
-    title: String,
+    /// Symbol name: the title with layout whitespace collapsed, or an
+    /// `<anonymous@line:col>` placeholder for an empty heading.
+    name: String,
     source: String,
     start_byte: usize,
     start_row: usize,
@@ -106,9 +108,21 @@ fn blocks(root: Node<'_>, source: &str, comments: &[std::ops::Range<usize>]) -> 
                         )
                     };
                     let end_row = marker.unwrap().start_position().row;
+                    // Setext titles span lines and ATX titles can be empty;
+                    // neither belongs in a symbol name or qualified path.
+                    let name = title.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let name = if name.is_empty() {
+                        format!(
+                            "<anonymous@{}:{}>",
+                            node.start_position().row + 1,
+                            node.start_position().column + 1
+                        )
+                    } else {
+                        name
+                    };
                     headings.push(Heading {
                         level,
-                        title: title.to_owned(),
+                        name,
                         source: signature,
                         start_byte: node.start_byte(),
                         start_row: node.start_position().row,
@@ -262,7 +276,7 @@ fn structure(source: &str, headings: &[Heading]) -> FileStructure {
     for heading in headings {
         let Heading {
             level,
-            title,
+            name: title,
             source: signature,
             start_byte: byte,
             start_row: heading_row,
@@ -343,7 +357,7 @@ fn flush_markdown(
     if start == end {
         return;
     }
-    let heading_path: Vec<_> = headings.iter().map(|h| h.title.clone()).collect();
+    let heading_path: Vec<_> = headings.iter().map(|h| h.name.clone()).collect();
     let mut prefix = String::new();
     // Reserve most of the byte budget for body text, even for enormous titles.
     for heading in headings {
@@ -490,7 +504,7 @@ mod tests {
         let chunks = parse("empty-title.md", "# #\n\nEmpty heading body.")
             .unwrap()
             .chunks;
-        assert_eq!(chunks[0].heading_path, [""]);
+        assert_eq!(chunks[0].heading_path, ["<anonymous@1:1>"]);
     }
 
     #[test]
@@ -655,7 +669,7 @@ mod tests {
             ("   ##\tCafé 🚀 ### \t", Some("Café 🚀")),
             ("###### C#", Some("C#")),
             ("# C# ###", Some("C#")),
-            ("##", Some("")),
+            ("##", Some("<anonymous@1:1>")),
             ("    # Indented code", None),
             ("\t# Tab-indented code", None),
             ("#No separator", None),

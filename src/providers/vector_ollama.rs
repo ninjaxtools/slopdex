@@ -85,7 +85,7 @@ impl Vector for OllamaVector {
         json!({"provider": "ollama", "model": self.model,
             "dimensions": self.dimensions, "nativeDimensions": self.native,
             "modelDigest": self.context.config["ollamaModelDigest"],
-            "endpoint": ollama::url(&self.context.config, "embed").expect("validated endpoint"),
+            "endpoint": ollama::profile_url(&self.context.config).expect("validated endpoint"),
             "contextLength": self.context_length, "truncate": true,
             "inputStrategy": ollama::family(&self.model), "strategyVersion": "ollama-v1"})
     }

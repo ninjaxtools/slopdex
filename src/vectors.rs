@@ -1,14 +1,16 @@
-//! Persistent cosine HNSW cache of caller-owned embeddings.
+//! Cosine HNSW primitives over caller-owned embeddings.
 //!
-//! `path` names the USearch binary; its manifest is `<path>.manifest.json`.
-//! The caller must hold an exclusive interprocess index lock for `open`, or a
-//! shared lock for `open_readonly` (which never publishes sidecars).
-//! The supplied vectors are authoritative: sidecars can always be regenerated.
+//! `path` names a USearch binary; its manifest is `<path>.manifest.json`.
+//! Production search goes through [`SharedIndex`], which publishes immutable
+//! bases with these primitives. The supplied vectors are authoritative:
+//! sidecars can always be regenerated.
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::collections::HashSet;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -35,6 +37,8 @@ pub struct VectorIndex {
 struct Manifest {
     version: u32,
     usearch_version: String,
+    /// Always 0 for published bases. Retained because it is part of the
+    /// on-disk manifest and of the fingerprint existing sidecars carry.
     generation: u64,
     dimensions: usize,
     /// Hashes of original F32 bits, ordered by caller key (input order is irrelevant).
@@ -44,6 +48,7 @@ struct Manifest {
 }
 
 impl Manifest {
+    #[cfg(test)]
     fn new(dimensions: usize, generation: u64, vectors: &[(u64, Vec<f32>)]) -> Result<Self> {
         ensure!(dimensions > 0, "vector dimensions must be positive");
         let mut hashes = BTreeMap::new();
@@ -94,6 +99,10 @@ impl VectorIndex {
     /// Valid caches are updated by removing deleted/changed keys and adding only
     /// new/replacement vectors. An unchanged snapshot performs no writes.
     /// Keys must be unique and cannot equal USearch's reserved `u64::MAX`.
+    ///
+    /// Test-only: the mutable per-worktree index protocol is no longer used by
+    /// the engine, but its tests still exercise the shared load/persist code.
+    #[cfg(test)]
     pub fn open(
         path: &Path,
         dimensions: usize,
@@ -129,6 +138,7 @@ impl VectorIndex {
 
     /// Use the persisted index if it matches, otherwise rebuild in memory.
     /// Multiple readers can do this without publishing sidecar files.
+    #[cfg(test)]
     pub fn open_readonly(
         path: &Path,
         dimensions: usize,
@@ -150,6 +160,7 @@ impl VectorIndex {
     /// scored in F64 and ordered by decreasing similarity.
     /// Queries must have the configured dimensions, finite values and nonzero norm,
     /// including when the index, limit, or allowed set is empty.
+    #[cfg(test)]
     pub fn search(
         &self,
         query: &[f32],
@@ -325,6 +336,7 @@ fn load_cached(path: &Path, dimensions: usize) -> Result<(Index, Manifest)> {
     Ok((index, manifest))
 }
 
+#[cfg(test)]
 fn reconcile(
     index: &Index,
     old: &Manifest,

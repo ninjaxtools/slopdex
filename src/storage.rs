@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
-pub const STRUCTURE_PARSER_VERSION: &str = "structure-v11-leading-comment-source-order";
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v12-nesting-limit-heading-names";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -125,8 +125,22 @@ impl Database {
             Connection::open(path)?
         };
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        let has_tables: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')", [], |r| r.get(0))?;
+        const HAS_TABLES: &str = "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')";
+        // WAL activation and first schema creation cannot rely on SQLite's busy
+        // handler, so cold opens are serialized across processes. An empty file
+        // is locked before its schema state is read; a nonempty file has at
+        // least completed WAL activation and can be inspected without a lock.
+        // Initialized indexes never take this lock.
+        let mut initialization = None;
+        if !readonly && std::fs::metadata(path).map_or(true, |file| file.len() == 0) {
+            initialization = Some(initialization_lock(path, config)?);
+        }
+        let mut has_tables: bool = conn.query_row(HAS_TABLES, [], |r| r.get(0))?;
+        if !readonly && !has_tables && initialization.is_none() {
+            // A peer may be between WAL activation and its schema commit.
+            initialization = Some(initialization_lock(path, config)?);
+            has_tables = conn.query_row(HAS_TABLES, [], |r| r.get(0))?;
+        }
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
             (!has_tables && version == 0) || (has_tables && version == 4),
@@ -233,20 +247,43 @@ impl Database {
                 .to_str()
                 .context("Global artifact store path is not UTF-8")?],
         )?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(SCHEMA)?;
-        tx.execute_batch("PRAGMA user_version=4;")?;
-        if incompatible_root {
-            reset_live(&tx)?;
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        if journal != "wal" {
+            conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         }
-        tx.execute("INSERT INTO metadata VALUES('identity',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [expected.to_string()])?;
-        tx.execute("INSERT INTO metadata VALUES('global_path',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [global_path.to_str().context("Global artifact store path is not UTF-8")?])?;
-        tx.execute(
-            "INSERT OR IGNORE INTO metadata VALUES('incarnation',lower(hex(randomblob(16))))",
-            [],
-        )?;
-        tx.commit()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let global_text = global_path
+            .to_str()
+            .context("Global artifact store path is not UTF-8")?;
+        // Reopening an initialized index is read-only setup: it must neither
+        // wait for nor compete with a live writer of this worktree database.
+        let current = has_tables
+            && identity.as_ref() == Some(&expected)
+            && binding.as_deref() == Some(global_text)
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='incarnation')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )?;
+        if !current {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            tx.execute_batch(SCHEMA)?;
+            tx.execute_batch("PRAGMA user_version=4;")?;
+            if incompatible_root {
+                reset_live(&tx)?;
+            }
+            tx.execute("INSERT INTO metadata VALUES('identity',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [expected.to_string()])?;
+            tx.execute("INSERT INTO metadata VALUES('global_path',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [global_text])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO metadata VALUES('incarnation',lower(hex(randomblob(16))))",
+                [],
+            )?;
+            tx.commit()?;
+        }
+        drop(initialization);
         let db = Self {
             conn,
             path: path.to_owned(),
@@ -255,6 +292,7 @@ impl Database {
         Ok(db)
     }
 
+    /// Not used by the engine; retained for the integration suites.
     pub fn reset(&self) -> Result<()> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
@@ -359,11 +397,10 @@ impl Database {
     }
 
     pub fn embedding_exists(&self, key: &str) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM global.embeddings WHERE key=?)",
-            [key],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM global.embeddings WHERE key=?)")?
+            .query_row([key], |row| row.get(0))?)
     }
 
     pub fn put_embedding(&self, key: &str, vector: &[f32]) -> Result<()> {
@@ -379,6 +416,8 @@ impl Database {
         Ok(())
     }
 
+    /// Eagerly loads every source. Not used by the engine, which reads
+    /// `file_records` and sources on demand; retained for the integration suites.
     pub fn files(&self) -> Result<Vec<File>> {
         let mut files = self.file_records()?;
         for file in &mut files {
@@ -389,9 +428,23 @@ impl Database {
 
     /// Metadata-only records. Source bytes are loaded and validated on demand.
     pub fn file_records(&self) -> Result<Vec<File>> {
+        // Two scans for the whole snapshot rather than several statements per file.
+        let mut diagnostics = HashMap::<String, Vec<String>>::new();
         let mut stmt = self
             .conn
-            .prepare("SELECT f.path,f.hash,f.language,f.source_mode,s.hash IS NOT NULL FROM files f LEFT JOIN global.sources s ON s.hash=f.hash ORDER BY f.path")?;
+            .prepare_cached("SELECT path,data FROM diagnostics ORDER BY path,ordinal")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (path, data) = row?;
+            diagnostics.entry(path).or_default().push(data);
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT f.path,f.hash,f.language,f.source_mode,s.hash IS NOT NULL,
+                    d.path IS NOT NULL,d.source_hash,d.content_hash,c.content,d.embedding_key
+             FROM files f LEFT JOIN global.sources s ON s.hash=f.hash
+             LEFT JOIN descriptions d ON d.scope='file' AND d.path=f.path AND d.identity=''
+             LEFT JOIN global.description_content c ON c.hash=d.content_hash
+             ORDER BY f.path",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 File {
@@ -401,30 +454,35 @@ impl Database {
                     language: r.get(2)?,
                     source_mode: r.get(3)?,
                     description: None,
-                    description_hash: None,
-                    description_embedding: None,
+                    description_hash: r.get(6)?,
+                    description_embedding: r.get(9)?,
                     errors: Vec::new(),
                 },
                 r.get::<_, bool>(4)?,
+                r.get::<_, bool>(5)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })?;
         rows.map(|r| {
-            let (mut file, source_exists) = r?;
+            let (mut file, source_exists, described, content_hash, content) = r?;
             ensure!(
                 source_exists,
                 "Missing global source artifact for {} ({}); rebuild the index",
                 file.path,
                 file.hash
             );
-            let description = description(&self.conn, "file", &file.path, "")?;
-            file.description = description.as_ref().map(|d| d.1.clone());
-            file.description_hash = description.as_ref().and_then(|d| d.0.clone());
-            file.description_embedding = description.and_then(|d| d.2);
-            file.errors = self
-                .conn
-                .prepare("SELECT data FROM diagnostics WHERE path=? ORDER BY ordinal")?
-                .query_map([&file.path], |r| r.get::<_, String>(0))?
-                .map(|r| Ok(serde_json::from_str(&r?)?))
+            if described {
+                file.description = Some(description_text(
+                    content_hash.as_deref().unwrap_or_default(),
+                    content,
+                )?);
+            }
+            file.errors = diagnostics
+                .remove(&file.path)
+                .unwrap_or_default()
+                .iter()
+                .map(|data| Ok(serde_json::from_str(data)?))
                 .collect::<Result<_>>()?;
             Ok(file)
         })
@@ -451,6 +509,7 @@ impl Database {
 
     /// File description vectors, like unit vectors, must be projected for the
     /// requested profile. Stale file descriptions remain available by policy.
+    /// Not used by the engine; retained for the integration suites.
     pub fn files_for_profile(&self, profile: &Value) -> Result<Vec<File>> {
         let mut files = self.files()?;
         for file in &mut files {
@@ -466,6 +525,7 @@ impl Database {
 
     /// The latest published association for the current input. Profile-specific
     /// searches should use items_for_profile instead.
+    /// Not used by the engine; retained for the integration suites.
     pub fn items(&self) -> Result<Vec<Item>> {
         self.read_items(None)
     }
@@ -494,8 +554,16 @@ impl Database {
     }
 
     fn read_items(&self, profile: Option<&Value>) -> Result<Vec<Item>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id,path,identity,kind,data,embedding_input_hash,content_hash FROM search_units ORDER BY id",
+        // One scan resolves each unit's shared payload and callable description;
+        // the remaining per-unit vector lookups reuse cached statements.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT u.id,u.path,u.identity,u.kind,u.data,u.embedding_input_hash,u.content_hash,p.value,
+                    d.path IS NOT NULL,d.source_hash,d.content_hash,c.content
+             FROM search_units u
+             LEFT JOIN global.cache p ON p.kind='unit-content' AND p.key=u.content_hash
+             LEFT JOIN descriptions d ON d.scope='callable' AND d.path=u.path AND d.identity=u.identity
+             LEFT JOIN global.description_content c ON c.hash=d.content_hash
+             ORDER BY u.id",
         )?;
         stmt.query_map([], |r| {
             Ok((
@@ -506,19 +574,42 @@ impl Database {
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, bool>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<String>>(10)?,
+                r.get::<_, Option<String>>(11)?,
             ))
         })?
         .map(|r| {
-            let (id, path, identity, kind, data, input_hash, content_hash) = r?;
+            let (
+                id,
+                path,
+                identity,
+                kind,
+                data,
+                input_hash,
+                content_hash,
+                payload,
+                described,
+                description_source,
+                description_hash,
+                description,
+            ) = r?;
             let mut data: Value = serde_json::from_str(&data)?;
             ensure!(data.is_object(), "Invalid stored search unit");
             data.as_object_mut()
                 .unwrap()
-                .extend(unit_content(&self.conn, &content_hash)?);
-            let stored_description = description(&self.conn, "callable", &path, &identity)?
-                .filter(|d| d.0.as_deref() == data["sourceHash"].as_str());
-            if let Some(d) = &stored_description {
-                data["description"] = json!(d.1);
+                .extend(decode_unit_content(&content_hash, payload)?);
+            let stored_description = if described {
+                let text =
+                    description_text(description_hash.as_deref().unwrap_or_default(), description)?;
+                (description_source.as_deref() == data["sourceHash"].as_str()).then_some(text)
+            } else {
+                None
+            };
+            if let Some(text) = &stored_description {
+                data["description"] = json!(text);
             } else if data.get("description").is_some() {
                 data["description"] = Value::Null;
             }
@@ -535,11 +626,11 @@ impl Database {
                 latest_embedding(&self.conn, id, "code", &input_hash)?
             }
             .unwrap_or_default();
-            let description_embedding = if let Some(d) = stored_description {
+            let description_embedding = if let Some(text) = stored_description {
                 if let Some(profile) = profile {
-                    self.cached_embedding_key(profile, &d.1)?
+                    self.cached_embedding_key(profile, &text)?
                 } else {
-                    latest_embedding(&self.conn, id, "description", &hash(&d.1))?
+                    latest_embedding(&self.conn, id, "description", &hash(&text))?
                 }
             } else {
                 None
@@ -586,7 +677,7 @@ impl Database {
     /// Saved declaration descriptions keyed by their structural symbol, without
     /// loading vectors or requiring a description provider for `map`.
     pub fn symbol_descriptions(&self, path: &str) -> Result<HashMap<usize, String>> {
-        let mut stmt = self.conn.prepare("SELECT s.symbol_id,s.data,d.source_hash,c.content
+        let mut stmt = self.conn.prepare_cached("SELECT s.symbol_id,s.data,d.source_hash,d.content_hash,c.content
             FROM search_units s JOIN descriptions d ON d.scope='callable' AND d.path=s.path AND d.identity=s.identity
             LEFT JOIN global.description_content c ON c.hash=d.content_hash
             WHERE s.path=? AND s.kind IN ('function','symbol-description') AND s.symbol_id IS NOT NULL ORDER BY s.id")?;
@@ -596,11 +687,13 @@ impl Database {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
         let mut descriptions = HashMap::new();
         for row in rows {
-            let (id, data, source_hash, description) = row?;
+            let (id, data, source_hash, content_hash, description) = row?;
+            let description = description_text(&content_hash, description)?;
             let data: Value = serde_json::from_str(&data)?;
             if source_hash.as_deref() == data["sourceHash"].as_str() {
                 descriptions.insert(usize::try_from(id)?, description);
@@ -704,9 +797,11 @@ impl Database {
         // WAL cannot atomically commit writes across attached databases. Make
         // reusable content durable first; the workspace transaction only binds
         // already committed artifacts and may safely leave orphans on failure.
-        let mut global = cache::open_store(&self.global_path, false)?;
-        global.execute_batch("PRAGMA synchronous=FULL;")?;
-        persist_publication_artifacts(&mut global, changed)?;
+        if !changed.is_empty() {
+            let mut global = cache::open_store(&self.global_path, false)?;
+            global.execute_batch("PRAGMA synchronous=FULL;")?;
+            persist_publication_artifacts(&mut global, changed)?;
+        }
         let tx = self.conn.transaction()?;
         for path in removed {
             tx.execute("DELETE FROM files WHERE path=?", [path])?;
@@ -768,22 +863,10 @@ impl Database {
         if dirty {
             tx.execute("DELETE FROM search_cache", [])?;
         }
-        let manifest = snapshot_manifest(&tx)?;
-        let digest = hash(&manifest);
-        // This independent WAL commit must precede the local snapshot pointer.
-        // The attached store is only read by `tx`, so it holds no writer lock.
-        global.execute(
-            "INSERT OR IGNORE INTO snapshots VALUES(?,?)",
-            params![digest, manifest],
-        )?;
-        ensure!(
-            global.query_row(
-                "SELECT EXISTS(SELECT 1 FROM snapshots WHERE digest=? AND manifest=?)",
-                params![digest, manifest],
-                |row| row.get::<_, bool>(0)
-            )?,
-            "Corrupt global snapshot artifact {digest}"
-        );
+        // Only the digest is published. The manifest body is hashed as a stream
+        // and never stored: nothing reads it back, and persisting an O(repository)
+        // document per publication dominated the global store's size.
+        let digest = snapshot_digest(&tx)?;
         tx.execute("INSERT INTO metadata VALUES('snapshot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [digest])?;
         tx.execute("DELETE FROM metadata WHERE key='snapshot_policy'", [])?;
         if let Some(policy) = policy {
@@ -812,6 +895,31 @@ impl Database {
         )?;
         Ok(())
     }
+}
+
+/// Serialize cold initialization of one worktree index across processes. The
+/// lock lives with the store a new index would bind, keyed by the index file.
+fn initialization_lock(path: &Path, config: &Value) -> Result<crate::registry::ArtifactLock> {
+    let index = std::path::absolute(path)?;
+    let global = cache::store_path(config)?;
+    ensure!(
+        index != global,
+        "Workspace index and global artifact store must use different SQLite paths"
+    );
+    drop(
+        cache::open_store(&global, false)
+            .with_context(|| format!("Cannot open global artifact store {}", global.display()))?,
+    );
+    // Path aliases of one index must contend on the same lock.
+    let index = match index.canonicalize() {
+        Ok(index) => index,
+        Err(_) => index,
+    };
+    crate::registry::lock_path(
+        &std::fs::canonicalize(&global)?,
+        "index-initialize",
+        &hash(index.as_os_str().as_encoded_bytes()),
+    )
 }
 
 fn reset_live(conn: &Connection) -> Result<()> {
@@ -913,9 +1021,188 @@ fn validate_embedding_reference(conn: &Connection, key: Option<&str>) -> Result<
     Ok(())
 }
 
+/// One section of the canonical snapshot document, in serialized key order.
+enum SnapshotSection {
+    Rows(&'static str),
+    ParseBindings,
+    Schema,
+}
+
+/// Sections are listed in the bytewise key order of the canonical JSON object.
+/// The order, the queries and their column order are part of the digest contract:
+/// changing any of them changes every `metadata.snapshot` and result-cache key.
+const SNAPSHOT_SECTIONS: [(&str, SnapshotSection); 10] = [
+    (
+        "descriptions",
+        SnapshotSection::Rows(
+            "SELECT scope,path,identity,source_hash,content_hash,embedding_key FROM descriptions ORDER BY path,scope,identity",
+        ),
+    ),
+    (
+        "diagnostics",
+        SnapshotSection::Rows("SELECT path,ordinal,data FROM diagnostics ORDER BY path,ordinal"),
+    ),
+    (
+        "embeddings",
+        SnapshotSection::Rows(
+            "SELECT s.path,s.identity,e.role,e.profile_key,e.input_hash,e.embedding_key FROM unit_embeddings e JOIN search_units s ON s.id=e.unit_id ORDER BY s.path,s.identity,e.role,e.profile_key,e.input_hash",
+        ),
+    ),
+    (
+        "files",
+        SnapshotSection::Rows(
+            "SELECT path,hash,language,source_mode,parser_version,structure_hash FROM files ORDER BY path",
+        ),
+    ),
+    (
+        "names",
+        SnapshotSection::Rows(
+            "SELECT path,symbol_id,ordinal,name FROM symbol_names ORDER BY path,symbol_id,ordinal",
+        ),
+    ),
+    // These parser bindings identify reusable extraction independent of paths.
+    ("parseBindings", SnapshotSection::ParseBindings),
+    (
+        "policy",
+        SnapshotSection::Rows(
+            "SELECT key,value FROM metadata WHERE key='selection_policy' ORDER BY key",
+        ),
+    ),
+    ("schema", SnapshotSection::Schema),
+    (
+        "symbols",
+        SnapshotSection::Rows(
+            "SELECT path,id,parent_id,ordinal,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata FROM symbols ORDER BY path,ordinal",
+        ),
+    ),
+    (
+        "units",
+        SnapshotSection::Rows(
+            "SELECT path,identity,kind,symbol_id,data,embedding_input_hash,content_hash FROM search_units ORDER BY path,identity",
+        ),
+    ),
+];
+
+struct HashWriter(sha2::Sha256);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        sha2::Digest::update(&mut self.0, bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The digest excludes workspace root, row IDs, generation and git checkpoint.
 /// It includes every normalized binding, parser contract and selection/provenance
-/// policy, so identical published content has the same immutable manifest.
+/// policy, so identical published content has the same digest. The canonical
+/// document is hashed while it is produced; it is never held in memory or stored.
+fn snapshot_digest(conn: &Connection) -> Result<String> {
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, HashWriter(Default::default()));
+    write_snapshot_manifest(conn, &mut out)?;
+    let hasher = out
+        .into_inner()
+        .map_err(|error| error.into_error())
+        .context("Hash snapshot manifest")?;
+    Ok(format!("{:x}", sha2::Digest::finalize(hasher.0)))
+}
+
+/// Emit exactly the bytes `serde_json::to_string` produces for the canonical
+/// object: compact separators, keys in bytewise order, and serde_json's own
+/// scalar serializers for every value so escaping and integers are identical.
+fn write_snapshot_manifest(conn: &Connection, out: &mut impl std::io::Write) -> Result<()> {
+    debug_assert!(SNAPSHOT_SECTIONS.is_sorted_by_key(|(name, _)| *name));
+    out.write_all(b"{")?;
+    for (index, (name, section)) in SNAPSHOT_SECTIONS.iter().enumerate() {
+        if index > 0 {
+            out.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut *out, name)?;
+        out.write_all(b":")?;
+        match section {
+            SnapshotSection::Schema => out.write_all(b"1")?,
+            SnapshotSection::Rows(sql) => {
+                let mut stmt = conn.prepare(sql)?;
+                let columns = stmt.column_count();
+                let mut rows = stmt.query([])?;
+                out.write_all(b"[")?;
+                let mut first = true;
+                while let Some(row) = rows.next()? {
+                    if !first {
+                        out.write_all(b",")?;
+                    }
+                    out.write_all(b"[")?;
+                    first = false;
+                    for column in 0..columns {
+                        if column > 0 {
+                            out.write_all(b",")?;
+                        }
+                        match row.get_ref(column)? {
+                            rusqlite::types::ValueRef::Null => out.write_all(b"null")?,
+                            rusqlite::types::ValueRef::Integer(value) => {
+                                serde_json::to_writer(&mut *out, &value)?
+                            }
+                            rusqlite::types::ValueRef::Text(value) => {
+                                serde_json::to_writer(&mut *out, &*String::from_utf8_lossy(value))?
+                            }
+                            other => {
+                                return Err(rusqlite::Error::InvalidColumnType(
+                                    column,
+                                    (*name).into(),
+                                    other.data_type(),
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    out.write_all(b"]")?;
+                }
+                out.write_all(b"]")?;
+            }
+            SnapshotSection::ParseBindings => {
+                let mut stmt = conn.prepare("SELECT DISTINCT hash,language,parser_version FROM files WHERE parser_version IS NOT NULL AND structure_hash=hash ORDER BY hash,language,parser_version")?;
+                let mut rows = stmt.query([])?;
+                out.write_all(b"[")?;
+                let mut first = true;
+                while let Some(row) = rows.next()? {
+                    let (hash, language, version): (String, String, String) =
+                        (row.get(0)?, row.get(1)?, row.get(2)?);
+                    if !first {
+                        out.write_all(b",")?;
+                    }
+                    out.write_all(b"{")?;
+                    first = false;
+                    for (index, (key, value)) in [
+                        ("language", language),
+                        ("parserVersion", version),
+                        ("sourceHash", hash),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        if index > 0 {
+                            out.write_all(b",")?;
+                        }
+                        serde_json::to_writer(&mut *out, key)?;
+                        out.write_all(b":")?;
+                        serde_json::to_writer(&mut *out, &value)?;
+                    }
+                    out.write_all(b"}")?;
+                }
+                out.write_all(b"]")?;
+            }
+        }
+    }
+    out.write_all(b"}")?;
+    Ok(())
+}
+
+/// The former materializing implementation, kept as the byte-level reference
+/// that the streamed digest must reproduce.
+#[cfg(test)]
 fn snapshot_manifest(conn: &Connection) -> Result<String> {
     let mut manifest = serde_json::Map::new();
     manifest.insert("schema".into(), json!(1));
@@ -998,6 +1285,7 @@ fn unit_payload(data: &Value) -> Result<String> {
     Ok(serde_json::to_string(&content)?)
 }
 
+#[cfg(test)]
 fn unit_content(conn: &Connection, key: &str) -> Result<serde_json::Map<String, Value>> {
     let payload: Option<String> = conn
         .query_row(
@@ -1006,6 +1294,13 @@ fn unit_content(conn: &Connection, key: &str) -> Result<serde_json::Map<String, 
             |row| row.get(0),
         )
         .optional()?;
+    decode_unit_content(key, payload)
+}
+
+fn decode_unit_content(
+    key: &str,
+    payload: Option<String>,
+) -> Result<serde_json::Map<String, Value>> {
     let payload = payload.with_context(|| {
         format!("Missing global unit content artifact {key}; rebuild the index")
     })?;
@@ -1027,14 +1322,39 @@ fn unit_content(conn: &Connection, key: &str) -> Result<serde_json::Map<String, 
     Ok(content)
 }
 
+/// A binding whose interned text is absent is a damaged store, not "no
+/// description": report which artifact is missing instead of a column type error.
+fn description_text(content_hash: &str, content: Option<String>) -> Result<String> {
+    content.with_context(|| {
+        format!("Missing global description content {content_hash}; rebuild the index")
+    })
+}
+
 fn description(
     conn: &Connection,
     scope: &str,
     path: &str,
     identity: &str,
 ) -> Result<Option<Description>> {
-    Ok(conn.query_row("SELECT d.source_hash,c.content,d.embedding_key FROM descriptions d LEFT JOIN global.description_content c ON c.hash=d.content_hash WHERE d.scope=? AND d.path=? AND d.identity=?",
-        params![scope, path, identity], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
+    let row = conn
+        .prepare_cached("SELECT d.source_hash,d.content_hash,c.content,d.embedding_key FROM descriptions d LEFT JOIN global.description_content c ON c.hash=d.content_hash WHERE d.scope=? AND d.path=? AND d.identity=?")?
+        .query_row(params![scope, path, identity], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .optional()?;
+    row.map(|(source_hash, content_hash, content, embedding)| {
+        Ok((
+            source_hash,
+            description_text(&content_hash, content)?,
+            embedding,
+        ))
+    })
+    .transpose()
 }
 
 fn latest_embedding(
@@ -1043,8 +1363,10 @@ fn latest_embedding(
     role: &str,
     input_hash: &str,
 ) -> Result<Option<String>> {
-    Ok(conn.query_row("SELECT embedding_key FROM unit_embeddings WHERE unit_id=? AND role=? AND input_hash=? ORDER BY rowid DESC LIMIT 1",
-        params![i64::try_from(id)?, role, input_hash], |r| r.get(0)).optional()?)
+    Ok(conn
+        .prepare_cached("SELECT embedding_key FROM unit_embeddings WHERE unit_id=? AND role=? AND input_hash=? ORDER BY rowid DESC LIMIT 1")?
+        .query_row(params![i64::try_from(id)?, role, input_hash], |r| r.get(0))
+        .optional()?)
 }
 
 fn write_file(conn: &Connection, file: &File, structural: bool) -> Result<()> {
@@ -1656,6 +1978,7 @@ mod tests {
         second.apply_structure(std::slice::from_ref(&original), &[], None)?;
         let expected = parsed_items(&original.0, &original.1)?.remove(0).data;
         let mut keys = Vec::new();
+        let mut digests = Vec::new();
         for db in [&first, &second] {
             let (data, key): (String, String) = db.conn.query_row(
                 "SELECT data,content_hash FROM search_units WHERE kind='function'",
@@ -1670,16 +1993,14 @@ mod tests {
                 db.items_for_profile(&json!({"model":"a"}))?[0].data,
                 expected
             );
-            let manifest: String = db.conn.query_row(
-                "SELECT manifest FROM global.snapshots WHERE digest=?",
-                [db.meta("snapshot")?.unwrap()],
-                |row| row.get(0),
-            )?;
-            let manifest: Value = serde_json::from_str(&manifest)?;
-            assert_eq!(manifest["units"][0][6], key);
+            // The digest binds the shared payload by content hash, not by root.
+            let digest = db.meta("snapshot")?.unwrap();
+            assert_eq!(snapshot_digest(&db.conn)?, digest);
+            digests.push(digest);
             keys.push(key);
         }
         assert_eq!(keys[0], keys[1]);
+        assert_eq!(digests[0], digests[1]);
         assert_eq!(
             first.conn.query_row(
                 "SELECT count(*) FROM global.cache WHERE kind='unit-content'",
@@ -1848,12 +2169,9 @@ mod tests {
         first.set_meta("dirty_paths", "[\"a.rs\"]")?;
         first.apply(&[record("a.rs"), record("z.rs")], &[], Some("commit-a"))?;
         let digest = first.meta("snapshot")?.unwrap();
-        let manifest: String = first.conn.query_row(
-            "SELECT manifest FROM global.snapshots WHERE digest=?",
-            [&digest],
-            |r| r.get(0),
-        )?;
-        assert_eq!(hash(&manifest), digest);
+        assert_eq!(digest.len(), 64);
+        assert_eq!(hash(snapshot_manifest(&first.conn)?), digest);
+        assert_eq!(snapshot_digest(&first.conn)?, digest);
         let mut second = Database::open_with_config(
             &dir.path().join("second.sqlite"),
             &dir.path().join("second-root"),
@@ -1882,17 +2200,22 @@ mod tests {
         assert!(second.meta("snapshot_policy")?.is_none());
         let path = first.path.clone();
         drop(first);
-        let first = Database::open(&path, &dir.path().join("new-root"), &json!({}), true)?;
+        let mut first = Database::open(&path, &dir.path().join("new-root"), &json!({}), true)?;
         assert!(first.paths()?.is_empty());
         assert!(first.meta("snapshot")?.is_none());
+        // Only digests are published: no manifest body is ever stored.
         assert_eq!(
-            first.conn.query_row(
-                "SELECT manifest FROM global.snapshots WHERE digest=?",
-                [&digest],
-                |r| r.get::<_, String>(0)
-            )?,
-            manifest
+            first
+                .conn
+                .query_row("SELECT count(*) FROM global.snapshots", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
         );
+        // The digest is a pure function of published content: republishing the
+        // same bindings under another root and generation reproduces it.
+        first.set_meta("selection_policy", "all-rust")?;
+        first.apply(&[record("z.rs"), record("a.rs")], &[], Some("commit-c"))?;
+        assert_eq!(first.meta("snapshot")?.as_deref(), Some(digest.as_str()));
         assert_eq!(
             first.conn.query_row(
                 "SELECT source FROM global.sources WHERE hash=?",
@@ -1922,12 +2245,12 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_publication_does_not_read_the_complete_manifest() -> Result<()> {
+    fn unchanged_publication_does_not_recompute_the_snapshot_digest() -> Result<()> {
         let (_dir, mut db) = fixture()?;
         db.set_meta("selection_policy", "all-rust")?;
         db.apply(&[record("code.rs")], &[], Some("commit"))?;
         let digest = db.meta("snapshot")?;
-        // Make a manifest-only table unavailable: unchanged publication must
+        // Make a digest-only table unavailable: unchanged publication must
         // consult only its checkpoint and policy, not traverse published rows.
         db.conn
             .execute("ALTER TABLE symbol_names RENAME TO unread_names", [])?;
@@ -2050,8 +2373,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_manifest_commits_before_a_rejected_local_pointer_and_retry_reuses_it() -> Result<()>
-    {
+    fn artifacts_commit_before_a_rejected_snapshot_pointer_and_retry_reuses_them() -> Result<()> {
         let (_dir, mut db) = fixture()?;
         let original = parsed_record("code.rs", "fn example() -> i32 { 1 }")?;
         db.apply_structure(&[original], &[], Some("old"))?;
@@ -2068,31 +2390,326 @@ mod tests {
         );
         assert!(db.conn.is_autocommit());
         assert_eq!(snapshot(&db)?, before);
+        assert_eq!(db.meta("snapshot")?.as_deref(), Some(old_digest.as_str()));
+        // The reusable content of the rejected publication is already durable.
         let global = cache::open_store(db.global_path(), true)?;
-        let (digest, manifest): (String, String) = global.query_row(
-            "SELECT digest,manifest FROM snapshots WHERE digest<>?",
-            [&old_digest],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        assert_eq!(hash(&manifest), digest);
-        let manifest: Value = serde_json::from_str(&manifest)?;
-        assert_eq!(manifest["files"][0][1], changed.0.hash);
-        let content_hash = manifest["units"][0][6].as_str().unwrap();
         assert!(global.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cache WHERE kind='unit-content' AND key=?)",
-            [content_hash],
+            "SELECT EXISTS(SELECT 1 FROM sources WHERE hash=?)",
+            [&changed.0.hash],
             |row| row.get::<_, bool>(0)
         )?);
+        let content_hash = hash(unit_payload(
+            &parsed_items(&changed.0, &changed.1)?[0].data,
+        )?);
+        assert!(global.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cache WHERE kind='unit-content' AND key=?)",
+            [&content_hash],
+            |row| row.get::<_, bool>(0)
+        )?);
+        let artifacts = |global: &Connection| {
+            global.query_row("SELECT (SELECT count(*) FROM sources),(SELECT count(*) FROM cache),(SELECT count(*) FROM description_content),(SELECT count(*) FROM snapshots)", [], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))
+            })
+        };
+        let committed = artifacts(&global)?;
+        assert_eq!(committed.3, 0);
         db.conn
             .execute_batch("DROP TRIGGER reject_snapshot_pointer")?;
         assert!(db.apply_structure(&[changed], &[], Some("new"))?);
-        assert_eq!(db.meta("snapshot")?.as_deref(), Some(digest.as_str()));
+        let digest = db.meta("snapshot")?.unwrap();
+        assert_ne!(digest, old_digest);
+        assert_eq!(snapshot_digest(&db.conn)?, digest);
         assert_eq!(
-            global.query_row("SELECT count(*) FROM snapshots", [], |row| row
-                .get::<_, i64>(0))?,
-            2
+            db.conn.query_row(
+                "SELECT content_hash FROM search_units WHERE kind='function'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            content_hash
         );
+        assert_eq!(artifacts(&global)?, committed);
         assert!(db.search_cache("query")?.is_none());
+        Ok(())
+    }
+
+    /// Every table the digest covers is populated, with text that exercises
+    /// JSON escaping, NULL columns and multi-row ordering.
+    fn digest_fixture(db: &mut Database) -> Result<()> {
+        db.set_meta(
+            "selection_policy",
+            "policy \"quoted\" \\ back\tslash \u{2028} é 🦀",
+        )?;
+        let mut rust = parsed_record(
+            "src/Café \"q\".rs",
+            "use std::collections::HashMap as Map;\n/// Says \"hi\"\t\\ \u{1} \u{7f} \u{2028} 🦀.\nstruct Café { value: i32 }\nimpl Café {\n    /// Run the service.\n    fn run(&self) -> i32 { self.value }\n    fn other(&self) -> &'static str { \"a\\\\b\\n\" }\n}\n",
+        )?;
+        rust.0.errors = vec![
+            json!({"message":"first \"problem\"\n","startLine":2,"code":"parse-error"}),
+            json!({"message":null,"nested":{"é":[1,-2,3.5,true]}}),
+        ];
+        let markdown = parsed_record(
+            "docs/Guide.md",
+            "# Title\n\nBody \\ text.\n\n## Second\n\nMore.\n",
+        )?;
+        let plain = parsed_record(
+            "b.rs",
+            "fn zero() {}\nfn zero_two() -> u64 { 18446744073709551615 }\n",
+        )?;
+        db.apply_structure(&[rust, markdown, plain], &[], Some("commit"))?;
+        let mut described = record("a.rs");
+        described.1[0].data["description"] = json!("Callable \"description\" \u{1f}");
+        db.apply(&[described, record("z.rs")], &[], Some("commit"))?;
+        db.conn.execute(
+            "INSERT INTO unit_embeddings(unit_id,role,profile_key,input_hash,embedding_key)
+             SELECT id,'code','profile \"a\"',embedding_input_hash,'code' FROM search_units",
+            [],
+        )?;
+        db.conn.execute(
+            "INSERT INTO unit_embeddings(unit_id,role,profile_key,input_hash,embedding_key)
+             SELECT id,'description','b',embedding_input_hash,'description' FROM search_units WHERE path='a.rs'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_snapshot_digest_equals_the_hash_of_the_materialized_manifest() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        // An empty workspace is the degenerate document.
+        let empty = snapshot_manifest(&db.conn)?;
+        assert_eq!(
+            empty,
+            r#"{"descriptions":[],"diagnostics":[],"embeddings":[],"files":[],"names":[],"parseBindings":[],"policy":[],"schema":1,"symbols":[],"units":[]}"#
+        );
+        assert_eq!(snapshot_digest(&db.conn)?, hash(&empty));
+
+        digest_fixture(&mut db)?;
+        let manifest = snapshot_manifest(&db.conn)?;
+        let parsed: Value = serde_json::from_str(&manifest)?;
+        for (section, minimum) in [
+            ("descriptions", 3),
+            ("diagnostics", 3),
+            ("embeddings", 3),
+            ("files", 5),
+            ("names", 2),
+            ("parseBindings", 3),
+            ("policy", 1),
+            ("symbols", 5),
+            ("units", 5),
+        ] {
+            assert!(
+                parsed[section].as_array().unwrap().len() >= minimum,
+                "{section}: {}",
+                parsed[section]
+            );
+        }
+        assert_eq!(parsed["schema"], 1);
+        // NULL and integer columns and escaped text all occur in the fixture.
+        for expected in [",null,", "\\\\", "\\t", "\\\"", "\u{2028}", "🦀"] {
+            assert!(manifest.contains(expected), "{expected:?}");
+        }
+        let mut streamed = Vec::new();
+        write_snapshot_manifest(&db.conn, &mut streamed)?;
+        assert_eq!(String::from_utf8(streamed)?, manifest);
+        let digest = snapshot_digest(&db.conn)?;
+        assert_eq!(digest, hash(&manifest));
+        // A dirty publication stores exactly this digest.
+        db.apply(&[record("published.rs")], &[], Some("commit"))?;
+        let manifest = snapshot_manifest(&db.conn)?;
+        assert_eq!(db.meta("snapshot")?, Some(hash(&manifest)));
+        assert_ne!(hash(&manifest), digest);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_publications_never_grow_the_snapshot_table() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let mut digests = HashSet::new();
+        for round in 0..6 {
+            let source = format!("fn example() -> i32 {{ {round} }}");
+            db.apply_structure(&[parsed_record("code.rs", &source)?], &[], None)?;
+            db.apply(&[record(&format!("file-{round}.rs"))], &[], None)?;
+            digests.insert(db.meta("snapshot")?.unwrap());
+            assert_eq!(
+                db.conn
+                    .query_row("SELECT count(*) FROM global.snapshots", [], |r| r
+                        .get::<_, i64>(0))?,
+                0
+            );
+        }
+        assert_eq!(digests.len(), 6);
+        // The table itself stays, so binaries that still write it keep working.
+        let global = cache::open_store(db.global_path(), false)?;
+        global.execute(
+            "INSERT INTO snapshots VALUES('older-binary','manifest')",
+            [],
+        )?;
+        db.apply(&[record("after.rs")], &[], None)?;
+        assert_eq!(
+            global.query_row("SELECT count(*) FROM snapshots", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn initialized_index_reopens_without_writing_or_waiting_for_a_writer() -> Result<()> {
+        let (dir, mut db) = fixture()?;
+        db.apply(&[record("code.rs")], &[], Some("commit"))?;
+        let path = db.path.clone();
+        let root = dir.path().to_owned();
+        let global = db.global_path().to_owned();
+        let incarnation = db.meta("incarnation")?;
+        // Another connection holds the worktree database's writer lock.
+        let writer = Connection::open(&path)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &writer,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        tx.execute("INSERT INTO metadata VALUES('pending','not committed')", [])?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> Result<Option<String>> {
+                let mut incarnation = None;
+                for config in [json!({}), json!({"artifactCachePath": global})] {
+                    let reopened = Database::open_with_config(&path, &root, &config, false)?;
+                    ensure!(
+                        reopened.conn.total_changes() == 0,
+                        "A warm writable open wrote to the index"
+                    );
+                    ensure!(
+                        reopened.meta("pending")?.is_none(),
+                        "Uncommitted rows must remain invisible"
+                    );
+                    ensure!(
+                        reopened.paths()? == ["code.rs"],
+                        "Published rows are readable"
+                    );
+                    incarnation = reopened.meta("incarnation")?;
+                    Database::open_readonly_with_config(&path, &root, &config)?;
+                }
+                Ok(incarnation)
+            })();
+            sender.send(result).expect("opener result receiver");
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        // Release the writer and join even on timeout, so a regression fails
+        // without stranding a worker for SQLite's full busy timeout.
+        drop(tx);
+        worker.join().expect("index opener");
+        let reopened =
+            result.context("Opening an initialized index waited for the worktree writer")??;
+        assert_eq!(reopened, incarnation);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_cold_index_opens_share_one_initialization() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut indexes = vec![dir.path().join("indexes")];
+        std::fs::create_dir(&indexes[0])?;
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&indexes[0], &alias)?;
+            indexes.push(alias);
+        }
+        for round in 0..6 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let workers: Vec<_> = (0..8)
+                .map(|worker| {
+                    let path = indexes[worker % indexes.len()].join(format!("index-{round}.sqlite"));
+                    let config = json!({"artifactCachePath": dir.path().join(format!("global-{round}.sqlite"))});
+                    let (barrier, root) = (barrier.clone(), root.clone());
+                    std::thread::spawn(move || {
+                        // Start barrier before any fallible setup.
+                        barrier.wait();
+                        Database::open_with_config(&path, &root, &config, false)
+                    })
+                })
+                .collect();
+            // Join everyone before propagating an error; successful connections
+            // stay open while their peers finish opening the same cold index.
+            let results: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("index opener"))
+                .collect();
+            let databases = results.into_iter().collect::<Result<Vec<_>>>()?;
+            let incarnation = databases[0].meta("incarnation")?.unwrap();
+            for (worker, db) in databases.iter().enumerate() {
+                assert_eq!(
+                    db.meta("incarnation")?.as_deref(),
+                    Some(incarnation.as_str())
+                );
+                assert_eq!(db.global_path(), databases[0].global_path());
+                assert_eq!(
+                    db.conn
+                        .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
+                    "wal"
+                );
+                db.set_meta(&format!("worker-{worker}"), "wrote")?;
+            }
+            assert_eq!(
+                databases[0].conn.query_row(
+                    "SELECT count(*) FROM metadata WHERE key LIKE 'worker-%'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                8
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_description_content_is_a_descriptive_error_for_every_reader() -> Result<()> {
+        let (_dir, mut db) = fixture()?;
+        let parsed = parsed_record(
+            "code.rs",
+            "fn first() {}\n\n/// Run the service.\nfn run() -> i32 { 1 }\n",
+        )?;
+        db.apply_structure(&[parsed], &[], None)?;
+        db.apply(&[record("described.rs")], &[], None)?;
+        assert_eq!(db.symbol_descriptions("code.rs")?.len(), 1);
+        assert_eq!(db.file_records()?.len(), 2);
+        let items = db.items()?.len();
+        let (callable, text): (String, String) = db.conn.query_row(
+            "SELECT d.content_hash,c.content FROM descriptions d JOIN global.description_content c ON c.hash=d.content_hash WHERE d.scope='callable' AND d.path='code.rs'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let file: String = db.conn.query_row(
+            "SELECT content_hash FROM descriptions WHERE scope='file' AND path='described.rs'",
+            [],
+            |r| r.get(0),
+        )?;
+        let expect = |error: anyhow::Error, key: &str| {
+            assert_eq!(
+                error.to_string(),
+                format!("Missing global description content {key}; rebuild the index")
+            );
+        };
+        db.conn.execute(
+            "DELETE FROM global.description_content WHERE hash=?",
+            [&callable],
+        )?;
+        expect(db.symbol_descriptions("code.rs").unwrap_err(), &callable);
+        expect(db.items().unwrap_err(), &callable);
+        expect(
+            db.items_for_profile(&json!({"model":"a"})).unwrap_err(),
+            &callable,
+        );
+        assert_eq!(db.file_records()?.len(), 2);
+        db.put_description_content(&callable, &text)?;
+        assert_eq!(db.items()?.len(), items);
+        db.conn.execute(
+            "DELETE FROM global.description_content WHERE hash=?",
+            [&file],
+        )?;
+        expect(db.file_records().unwrap_err(), &file);
+        expect(db.files().unwrap_err(), &file);
         Ok(())
     }
 

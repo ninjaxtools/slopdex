@@ -13,6 +13,11 @@
 //! Embedding/reranking overrides may also include `/embeddings` or `/rerank`.
 //! Optional operation-specific `*ApiKey` keys override provider-specific `*ApiKey`
 //! keys and the usual environment variables. Never print this struct or its config.
+//! Hosted base URLs off the provider default and off loopback require `https`
+//! (or `allowInsecureEndpoints`) and are named once per process on stderr; when the
+//! configuration came from the repository file (`configOrigin: "repository"`), such
+//! endpoints never receive environment/stored credentials unless the host is in
+//! the user config's `trustedEndpointHosts` or `--trust-repo-endpoints` is passed.
 //! `providerTimeoutMs` defaults to 60,000 (capped at 300,000), `providerMaxRetries`
 //! defaults to 2 (maximum 5), and `retryDelayMs` defaults to 250. Backoff and numeric
 //! Retry-After delays are capped at five seconds. Description failover/empty-output
@@ -64,12 +69,23 @@ mod tests;
 
 const OPENAI: &str = "https://api.openai.com/v1";
 const JINA: &str = "https://api.jina.ai/v1";
+const COHERE: &str = "https://api.cohere.com/v2";
 const ZEN: &str = "https://opencode.ai/zen/v1";
 const GO: &str = "https://opencode.ai/zen/go/v1";
 const DESCRIPTION_ATTEMPTS: usize = 6;
 
+/// Reserved effective-configuration keys set by the CLI loader; never saved.
+/// `configOrigin: "repository"` marks settings loaded from `<root>/.slopdex/config.json`.
+pub const CONFIG_ORIGIN_KEY: &str = "configOrigin";
+pub const CONFIG_ORIGIN_REPOSITORY: &str = "repository";
+/// `--trust-repo-endpoints`: allow repository-configured remote endpoints to use
+/// environment/stored credentials for this invocation.
+pub const TRUST_REPOSITORY_ENDPOINTS_KEY: &str = "trustRepositoryEndpoints";
+
 type ReportedCalls = Mutex<HashSet<(String, String, String)>>;
 static REPORTED_CALLS: OnceLock<ReportedCalls> = OnceLock::new();
+type ReportedEndpoints = Mutex<HashSet<(String, String)>>;
+static REPORTED_ENDPOINTS: OnceLock<ReportedEndpoints> = OnceLock::new();
 
 /// Decide atomically so concurrent requests report each identity only once.
 fn should_report_call(
@@ -366,6 +382,24 @@ fn stored_key(path: &std::path::Path, provider: &str) -> Option<String> {
 }
 
 fn api_key(config: &Value, operation_key: &str, provider: &str) -> Result<String> {
+    resolve_api_key(
+        config,
+        operation_key,
+        provider,
+        |name| std::env::var(name).ok(),
+        |provider| auth_path().and_then(|p| stored_key(&p, provider)),
+    )
+}
+
+/// Credential lookup with injectable process state, so policy is testable
+/// without mutating the environment of parallel tests.
+fn resolve_api_key(
+    config: &Value,
+    operation_key: &str,
+    provider: &str,
+    environment: impl Fn(&str) -> Option<String>,
+    stored: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
     let (setting, env) = match provider {
         "openai" => ("openaiApiKey", "OPENAI_API_KEY"),
         "jina" => ("jinaApiKey", "JINA_API_KEY"),
@@ -373,19 +407,180 @@ fn api_key(config: &Value, operation_key: &str, provider: &str) -> Result<String
         "opencode" | "opencode-go" => ("opencodeApiKey", "OPENCODE_API_KEY"),
         _ => bail!("Unsupported credential provider"),
     };
+    // Keys written into the selected config file travel with its endpoints.
     if let Some(key) = string(config, &[operation_key, setting])? {
         return Ok(key.into());
     }
-    if let Some(key) = std::env::var(env).ok().filter(|key| !key.trim().is_empty()) {
+    if let Some(key) = environment(env).filter(|key| !key.trim().is_empty()) {
+        guard_foreign_credential(config, operation_key, provider, env)?;
         return Ok(key.trim().into());
     }
     if provider.starts_with("opencode") {
-        if let Some(key) = auth_path().and_then(|p| stored_key(&p, provider)) {
+        if let Some(key) = stored(provider) {
+            guard_foreign_credential(config, operation_key, provider, "stored opencode/auth.json")?;
             return Ok(key);
         }
         bail!("OPENCODE_API_KEY or stored opencode/auth.json credentials are required");
     }
     bail!("{env} is required")
+}
+
+/// The base-URL setting and provider default behind an operation's credential.
+fn operation_endpoint(operation_key: &str, provider: &str) -> Result<(&'static str, &'static str)> {
+    Ok(match operation_key {
+        "embeddingApiKey" => (
+            "embeddingBaseUrl",
+            if provider == "jina" { JINA } else { OPENAI },
+        ),
+        "descriptionApiKey" => (
+            "descriptionBaseUrl",
+            match provider {
+                "opencode" => ZEN,
+                "opencode-go" => GO,
+                _ => OPENAI,
+            },
+        ),
+        "rerankerApiKey" => (
+            "rerankerBaseUrl",
+            match provider {
+                "cohere" => COHERE,
+                "jina" => JINA,
+                _ => OPENAI,
+            },
+        ),
+        _ => bail!("Unsupported credential operation"),
+    })
+}
+
+fn operation_name(operation_key: &str) -> &'static str {
+    match operation_key {
+        "embeddingApiKey" => "embedding",
+        "descriptionApiKey" => "description",
+        _ => "reranking",
+    }
+}
+
+/// A cloned repository's `.slopdex/config.json` must not route the user's
+/// environment or stored credentials to a remote host it chose. Keys that the
+/// repository file supplies itself, loopback hosts, and the provider defaults
+/// are exempt; the user config's `trustedEndpointHosts` or
+/// `--trust-repo-endpoints` allow a specific host.
+fn guard_foreign_credential(
+    config: &Value,
+    operation_key: &str,
+    provider: &str,
+    source: &str,
+) -> Result<()> {
+    if config[CONFIG_ORIGIN_KEY] != CONFIG_ORIGIN_REPOSITORY
+        || config[TRUST_REPOSITORY_ENDPOINTS_KEY] == true
+    {
+        return Ok(());
+    }
+    let (key, default) = operation_endpoint(operation_key, provider)?;
+    let Some(url) = remote_custom_endpoint(config, key, default)? else {
+        return Ok(());
+    };
+    let host = host_label(&url);
+    let bare = url.host_str().unwrap_or("");
+    let trusted = config["trustedEndpointHosts"]
+        .as_array()
+        .is_some_and(|hosts| {
+            hosts.iter().filter_map(Value::as_str).any(|entry| {
+                let entry = entry.trim();
+                entry.eq_ignore_ascii_case(&host) || entry.eq_ignore_ascii_case(bare)
+            })
+        });
+    ensure!(
+        trusted,
+        "The repository config routes {} requests to {host}, but the {source} credential did not come from that file. \
+         To allow this, add {host:?} to trustedEndpointHosts in your user config \
+         (slopdex --config \"$XDG_CONFIG_HOME/slopdex/config.json\" config set trustedEndpointHosts '[\"{host}\"]'), \
+         run with --trust-repo-endpoints, or set {operation_key} in the repository config",
+        operation_name(operation_key)
+    );
+    Ok(())
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or("").trim_matches(['[', ']']);
+    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn host_label(url: &reqwest::Url) -> String {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
+/// The configured base URL for `key` when its scheme/host/port differ from the
+/// provider default and the host is not loopback. Loopback proxies cannot
+/// exfiltrate off this machine; path differences on the default host are routing.
+fn remote_custom_endpoint(
+    config: &Value,
+    key: &str,
+    default: &str,
+) -> Result<Option<reqwest::Url>> {
+    let Some(base) = string(config, &[key])? else {
+        return Ok(None);
+    };
+    let url = validate_url(base)?;
+    let standard = validate_url(default)?;
+    let same = url.scheme() == standard.scheme()
+        && url.host_str().map(str::to_ascii_lowercase)
+            == standard.host_str().map(str::to_ascii_lowercase)
+        && url.port_or_known_default() == standard.port_or_known_default();
+    if same || is_loopback(&url) {
+        return Ok(None);
+    }
+    Ok(Some(url))
+}
+
+/// Hosted operations pointed away from the provider default: require TLS off
+/// loopback unless `allowInsecureEndpoints` opts in, and name the host once per
+/// process so a repository-supplied endpoint is never silent.
+fn check_hosted_endpoint(config: &Value, operation: &str, key: &str, default: &str) -> Result<()> {
+    let Some(url) = remote_custom_endpoint(config, key, default)? else {
+        return Ok(());
+    };
+    let host = host_label(&url);
+    ensure!(
+        url.scheme() == "https" || config["allowInsecureEndpoints"] == true,
+        "{key} must use https for non-loopback host {host}; set allowInsecureEndpoints to true to permit plain HTTP"
+    );
+    let first = REPORTED_ENDPOINTS
+        .get_or_init(ReportedEndpoints::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert((operation.to_owned(), host.clone()));
+    if first {
+        let origin = if config[CONFIG_ORIGIN_KEY] == CONFIG_ORIGIN_REPOSITORY {
+            " (set by the repository config)"
+        } else {
+            ""
+        };
+        crate::ui::warning(format!(
+            "slopdex: warning: {operation} requests use custom endpoint host {host}{origin}"
+        ));
+    }
+    Ok(())
+}
+
+/// Identity form of an endpoint for profiles and status output: query strings
+/// carry routing/tenant parameters, not model identity, and are never persisted.
+pub(super) fn profile_endpoint(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut url) => {
+            url.set_query(None);
+            url.set_fragment(None);
+            url.into()
+        }
+        Err(_) => url.to_owned(),
+    }
 }
 
 fn validate_url(base: &str) -> Result<reqwest::Url> {

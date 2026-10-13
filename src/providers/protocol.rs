@@ -99,6 +99,9 @@ pub(super) fn conversation_request(
     })
 }
 
+const TRUNCATED: &str =
+    "Provider truncated the description at its output limit; the same request cannot complete";
+
 pub(super) fn description_text(
     value: &Value,
     protocol: Protocol,
@@ -109,10 +112,12 @@ pub(super) fn description_text(
     let mut parts = Vec::new();
     match protocol {
         Protocol::Responses => {
-            if matches!(
-                value["status"].as_str(),
-                Some("failed" | "cancelled" | "incomplete")
-            ) {
+            // `incomplete` reports an output-limit or content-filter stop: the
+            // identical request cannot complete, but another model may.
+            if value["status"] == "incomplete" {
+                return Err(Failure::permanent(TRUNCATED));
+            }
+            if matches!(value["status"].as_str(), Some("failed" | "cancelled")) {
                 return Err(Failure::empty(
                     "Provider returned an incomplete description",
                 ));
@@ -130,9 +135,7 @@ pub(super) fn description_text(
         Protocol::Chat => {
             let choice = &value["choices"][0];
             if choice["finish_reason"] == "length" {
-                return Err(Failure::empty(
-                    "Provider returned an incomplete description",
-                ));
+                return Err(Failure::permanent(TRUNCATED));
             }
             if let Some(text) = choice["message"]["content"].as_str() {
                 parts.push(text);
@@ -142,18 +145,19 @@ pub(super) fn description_text(
         }
         Protocol::Messages => {
             if value["stop_reason"] == "max_tokens" {
-                return Err(Failure::empty(
-                    "Provider returned an incomplete description",
-                ));
+                return Err(Failure::permanent(TRUNCATED));
             }
             collect_text(&value["content"], "text", &mut parts);
         }
         Protocol::Gemini => {
+            if !value["promptFeedback"]["blockReason"].is_null() {
+                return Err(Failure::permanent(
+                    "Provider blocked the description prompt; the same request cannot succeed",
+                ));
+            }
             let candidate = &value["candidates"][0];
             if candidate["finishReason"] == "MAX_TOKENS" {
-                return Err(Failure::empty(
-                    "Provider returned an incomplete description",
-                ));
+                return Err(Failure::permanent(TRUNCATED));
             }
             if let Some(content) = candidate["content"]["parts"].as_array() {
                 for part in content {

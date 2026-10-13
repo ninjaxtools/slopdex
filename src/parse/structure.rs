@@ -4,7 +4,8 @@
 //! zero-based, half-open; lines and UTF-8 byte columns are one-based, with an
 //! exclusive end (including an end at column 1 of the following line).
 
-use super::syntax::{children, text, unwrap_value};
+use super::Diagnostic;
+use super::syntax::{Descent, children, text, unwrap_value};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
@@ -85,13 +86,22 @@ impl StructureNode {
     }
 }
 
-pub(super) fn extract(language: &str, root: Node<'_>, source: &str) -> FileStructure {
+/// Extracts declarations; a region nested beyond the `Descent` limits
+/// is skipped and reported through `errors` instead of overflowing the stack.
+pub(super) fn extract(
+    language: &str,
+    root: Node<'_>,
+    source: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> FileStructure {
     let mut collector = Collector {
         language,
         source,
         nodes: Vec::new(),
+        descent: Descent::default(),
     };
     collector.walk(root, None, false);
+    errors.extend(collector.descent.truncated);
     FileStructure {
         nodes: collector.nodes,
     }
@@ -206,40 +216,49 @@ fn js_declaration_value(node: Node<'_>) -> bool {
         || node.kind() == "object" && contains_js_declaration(node)
 }
 
-fn contains_js_declaration(node: Node<'_>) -> bool {
+fn contains_js_declaration(root: Node<'_>) -> bool {
     // Anonymous callbacks that compute property values do not turn a data
     // object into a declaration. Keep bindings that scope real declarations.
-    matches!(
-        node.kind(),
-        "class"
-            | "class_declaration"
-            | "abstract_class_declaration"
-            | "interface_declaration"
-            | "type_alias_declaration"
-            | "enum_declaration"
-            | "internal_module"
-            | "module"
-            | "function_declaration"
-            | "generator_function_declaration"
-            | "method_definition"
-    ) || matches!(node.kind(), "function_expression" | "generator_function")
-        && node.child_by_field_name("name").is_some()
-        || matches!(
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
             node.kind(),
-            "variable_declarator"
-                | "assignment_expression"
-                | "pair"
-                | "public_field_definition"
-                | "property_definition"
-                | "field_definition"
-        ) && value(node).is_some_and(|v| function_value(v) || v.kind() == "class")
-        || children(node).into_iter().any(contains_js_declaration)
+            "class"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+                | "type_alias_declaration"
+                | "enum_declaration"
+                | "internal_module"
+                | "module"
+                | "function_declaration"
+                | "generator_function_declaration"
+                | "method_definition"
+        ) || matches!(node.kind(), "function_expression" | "generator_function")
+            && node.child_by_field_name("name").is_some()
+            || matches!(
+                node.kind(),
+                "variable_declarator"
+                    | "assignment_expression"
+                    | "pair"
+                    | "public_field_definition"
+                    | "property_definition"
+                    | "field_definition"
+            ) && value(node).is_some_and(|v| function_value(v) || v.kind() == "class")
+        {
+            return true;
+        }
+        stack.extend(children(node));
+    }
+    false
 }
 
 struct Collector<'a> {
     language: &'a str,
     source: &'a str,
     nodes: Vec<StructureNode>,
+    /// Bounds recursion; holds the diagnostic for a skipped region.
+    descent: Descent,
 }
 
 impl Collector<'_> {
@@ -390,7 +409,16 @@ impl Collector<'_> {
         attrs
     }
 
+    /// Every descent into the tree passes through here, so stack use stays
+    /// bounded by `Descent` regardless of the input's nesting.
     fn walk(&mut self, node: Node<'_>, parent: Option<usize>, in_callable: bool) {
+        if self.descent.enter(node) {
+            self.walk_inner(node, parent, in_callable);
+            self.descent.leave();
+        }
+    }
+
+    fn walk_inner(&mut self, node: Node<'_>, parent: Option<usize>, in_callable: bool) {
         let syntax = node.kind();
         // Inline object members belong to their type expression, not the
         // nearest named scope. Only direct object aliases expose child symbols.
@@ -1234,14 +1262,39 @@ impl Collector<'_> {
         kind: &str,
         edits: &mut Vec<(usize, usize)>,
     ) {
-        let edits_start = edits.len();
+        // Edits are sorted afterwards, so the visiting order is irrelevant;
+        // only children outside this node's own excluded ranges are visited.
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            let edits_start = edits.len();
+            if !self.node_signature_edits(root, node, kind, edits) {
+                continue;
+            }
+            let excluded = &edits[edits_start..];
+            stack.extend(children(node).into_iter().filter(|child| {
+                !excluded
+                    .iter()
+                    .any(|(start, end)| child.start_byte() >= *start && child.end_byte() <= *end)
+            }));
+        }
+    }
+
+    /// Records the ranges excluded from `node`'s signature; returns whether
+    /// its children may contribute further edits.
+    fn node_signature_edits(
+        &self,
+        root: Node<'_>,
+        node: Node<'_>,
+        kind: &str,
+        edits: &mut Vec<(usize, usize)>,
+    ) -> bool {
         let syntax = node.kind();
         if matches!(
             syntax,
             "comment" | "line_comment" | "block_comment" | "decorator" | "attribute_item"
         ) {
             edits.push((node.start_byte(), node.end_byte()));
-            return;
+            return false;
         }
         // These AST nodes are declaration bodies, never initializer delimiters
         // inferred by searching for braces in text (which breaks generic types).
@@ -1263,7 +1316,7 @@ impl Collector<'_> {
             )
         {
             edits.push((node.start_byte(), node.end_byte()));
-            return;
+            return false;
         }
         if node != root
             && matches!(syntax, "object_type" | "interface_type" | "struct_type")
@@ -1277,13 +1330,13 @@ impl Collector<'_> {
                 edits.push((body.start_byte(), body.end_byte()));
             } else if syntax == "object_type" {
                 edits.push((node.start_byte(), node.end_byte()));
-                return;
+                return false;
             } else {
                 // Go interfaces have their braces directly on interface_type.
                 let mut c = node.walk();
                 if let Some(open) = node.children(&mut c).find(|n| n.kind() == "{") {
                     edits.push((open.start_byte(), node.end_byte()));
-                    return;
+                    return false;
                 }
             }
         }
@@ -1294,7 +1347,7 @@ impl Collector<'_> {
                 .find(|n| matches!(n.kind(), "{" | "(" | "["))
             {
                 edits.push((open.start_byte(), node.end_byte()));
-                return;
+                return false;
             }
         }
         if syntax == "enum_constant"
@@ -1371,16 +1424,7 @@ impl Collector<'_> {
                 edits.push((start, value.end_byte()));
             }
         }
-        let excluded = edits[edits_start..].to_vec();
-        for child in children(node) {
-            if excluded
-                .iter()
-                .any(|(start, end)| child.start_byte() >= *start && child.end_byte() <= *end)
-            {
-                continue;
-            }
-            self.signature_edits(root, child, kind, edits);
-        }
+        true
     }
 
     fn multi_declaration(&mut self, node: Node<'_>, parent: Option<usize>, local: bool) {
@@ -1496,27 +1540,37 @@ impl Collector<'_> {
         }
     }
 
-    fn c_parameters(&mut self, node: Node<'_>, parent: Option<usize>) {
-        for child in children(node) {
-            if child.kind() == "parameter_list" {
-                self.walk(child, parent, true);
-            } else if child.kind().ends_with("declarator") {
-                self.c_parameters(child, parent);
+    fn c_parameters(&mut self, declarator: Node<'_>, parent: Option<usize>) {
+        // Parameter lists and nested declarators are visited in source order.
+        let mut stack = vec![declarator];
+        while let Some(node) = stack.pop() {
+            if node != declarator && node.kind() == "parameter_list" {
+                self.walk(node, parent, true);
+                continue;
             }
+            stack.extend(
+                children(node)
+                    .into_iter()
+                    .filter(|child| {
+                        child.kind() == "parameter_list" || child.kind().ends_with("declarator")
+                    })
+                    .rev(),
+            );
         }
     }
 
     fn c_nested_types(&mut self, node: Node<'_>, parent: Option<usize>, local: bool) {
-        if matches!(
-            node.kind(),
-            "struct_specifier" | "union_specifier" | "enum_specifier"
-        ) && node.child_by_field_name("name").is_some()
-            && node.child_by_field_name("body").is_some()
-        {
-            self.walk(node, parent, local);
-        } else {
-            for child in children(node) {
-                self.c_nested_types(child, parent, local);
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "struct_specifier" | "union_specifier" | "enum_specifier"
+            ) && node.child_by_field_name("name").is_some()
+                && node.child_by_field_name("body").is_some()
+            {
+                self.walk(node, parent, local);
+            } else {
+                stack.extend(children(node).into_iter().rev());
             }
         }
     }
@@ -1569,20 +1623,19 @@ impl Collector<'_> {
     }
 }
 
-fn declarator_name(source: &str, node: Node<'_>) -> Option<String> {
-    if matches!(
-        node.kind(),
-        "identifier" | "field_identifier" | "type_identifier"
-    ) {
-        return Some(text(source, node).to_owned());
+fn declarator_name(source: &str, mut node: Node<'_>) -> Option<String> {
+    loop {
+        if matches!(
+            node.kind(),
+            "identifier" | "field_identifier" | "type_identifier"
+        ) {
+            return Some(text(source, node).to_owned());
+        }
+        if let Some(name) = node.child_by_field_name("name") {
+            return Some(text(source, name).to_owned());
+        }
+        node = super::syntax::declarator_inner(node)?;
     }
-    if let Some(name) = node.child_by_field_name("name") {
-        return Some(text(source, name).to_owned());
-    }
-    if let Some(inner) = super::syntax::declarator_inner(node) {
-        return declarator_name(source, inner);
-    }
-    None
 }
 
 pub(super) fn go_callable_target<'tree>(source: &str, node: Node<'tree>) -> Option<Node<'tree>> {
@@ -1602,26 +1655,19 @@ fn python_type_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn binding_names(source: &str, node: Node<'_>, names: &mut Vec<String>) {
-    match node.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => {
-            names.push(text(source, node).to_owned())
-        }
-        "pair_pattern" => {
-            if let Some(value) = node.child_by_field_name("value") {
-                binding_names(source, value, names);
+fn binding_names(source: &str, root: Node<'_>, names: &mut Vec<String>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                names.push(text(source, node).to_owned())
             }
-        }
-        "assignment_pattern" | "object_assignment_pattern" => {
-            if let Some(left) = node.child_by_field_name("left") {
-                binding_names(source, left, names);
+            "pair_pattern" => stack.extend(node.child_by_field_name("value")),
+            "assignment_pattern" | "object_assignment_pattern" => {
+                stack.extend(node.child_by_field_name("left"))
             }
-        }
-        "attribute" | "subscript" => {}
-        _ => {
-            for child in children(node) {
-                binding_names(source, child, names);
-            }
+            "attribute" | "subscript" => {}
+            _ => stack.extend(children(node).into_iter().rev()),
         }
     }
 }

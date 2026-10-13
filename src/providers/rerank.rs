@@ -37,7 +37,9 @@ impl Configuration {
             provider,
         )?;
         let base = string(config, &["rerankerBaseUrl"])?.unwrap_or(default_base);
-        // URL validation stays in rerank, after candidate and credential validation.
+        // Endpoint policy (TLS, custom-host notice) applies when the reranker is
+        // constructed; path validation stays in rerank, after candidate checks.
+        super::check_hosted_endpoint(config, "reranking", "rerankerBaseUrl", default_base)?;
         Ok(Self {
             model: model.to_owned(),
             base: base.to_owned(),

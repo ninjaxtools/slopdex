@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    parse::{FileStructure, ParsedFile, StructureNode},
+    parse::{FileStructure, ImportBinding, ParsedFile, StructureNode},
     storage::{Database, STRUCTURE_PARSER_VERSION},
 };
 
@@ -68,6 +68,11 @@ fn callable(node: &StructureNode) -> bool {
         node.kind.as_str(),
         "function" | "method" | "constructor" | "generator"
     )
+}
+
+/// Structure ids are file-local vector indexes; verify rather than scan.
+fn node_by_id(structure: &FileStructure, id: usize) -> Option<&StructureNode> {
+    structure.nodes.get(id).filter(|node| node.id == id)
 }
 
 impl CallGraph {
@@ -163,11 +168,7 @@ impl CallGraph {
     }
 
     pub fn node(&self, key: &Key) -> Option<&StructureNode> {
-        self.files
-            .get(&key.path)?
-            .nodes
-            .iter()
-            .find(|node| node.id == key.id)
+        node_by_id(self.files.get(&key.path)?, key.id)
     }
 
     pub fn expand(
@@ -253,6 +254,96 @@ impl CallGraph {
     }
 }
 
+/// In Python and JavaScript/TypeScript a bare name is a lexical lookup: it
+/// reaches enclosing functions and namespaces, never the members of an
+/// enclosing class, object, or interface. Other languages keep their nested
+/// member rules (Java inner classes, Go/C nested scopes, Rust nested items).
+fn bare_name_reaches(language: &str, ancestor: &StructureNode) -> bool {
+    !matches!(
+        language,
+        "python" | "javascript" | "jsx" | "typescript" | "tsx"
+    ) || callable(ancestor)
+        || ancestor.kind == "module"
+}
+
+/// `Foo` for `impl Foo`, `impl<T> Foo<T>`, and `impl Trait for Foo<T>`.
+fn impl_type(name: &str) -> &str {
+    let name = name
+        .strip_prefix('<')
+        .and_then(|inner| inner.split(" as ").next())
+        .unwrap_or(name);
+    name.split('<').next().unwrap_or(name).trim()
+}
+
+/// Whether `container` is the static receiver written as `receiver`.
+fn container_named(container: &StructureNode, receiver: &str) -> bool {
+    match container.kind.as_str() {
+        "class" | "struct" | "module" | "interface" | "enum" => container.name == receiver,
+        "impl" => impl_type(&container.name) == receiver,
+        _ => false,
+    }
+}
+
+/// A member reachable through its type's name rather than an instance.
+fn static_member(node: &StructureNode) -> bool {
+    node.kind == "constructor"
+        || node.signature.contains("static")
+        || node.attributes.iter().any(|attribute| {
+            attribute.contains("staticmethod") || attribute.contains("classmethod")
+        })
+        || node.language == "rust" && node.kind == "method" && !rust_self_receiver(&node.signature)
+}
+
+/// Whether a Rust signature's parameter list starts with a `self` receiver.
+fn rust_self_receiver(signature: &str) -> bool {
+    let mut depth = 0usize;
+    let mut parameters = None;
+    for (offset, c) in signature.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            '(' if depth == 0 => {
+                parameters = Some(&signature[offset + 1..]);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(parameters) = parameters else {
+        return false;
+    };
+    let mut rest = parameters.trim_start();
+    rest = rest.strip_prefix('&').unwrap_or(rest).trim_start();
+    if rest.starts_with('\'') {
+        rest = rest.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+    }
+    rest = rest.trim_start();
+    rest = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+    rest.strip_prefix("self")
+        .is_some_and(|after| after.is_empty() || after.starts_with([',', ')', ':', ' ']))
+}
+
+/// The local name an import binds; Go packages bind their last path segment.
+fn local_name<'a>(language: &str, binding: &'a ImportBinding) -> Option<&'a str> {
+    binding
+        .alias
+        .as_deref()
+        .or(binding.name.as_deref())
+        .or_else(|| {
+            (language == "go").then(|| binding.path.rsplit('/').next().unwrap_or(&binding.path))
+        })
+}
+
+/// Whether a binding names a module/namespace whose members are reached with
+/// a receiver. JavaScript named and default imports are values, so only
+/// namespace (`* as`) and `require` bindings qualify; paths in the other
+/// languages always name modules, packages, or types.
+fn module_binding(language: &str, binding: &ImportBinding) -> bool {
+    !matches!(language, "javascript" | "jsx" | "typescript" | "tsx")
+        || binding.wildcard
+        || binding.name.is_none()
+}
+
 fn resolve(
     files: &BTreeMap<String, FileStructure>,
     indexed: &BTreeSet<Key>,
@@ -262,14 +353,11 @@ fn resolve(
     receiver: Option<&str>,
 ) -> Option<Key> {
     let structure = files.get(path)?;
+    let language = owner.language.as_str();
     let ancestors: Vec<_> = std::iter::successors(owner.parent_id, |id| {
-        structure
-            .nodes
-            .iter()
-            .find(|n| n.id == *id)
-            .and_then(|n| n.parent_id)
+        node_by_id(structure, *id).and_then(|n| n.parent_id)
     })
-    .filter_map(|id| structure.nodes.iter().find(|n| n.id == id))
+    .filter_map(|id| node_by_id(structure, id))
     .collect();
     let scope = ancestors.iter().find(|n| {
         matches!(
@@ -284,23 +372,20 @@ fn resolve(
         .filter(|n| callable(n) && n.name == name)
     {
         let valid = match receiver {
-            None => {
-                node.parent_id.is_none()
-                    || ancestors
-                        .iter()
-                        .any(|parent| Some(parent.id) == node.parent_id)
-            }
+            None => match node.parent_id {
+                None => true,
+                Some(parent_id) => ancestors
+                    .iter()
+                    .any(|parent| parent.id == parent_id && bare_name_reaches(language, parent)),
+            },
             Some("self" | "this" | "Self" | "cls") => scope.is_some_and(|s| {
                 node.parent_id == Some(s.id)
                     || node.qualified_name.starts_with(&format!("{}.", s.name))
             }),
-            Some(receiver) => structure.nodes.iter().any(|container| {
-                matches!(
-                    container.kind.as_str(),
-                    "class" | "struct" | "module" | "interface"
-                ) && container.name == receiver
-                    && node.parent_id == Some(container.id)
-            }),
+            Some(receiver) => node
+                .parent_id
+                .and_then(|id| node_by_id(structure, id))
+                .is_some_and(|container| container_named(container, receiver)),
         };
         if valid {
             let key = Key {
@@ -335,9 +420,10 @@ fn resolve(
     // using a globally unique bare name or an unknown runtime receiver.
     for import in structure.nodes.iter().filter(|n| n.kind == "import") {
         for binding in &import.imports {
-            let local = binding.alias.as_deref().or(binding.name.as_deref());
             let referenced = receiver.unwrap_or(name);
-            if local != Some(referenced) || (binding.wildcard && receiver.is_none()) {
+            if local_name(language, binding) != Some(referenced)
+                || (binding.wildcard && receiver.is_none())
+            {
                 continue;
             }
             let target_name = if receiver.is_some() {
@@ -345,6 +431,9 @@ fn resolve(
             } else {
                 binding.name.as_deref().unwrap_or(name)
             };
+            // `config.validate()` reaches a module-level function only through
+            // a namespace binding; a value binding would need the value's type.
+            let namespace = receiver.is_some() && module_binding(language, binding);
             for (other_path, other) in files {
                 if other_path == path
                     || !import_path_matches(
@@ -357,19 +446,27 @@ fn resolve(
                 {
                     continue;
                 }
-                for node in other.nodes.iter().filter(|n| {
-                    callable(n)
-                        && n.name == target_name
-                        && (n.parent_id.is_none()
-                            || receiver.is_some_and(|r| {
-                                n.qualified_name
-                                    == format!(
-                                        "{}.{target_name}",
-                                        binding.name.as_deref().unwrap_or(r)
-                                    )
-                                    && (n.kind == "constructor" || n.signature.contains("static"))
-                            }))
-                }) {
+                for node in other
+                    .nodes
+                    .iter()
+                    .filter(|n| callable(n) && n.name == target_name)
+                {
+                    let valid = match (receiver, node.parent_id) {
+                        (None, parent) => parent.is_none(),
+                        // Go methods are top-level declarations too, but only
+                        // functions are reachable through a package name.
+                        (Some(_), None) => {
+                            namespace && (language != "go" || node.kind == "function")
+                        }
+                        (Some(receiver), Some(parent)) => {
+                            let container = binding.name.as_deref().unwrap_or(receiver);
+                            node_by_id(other, parent).is_some_and(|c| container_named(c, container))
+                                && static_member(node)
+                        }
+                    };
+                    if !valid {
+                        continue;
+                    }
                     let key = Key {
                         path: other_path.clone(),
                         id: node.id,
@@ -442,21 +539,21 @@ fn import_path_matches(
             || target == format!("{path}/__init__.py");
     }
     if target.ends_with(".rs") {
-        let module = module
-            .strip_prefix("crate::")
-            .or_else(|| module.strip_prefix("self::"))
+        return rust_import_matches(from, target, module, imported_callable);
+    }
+    if target.ends_with(".go") {
+        // Files of package `p` live in a directory named `p`; the import path's
+        // last segment is the package directory for conventional layouts.
+        let package = module
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
             .unwrap_or(module);
-        let module = if imported_callable {
-            module
-                .rsplit_once("::")
-                .map(|(prefix, _)| prefix)
-                .unwrap_or(module)
-        } else {
-            module
-        };
-        let segments = module.replace("::", "/");
-        return target.ends_with(&format!("{segments}.rs"))
-            || target.ends_with(&format!("{segments}/mod.rs"));
+        let directory = target
+            .rsplit_once('/')
+            .map(|(directory, _)| directory.rsplit('/').next().unwrap_or(directory))
+            .unwrap_or("");
+        return !package.is_empty() && directory == package;
     }
     if target.ends_with(".java") {
         let module = if imported_callable {
@@ -470,4 +567,321 @@ fn import_path_matches(
         return target.ends_with(&format!("{}.java", module.replace('.', "/")));
     }
     false
+}
+
+/// Rust paths name items: a callable import points at its parent module's
+/// file, a receiver import names either a module file or a type in its parent
+/// module. `super::` paths resolve relative to the importing file's module.
+fn rust_import_matches(from: &str, target: &str, module: &str, imported_callable: bool) -> bool {
+    let segments: Vec<&str> = module.split("::").collect();
+    let candidates: Vec<&[&str]> = if imported_callable {
+        vec![&segments[..segments.len().saturating_sub(1)]]
+    } else {
+        vec![&segments[..], &segments[..segments.len().saturating_sub(1)]]
+    };
+    if segments.first() == Some(&"super") {
+        let supers = segments.iter().take_while(|s| **s == "super").count();
+        let Some(base) = rust_super_directory(from, supers) else {
+            return false;
+        };
+        return candidates.into_iter().any(|segments| {
+            let segments = &segments[supers.min(segments.len())..];
+            rust_module_files(&base, segments)
+                .iter()
+                .any(|candidate| candidate == target)
+        });
+    }
+    candidates.into_iter().any(|segments| {
+        let segments: Vec<&str> = segments
+            .iter()
+            .copied()
+            .filter(|s| !matches!(*s, "crate" | "self"))
+            .collect();
+        if segments.is_empty() {
+            return target.ends_with("lib.rs") || target.ends_with("main.rs");
+        }
+        let path = segments.join("/");
+        target.ends_with(&format!("{path}.rs")) || target.ends_with(&format!("{path}/mod.rs"))
+    })
+}
+
+/// The directory whose files belong to the module `supers` levels above the
+/// importing file's module. `b.rs` is module `b` whose parent's files share
+/// its directory; `mod.rs`, `lib.rs`, and `main.rs` are their directory's own
+/// module, so their parent lives one level up.
+fn rust_super_directory(from: &str, supers: usize) -> Option<Vec<String>> {
+    let (directory, file) = from.rsplit_once('/').unwrap_or(("", from));
+    let mut directory: Vec<String> = directory
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let stem = file.strip_suffix(".rs").unwrap_or(file);
+    let climbs = supers - usize::from(!matches!(stem, "mod" | "lib" | "main"));
+    for _ in 0..climbs {
+        directory.pop()?;
+    }
+    Some(directory)
+}
+
+/// Files that can hold the module at `segments` under `base`; an empty path
+/// names `base`'s own module file.
+fn rust_module_files(base: &[String], segments: &[&str]) -> Vec<String> {
+    let join = |parts: &[&str]| parts.join("/");
+    let base_parts: Vec<&str> = base.iter().map(String::as_str).collect();
+    if segments.is_empty() {
+        let mut files = vec![
+            join(&[&base_parts[..], &["mod.rs"]].concat()),
+            join(&[&base_parts[..], &["lib.rs"]].concat()),
+            join(&[&base_parts[..], &["main.rs"]].concat()),
+        ];
+        if let Some((name, parent)) = base_parts.split_last() {
+            let file = format!("{name}.rs");
+            files.push(join(&[parent, &[file.as_str()]].concat()));
+        }
+        return files;
+    }
+    let path = [&base_parts[..], segments].concat();
+    vec![
+        format!("{}.rs", join(&path)),
+        join(&[&path[..], &["mod.rs"]].concat()),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::parse;
+
+    fn build(files: &[(&str, &str)]) -> CallGraph {
+        let parsed: Vec<_> = files
+            .iter()
+            .map(|(path, source)| (*path, parse(path, source).unwrap()))
+            .collect();
+        for (path, parsed) in &parsed {
+            assert!(parsed.errors.is_empty(), "{path}: {:?}", parsed.errors);
+        }
+        CallGraph::from_parsed(parsed.iter().map(|(path, parsed)| (*path, parsed))).unwrap()
+    }
+
+    /// Edges as `path:qualified -> path:qualified`, sorted.
+    fn edges(graph: &CallGraph) -> Vec<String> {
+        let name = |key: &Key| format!("{}:{}", key.path, graph.node(key).unwrap().qualified_name);
+        let mut result: Vec<_> = graph
+            .edges
+            .iter()
+            .flat_map(|(from, to)| {
+                to.iter()
+                    .map(move |to| format!("{} -> {}", name(from), name(to)))
+            })
+            .collect();
+        result.sort();
+        result
+    }
+
+    #[test]
+    fn node_lookup_uses_ids_as_indexes() {
+        let graph = build(&[("a.rs", "fn first() {}\nfn second() { first(); }")]);
+        let key = Key {
+            path: "a.rs".into(),
+            id: 1,
+        };
+        assert_eq!(graph.node(&key).unwrap().name, "second");
+        assert!(
+            graph
+                .node(&Key {
+                    path: "a.rs".into(),
+                    id: 7
+                })
+                .is_none()
+        );
+        assert!(
+            graph
+                .node(&Key {
+                    path: "missing.rs".into(),
+                    id: 0
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rust_associated_functions_resolve_through_impl_blocks() {
+        let graph = build(&[(
+            "a.rs",
+            "pub struct Foo;\nimpl Foo {\n  pub fn new() -> Self { Foo }\n  pub fn run(&self) { self.step(); }\n  fn step(&self) {}\n}\nimpl<T> Wrapper<T> {\n  pub fn create() -> Self { todo!() }\n}\npub fn build() { let foo = Foo::new(); foo.run(); Wrapper::create(); }\n",
+        )]);
+        assert_eq!(
+            edges(&graph),
+            [
+                "a.rs:Foo.run -> a.rs:Foo.step",
+                "a.rs:build -> a.rs:Foo.new",
+                "a.rs:build -> a.rs:Wrapper<T>.create",
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_static_methods_resolve_across_files_without_self_receivers() {
+        let graph = build(&[
+            (
+                "src/foo.rs",
+                "pub struct Foo;\nimpl Foo {\n  pub fn new() -> Self { Foo }\n  pub fn with(count: usize) -> Self { Foo }\n  pub fn run(&self) {}\n  pub fn reset(&mut self) {}\n  pub fn shared(self: Box<Self>) {}\n}\n",
+            ),
+            (
+                "src/main.rs",
+                "use crate::foo::Foo;\nfn main() { let foo = Foo::new(); Foo::with(2); Foo::run(); Foo::reset(); Foo::shared(); foo.run(); }\n",
+            ),
+        ]);
+        assert_eq!(
+            edges(&graph),
+            [
+                "src/main.rs:main -> src/foo.rs:Foo.new",
+                "src/main.rs:main -> src/foo.rs:Foo.with",
+            ]
+        );
+        assert!(rust_self_receiver("fn run(&self)"));
+        assert!(rust_self_receiver("fn run(&'a mut self, x: i32)"));
+        assert!(rust_self_receiver("fn run(mut self)"));
+        assert!(rust_self_receiver("fn run(self: Box<Self>)"));
+        assert!(!rust_self_receiver("fn run(selfish: i32)"));
+        assert!(!rust_self_receiver("fn run<F: Fn(i32)>(f: F)"));
+    }
+
+    #[test]
+    fn bare_names_skip_enclosing_class_members_in_python_and_javascript() {
+        let graph = build(&[
+            (
+                "a.py",
+                "def helper():\n    pass\n\nclass Service:\n    def helper(self):\n        pass\n\n    def run(self):\n        helper()\n        self.helper()\n",
+            ),
+            (
+                "a.ts",
+                "function helper() {}\nclass Service {\n  helper() {}\n  run() { helper(); this.helper(); }\n}\nconst api = { helper() {}, run() { helper(); } };\n",
+            ),
+        ]);
+        assert_eq!(
+            edges(&graph),
+            [
+                "a.py:Service.run -> a.py:Service.helper",
+                "a.py:Service.run -> a.py:helper",
+                "a.ts:Service.run -> a.ts:Service.helper",
+                "a.ts:Service.run -> a.ts:helper",
+                "a.ts:api.run -> a.ts:helper",
+            ]
+        );
+        // Nested functions and namespaces are lexical scopes.
+        let graph = build(&[(
+            "b.py",
+            "def outer():\n    def first():\n        pass\n    def second():\n        first()\n",
+        )]);
+        assert_eq!(edges(&graph), ["b.py:outer.second -> b.py:outer.first"]);
+    }
+
+    #[test]
+    fn java_bare_names_still_reach_enclosing_class_methods() {
+        let graph = build(&[(
+            "Demo.java",
+            "class Demo { void helper() {} void run() { helper(); } }",
+        )]);
+        assert_eq!(
+            edges(&graph),
+            ["Demo.java:Demo.run -> Demo.java:Demo.helper"]
+        );
+    }
+
+    #[test]
+    fn value_receivers_do_not_resolve_as_imported_modules() {
+        let graph = build(&[
+            (
+                "src/config.rs",
+                "pub struct Config;\npub fn load() -> Config { Config }\npub fn validate() {}\nimpl Config { pub fn validate(&self) {} }\n",
+            ),
+            (
+                "src/main.rs",
+                "use crate::config;\nfn main() { let config = config::load(); config.validate(); }\n",
+            ),
+            (
+                "lib/config.js",
+                "export function validate() {}\nexport default { validate };\n",
+            ),
+            (
+                "lib/named.js",
+                "import { config } from './config';\nexport function run() { config.validate(); }\n",
+            ),
+            (
+                "lib/namespace.js",
+                "import * as config from './config';\nexport function run() { config.validate(); }\n",
+            ),
+            (
+                "lib/required.ts",
+                "import config = require('./config');\nexport function run() { config.validate(); }\n",
+            ),
+        ]);
+        assert_eq!(
+            edges(&graph),
+            [
+                "lib/namespace.js:run -> lib/config.js:validate",
+                "lib/required.ts:run -> lib/config.js:validate",
+                "src/main.rs:main -> src/config.rs:load",
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_super_imports_resolve_relative_to_the_importing_module() {
+        let graph = build(&[
+            ("src/util.rs", "pub fn shared() {}\n"),
+            ("src/a/mod.rs", "pub fn parent_helper() {}\n"),
+            ("src/a/b.rs", "pub fn deep() {}\n"),
+            (
+                "src/a/c.rs",
+                "use super::b;\nuse super::parent_helper;\nuse super::super::util::shared;\nuse super::super::util;\npub fn run() { b::deep(); parent_helper(); shared(); util::shared(); }\n",
+            ),
+            (
+                "src/a/d/mod.rs",
+                "use super::b::deep;\npub fn run() { deep(); }\n",
+            ),
+            ("src/other/util.rs", "pub fn shared() {}\n"),
+        ]);
+        assert_eq!(
+            edges(&graph),
+            [
+                "src/a/c.rs:run -> src/a/b.rs:deep",
+                "src/a/c.rs:run -> src/a/mod.rs:parent_helper",
+                "src/a/c.rs:run -> src/util.rs:shared",
+                "src/a/d/mod.rs:run -> src/a/b.rs:deep",
+            ]
+        );
+        assert_eq!(
+            rust_super_directory("src/a/b.rs", 1),
+            Some(vec!["src".to_owned(), "a".to_owned()])
+        );
+        assert_eq!(
+            rust_super_directory("src/a/mod.rs", 1),
+            Some(vec!["src".to_owned()])
+        );
+        assert_eq!(rust_super_directory("lib.rs", 1), None);
+    }
+
+    #[test]
+    fn go_imports_resolve_package_functions_by_path_segment() {
+        let graph = build(&[
+            (
+                "config/config.go",
+                "package config\n\nfunc Load() {}\n\ntype Store struct{}\n\nfunc (s Store) Load() {}\n\nfunc Validate() {}\n",
+            ),
+            (
+                "cmd/main.go",
+                "package main\n\nimport (\n\t\"fmt\"\n\t\"example.com/app/config\"\n\tcfg \"example.com/app/config\"\n)\n\nfunc main() { config.Load(); cfg.Validate(); fmt.Println() }\n",
+            ),
+            (
+                "other/config/x.go",
+                "package config\n\nfunc Validate() {}\n",
+            ),
+        ]);
+        // `Load` ignores the same-named method; `Validate` is ambiguous between
+        // two `config` directories and is dropped.
+        assert_eq!(edges(&graph), ["cmd/main.go:main -> config/config.go:Load"]);
+    }
 }

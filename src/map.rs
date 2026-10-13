@@ -706,7 +706,8 @@ fn display_end(node: &StructureNode) -> usize {
     inclusive_end(node.end_line, node.end_column, node.start_line)
 }
 
-pub fn render_node(
+#[cfg(test)]
+pub(crate) fn render_node(
     node: &StructureNode,
     depth: usize,
     annotation: Option<&str>,
@@ -720,10 +721,6 @@ pub fn render_node(
 
 /// A ranked hit is independent of neighboring hits: render its ancestors on
 /// every occurrence, but keep the hunk range anchored to the matching symbol.
-pub fn render_context(nodes: &[StructureNode], annotation: Option<&str>, detail: Detail) -> String {
-    render_context_with_description(nodes, annotation, detail, None)
-}
-
 pub fn render_context_with_description(
     nodes: &[StructureNode],
     annotation: Option<&str>,
@@ -748,10 +745,6 @@ pub fn render_context_with_description(
         ));
     }
     output
-}
-
-pub fn render_declarations(nodes: &[StructureNode], detail: Detail) -> String {
-    render_declarations_with_annotation(nodes, detail, None)
 }
 
 pub fn render_declarations_with_annotation(
@@ -929,11 +922,14 @@ pub fn matching_node<'a>(structure: &'a FileStructure, unit: &Value) -> Option<&
     let end = unit["endLine"].as_u64().unwrap_or(start as u64) as usize;
     let qualified = unit["qualifiedName"].as_str();
     let name = unit["name"].as_str();
+    // Hoisted: this runs once per unit over every node of the file.
+    let any_kind = unit["startByte"].is_u64();
+    let column = unit["startColumn"].as_u64().unwrap_or(1) as usize;
     structure
         .nodes
         .iter()
         .filter(|node| {
-            (unit["startByte"].is_u64()
+            (any_kind
                 || matches!(
                     node.kind.as_str(),
                     "function" | "method" | "constructor" | "generator"
@@ -947,8 +943,7 @@ pub fn matching_node<'a>(structure: &'a FileStructure, unit: &Value) -> Option<&
             (
                 qualified != Some(node.qualified_name.as_str()),
                 node.start_line.abs_diff(start) + node.end_line.abs_diff(end),
-                node.start_column
-                    .abs_diff(unit["startColumn"].as_u64().unwrap_or(1) as usize),
+                node.start_column.abs_diff(column),
                 node.id,
             )
         })

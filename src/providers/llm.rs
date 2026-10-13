@@ -67,6 +67,7 @@ impl Configured {
         }
         let base = string(config, &["descriptionBaseUrl"])?.unwrap_or(A::DEFAULT_BASE);
         validate_url(base)?;
+        super::check_hosted_endpoint(config, "description", "descriptionBaseUrl", A::DEFAULT_BASE)?;
         // Protocol builders normalize the path; trimming the whole URL can alter query values.
         let base = base.to_owned();
         Ok(Self {
@@ -78,11 +79,12 @@ impl Configured {
     }
 
     /// The profile identifies the configured primary, even while fallback is active.
+    /// Custom endpoints are recorded without their query string.
     pub(super) fn profile<A: Adapter>(&self) -> Value {
         let mut profile = json!({"provider": A::PROVIDER, "model": self.models[0],
             "strategyVersion": "file-conversation-v3"});
         if self.context.config["descriptionBaseUrl"].is_string() {
-            profile["endpoint"] = json!(self.base);
+            profile["endpoint"] = json!(super::profile_endpoint(&self.base));
         }
         if self.models.len() > 1 {
             profile["fallbackModel"] = json!(self.models[1]);

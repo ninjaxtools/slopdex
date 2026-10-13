@@ -274,30 +274,45 @@ fn normalize_remote(root: &Path, value: &str) -> Option<String> {
     Some(clean_path(&path.to_string_lossy()))
 }
 
-fn insert_scoped(paths: &mut HashSet<String>, scope: &Path, bytes: &[u8]) -> Result<()> {
-    let path = std::str::from_utf8(bytes).context("Git path is not UTF-8")?;
+/// Git reports paths as bytes. Decode them without rejecting the whole status:
+/// a name this design cannot index must not hide every other change.
+#[cfg(unix)]
+fn git_path(bytes: &[u8]) -> std::borrow::Cow<'_, Path> {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(bytes)).into()
+}
+
+#[cfg(not(unix))]
+fn git_path(bytes: &[u8]) -> std::borrow::Cow<'_, Path> {
+    match String::from_utf8_lossy(bytes) {
+        std::borrow::Cow::Borrowed(path) => Path::new(path).into(),
+        std::borrow::Cow::Owned(path) => PathBuf::from(path).into(),
+    }
+}
+
+/// Indexed paths are UTF-8 strings, so an undecodable Git path can never be a
+/// source path. Treat it as outside the scope instead of failing the refresh.
+fn insert_scoped(paths: &mut HashSet<String>, scope: &Path, bytes: &[u8]) {
+    let Ok(path) = std::str::from_utf8(bytes) else {
+        return;
+    };
     if let Ok(relative) = Path::new(path).strip_prefix(scope)
         && !relative.as_os_str().is_empty()
         && relative
             .components()
             .all(|c| matches!(c, Component::Normal(_)))
+        && let Some(relative) = relative.to_str()
     {
-        paths.insert(
-            relative
-                .to_str()
-                .context("Git path is not UTF-8")?
-                .to_owned(),
-        );
+        paths.insert(relative.to_owned());
     }
-    Ok(())
 }
 
-fn is_policy_path(scope: &Path, bytes: &[u8]) -> Result<bool> {
-    let path = Path::new(std::str::from_utf8(bytes).context("Git path is not UTF-8")?);
+fn is_policy_path(scope: &Path, bytes: &[u8]) -> bool {
+    let path = git_path(bytes);
     let name = path.file_name().and_then(|name| name.to_str());
     let parent = path.parent().unwrap_or(Path::new(""));
-    Ok(matches!(name, Some(".gitignore" | ".ignore" | ".rgignore"))
-        && (parent.starts_with(scope) || scope.starts_with(parent)))
+    matches!(name, Some(".gitignore" | ".ignore" | ".rgignore"))
+        && (parent.starts_with(scope) || scope.starts_with(parent))
 }
 
 fn status_paths(checkout: &Path, scope: &Path) -> Result<(HashSet<String>, bool)> {
@@ -322,38 +337,15 @@ fn status_paths(checkout: &Path, scope: &Path) -> Result<(HashSet<String>, bool)
             record.len() >= 4 && record[2] == b' ',
             "Invalid Git status record"
         );
-        insert_scoped(&mut paths, scope, &record[3..])?;
-        policy_changed |= is_policy_path(scope, &record[3..])?;
+        insert_scoped(&mut paths, scope, &record[3..]);
+        policy_changed |= is_policy_path(scope, &record[3..]);
         if record[..2].iter().any(|b| matches!(b, b'R' | b'C')) {
             let original = records.next().context("Missing Git rename source")?;
-            insert_scoped(&mut paths, scope, original)?;
-            policy_changed |= is_policy_path(scope, original)?;
+            insert_scoped(&mut paths, scope, original);
+            policy_changed |= is_policy_path(scope, original);
         }
     }
     Ok((paths, policy_changed))
-}
-
-/// Git's tracked/untracked candidates, relative to the selected root; apply engine policies too.
-/// Unlike changes(), this supports initial scans of unborn checkouts.
-pub fn tracked_untracked_paths(root: &Path) -> Result<Option<HashSet<String>>> {
-    let Some((checkout, scope)) = checkout(root)? else {
-        return Ok(None);
-    };
-    let data = bytes(
-        &checkout,
-        &[
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ],
-    )?;
-    let mut paths = HashSet::new();
-    for path in data.split(|b| *b == 0).filter(|b| !b.is_empty()) {
-        insert_scoped(&mut paths, &scope, path)?;
-    }
-    Ok(Some(paths))
 }
 
 /// None requests a full scan: non-Git/unborn checkout, no checkpoint, or missing prior commit.
@@ -387,8 +379,8 @@ pub fn changes(root: &Path, checkpoint: Option<&str>) -> Result<Option<Changes>>
             ],
         )?;
         for path in data.split(|b| *b == 0).filter(|b| !b.is_empty()) {
-            insert_scoped(&mut changed, &scope, path)?;
-            policy_changed |= is_policy_path(&scope, path)?;
+            insert_scoped(&mut changed, &scope, path);
+            policy_changed |= is_policy_path(&scope, path);
         }
     }
     Ok(Some(Changes {
@@ -423,34 +415,207 @@ pub fn resolve_base(root: &Path, reference: &str, checkpoint: Option<&str>) -> R
     Ok(resolved)
 }
 
+/// Blob IDs of regular files in a commit, keyed by checkout-relative path bytes.
+fn tree_blobs(checkout: &Path, resolved: &str) -> Result<HashMap<Vec<u8>, String>> {
+    let data = bytes(checkout, &["ls-tree", "-r", "-z", "--full-tree", resolved])?;
+    let mut blobs = HashMap::new();
+    for record in data.split(|b| *b == 0).filter(|b| !b.is_empty()) {
+        let Some(tab) = record.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let mut fields = record[..tab].split(|b| *b == b' ');
+        let (_mode, kind, oid) = (fields.next(), fields.next(), fields.next());
+        if kind == Some(b"blob".as_slice())
+            && let Some(oid) = oid.and_then(|oid| std::str::from_utf8(oid).ok())
+        {
+            blobs.insert(record[tab + 1..].to_vec(), oid.to_owned());
+        }
+    }
+    Ok(blobs)
+}
+
+/// One checkout-converted blob. Used when batch mode is unavailable or cannot
+/// frame the path (batch input is line-delimited).
+fn filtered_blob(root: &Path, resolved: &str, path: &[u8]) -> Option<Vec<u8>> {
+    let path = std::str::from_utf8(path).ok()?;
+    bytes(
+        root,
+        &["cat-file", "--filters", &format!("{resolved}:{path}")],
+    )
+    .ok()
+}
+
+/// Read many blobs as a checkout would write them (EOL conversion, ident, and
+/// smudge filters) through one `git cat-file --batch --filters` process
+/// (Git 2.11+).
+///
+/// Batch headers report the stored size, not the converted size, so each
+/// request is followed by a deliberately unresolvable object: Git answers it
+/// with a `<name> missing` line that frames the preceding content exactly.
+/// None means batch mode failed; callers fall back to one process per file.
+fn filtered_blobs(
+    checkout: &Path,
+    requests: &[(&[u8], &str)],
+    mut visit: impl FnMut(usize, Vec<u8>),
+) -> Option<()> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    if requests.is_empty() {
+        return Some(());
+    }
+    let sentinel = format!(
+        "slopdex-end-{}",
+        crate::hash(format!(
+            "{:?}{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ))
+    );
+    let terminator = format!("{sentinel} missing\n").into_bytes();
+    let mut child = Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(checkout)
+        .args(["cat-file", "--batch", "--filters"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let mut stdout = BufReader::new(child.stdout.take()?);
+    let mut read = || -> Option<()> {
+        for (index, (_, oid)) in requests.iter().enumerate() {
+            let mut header = Vec::new();
+            if stdout.read_until(b'\n', &mut header).ok()? == 0 {
+                return None;
+            }
+            let found = header.starts_with(format!("{oid} blob ").as_bytes());
+            let mut content = Vec::new();
+            loop {
+                let start = content.len();
+                if stdout.read_until(b'\n', &mut content).ok()? == 0 {
+                    return None;
+                }
+                if content[start..] == terminator[..] {
+                    content.truncate(start);
+                    break;
+                }
+            }
+            if found {
+                // Git terminates each object with one newline of its own.
+                if content.pop() != Some(b'\n') {
+                    return None;
+                }
+                visit(index, content);
+            } else if !content.is_empty() {
+                return None;
+            }
+        }
+        Some(())
+    };
+    let complete = std::thread::scope(|scope| {
+        // Feed requests concurrently: Git answers while it reads, and neither
+        // pipe may fill up while the other side is blocked.
+        scope.spawn(|| {
+            for (path, oid) in requests {
+                let mut line = Vec::with_capacity(oid.len() + path.len() + sentinel.len() + 5);
+                line.extend_from_slice(oid.as_bytes());
+                line.push(b' ');
+                line.extend_from_slice(path);
+                line.push(b'\n');
+                line.extend_from_slice(sentinel.as_bytes());
+                line.extend_from_slice(b" -\n");
+                if stdin.write_all(&line).is_err() {
+                    break;
+                }
+            }
+            // Closing the pipe lets Git exit after its last answer.
+            drop(stdin);
+        });
+        let complete = read();
+        if complete.is_none() {
+            // Unblock the writer before the scope joins it.
+            let _ = child.kill();
+        }
+        complete
+    });
+    let status = child.wait().ok()?;
+    (complete.is_some() && status.success()).then_some(())
+}
+
+/// Callables whose qualified name and source hash are absent from the base commit.
+/// Indexed source hashes describe checked-out text, so base blobs are compared
+/// after checkout conversion (`core.autocrlf`, `eol`/`ident` attributes, filters).
 pub fn changed_identities(root: &Path, resolved: &str, items: &[Item]) -> Result<HashSet<u64>> {
-    let prefix = text(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
-    let mut base = HashMap::<String, HashSet<(String, String)>>::new();
+    let mut prefix = bytes(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    // Strip exactly Git's line terminator, preserving newlines in directory names.
+    if prefix.last() == Some(&b'\n') {
+        prefix.pop();
+    }
+    let mut paths: Vec<&str> = items
+        .iter()
+        .filter(|item| item.kind == "function")
+        .map(|item| item.path.as_str())
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let symbols = |path: &str, source: Vec<u8>| -> HashSet<(String, String)> {
+        String::from_utf8(source)
+            .ok()
+            .and_then(|source| parse::parse(path, &source).ok())
+            .map(|parsed| {
+                parsed
+                    .callables
+                    .into_iter()
+                    .map(|c| (c.qualified_name, c.source_hash))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let full: Vec<Vec<u8>> = paths
+        .iter()
+        .map(|path| [prefix.as_slice(), path.as_bytes()].concat())
+        .collect();
+    let mut base = HashMap::<&str, HashSet<(String, String)>>::new();
+    if !paths.is_empty()
+        && let Some(checkout) = checkout_root(root)?
+        && let Ok(blobs) = tree_blobs(&checkout, resolved)
+    {
+        let (batch, requests): (Vec<&str>, Vec<(&[u8], &str)>) = paths
+            .iter()
+            .zip(&full)
+            .filter(|(_, full)| !full.contains(&b'\n'))
+            .filter_map(|(path, full)| Some((*path, (full.as_slice(), blobs.get(full)?.as_str()))))
+            .unzip();
+        let mut sources = HashMap::new();
+        if filtered_blobs(&checkout, &requests, |index, source| {
+            sources.insert(batch[index], source);
+        })
+        .is_some()
+        {
+            for (path, full) in paths.iter().zip(&full) {
+                if !blobs.contains_key(full) {
+                    // Absent from the base commit: every callable is new.
+                    base.insert(*path, HashSet::new());
+                } else if let Some(source) = sources.remove(path) {
+                    base.insert(*path, symbols(path, source));
+                }
+            }
+        }
+    }
+    for (path, full) in paths.iter().zip(&full) {
+        if !base.contains_key(path) {
+            let found = filtered_blob(root, resolved, full)
+                .map(|source| symbols(path, source))
+                .unwrap_or_default();
+            base.insert(*path, found);
+        }
+    }
     let mut changed = HashSet::new();
     for item in items.iter().filter(|i| i.kind == "function") {
-        if !base.contains_key(&item.path) {
-            let source = bytes(
-                root,
-                &[
-                    "show",
-                    "--end-of-options",
-                    &format!("{resolved}:{prefix}{}", item.path),
-                ],
-            )
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok());
-            let symbols = source
-                .and_then(|s| parse::parse(&item.path, &s).ok())
-                .map(|p| {
-                    p.callables
-                        .into_iter()
-                        .map(|c| (c.qualified_name, c.source_hash))
-                        .collect()
-                })
-                .unwrap_or_default();
-            base.insert(item.path.clone(), symbols);
-        }
-        if !base[&item.path].contains(&(
+        if !base[item.path.as_str()].contains(&(
             item.data["qualifiedName"].as_str().unwrap_or("").into(),
             item.data["sourceHash"].as_str().unwrap_or("").into(),
         )) {
@@ -581,7 +746,6 @@ mod tests {
         assert!(identity(dir.path())?.is_none());
         assert!(lineage(dir.path())?.is_none());
         assert!(changes(dir.path(), None)?.is_none());
-        assert!(tracked_untracked_paths(dir.path())?.is_none());
         assert!(dirty_paths(dir.path())?.is_empty());
         assert!(resolve_base(dir.path(), "HEAD", None).is_err());
         let repo = Repo::new()?;
@@ -596,10 +760,6 @@ mod tests {
         assert!(identity.lineage.is_none());
         assert!(lineage(repo.root())?.unwrap().history_roots.is_none());
         assert!(changes(repo.root(), Some("HEAD"))?.is_none());
-        assert_eq!(
-            tracked_untracked_paths(repo.root())?.unwrap(),
-            HashSet::from(["staged.rs".into(), "untracked.rs".into()])
-        );
         assert!(dirty_paths(repo.root())?.is_empty());
         assert!(resolve_base(repo.root(), "HEAD", None).is_err());
         repo.commit()?;
@@ -700,6 +860,90 @@ mod tests {
             changed_identities(repo.root(), &base, &items)?,
             HashSet::from([2, 4])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_identities_compare_checkout_converted_text() -> Result<()> {
+        let repo = Repo::new()?;
+        repo.write(".gitattributes", "* text eol=crlf\n")?;
+        let stored = "fn same() -> i32 {\n    1\n}\n";
+        // Batch requests are `<object> <path>` lines: spaces must survive, and
+        // content without a final newline must be framed exactly.
+        let paths = ["a.rs", "dir with space/b c.rs", "pkg/unterminated.rs"];
+        repo.write(paths[0], stored)?;
+        repo.write(paths[1], stored)?;
+        repo.write(paths[2], stored.trim_end())?;
+        let base = repo.commit()?;
+        // Check the files out again so the working tree holds converted text.
+        for path in paths {
+            fs::remove_file(repo.root().join(path))?;
+        }
+        repo.git(&["checkout", "--quiet", "--", "."])?;
+        let mut items = Vec::new();
+        for (id, path) in paths.into_iter().enumerate() {
+            let checked_out = fs::read_to_string(repo.root().join(path))?;
+            assert!(checked_out.contains("{\r\n"), "{path}: {checked_out:?}");
+            items.push(item(id as u64, path, &checked_out)?);
+        }
+        assert_ne!(
+            items[0].data["sourceHash"],
+            item(9, "a.rs", stored)?.data["sourceHash"],
+            "fixture must distinguish stored and checked-out text"
+        );
+        assert!(changed_identities(repo.root(), &base, &items)?.is_empty());
+        // The same holds from a subdirectory root, where paths gain a prefix.
+        let scoped = [item(
+            7,
+            "unterminated.rs",
+            &fs::read_to_string(repo.root().join(paths[2]))?,
+        )?];
+        assert!(changed_identities(&repo.root().join("pkg"), &base, &scoped)?.is_empty());
+        // Real edits and files absent from the base are still reported.
+        let edited = item(3, "a.rs", "fn same() -> i32 {\r\n    2\r\n}\r\n")?;
+        let added = item(4, "added.rs", stored)?;
+        assert_eq!(
+            changed_identities(repo.root(), &base, &[items[0].clone(), edited, added])?,
+            HashSet::from([3, 4])
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undecodable_paths_are_outside_every_scope() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let repo = Repo::new()?;
+        repo.write("pkg/code.rs", "fn example() {}")?;
+        let checkpoint = repo.commit()?;
+        let latin1 = |name: &[u8]| repo.root().join(std::ffi::OsStr::from_bytes(name));
+        // Untracked outside and inside the scope, tracked inside it, and an
+        // ignore file below an undecodable directory inside it.
+        fs::write(latin1(b"caf\xe9.rs"), "fn outside() {}")?;
+        fs::write(latin1(b"pkg/na\xefve.rs"), "fn inside() {}")?;
+        fs::write(latin1(b"pkg/tracked\xff.rs"), "fn tracked() {}")?;
+        repo.git(&["add", "pkg"])?;
+        repo.write("pkg/added.rs", "fn added() {}")?;
+        for root in [repo.root().to_owned(), repo.root().join("pkg")] {
+            let scoped = root != repo.root();
+            let expected: HashSet<String> =
+                HashSet::from([if scoped { "added.rs" } else { "pkg/added.rs" }.into()]);
+            assert_eq!(dirty_paths(&root)?, expected);
+            let current = changes(&root, Some(&checkpoint))?.unwrap();
+            assert_eq!(current.dirty, expected);
+            assert!(!current.policy_changed);
+        }
+        fs::create_dir(latin1(b"pkg/d\xe9p"))?;
+        fs::write(latin1(b"pkg/d\xe9p/.gitignore"), "*.tmp\n")?;
+        assert!(
+            changes(&repo.root().join("pkg"), Some(&checkpoint))?
+                .unwrap()
+                .policy_changed
+        );
+        repo.commit()?;
+        let committed = changes(&repo.root().join("pkg"), Some(&checkpoint))?.unwrap();
+        assert!(committed.dirty.is_empty());
+        assert_eq!(committed.changed, HashSet::from(["added.rs".into()]));
         Ok(())
     }
 
@@ -1096,28 +1340,6 @@ mod tests {
         let committed = changes(&root, Some(&checkpoint))?.unwrap();
         assert!(committed.dirty.is_empty());
         assert_eq!(committed.changed, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn initial_candidates_respect_git_ignores_and_selected_scope() -> Result<()> {
-        let repo = Repo::new()?;
-        repo.write(".gitignore", "ignored/\n")?;
-        repo.write("pkg/tracked.rs", "tracked")?;
-        repo.write("outside.rs", "outside")?;
-        repo.commit()?;
-        fs::remove_file(repo.root().join("pkg/tracked.rs"))?;
-        repo.write("pkg/untracked.rs", "untracked")?;
-        repo.write("pkg/nested/untracked.rs", "nested untracked")?;
-        repo.write("pkg/ignored/skip.rs", "ignored")?;
-        assert_eq!(
-            tracked_untracked_paths(&repo.root().join("pkg"))?.unwrap(),
-            HashSet::from([
-                "tracked.rs".into(),
-                "untracked.rs".into(),
-                "nested/untracked.rs".into()
-            ])
-        );
         Ok(())
     }
 

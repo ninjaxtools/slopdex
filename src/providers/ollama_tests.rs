@@ -238,7 +238,8 @@ fn ollama_prepare_discovers_dimensions_and_pins_identity_without_mutating_failur
     assert_eq!(value["ollamaModelDigest"], "fixture-digest");
     assert_eq!(value["ollamaContextLength"], 8192);
     assert_eq!(value["model"], OLLAMA_DEFAULT_MODEL);
-    assert_eq!(value["ollamaModelFamily"], "qwen3");
+    // The input strategy derives from the model name; no family is persisted.
+    assert!(value.get("ollamaModelFamily").is_none());
     assert!(value.get("ollamaAutoPull").is_none());
     let mock = Mock::new(vec![
         (200, model_list()),
@@ -400,4 +401,39 @@ fn ollama_context_and_input_strategy_are_profile_inputs_not_scheduling() {
     }
     value["ollamaContextLength"] = json!(4096);
     assert_ne!(Providers::new(&value).unwrap().embedding_profile(), before);
+}
+
+#[test]
+fn unreachable_ollama_is_reported_only_for_transport_failures() {
+    let mock = Mock::new(vec![(500, json!({"error": "busy"}))]);
+    let value = config(&mock);
+    let error = format!("{:#}", installed_embedding_models(&value).unwrap_err());
+    assert!(error.contains("HTTP 500"), "{error}");
+    assert!(!error.contains("Cannot reach Ollama"), "{error}");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut value = config(&mock);
+    value["embeddingBaseUrl"] = json!(format!("http://127.0.0.1:{port}/api"));
+    let error = format!("{:#}", installed_embedding_models(&value).unwrap_err());
+    assert!(error.contains("Cannot reach Ollama"), "{error}");
+}
+
+#[test]
+fn ollama_profiles_strip_endpoint_query_strings_and_resolve_against_them() {
+    let mock = Mock::new(vec![]);
+    let mut value = config(&mock);
+    value["embeddingBaseUrl"] = json!(format!("{}/?token=secret", mock.base));
+    let profile = Providers::new(&value).unwrap().embedding_profile();
+    assert_eq!(profile["endpoint"], format!("{}/embed", mock.base));
+    assert!(!profile.to_string().contains("secret"));
+    // A saved profile recovers identity without a server; the model stays implicit.
+    let mut minimal = json!({"provider": "ollama",
+        "embeddingBaseUrl": format!("{}/?token=secret", mock.base)});
+    resolve_embeddings(&mut minimal, Some(&profile.to_string())).unwrap();
+    assert_eq!(minimal["ollamaModelDigest"], "fixture-digest");
+    assert_eq!(minimal["ollamaNativeDimensions"], 2);
+    assert!(minimal.get("model").is_none());
+    assert!(mock.requests.lock().unwrap().is_empty());
 }

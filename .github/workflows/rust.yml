@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same ref supersedes any run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   native:
     name: ${{ matrix.platform }}
@@ -28,7 +33,7 @@ jobs:
             platform: win32-x64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -1302,3 +1302,75 @@ fn markdown_opaque_html_spans_end_at_their_own_literal_boundaries() {
         ranges(&parsed, source);
     }
 }
+
+#[test]
+fn markdown_empty_headings_get_anonymous_names_and_keep_verbatim_signatures() {
+    let source = "#\n\n## Child\n\ntext\n\n##   ##\n\n> ###\n";
+    let parsed = accepted("empty.md", source);
+    assert_eq!(
+        qualified(&parsed),
+        [
+            "<anonymous@1:1>",
+            "<anonymous@1:1>.Child",
+            "<anonymous@1:1>.<anonymous@7:1>",
+            "<anonymous@1:1>.<anonymous@7:1>.<anonymous@9:3>",
+        ]
+    );
+    let root = named(&parsed, "<anonymous@1:1>");
+    assert_eq!(root.name, "<anonymous@1:1>");
+    assert_eq!(root.names, ["<anonymous@1:1>"]);
+    assert_eq!(root.signature, "#");
+    assert_eq!(
+        named(&parsed, "<anonymous@1:1>.<anonymous@7:1>").signature,
+        "##   ##"
+    );
+    let child = named(&parsed, "<anonymous@1:1>.Child");
+    assert_eq!(child.name, "Child");
+    assert!(
+        parsed
+            .chunks
+            .iter()
+            .any(|chunk| chunk.heading_path == ["<anonymous@1:1>", "Child"]
+                && chunk.content.contains("text"))
+    );
+    ranges(&parsed, source);
+}
+
+#[test]
+fn markdown_setext_and_multiline_heading_names_collapse_whitespace() {
+    let source = "Wrapped   setext\ntitle\n====\n\nintro\n\nSecond\tline\n---\n\nbody\n\n#  Spaced \t out  heading\n";
+    let parsed = accepted("setext.md", source);
+    assert_eq!(
+        qualified(&parsed),
+        [
+            "Wrapped setext title",
+            "Wrapped setext title.Second line",
+            "Spaced out heading",
+        ]
+    );
+    let root = named(&parsed, "Wrapped setext title");
+    assert_eq!(root.name, "Wrapped setext title");
+    assert_eq!(root.names, ["Wrapped setext title"]);
+    // Signatures stay verbatim, including the original line break.
+    assert_eq!(root.signature, "Wrapped   setext\ntitle\n====");
+    assert_eq!(
+        named(&parsed, "Wrapped setext title.Second line").signature,
+        "Second\tline\n---"
+    );
+    assert_eq!(
+        named(&parsed, "Spaced out heading").signature,
+        "#  Spaced \t out  heading"
+    );
+    for node in &parsed.structure.nodes {
+        assert!(!node.name.contains('\n'), "{node:?}");
+        assert!(!node.qualified_name.contains('\n'), "{node:?}");
+    }
+    assert!(parsed.chunks.iter().all(|chunk| {
+        parsed
+            .structure
+            .nodes
+            .iter()
+            .any(|node| node.qualified_name == chunk.heading_path.join("."))
+    }));
+    ranges(&parsed, source);
+}

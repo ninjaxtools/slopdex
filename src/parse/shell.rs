@@ -185,14 +185,20 @@ fn reparse(parser: &mut Parser, source: &str, edits: &[Edit]) -> Option<Tree> {
         point = advance(point, prefix);
         let start_byte = input.len();
         let old_end_position = advance(point, &edit.replacement);
-        inverses.push(InputEdit {
-            start_byte,
-            old_end_byte: start_byte + edit.replacement.len(),
-            new_end_byte: start_byte + edit.range.len(),
-            start_position: point,
-            old_end_position,
-            new_end_position: advance(point, &source.as_bytes()[edit.range.clone()]),
-        });
+        let new_end_position = advance(point, &source.as_bytes()[edit.range.clone()]);
+        // Masking replaces data byte for byte and keeps its line breaks, so
+        // no coordinate moves. Skipping those inverse edits keeps a heredoc
+        // with thousands of masked gaps from costing one tree edit per gap.
+        if edit.replacement.len() != edit.range.len() || old_end_position != new_end_position {
+            inverses.push(InputEdit {
+                start_byte,
+                old_end_byte: start_byte + edit.replacement.len(),
+                new_end_byte: start_byte + edit.range.len(),
+                start_position: point,
+                old_end_position,
+                new_end_position,
+            });
+        }
         input.extend_from_slice(&edit.replacement);
         point = old_end_position;
         position = edit.range.end;
@@ -474,6 +480,28 @@ fn terminator(source: &str, start: usize, doc: &Heredoc) -> Option<Range<usize>>
     None
 }
 
+/// Sorted, merged ranges for `covers`: a script can hold thousands of both
+/// opaque ranges and candidate positions.
+fn disjoint(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.retain(|range| !range.is_empty());
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+fn covers(disjoint: &[Range<usize>], position: usize) -> bool {
+    let index = disjoint.partition_point(|range| range.end <= position);
+    disjoint
+        .get(index)
+        .is_some_and(|range| range.contains(&position))
+}
+
 fn opaque_ranges(tree: &Tree) -> Vec<Range<usize>> {
     descendants(tree.root_node())
         .filter_map(|n| {
@@ -501,10 +529,31 @@ fn opaque_ranges(tree: &Tree) -> Vec<Range<usize>> {
 
 /// Match executable expansion syntax with the Bash grammar, including case
 /// patterns, nested substitutions, and quotes that defeat delimiter counting.
+///
+/// The grammar reads left to right, so an expansion's extent is settled by
+/// the time its closer is seen. Parsing exponentially growing windows keeps
+/// the total work proportional to the expansion's own length rather than to
+/// the remaining text, which made thousands of short expansions quadratic.
 fn expansion_end(parser: &mut Parser, source: &str, start: usize, end: usize) -> usize {
-    let Some(tree) = parser.parse(&source[start..end], None) else {
-        return end;
-    };
+    const WINDOW: usize = 256;
+    let mut window = start.saturating_add(WINDOW).min(end);
+    loop {
+        let found = parsed_expansion_end(parser, &source[start..window]);
+        // A closer at the very edge may be an artifact of truncation; only a
+        // complete expansion followed by more window text is trusted.
+        if let Some(length) = found.filter(|length| window == end || start + length < window) {
+            return start + length;
+        }
+        if window == end {
+            return end;
+        }
+        window = window.saturating_mul(2).min(end).max(start + 1);
+    }
+}
+
+/// Length of a complete expansion at the beginning of `fragment`, if any.
+fn parsed_expansion_end(parser: &mut Parser, fragment: &str) -> Option<usize> {
+    let tree = parser.parse(fragment, None)?;
     descendants(tree.root_node())
         .find(|n| {
             n.start_byte() == 0
@@ -517,12 +566,60 @@ fn expansion_end(parser: &mut Parser, source: &str, start: usize, end: usize) ->
             n.child(n.child_count().saturating_sub(1))
                 .is_some_and(|last| !last.is_missing() && matches!(last.kind(), ")" | "))" | "}"))
         })
-        .map_or(end, |n| start + n.end_byte())
+        .map(|n| n.end_byte())
+}
+
+/// Complete expansions of one parsed stretch of a heredoc body, by start byte.
+///
+/// A body with thousands of expansions would otherwise need one parse each.
+/// One parse of a bounded chunk answers every expansion it contains; anything
+/// it cannot answer (text that changed the parse context, or an expansion
+/// reaching the chunk's edge) falls back to `expansion_end` at that position.
+#[derive(Default)]
+struct ExpansionChunk {
+    range: Range<usize>,
+    ends: std::collections::HashMap<usize, usize>,
+}
+
+impl ExpansionChunk {
+    const BYTES: usize = 64 * 1024;
+
+    fn parse(parser: &mut Parser, source: &str, start: usize, end: usize) -> Self {
+        let mut stop = start.saturating_add(Self::BYTES).min(end);
+        while !source.is_char_boundary(stop) {
+            stop += 1;
+        }
+        let mut ends = std::collections::HashMap::new();
+        if let Some(tree) = parser.parse(&source[start..stop], None) {
+            for node in descendants(tree.root_node()) {
+                if matches!(
+                    node.kind(),
+                    "command_substitution" | "arithmetic_expansion" | "expansion"
+                ) && node
+                    .child(node.child_count().saturating_sub(1))
+                    .is_some_and(|last| {
+                        !last.is_missing() && matches!(last.kind(), ")" | "))" | "}")
+                    })
+                    // A closer at the chunk's edge may be a truncation artifact.
+                    && (stop == end || start + node.end_byte() < stop)
+                {
+                    // Pre-order: the outermost expansion at a position wins.
+                    ends.entry(start + node.start_byte())
+                        .or_insert(start + node.end_byte());
+                }
+            }
+        }
+        Self {
+            range: start..stop,
+            ends,
+        }
+    }
 }
 
 fn islands(parser: &mut Parser, source: &str, range: Range<usize>) -> Vec<Range<usize>> {
     let bytes = source.as_bytes();
     let mut result = Vec::new();
+    let mut chunk = ExpansionChunk::default();
     let mut i = range.start;
     while i < range.end {
         if bytes[i] == b'\\' {
@@ -532,7 +629,13 @@ fn islands(parser: &mut Parser, source: &str, range: Range<usize>) -> Vec<Range<
             // starting at its second dollar sign.
             i += 2;
         } else if bytes[i] == b'$' && matches!(bytes.get(i + 1), Some(b'(' | b'{')) {
-            let end = expansion_end(parser, source, i, range.end);
+            if !chunk.range.contains(&i) {
+                chunk = ExpansionChunk::parse(parser, source, i, range.end);
+            }
+            let end = match chunk.ends.get(&i) {
+                Some(end) => *end,
+                None => expansion_end(parser, source, i, range.end),
+            };
             result.push(i..end);
             i = end;
         } else if bytes[i] == b'`' {
@@ -826,7 +929,7 @@ fn recover_functions(
     edits: &mut Vec<Edit>,
     seen: &mut HashSet<usize>,
 ) {
-    let opaque = opaque_ranges(tree);
+    let opaque = disjoint(opaque_ranges(tree));
     let candidates = descendants(tree.root_node())
         .filter(|n| {
             n.kind() == "function"
@@ -847,7 +950,7 @@ fn recover_functions(
         })
         .collect::<Vec<_>>();
     for (start, defined, existing_body) in candidates {
-        if seen.contains(&start) || opaque.iter().any(|r| r.contains(&start)) {
+        if seen.contains(&start) || covers(&opaque, start) {
             continue;
         }
         let Some(mut name) = word(source, start) else {
