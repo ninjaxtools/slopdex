@@ -1505,6 +1505,28 @@ fn cli_config_defaults_to_global_and_updates_the_selected_file() -> Result<()> {
 }
 
 #[test]
+fn cli_config_text_renderings_redact_api_keys() -> Result<()> {
+    let repo = Repo::new()?;
+    // Capture a child's streams so text output is redirected even when the
+    // test runner itself has a terminal and would select cliclack rendering.
+    for key in ["embeddingApiKey", "openaiApiKey"] {
+        let output = repo.cli_format(&["config", "set", key, TEST_KEY], "text")?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        assert!(text.contains(&format!("{key}=<redacted>")), "{text}");
+        assert!(output.stderr.is_empty());
+        let saved: Value =
+            serde_json::from_slice(&fs::read(repo.home.join("slopdex/config.json"))?)?;
+        assert_eq!(saved[key], TEST_KEY);
+    }
+    Ok(())
+}
+
+#[test]
 fn cli_cross_search_exclusions_report_only_total_and_added() -> Result<()> {
     let repo = Repo::new()?;
     repo.write(

@@ -1070,15 +1070,9 @@ fn config_renderings_redact_api_keys() {
         read_config(&path).unwrap()["embeddingApiKey"],
         "sk-live-secret"
     );
-    let cli = parse(&["config", "set", "openaiApiKey", "sk-other-secret"]);
-    let Command::Config { args } = cli.command else {
-        panic!()
-    };
-    let mut out = Vec::new();
-    run_config(&cli.global, &path, &args, &mut out).unwrap();
-    let text = String::from_utf8(out).unwrap();
-    assert!(text.contains("openaiApiKey=<redacted>"), "{text}");
-    assert!(!text.contains("secret"), "{text}");
+    let result = config_action_json(&path, &["config", "set", "openaiApiKey", "sk-other-secret"]);
+    assert_eq!(result["openaiApiKey"], "<redacted>");
+    assert!(!result.to_string().contains("secret"));
     let dumped = config_action_json(
         &path,
         &[
