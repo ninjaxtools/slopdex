@@ -638,6 +638,15 @@ impl Repo {
         Ok(String::from_utf8(output.stdout)?.trim().to_owned())
     }
 
+    fn init_git(&self) -> Result<()> {
+        self.git(&["init", "--quiet"])?;
+        // Fixture writes use LF. Engine's in-process Git children inherit user
+        // config, unlike child(), so persist the same EOL policy for both paths.
+        self.git(&["config", "--local", "core.autocrlf", "false"])?;
+        self.git(&["config", "--local", "core.eol", "lf"])?;
+        Ok(())
+    }
+
     fn cli(&self, args: &[&str]) -> Result<Output> {
         self.cli_format(args, "json")
     }
@@ -801,6 +810,43 @@ impl AccessWatch {
     }
 }
 
+#[test]
+fn git_fixture_line_endings_override_inherited_global_config() -> Result<()> {
+    for settings in ["autocrlf = true", "autocrlf = false\n\teol = crlf"] {
+        let repo = Repo::new()?;
+        repo.init_git()?;
+        let source = function("unchanged", "VECTOR_EAST");
+        repo.write(".gitattributes", "*.rs text\n")?;
+        repo.write("code.rs", &source)?;
+        repo.git(&["add", "."])?;
+        repo.git(&["commit", "--quiet", "-m", "base"])?;
+        fs::write(
+            repo.home.join("gitconfig"),
+            format!("[core]\n\t{settings}\n[fixture]\n\tmarker = inherited\n"),
+        )?;
+        let inherited_git = |args: &[&str]| -> Result<Output> {
+            // Git for Windows cannot open canonical verbatim config paths.
+            // Resolve the fixture file from the child's cwd instead.
+            let output = repo
+                .child("git")
+                .env("GIT_CONFIG_GLOBAL", "../home/gitconfig")
+                .args(args)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(output)
+        };
+        let marker = inherited_git(&["config", "--get", "fixture.marker"])?;
+        assert_eq!(String::from_utf8(marker.stdout)?.trim(), "inherited");
+        let blob = inherited_git(&["cat-file", "--filters", "HEAD:code.rs"])?;
+        assert_eq!(blob.stdout, source.as_bytes(), "{settings}");
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn git_clean_repeated_refresh_and_cached_reopen_do_not_read_sources_or_shared_bases() -> Result<()>
@@ -808,7 +854,7 @@ fn git_clean_repeated_refresh_and_cached_reopen_do_not_read_sources_or_shared_ba
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let config = mock.config();
-    repo.git(&["init", "-q"])?;
+    repo.init_git()?;
     repo.write("api.rs", &function("saved", "VECTOR_EAST"))?;
     // Avoid Git's racy-clean timestamp check reading freshly written content:
     // the index records an mtime that is unambiguously older than its own write.
@@ -871,7 +917,7 @@ fn git_branch_switches_and_dirty_restores_reuse_paid_artifacts_and_shared_base()
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let config = mock.config();
-    repo.git(&["init", "-q"])?;
+    repo.init_git()?;
     for (path, name, marker) in [
         ("keep.rs", "keep", "VECTOR_EAST"),
         ("other.rs", "other", "VECTOR_MID"),
@@ -963,7 +1009,7 @@ fn git_policy_changes_force_rescan_and_restoration_reuses_global_artifacts() -> 
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let mut config = mock.config();
-    repo.git(&["init", "-q"])?;
+    repo.init_git()?;
     repo.write("keep.rs", &function("keep", "VECTOR_EAST"))?;
     repo.write("skip.rs", &function("skip", "VECTOR_MID"))?;
     repo.write(".ignore", "")?;
@@ -1708,7 +1754,7 @@ fn cli_bare_map_uses_checkout_root_or_non_git_cwd_and_respects_explicit_root() -
     for git in [false, true] {
         let repo = Repo::new()?;
         if git {
-            repo.git(&["init", "--quiet"])?;
+            repo.init_git()?;
         }
         repo.write("root.rs", "pub fn root_symbol() {}\n")?;
         repo.write("nested/code.rs", "pub fn nested_symbol() {}\n")?;
@@ -2345,7 +2391,7 @@ fn source_change_during_embedding_keeps_structure_pending_and_retains_paid_artif
 fn git_head_change_during_embedding_keeps_structure_pending_and_can_retry() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    repo.git(&["init", "--quiet"])?;
+    repo.init_git()?;
     repo.write("old.rs", &function("old", "VECTOR_EAST"))?;
     repo.git(&["add", "."])?;
     repo.git(&["commit", "--quiet", "-m", "initial"])?;
@@ -3528,7 +3574,7 @@ fn git_changed_since_filters_symbols_while_uncommitted_includes_staged_and_untra
 -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    repo.git(&["init", "--quiet"])?;
+    repo.init_git()?;
     repo.write(
         "tracked.rs",
         &(function("changed", "VECTOR_EAST") + &function("untouched", "VECTOR_MID")),
@@ -4344,7 +4390,7 @@ fn regression_changed_since_moving_branch_invalidates_cross_cache_and_rechecks_a
 -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    repo.git(&["init", "--quiet"])?;
+    repo.init_git()?;
     repo.write(
         "code.rs",
         &(function("changed", "VECTOR_EAST") + &function("peer", "VECTOR_MID")),
@@ -4423,7 +4469,7 @@ fn regression_changed_since_moving_branch_invalidates_cross_cache_and_rechecks_a
 fn regression_git_subdirectory_root_scopes_uncommitted_and_changed_since_paths() -> Result<()> {
     let mock = Mock::start()?;
     let mut repo = Repo::new()?;
-    repo.git(&["init", "--quiet"])?;
+    repo.init_git()?;
     repo.write(
         "workspace/pkg/tracked.rs",
         &(function("edited", "VECTOR_EAST") + &function("untouched", "VECTOR_MID")),
@@ -4581,7 +4627,7 @@ fn cli_external_map_uses_checkout_config_and_saved_snapshot() -> Result<()> {
     let mut external = Repo::new()?;
     external.root = invoker._temp.path().join("external-checkout");
     fs::create_dir(&external.root)?;
-    external.git(&["init", "--quiet"])?;
+    external.init_git()?;
     invoker.write(".slopdex/config.json", "not valid JSON")?;
     let config = json!({"indexPath": external.index});
     external.write(".slopdex/config.json", &config.to_string())?;
@@ -4628,7 +4674,7 @@ fn cli_external_map_uses_checkout_config_and_saved_snapshot() -> Result<()> {
 fn cli_external_map_uses_source_root_xdg_index_without_config() -> Result<()> {
     let invoker = Repo::new()?;
     let mut external = Repo::new()?;
-    external.git(&["init", "--quiet"])?;
+    external.init_git()?;
     external.home = invoker.home.clone();
     external.index = invoker
         .home
@@ -4721,7 +4767,7 @@ fn cli_external_map_combines_independent_repositories_and_warns_for_missing_path
         (&first, "first_saved"),
         (&second, "second_saved"),
     ] {
-        repo.git(&["init", "--quiet"])?;
+        repo.init_git()?;
         let config = json!({"indexPath": repo.index});
         repo.write(".slopdex/config.json", &config.to_string())?;
         repo.write("src/api.rs", &function(name, "saved"))?;
@@ -4792,7 +4838,7 @@ fn cli_external_map_combines_independent_repositories_and_warns_for_missing_path
 fn cli_external_map_explicit_config_and_index_override_source_defaults() -> Result<()> {
     let invoker = Repo::new()?;
     let external = Repo::new()?;
-    external.git(&["init", "--quiet"])?;
+    external.init_git()?;
     invoker.write(".slopdex/config.json", "not valid JSON")?;
     let configured_index = external._temp.path().join("configured.sqlite");
     let explicit_index = external._temp.path().join("explicit.sqlite");
@@ -4855,7 +4901,7 @@ fn cli_external_cross_source_uses_checkout_snapshot_and_preserves_target_options
     let target = Repo::new()?;
     source.root = invoker._temp.path().join("source-checkout");
     fs::create_dir(&source.root)?;
-    source.git(&["init", "--quiet"])?;
+    source.init_git()?;
     invoker.write(".slopdex/config.json", "not valid JSON")?;
     let mut config = mock.config();
     config["indexPath"] = json!(source.index);

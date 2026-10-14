@@ -6,6 +6,12 @@
 
 - Tests that open an Engine, Database, or Artifacts store must use an `artifactCachePath` inside their own `tempfile::TempDir` (or reopen an index already bound to that store). Never use the real per-user cache or mutate process-wide cache environment variables in parallel tests; sharing tests may share a store only within their own fixture. Isolate CLI subprocesses through configuration or per-child cache environment variables.
 
+# Git fixture isolation
+
+- Ordinary LF-written Git fixtures must persist repository-local `core.autocrlf=false` and `core.eol=lf` before committing or indexing; use the fixture initialization helper (`Repo::init_git` in `tests/rust_integration.rs`). Clearing environment variables or passing `-c` only to fixture Git commands does not isolate Git spawned by an in-process Engine. Keep intentionally non-Git fixtures non-Git.
+- Tests of checkout conversion must explicitly configure their EOL policy, attributes, or filters and obtain the intended checked-out bytes before indexing. `sourceHash` hashes exact callable bytes, including line endings; do not normalize production hashes or disable checkout filtering merely to fix inconsistent fixtures. A clean Git status does not imply byte-identical source.
+- Cover inherited `core.autocrlf=true` and `core.autocrlf=false` with `core.eol=crlf` using a temporary global config scoped to child processes, never process-wide environment mutation. Include a text-attributed file so `core.eol` takes effect, and verify an unrelated config marker to prove the temporary global config was actually read.
+
 # Cross-platform filesystem tests
 
 - Temporary directories may have symlinked ancestors (notably macOS `/var` → `/private/var`), while subprocess `current_dir()` reports the physical path. Canonicalize an existing fixture base before deriving paths used in subprocess path assertions, including paths for files that do not exist yet. When testing filesystem identity rather than literal path spelling, compare canonical paths; do not change CLI path semantics just to satisfy an assertion.
