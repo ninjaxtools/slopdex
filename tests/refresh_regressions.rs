@@ -127,6 +127,7 @@ fn error_codes(engine: &Engine) -> Result<Vec<(String, String)>> {
     Ok(codes)
 }
 
+#[cfg(unix)]
 fn paths(engine: &Engine) -> Result<Vec<String>> {
     let mut paths: Vec<_> = engine
         .map(&json!({"limit": "none"}))?

@@ -2608,14 +2608,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let root = dir.path().join("root");
         std::fs::create_dir(&root)?;
-        let mut indexes = vec![dir.path().join("indexes")];
+        let indexes = [dir.path().join("indexes")];
         std::fs::create_dir(&indexes[0])?;
         #[cfg(unix)]
-        {
+        let indexes = {
             let alias = dir.path().join("alias");
             std::os::unix::fs::symlink(&indexes[0], &alias)?;
-            indexes.push(alias);
-        }
+            [indexes[0].clone(), alias]
+        };
         for round in 0..6 {
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
             let workers: Vec<_> = (0..8)

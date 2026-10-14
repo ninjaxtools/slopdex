@@ -77,6 +77,7 @@ pub(super) fn redacted(value: &Value) -> Value {
     }
 }
 
+#[cfg(unix)]
 fn contains_secret(config: &Value) -> bool {
     config.as_object().is_some_and(|object| {
         object
