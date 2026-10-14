@@ -20,6 +20,7 @@ struct Repo {
     _temp: TempDir,
     root: PathBuf,
     index: PathBuf,
+    git_config: PathBuf,
     config: Value,
 }
 
@@ -30,9 +31,14 @@ impl Repo {
         let base = temp.path().canonicalize()?;
         let root = base.join("repo");
         fs::create_dir(&root)?;
+        // Git probes config paths, and Windows' NUL device rejects that access.
+        // A regular empty file keeps global configuration isolated on every OS.
+        let git_config = base.join("gitconfig");
+        fs::write(&git_config, "")?;
         let repo = Self {
             root,
             index: base.join("index.sqlite"),
+            git_config,
             config: json!({"artifactCachePath": base.join("artifacts.sqlite")}),
             _temp: temp,
         };
@@ -46,10 +52,7 @@ impl Repo {
         let output = Command::new("git")
             .current_dir(&self.root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
+            .env("GIT_CONFIG_GLOBAL", &self.git_config)
             .args([
                 "-c",
                 "user.name=Refresh Fixture",
