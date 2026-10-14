@@ -12,6 +12,10 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 struct Repo {
     _temp: TempDir,
     root: PathBuf,
@@ -297,6 +301,9 @@ mod unix {
     #[test]
     fn untracked_undecodable_name_outside_the_selected_root() -> Result<()> {
         let repo = Repo::new(true)?;
+        if !test_support::supports_non_utf8_names(&repo.root)? {
+            return Ok(());
+        }
         repo.write("pkg/code.rs", "pub fn code() {}\n")?;
         repo.commit()?;
         fs::write(latin1(&repo.root, b"caf\xe9.rs"), "pub fn outside() {}\n")?;
@@ -310,6 +317,9 @@ mod unix {
     #[test]
     fn untracked_undecodable_name_inside_the_selected_root() -> Result<()> {
         let repo = Repo::new(true)?;
+        if !test_support::supports_non_utf8_names(&repo.root)? {
+            return Ok(());
+        }
         repo.write("pkg/code.rs", "pub fn code() {}\n")?;
         repo.commit()?;
         let mut engine = repo.open()?;
@@ -328,6 +338,9 @@ mod unix {
     #[test]
     fn tracked_undecodable_name_inside_the_selected_root() -> Result<()> {
         let repo = Repo::new(true)?;
+        if !test_support::supports_non_utf8_names(&repo.root)? {
+            return Ok(());
+        }
         repo.write("pkg/code.rs", "pub fn code() {}\n")?;
         fs::write(
             latin1(&repo.root, b"pkg/tracked\xff.rs"),

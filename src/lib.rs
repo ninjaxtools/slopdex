@@ -13,6 +13,8 @@ pub mod providers;
 mod registry;
 pub mod storage;
 mod symbols;
+#[cfg(all(test, unix))]
+mod test_support;
 mod ui;
 pub mod vectors;
 

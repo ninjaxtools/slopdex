@@ -3878,14 +3878,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn discovery_skips_undecodable_names_and_unreadable_directories() -> Result<()> {
-        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+    fn relative_utf8_skips_undecodable_paths_without_filesystem_access() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let root = Path::new("repo");
+        assert_eq!(
+            relative_utf8(root, &root.join("kept.rs"))?,
+            Some("kept.rs".into())
+        );
+        for name in [&b"na\xefve.rs"[..], b"caf\xe9/inner.rs", b"data\xff.bin"] {
+            let path = root.join(std::ffi::OsStr::from_bytes(name));
+            assert_eq!(relative_utf8(root, &path)?, None);
+        }
+        assert!(relative_utf8(root, Path::new("outside.rs")).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_undecodable_names() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("plain");
-        fs::create_dir_all(root.join("locked"))?;
+        fs::create_dir(&root)?;
+        if !crate::test_support::supports_non_utf8_names(&root)? {
+            return Ok(());
+        }
         fs::create_dir_all(root.join(std::ffi::OsStr::from_bytes(b"caf\xe9")))?;
         fs::write(root.join("kept.rs"), "pub fn kept() {}\n")?;
-        fs::write(root.join("locked/hidden.rs"), "pub fn hidden() {}\n")?;
         // Latin-1 names: a supported source file, a nested one, and other data.
         for name in [&b"na\xefve.rs"[..], b"caf\xe9/inner.rs", b"data\xff.bin"] {
             fs::write(
@@ -3896,6 +3915,25 @@ mod tests {
         let index = temp.path().join("index.sqlite");
         let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
         // This is exactly what an unindexed map walks.
+        assert_eq!(source_paths(&root, &index, &config)?, ["kept.rs"]);
+        let mut engine = Engine::open_map(&root, &index, config)?;
+        assert_eq!(engine.refresh_structure()?["filesUpdated"], 1);
+        assert_eq!(engine.refresh_structure()?["filesUpdated"], 0);
+        assert_eq!(engine.db.paths()?, ["kept.rs"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_unreadable_directories() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("plain");
+        fs::create_dir_all(root.join("locked"))?;
+        fs::write(root.join("kept.rs"), "pub fn kept() {}\n")?;
+        fs::write(root.join("locked/hidden.rs"), "pub fn hidden() {}\n")?;
+        let index = temp.path().join("index.sqlite");
+        let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
         assert_eq!(
             source_paths(&root, &index, &config)?,
             ["kept.rs", "locked/hidden.rs"]

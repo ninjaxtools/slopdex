@@ -909,11 +909,46 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn undecodable_git_bytes_are_outside_every_scope() {
+        for scope in [Path::new(""), Path::new("pkg")] {
+            let mut paths = HashSet::new();
+            for name in [
+                &b"caf\xe9.rs"[..],
+                b"pkg/na\xefve.rs",
+                b"pkg/tracked\xff.rs",
+            ] {
+                insert_scoped(&mut paths, scope, name);
+                assert!(!is_policy_path(scope, name));
+            }
+            assert!(paths.is_empty());
+            insert_scoped(&mut paths, scope, b"pkg/added.rs");
+            assert_eq!(
+                paths,
+                HashSet::from([if scope.as_os_str().is_empty() {
+                    "pkg/added.rs".into()
+                } else {
+                    "added.rs".into()
+                }])
+            );
+            // The filename is decodable even when its parent directory is not.
+            assert!(is_policy_path(scope, b"pkg/d\xe9p/.gitignore"));
+            assert!(!is_policy_path(scope, b"pkg/d\xe9p/not-policy.rs"));
+        }
+        assert!(!is_policy_path(
+            Path::new("pkg"),
+            b"other/d\xe9p/.gitignore"
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn undecodable_paths_are_outside_every_scope() -> Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let repo = Repo::new()?;
+        if !crate::test_support::supports_non_utf8_names(repo.root())? {
+            return Ok(());
+        }
         repo.write("pkg/code.rs", "fn example() {}")?;
         let checkpoint = repo.commit()?;
         let latin1 = |name: &[u8]| repo.root().join(std::ffi::OsStr::from_bytes(name));
