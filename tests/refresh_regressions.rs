@@ -52,7 +52,9 @@ impl Repo {
         let output = Command::new("git")
             .current_dir(&self.root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", &self.git_config)
+            // Git for Windows cannot open Rust's canonical \\?\ config paths.
+            // Keep fixture paths canonical, but resolve this file from the child cwd.
+            .env("GIT_CONFIG_GLOBAL", "../gitconfig")
             .args([
                 "-c",
                 "user.name=Refresh Fixture",
@@ -112,6 +114,46 @@ impl Repo {
             |row| row.get(0),
         )?)
     }
+}
+
+#[test]
+fn git_fixture_reads_its_isolated_global_config() -> Result<()> {
+    let mut repo = Repo::new(true)?;
+    fs::write(
+        &repo.git_config,
+        "[fixture]\n\tmarker = refresh-regression\n",
+    )?;
+    #[cfg(not(windows))]
+    let roots = [repo.root.clone()];
+    #[cfg(windows)]
+    let roots = {
+        use anyhow::Context;
+
+        let root = repo.root.to_str().context("Fixture path must be UTF-8")?;
+        let ordinary_root = if let Some(unc_root) = root.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc_root}")
+        } else {
+            root.strip_prefix(r"\\?\")
+                .context("Canonical Windows fixture path must have a verbatim prefix")?
+                .to_owned()
+        };
+        [
+            repo.root.clone(),
+            PathBuf::from(&ordinary_root),
+            PathBuf::from(format!("{ordinary_root}/.")),
+        ]
+    };
+    for root in roots {
+        repo.root = root;
+        repo.git(&[
+            "config",
+            "--global",
+            "--get",
+            "fixture.marker",
+            "^refresh-regression$",
+        ])?;
+    }
+    Ok(())
 }
 
 fn error_codes(engine: &Engine) -> Result<Vec<(String, String)>> {
