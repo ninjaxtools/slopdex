@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::{
     cache, hash, map,
     parse::{FileStructure, ParsedFile, StructureNode},
+    registry,
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
@@ -62,6 +63,8 @@ pub struct Database {
     pub conn: Connection,
     pub path: PathBuf,
     global_path: PathBuf,
+    // Declared after the connection so it remains held until that connection closes.
+    _store_usage: registry::ArtifactLock,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +119,11 @@ impl Database {
         force: bool,
         readonly: bool,
     ) -> Result<Self> {
+        let initial_file = match std::fs::metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
         let conn = if readonly {
             Connection::open_with_flags(
                 path,
@@ -230,6 +238,25 @@ impl Database {
         })?;
         let global_path = std::fs::canonicalize(&global_path)?;
         drop(global);
+        let store_usage = registry::store_usage(&global_path, false, registry::LOCK_TIMEOUT)?;
+        if let Some(initial) = initial_file {
+            // Direct Database users do not own an Engine index lock. Pruning
+            // may have removed the file while this opener waited for the store
+            // guard; never continue using SQLite's now-unlinked old connection.
+            let current = std::fs::metadata(path)
+                .context("Index changed while waiting for the artifact store; retry opening it")?;
+            #[cfg(unix)]
+            let same_file = {
+                use std::os::unix::fs::MetadataExt;
+                initial.dev() == current.dev() && initial.ino() == current.ino()
+            };
+            #[cfg(not(unix))]
+            let same_file = initial.created().ok() == current.created().ok();
+            ensure!(
+                same_file && current.is_file(),
+                "Index changed while waiting for the artifact store; retry opening it"
+            );
+        }
         if readonly {
             // URI mode makes the attached store genuinely read-only too.
             let uri = sqlite_readonly_uri(&global_path)?;
@@ -239,6 +266,7 @@ impl Database {
                 conn,
                 path: path.to_owned(),
                 global_path,
+                _store_usage: store_usage,
             });
         }
         conn.execute(
@@ -288,7 +316,9 @@ impl Database {
             conn,
             path: path.to_owned(),
             global_path,
+            _store_usage: store_usage,
         };
+        registry::register_workspace(&db, root)?;
         Ok(db)
     }
 

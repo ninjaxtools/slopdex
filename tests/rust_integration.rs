@@ -9027,6 +9027,79 @@ fn missing_global_source_artifacts_report_actionable_diagnostics() -> Result<()>
 }
 
 #[test]
+fn prune_deleted_worktree_rebuild_reuses_every_paid_artifact() -> Result<()> {
+    let mock = Mock::start()?;
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("worktree");
+    let index = temp.path().join("index.sqlite");
+    let mut config = mock.config();
+    config["artifactCachePath"] = json!(temp.path().join("shared.sqlite"));
+    let config_path = temp.path().join("config.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let source = function("shared", "VECTOR_EAST");
+    fs::create_dir(&root)?;
+    fs::write(root.join("api.rs"), &source)?;
+    let mut engine = Engine::open(&root, &index, isolated(&index, config.clone()))?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    let results = engine.search("east", "search-code", &all())?;
+    assert!(!results.is_empty());
+    let calls = mock.count();
+    drop(engine);
+    fs::remove_dir_all(&root)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_slopdex"))
+        .args([
+            "--root",
+            temp.path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+            "cache",
+            "prune",
+        ])
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["worktreesRemoved"], 1);
+    assert_eq!(report["vectorRowsDeleted"], 0);
+    assert_eq!(report["descriptionRowsDeleted"], 0);
+    assert!(!index.exists());
+    assert_eq!(mock.count(), calls, "prune must never call providers");
+    let global = Connection::open(config["artifactCachePath"].as_str().unwrap())?;
+    assert_eq!(
+        global.query_row("SELECT count(*) FROM sources", [], |r| r.get::<_, i64>(0))?,
+        0
+    );
+    assert_eq!(
+        global.query_row(
+            "SELECT count(*) FROM cache WHERE kind IN ('parse','unit-content','callgraph')",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    drop(global);
+    fs::create_dir(&root)?;
+    fs::write(root.join("api.rs"), source)?;
+    let mut engine = Engine::open(&root, &index, isolated(&index, config))?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    assert!(!engine.search("east", "search-code", &all())?.is_empty());
+    assert_eq!(
+        mock.count(),
+        calls,
+        "rebuilding must reuse generated descriptions and document/query vectors"
+    );
+    assert_eq!(engine.status()?["fileDescriptionCount"], 1);
+    assert_eq!(engine.status()?["descriptionCount"], 1);
+    Ok(())
+}
+
+#[test]
 fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Result<()> {
     let mock = Mock::start()?;
     let temp = tempfile::tempdir()?;

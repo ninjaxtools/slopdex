@@ -48,7 +48,7 @@ can also follow the command. Quote multiword queries.
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
 | `update --setup` | Configure and prepare embeddings only, save the selected settings, then update. Embedding flags make setup noninteractive. | JSON refresh statistics |
 | `generate descriptions` | Refresh normally, then explicitly generate missing or stale file and callable descriptions from indexed source. | JSON statistics |
-| `cache prune [--vacuum]` | Delete obsolete snapshot manifests and unused lock files from the global artifact store without opening an index; `--vacuum` also returns freed space to the filesystem. | JSON maintenance report |
+| `cache prune [--vacuum] [--prune-vectors] [--prune-descriptions]` | Remove missing-worktree indexes and rebuildable artifacts; keep provider-generated vectors and descriptions unless explicitly opted out. `--vacuum` also returns freed space to the filesystem. | JSON maintenance report |
 | `help [<command>...]` | Print the long help for the program or for one command path, e.g. `help search` or `help index errors`. | Help text |
 | `help models [opencode\|opencode-go]` | Fetch one or both live public OpenCode catalogs without opening an index or requiring credentials. | Qualified `provider/model` lines |
 | `config [prefix]` | Configure matching settings interactively without opening an index. | Updated-setting summary |
@@ -1033,20 +1033,45 @@ for transaction and sidecar publication details.
 ### Pruning the global store
 
 ```bash
-slopdex cache prune            # delete obsolete rows and lock files, report sizes
-slopdex cache prune --vacuum   # also shrink the database file
+slopdex cache prune                       # clean up, preserving provider results
+slopdex cache prune --vacuum              # also shrink the database file
+slopdex cache prune --prune-vectors       # explicitly discard cached vectors too
+slopdex cache prune --prune-descriptions  # explicitly discard generated descriptions too
 ```
 
 `cache prune` maintains the global artifact store selected by `artifactCachePath`
-(otherwise the per-user default). It opens no index, calls no provider, and never
+(otherwise the per-user default). It inspects saved index metadata, calls no provider, and never
 runs implicitly. It fails if the store does not exist rather than creating one.
 
-Earlier versions saved a complete snapshot manifest in the store's `snapshots`
-table on every changed refresh; current versions save only the digest in the
-worktree index. Prune deletes all of those rows, removes lock files under
-`<global-store>.locks` that no process holds (earlier versions never deleted
-them), and truncates the write-ahead log. Embeddings, descriptions, sources, parse
-artifacts, and every worktree index are untouched, so nothing needs re-indexing.
+Prune detects missing indexed roots, deletes their SQLite indexes and recognized
+sidecars, and removes unused sources, search-unit payloads, description fragments,
+parse/call-graph artifacts, repository registrations, and derived vector bases.
+Live indexes keep their authoritative source/content/vector bindings. An existing
+directory without `.git` is not considered missing. Unrelated files beside custom
+indexes are never removed. Persistent index/base lock files are deliberately kept
+to avoid splitting the lock domain of an already-waiting opener; tiny otherwise
+empty cache directories may remain.
+
+**Provider results survive by default**, regardless of whether the provider was
+local (such as Ollama) or remote (such as OpenAI or Jina). This includes all
+document, symbol, description, and query vectors, generated descriptions and
+their full generation context, explanations, and rerankings. Re-indexing identical
+inputs with compatible model settings can reuse those results without model calls.
+`--prune-vectors` and `--prune-descriptions` independently permit deletion of
+**unused** vectors and generated description records, respectively. They do not
+remove live workspace bindings; explanations and rerankings are still retained.
+These flags affect the local store, not objects in an optional S3 cache.
+
+Custom indexes are registered when opened writable. Existing default-cache
+indexes are also discovered during pruning. Open copied or moved custom indexes
+writable at their new paths before pruning. Older custom indexes that have never
+reopened cannot be discovered automatically. When upgrading a pre-tracking store,
+its existing authoritative payloads are conservatively pinned so those indexes
+cannot be damaged, even with the opt-in flags. The report exposes this retained
+legacy count; subsequently created unreferenced payloads can be reclaimed normally.
+
+Prune also empties the obsolete `snapshots` table, removes unused artifact lock
+files under `<global-store>.locks`, and truncates the write-ahead log.
 
 The JSON report contains:
 
@@ -1054,6 +1079,12 @@ The JSON report contains:
 | --- | --- |
 | `store` | Canonical store path. |
 | `snapshotRowsDeleted` | Snapshot manifest rows removed by this run. |
+| `worktreesRemoved`, `worktreesBusy` | Missing-worktree indexes removed, and indexes skipped because their lifetime lock is held or their path is reserved for coordination. |
+| `artifactRowsDeleted` | Unused reconstructible artifact and upload-bookkeeping rows removed. |
+| `vectorRowsDeleted`, `descriptionRowsDeleted` | Unused provider results removed by the corresponding opt-in flag. |
+| `repositoryRowsDeleted` | Obsolete repository registrations and family-evidence rows removed. |
+| `indexFilesRemoved` | SQLite/sidecar and unused shared vector-base files removed. |
+| `legacyArtifactsRetained` | Pre-tracking authoritative payloads pinned to protect undiscoverable older custom indexes. |
 | `lockFilesRemoved`, `lockFilesBusy` | Lock files deleted, and those skipped because a process holds them. |
 | `walTruncated` | `false` when a concurrent reader prevented resetting the write-ahead log; rerun later. |
 | `databaseBytes` | Size of the main database file after the run. |
@@ -1070,11 +1101,13 @@ first; with too little, the command fails with the required and available byte
 counts and rewrites nothing. Run plain `cache prune` first to see
 `vacuumRequiredFreeBytes`.
 
-Prune is safe while other slopdex processes use the store: rows are deleted in
-small transactions and held lock files are skipped. It waits at most 10 seconds
-for another writer and then reports that the store is busy; rerun it. A vacuum
-holds the store's writer lock for its whole duration, so run `--vacuum` when no
-other process is indexing.
+Prune takes an exclusive store-maintenance lock; database and artifact users hold
+it shared for their lifetime. It waits at most 10 seconds for those users or a
+SQLite writer, then reports that the store is busy; rerun after they finish.
+Deletion uses small transactions. Held index/base locks are skipped; if an index
+cannot be inspected, global reachability cleanup is deferred. Run pruning when
+other slopdex commands have finished, especially with `--vacuum`.
+Finish older-version commands first: they do not participate in the maintenance lock.
 
 ### Descriptions
 

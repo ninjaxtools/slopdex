@@ -1,4 +1,4 @@
-//! Repository relatedness and per-artifact single-flight coordination.
+//! Workspace tracking, repository relatedness, and artifact/store coordination.
 //! Family membership is discovery evidence, never proof that a snapshot is reusable.
 
 use std::{
@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 
 use crate::{git, hash, storage::Database};
@@ -27,8 +27,94 @@ CREATE INDEX IF NOT EXISTS global.family_evidence_family ON family_evidence(fami
 ";
 pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Kinds whose lock file is a fixed, never-retired path. Store initialization
-/// is a correctness lock shared with binaries that never unlink lock files.
+/// and maintenance must always synchronize through the same named file.
 const PERSISTENT_KINDS: [&str; 1] = ["store"];
+const PERSISTENT_STORE_KEYS: [&str; 2] = ["initialize", "maintenance"];
+
+/// Add tracking to a pretracking store without losing references from old custom
+/// indexes that cannot be discovered. `schema` is `main` for a standalone store
+/// connection or `global` for an attached store. Warm opens are read-only setup.
+pub(crate) fn ensure_workspace_tracking(conn: &Connection, schema: &str) -> Result<()> {
+    ensure!(matches!(schema, "main" | "global"), "Invalid store schema");
+    if workspace_tracking_exists(conn, schema)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    initialize_workspace_tracking(&tx, schema)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn workspace_tracking_exists(conn: &Connection, schema: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {schema}.sqlite_master WHERE type='table' AND name='workspaces')"
+        ),
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Called under an immediate transaction. Recheck after taking the write lock:
+/// a concurrent initializer may already have completed the one-time pinning.
+fn initialize_workspace_tracking(conn: &Connection, schema: &str) -> Result<()> {
+    if workspace_tracking_exists(conn, schema)? {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "CREATE TABLE {schema}.workspaces(index_path TEXT PRIMARY KEY,root TEXT NOT NULL);
+         CREATE TABLE {schema}.legacy_artifacts(kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(kind,key));
+         INSERT INTO {schema}.legacy_artifacts SELECT 'source',hash FROM {schema}.sources;
+         INSERT INTO {schema}.legacy_artifacts SELECT 'unit-content',key FROM {schema}.cache WHERE kind='unit-content';
+         INSERT INTO {schema}.legacy_artifacts SELECT 'description-content',hash FROM {schema}.description_content;
+         INSERT INTO {schema}.legacy_artifacts SELECT 'embedding',key FROM {schema}.embeddings;"
+    ))?;
+    Ok(())
+}
+
+/// Track every writable workspace index, independently of Git registration.
+/// Existing stores gain this optional table lazily without a schema-version bump.
+/// A warm open with unchanged registration must not take a write transaction:
+/// another connection may already be writing either attached database.
+pub(crate) fn register_workspace(db: &Database, root: &Path) -> Result<()> {
+    let index = db.path.canonicalize()?;
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            std::path::absolute(root)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let index = index
+        .to_str()
+        .context("Workspace index path is not UTF-8")?;
+    let root = root.to_str().context("Workspace root path is not UTF-8")?;
+    let exists = workspace_tracking_exists(&db.conn, "global")?;
+    if exists
+        && db
+            .conn
+            .query_row(
+                "SELECT root FROM global.workspaces WHERE index_path=?",
+                [index],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            == Some(root)
+    {
+        return Ok(());
+    }
+    ensure_writable(db)?;
+    let tx = Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate)?;
+    initialize_workspace_tracking(&tx, "global")?;
+    tx.execute(
+        "INSERT INTO global.workspaces(index_path,root) VALUES(?,?)
+         ON CONFLICT(index_path) DO UPDATE SET root=excluded.root WHERE root<>excluded.root",
+        params![index, root],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
 
 /// Register once per checkout incarnation. Cached calls use filesystem identity
 /// and one indexed family lookup, without invoking Git or traversing history.
@@ -284,8 +370,8 @@ fn fingerprint(root: &Path, identity: &Value) -> Result<String> {
     ]))?))
 }
 
-/// A held per-artifact lock. Dropping it releases the lock and retires its file,
-/// so `<store>.locks` holds only locks that are currently held or awaited.
+/// A held artifact or store lock. Dropping it releases the lock; per-artifact
+/// files are retired, while store coordination files remain permanently named.
 pub(crate) struct ArtifactLock {
     file: fs::File,
     path: PathBuf,
@@ -347,8 +433,17 @@ fn live(file: &fs::File, path: &Path) -> bool {
 /// Poll for an exclusive advisory lock until `deadline`. `Ok(false)` reports a
 /// timeout; the caller decides whether that is an error or a fallback.
 pub(crate) fn lock_exclusive_until(file: &fs::File, deadline: Instant) -> std::io::Result<bool> {
+    lock_until(file, true, deadline)
+}
+
+fn lock_until(file: &fs::File, exclusive: bool, deadline: Instant) -> std::io::Result<bool> {
     loop {
-        match FileExt::try_lock_exclusive(file) {
+        let attempt = if exclusive {
+            FileExt::try_lock_exclusive(file)
+        } else {
+            FileExt::try_lock_shared(file)
+        };
+        match attempt {
             Ok(()) => return Ok(true),
             // Windows reports ERROR_LOCK_VIOLATION, which is not necessarily
             // mapped to WouldBlock. Compare fs2's native contention code too.
@@ -386,6 +481,37 @@ fn open_lock_file(path: &Path, create: bool) -> std::io::Result<fs::File> {
         .create(create)
         .truncate(false)
         .open(path)
+}
+
+/// Coordinate maintenance against every live database/artifact-store user.
+/// Initialize/open the store first, then acquire this guard before attaching or
+/// using it. Shared users retain their guard for their entire lifetime; pruning
+/// retains an exclusive guard across its complete global mark/sweep operation.
+/// Unlike per-artifact locks, this shared/exclusive lock must never be unlinked.
+pub(crate) fn store_usage(
+    global_path: &Path,
+    exclusive: bool,
+    timeout: Duration,
+) -> Result<ArtifactLock> {
+    let global_path = global_path
+        .canonicalize()
+        .with_context(|| format!("Resolve artifact store {}", global_path.display()))?;
+    let directory = lock_directory(&global_path);
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(lock_file_name("store", "maintenance")?);
+    let file = open_lock_file(&path, true)
+        .with_context(|| format!("Open store maintenance lock {}", path.display()))?;
+    ensure!(
+        lock_until(&file, exclusive, Instant::now() + timeout)
+            .context("Acquire store maintenance lock")?,
+        "Artifact store is busy: {}",
+        global_path.display()
+    );
+    Ok(ArtifactLock {
+        file,
+        path,
+        persistent: true,
+    })
 }
 
 /// Acquire only around the provider request/artifact computation. After acquiring,
@@ -477,8 +603,8 @@ pub(crate) fn lock_paths<'a>(
 /// Remove lock files nobody holds, including those left by binaries that never
 /// retired them. Returns `(removed, busy)`. A file is removed only under its own
 /// exclusive lock and with the same retirement marking as a normal release, so
-/// concurrent lockers of this version stay correct. The store initialization
-/// lock is permanent and is never removed.
+/// concurrent lockers of this version stay correct. Store initialization and
+/// maintenance locks are permanent and are never removed.
 pub(crate) fn prune_locks(global_path: &Path) -> Result<(u64, u64)> {
     let directory = lock_directory(global_path);
     let entries = match fs::read_dir(&directory) {
@@ -490,7 +616,9 @@ pub(crate) fn prune_locks(global_path: &Path) -> Result<(u64, u64)> {
     };
     let mut persistent = Vec::new();
     for kind in PERSISTENT_KINDS {
-        persistent.push(lock_file_name(kind, "initialize")?);
+        for key in PERSISTENT_STORE_KEYS {
+            persistent.push(lock_file_name(kind, key)?);
+        }
     }
     let (mut removed, mut busy) = (0, 0);
     for entry in entries {
@@ -523,6 +651,9 @@ pub(crate) fn prune_locks(global_path: &Path) -> Result<(u64, u64)> {
     }
     Ok((removed, busy))
 }
+
+#[cfg(test)]
+mod maintenance_tests;
 
 #[cfg(test)]
 mod tests {

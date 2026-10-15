@@ -96,6 +96,11 @@ To create a vector index, the `update` command needs to be run once in a Git rep
 
 Each worktree has its own index in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). There is also a global cache that is reused across worktrees, so hash-identical code will not cause unneeded model provider requests. Configuaration is stored in `$XDG_CONFIG_HOME/slopdex/config.json`. Global configuration can be overridden with a repository local `.slopdex/config.json` file. See also [cache configuration](docs/reference.md#shared-provider-artifacts).
 
+`slopdex cache prune` removes missing-worktree indexes and unused rebuildable data,
+but preserves provider-generated vectors and descriptions for reuse. Add
+`--prune-vectors` or `--prune-descriptions` to explicitly remove unused results of
+that kind, and `--vacuum` to return freed database space to the filesystem.
+
 By default code and docs indexes are searched and ranked together, see `--formats` to enable other file types.
 
 ```console

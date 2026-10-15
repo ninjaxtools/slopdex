@@ -277,11 +277,23 @@ fn run_workspace(
         }
     }
     if let Command::Cache {
-        action: CacheAction::Prune { vacuum },
+        action:
+            CacheAction::Prune {
+                vacuum,
+                prune_vectors,
+                prune_descriptions,
+            },
     } = &cli.command
     {
         let report = ui::spin("Pruning global artifact store", || {
-            crate::cache::prune(&config, *vacuum)
+            crate::cache::prune_with_options(
+                &config,
+                crate::cache::PruneOptions {
+                    vacuum: *vacuum,
+                    prune_vectors: *prune_vectors,
+                    prune_descriptions: *prune_descriptions,
+                },
+            )
         })?;
         return print_json(&mut out, &serde_json::to_value(report)?);
     }

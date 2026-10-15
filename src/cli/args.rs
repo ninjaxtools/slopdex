@@ -149,7 +149,7 @@ pub(super) enum Command {
     },
     /// Refresh the current working tree and Git HEAD
     Update(UpdateArgs),
-    /// Maintain the global artifact store without opening an index
+    /// Maintain cached worktrees and artifacts without refreshing indexes or calling providers
     Cache {
         #[command(subcommand)]
         action: CacheAction,
@@ -176,11 +176,17 @@ pub(super) enum IndexAction {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum CacheAction {
-    /// Delete obsolete snapshot manifests and unused lock files; report reclaimable space
+    /// Remove missing-worktree indexes and rebuildable artifacts; keep provider results by default
     Prune {
         /// Also rewrite the store to return freed space to the filesystem (needs free disk space)
         #[arg(long)]
         vacuum: bool,
+        /// Also delete unused provider-generated vectors (may require model calls to regenerate)
+        #[arg(long)]
+        prune_vectors: bool,
+        /// Also delete unused provider-generated descriptions (may require model calls to regenerate)
+        #[arg(long)]
+        prune_descriptions: bool,
     },
 }
 

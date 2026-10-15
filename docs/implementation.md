@@ -280,6 +280,7 @@ paths are never imported or used as compatibility seeds. See the
 | Global `cache`, `description_content` | Parse, resolved call-graph, search-unit source/input, and provider artifacts; interned description text, prompts, settings, profiles, and conversation messages. |
 | Global `snapshots` | Unused. Retained, and still validated on open, only so binaries that persisted snapshot manifests can share the schema-1 store; nothing writes or reads it now, and `cache prune` empties it. |
 | Global registry/upload tables | Repository relatedness evidence and best-effort remote upload bookkeeping. |
+| Global `workspaces`, `legacy_artifacts` | Canonical index/root registrations and conservative pre-tracking payload roots for older undiscoverable custom indexes. |
 
 The worktree connection attaches the global store as `global`. Both databases are
 needed to read a saved snapshot. `artifactCachePath` selects the global store when
@@ -337,8 +338,9 @@ Releasing unlinks the file under its own lock and then marks the orphaned file
 nonempty; a waiter that acquires a marked file, or (on Unix) one whose inode is no
 longer the one at its path, retries on the current file. The lock directory is
 therefore bounded by in-flight work instead of by every key ever used. The
-`store`/`initialize` lock is the one permanent file: it guards WAL activation and
-is shared with binaries that never unlink lock files. Per-key granularity is
+`store`/`initialize` and `store`/`maintenance` locks are permanent: the former
+guards WAL activation and is shared with older binaries; the latter is shared
+for every Database/Artifacts lifetime and exclusive during prune. Per-key granularity is
 deliberate. Hashing keys into a fixed set of bucket files would also bound the
 directory, but ten parallel embedding batches of 32-64 keys would then almost
 always share a bucket, serialize behind each other's provider calls, and exceed
@@ -355,10 +357,22 @@ query results, and USearch files are not uploaded. Ordinary map does not fetch S
 Backfill exports only artifacts belonging to the requesting worktree, not unrelated
 repositories' entries in the global store.
 Automatic garbage collection is not implemented. `cache::prune` (`slopdex cache
-prune`) is the explicit maintenance entry point: it deletes every obsolete
-`snapshots` row in small transactions, removes lock files it can lock exclusively
-(left by binaries that never retired them), and truncates the WAL. It waits at
-most 10 seconds for another writer and then reports the store busy. Freed pages
+prune`) is the explicit maintenance entry point. Under an exclusive maintenance
+lock it inventories registered/custom and default-cache indexes, removes exact
+payload files for positively missing roots, and traces live sources, unit-content,
+description content (including symbol metadata), and embedding associations.
+All provider embeddings, generated descriptions and their generation fragments
+are additional roots by default; the independent `--prune-vectors` and
+`--prune-descriptions` flags remove only unreferenced results. Explanations,
+rerankings, and unknown artifact kinds are retained conservatively. Old stores
+gain tracking tables lazily and pin pre-tracking authoritative payloads because
+unopened older custom indexes are undiscoverable. Live referenced payloads are
+never swept. Unreferenced parse/call-graph artifacts, repository evidence, upload
+markers, obsolete snapshots, and shared ANN bases are reconstructible cleanup
+targets. Index/base locks are never unlinked; publication markers are removed
+before base payloads, under the exact base lock. Atomic-write temporaries stay.
+It also removes unused artifact locks and truncates the WAL. Deletion uses small
+transactions and bounded waits, reporting a busy store rather than hanging. Freed pages
 are reported from `freelist_count * page_size` and reused by later artifacts.
 `--vacuum` runs `VACUUM` only after checking free space: twice the live data on
 the store's filesystem (temporary copy plus WAL) and the live data in SQLite's

@@ -288,7 +288,7 @@ fn unindexed_multi_workspace_map_builtin_limit_is_global() -> Result<()> {
 }
 
 #[test]
-fn cache_prune_reports_the_configured_store_without_opening_an_index() -> Result<()> {
+fn cache_prune_reports_the_configured_store_without_initializing_an_index() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root");
     std::fs::create_dir(&root)?;
@@ -328,6 +328,42 @@ fn cache_prune_reports_the_configured_store_without_opening_an_index() -> Result
     assert_eq!(report["snapshotRowsDeleted"], 0);
     assert_eq!(report["vacuumed"], false);
     assert_eq!(run(&["--vacuum"])?["vacuumed"], true);
+    let conn = crate::cache::open_store(&store, false)?;
+    conn.execute("INSERT INTO embeddings VALUES('vector',X'0000803F')", [])?;
+    let hash = crate::hash("generation");
+    let generated = json!({"text":"generated","generation":{
+        "scope":"file","path":"deleted.rs","symbol":null,"source_hash":hash,"file_hash":hash,
+        "file_description_hash":null,"profile_hash":hash,"settings_hash":hash,"system_hash":hash,
+        "prompt_hash":hash,"messages":[],"regenerate":false
+    }});
+    conn.execute(
+        "INSERT INTO cache VALUES('description','description',?)",
+        [generated.to_string()],
+    )?;
+    run(&[])?;
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM embeddings", [], |r| r
+            .get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM cache WHERE kind='description'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(run(&["--prune-vectors"])?["vectorRowsDeleted"], 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM cache WHERE kind='description'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(run(&["--prune-descriptions"])?["descriptionRowsDeleted"], 1);
     assert_eq!(std::fs::read_dir(&root)?.count(), 0);
     Ok(())
 }

@@ -20,6 +20,10 @@ use serde_json::Value;
 
 use crate::{hash, registry, storage::Database, ui};
 
+mod prune;
+#[cfg(test)]
+mod prune_tests;
+
 const MAX_S3_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 
 const WORKSPACE_EMBEDDINGS: &str = "SELECT key,vector FROM global.embeddings WHERE key IN (
@@ -37,6 +41,8 @@ CREATE TABLE description_content(hash TEXT PRIMARY KEY,content TEXT NOT NULL);
 CREATE TABLE snapshots(digest TEXT PRIMARY KEY,manifest TEXT NOT NULL);
 CREATE TABLE remote_uploads(remote TEXT NOT NULL,kind TEXT NOT NULL,key TEXT NOT NULL,digest TEXT NOT NULL,
  PRIMARY KEY(remote,kind,key));
+CREATE TABLE workspaces(index_path TEXT PRIMARY KEY,root TEXT NOT NULL);
+CREATE TABLE legacy_artifacts(kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(kind,key));
 PRAGMA user_version=1;
 ";
 
@@ -280,6 +286,14 @@ const PRUNE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRUNE_BATCH_ROWS: i64 = 16;
 const VACUUM_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Provider results are retained unless their deletion is explicitly requested.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PruneOptions {
+    pub vacuum: bool,
+    pub prune_vectors: bool,
+    pub prune_descriptions: bool,
+}
+
 /// Result of [`prune`]. All sizes are bytes.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -287,6 +301,15 @@ pub struct PruneReport {
     pub store: PathBuf,
     /// Obsolete snapshot manifest rows removed by this run.
     pub snapshot_rows_deleted: u64,
+    pub worktrees_removed: u64,
+    pub worktrees_busy: u64,
+    pub artifact_rows_deleted: u64,
+    pub vector_rows_deleted: u64,
+    pub description_rows_deleted: u64,
+    pub repository_rows_deleted: u64,
+    pub index_files_removed: u64,
+    /// Pre-tracking authoritative artifacts pinned for undiscovered custom indexes.
+    pub legacy_artifacts_retained: u64,
     pub lock_files_removed: u64,
     /// Lock files left alone because another process holds them.
     pub lock_files_busy: u64,
@@ -348,21 +371,37 @@ fn sqlite_temporary_directory() -> PathBuf {
 /// Explicit, user-invoked maintenance of the global artifact store selected by
 /// `config`. It never runs implicitly.
 ///
-/// Snapshot manifests are no longer written or read, so every `snapshots` row is
-/// removed; lock files nobody holds are deleted; the write-ahead log is reset.
+/// Missing worktrees and their unused reconstructible artifacts are removed.
+/// Provider vectors and generated descriptions are retained by default, including
+/// their generation context. Opt-in removal never deletes live workspace bindings.
+/// Snapshot manifests and unheld artifact locks are also removed, and the WAL reset.
 /// Deleted rows become free pages that later artifacts reuse. Returning them to
 /// the filesystem needs `vacuum`, which rewrites the whole database and is
 /// refused, before anything is rewritten, unless enough disk space is free.
 ///
-/// Concurrent users are safe: deletion runs in small transactions, waits a
-/// bounded time for other writers, and reports a busy store instead of hanging.
+/// Concurrent users are excluded by the store maintenance lock, with a bounded
+/// wait that reports a busy store instead of hanging.
 /// A vacuum holds the writer lock for its whole duration and is best run while
 /// no other slopdex process is indexing.
 pub fn prune(config: &Value, vacuum: bool) -> Result<PruneReport> {
-    prune_within(config, vacuum, PRUNE_BUSY_TIMEOUT)
+    prune_with_options(
+        config,
+        PruneOptions {
+            vacuum,
+            ..PruneOptions::default()
+        },
+    )
 }
 
-fn prune_within(config: &Value, vacuum: bool, busy_timeout: Duration) -> Result<PruneReport> {
+pub fn prune_with_options(config: &Value, options: PruneOptions) -> Result<PruneReport> {
+    prune_within(config, options, PRUNE_BUSY_TIMEOUT)
+}
+
+fn prune_within(
+    config: &Value,
+    options: PruneOptions,
+    busy_timeout: Duration,
+) -> Result<PruneReport> {
     let path = store_path(config)?;
     anyhow::ensure!(
         path.is_file(),
@@ -373,6 +412,7 @@ fn prune_within(config: &Value, vacuum: bool, busy_timeout: Duration) -> Result<
     let conn = open_store(&path, false)
         .with_context(|| format!("Cannot open global artifact store {}", path.display()))?;
     let path = std::fs::canonicalize(path)?;
+    let _maintenance = registry::store_usage(&path, true, busy_timeout)?;
     conn.busy_timeout(busy_timeout)?;
     let busy = |error: rusqlite::Error| {
         let contended = matches!(
@@ -402,6 +442,20 @@ fn prune_within(config: &Value, vacuum: bool, busy_timeout: Duration) -> Result<
         }
         snapshot_rows_deleted += deleted as u64;
     }
+    // Unit tests must not inspect or clean up the real per-user cache.
+    #[cfg(test)]
+    let worktrees = path.parent().unwrap().join("worktrees-v1");
+    #[cfg(not(test))]
+    let worktrees = directory()?.join("worktrees-v1");
+    let cleaned = prune::cleanup(&conn, &path, options, &worktrees).map_err(|error| {
+        if let Some(sqlite) = error.downcast_ref::<rusqlite::Error>()
+            && matches!(sqlite.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+        {
+            error.context(format!("The global artifact store {} is busy; retry when no other slopdex process is writing to it", path.display()))
+        } else {
+            error
+        }
+    })?;
     let (lock_files_removed, lock_files_busy) = registry::prune_locks(&path)?;
     // The pragma reports contention in its first column rather than failing.
     let checkpoint = |conn: &Connection| {
@@ -420,7 +474,7 @@ fn prune_within(config: &Value, vacuum: bool, busy_timeout: Duration) -> Result<
         .parent()
         .context("Global artifact store has no parent")?;
     let available_bytes = fs2::available_space(directory)?;
-    if vacuum {
+    if options.vacuum {
         anyhow::ensure!(
             available_bytes >= vacuum_required_free_bytes,
             "Not enough free disk space to vacuum {}: about {} bytes must be free in {} (twice the {} bytes of live data, for SQLite's temporary copy and write-ahead log), but only {} are available. Nothing was rewritten; the {} freed bytes stay reusable by new artifacts without a vacuum.",
@@ -449,12 +503,20 @@ fn prune_within(config: &Value, vacuum: bool, busy_timeout: Duration) -> Result<
     Ok(PruneReport {
         store: path,
         snapshot_rows_deleted,
+        worktrees_removed: cleaned.worktrees_removed,
+        worktrees_busy: cleaned.worktrees_busy,
+        artifact_rows_deleted: cleaned.artifact_rows_deleted,
+        vector_rows_deleted: cleaned.vector_rows_deleted,
+        description_rows_deleted: cleaned.description_rows_deleted,
+        repository_rows_deleted: cleaned.repository_rows_deleted,
+        index_files_removed: cleaned.index_files_removed,
+        legacy_artifacts_retained: cleaned.legacy_artifacts_retained,
         lock_files_removed,
         lock_files_busy,
         wal_truncated,
         database_bytes: size.database,
         reclaimable_bytes: size.reclaimable,
-        vacuumed: vacuum,
+        vacuumed: options.vacuum,
         vacuum_required_free_bytes,
         available_bytes,
     })
@@ -465,6 +527,7 @@ pub struct Artifacts {
     local: Connection,
     path: PathBuf,
     remote: Option<Remote>,
+    _store_usage: registry::ArtifactLock,
 }
 
 struct Remote {
@@ -489,6 +552,7 @@ impl Artifacts {
         let local = open_store(&path, readonly)
             .with_context(|| format!("Cannot open global artifact store {}", path.display()))?;
         let path = std::fs::canonicalize(path)?;
+        let usage = registry::store_usage(&path, false, registry::LOCK_TIMEOUT)?;
         let remote = config.get("artifactS3").and_then(|settings| {
             Remote::open(settings)
                 .map_err(|_| ui::warning("S3 artifact cache unavailable; continuing locally"))
@@ -498,6 +562,7 @@ impl Artifacts {
             local,
             path,
             remote,
+            _store_usage: usage,
         })
     }
 
@@ -1124,7 +1189,7 @@ mod tests {
 
     #[test]
     fn prune_drops_snapshot_manifests_and_stale_locks_and_vacuum_shrinks_the_store() -> Result<()> {
-        let (dir, config, db, _artifacts) = fixture()?;
+        let (dir, config, db, artifacts) = fixture()?;
         let store = db.global_path().to_owned();
         db.put_embedding(&hash("kept"), &[1.0, 0.0])?;
         db.cache_put("parse", &hash("kept"), "kept artifact")?;
@@ -1140,6 +1205,8 @@ mod tests {
         let stale = locks.join(format!("{}.lock", hash("stale")));
         std::fs::write(&stale, "")?;
         let held = registry::lock_path(&store, "embedding", "held")?;
+        drop(artifacts);
+        drop(db);
         assert!(
             prune(
                 &serde_json::json!({"artifactCachePath":dir.path().join("missing.sqlite")}),
@@ -1166,9 +1233,8 @@ mod tests {
         // Without a vacuum the file keeps its size; the pages are only free.
         assert_eq!(store_file_bytes(&store)?, report.database_bytes);
         assert_eq!(
-            db.conn
-                .query_row("SELECT count(*) FROM global.snapshots", [], |r| r
-                    .get::<_, i64>(0))?,
+            open_store(&store, true)?
+                .query_row("SELECT count(*) FROM snapshots", [], |r| r.get::<_, i64>(0))?,
             0
         );
         drop(held);
@@ -1183,12 +1249,15 @@ mod tests {
             "{again:?}"
         );
         assert_eq!(store_file_bytes(&store)?, again.database_bytes);
-        // Artifacts survive and the live connection keeps working.
+        // Provider vectors survive; unused reconstructible parse artifacts do not.
+        let db = Database::open_with_config(
+            &dir.path().join("index.sqlite"),
+            dir.path(),
+            &config,
+            false,
+        )?;
         assert_eq!(db.embedding(&hash("kept"))?, Some(vec![1.0, 0.0]));
-        assert_eq!(
-            db.cache("parse", &hash("kept"))?.as_deref(),
-            Some("kept artifact")
-        );
+        assert_eq!(db.cache("parse", &hash("kept"))?.as_deref(), None);
         db.cache_put("parse", &hash("after"), "written after pruning")?;
         open_store(&store, false)?;
         Ok(())
@@ -1196,12 +1265,14 @@ mod tests {
 
     #[test]
     fn prune_reports_a_busy_store_without_hanging_or_deleting() -> Result<()> {
-        let (_dir, config, db, _artifacts) = fixture()?;
+        let (_dir, config, db, artifacts) = fixture()?;
         db.conn.execute(
             "INSERT INTO global.snapshots VALUES(?,?)",
             params![hash("snapshot"), "manifest"],
         )?;
         let writer = open_store(db.global_path(), false)?;
+        drop(artifacts);
+        drop(db);
         let tx = rusqlite::Transaction::new_unchecked(
             &writer,
             rusqlite::TransactionBehavior::Immediate,
@@ -1209,7 +1280,7 @@ mod tests {
         tx.execute("INSERT INTO sources VALUES('pending','not committed')", [])?;
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = prune_within(&config, false, Duration::from_millis(300));
+            let result = prune_within(&config, PruneOptions::default(), Duration::from_millis(300));
             sender
                 .send(result.map(|report| report.snapshot_rows_deleted))
                 .expect("prune result receiver");
@@ -1223,9 +1294,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("is busy"), "{error:#}");
         assert_eq!(
-            db.conn
-                .query_row("SELECT count(*) FROM global.snapshots", [], |r| r
-                    .get::<_, i64>(0))?,
+            writer.query_row("SELECT count(*) FROM snapshots", [], |r| r.get::<_, i64>(0))?,
             1
         );
         Ok(())
