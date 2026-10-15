@@ -163,6 +163,7 @@ fn help_describes_all_indexes_semantic_selection_and_explicit_generation() {
         search.contains("Semantic query over symbols, descriptions, and heading titles"),
         "{search}"
     );
+    assert!(search.contains("callable-source"), "{search}");
     for index in [
         "callable code",
         "generated callable/file description",
@@ -233,6 +234,8 @@ fn shared_selection_arguments_reach_all_search_options() {
             "Setup",
             "--regexp",
             "Guide",
+            "-e",
+            r"assert\(|throw new Error|ǃ\(",
             "-i",
             "-q",
             "validateSession",
@@ -259,7 +262,12 @@ fn shared_selection_arguments_reach_all_search_options() {
         );
         assert_eq!(
             options["regexp"],
-            json!(["^Service\\.", "Setup", "Guide"]),
+            json!([
+                "^Service\\.",
+                "Setup",
+                "Guide",
+                r"assert\(|throw new Error|ǃ\("
+            ]),
             "{command}"
         );
         assert_eq!(options["ignoreCase"], true, "{command}");

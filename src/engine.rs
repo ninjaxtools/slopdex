@@ -1081,8 +1081,13 @@ impl Engine {
             if !selection.path_matches(&path) {
                 continue;
             }
+            let source = selection
+                .has_regex()
+                .then(|| self.source(&path))
+                .transpose()?;
             for node in &structure.nodes {
-                if !selection.kind_matches(&node.kind) || !selection.symbol_matches_at(&path, node)
+                if !selection.kind_matches(&node.kind)
+                    || !selection.symbol_matches_in(&path, node, source)
                 {
                     continue;
                 }
@@ -2084,6 +2089,10 @@ impl Engine {
                         &i.path,
                         &i.data,
                         self.cached_structure(&i.path)?.as_deref(),
+                        (selection.has_regex()
+                            && matches!(i.kind.as_str(), "function" | "symbol-description"))
+                        .then(|| self.source(&i.path))
+                        .transpose()?,
                     )
                 {
                     allowed.insert(i.id);
@@ -2245,7 +2254,7 @@ impl Engine {
             .collect();
         Ok(hash(
             json!([
-                "query-v9-rerank-cap-probe",
+                "query-v10-callable-source-regex",
                 crate::formats::VERSION,
                 self.db.meta("snapshot")?,
                 self.db.generation()?,
@@ -2398,7 +2407,7 @@ impl Engine {
         let cache_key = || -> Result<String> {
             Ok(hash(
                 json!([
-                    "cross-v7-format-groups",
+                    "cross-v8-callable-source-regex",
                     crate::formats::VERSION,
                     self.db.meta("snapshot")?,
                     self.db.generation()?,
@@ -2467,6 +2476,10 @@ impl Engine {
                     &source.path,
                     &source.data,
                     self.cached_structure(&source.path)?.as_deref(),
+                    selection
+                        .has_regex()
+                        .then(|| self.source(&source.path))
+                        .transpose()?,
                 )
                 && source_path.as_ref().is_none_or(|p| under(&source.path, p))
                 && (!flag(options, "uncommitted") || source.data["sourceMode"] == "working-tree")
@@ -2761,6 +2774,10 @@ impl crate::map::StructureSource for Engine {
 
     fn source(&self, path: &str) -> Option<&str> {
         self.presentation_source(path)
+    }
+
+    fn selection_source(&self, path: &str) -> Result<Option<&str>> {
+        self.source(path).map(Some)
     }
 
     fn call_graph(&self) -> Result<crate::callgraph::CallGraph> {

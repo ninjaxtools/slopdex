@@ -410,8 +410,14 @@ Map, query searches, `describe`, and cross-search accept:
   the indexed universe and never reopen files excluded by indexing configuration
   or discovery ignore rules. Quote patterns, for example `-g '*.rs' -g '!tests/**'`.
 - `-e`, `--regexp <REGEXP>` (alias `--regex`): repeatable, case-sensitive **Rust
-  regexes**, ORed together. Callable searches match `qualifiedName`, with no anchor
-  rewriting or implicit bare-name fallback. Map uses the same qualified-name contract,
+  regexes**, ORed together. Callables match either `qualifiedName` or their exact
+  source text, with no anchor rewriting or implicit bare-name fallback. Source
+  matching covers functions, methods, constructors, and generators, including their
+  bodies and attached comments; it is lexical, not syntactic call detection, so
+  literals and declarations can also match. For example,
+  `-e 'assert\(|throw new Error|ǃ\('` selects callables containing those patterns.
+  Indexed queries use saved source, not current filesystem contents.
+  Map uses the same qualified-name contract,
   including extra bindings qualified in their enclosing scope, and matches import
   paths and aliases. Markdown
   names are heading paths joined with `.`, for example `Guide.Setup`.
@@ -476,10 +482,10 @@ separate symbol search channel is opened lazily from normalized names in saved
 structures, using a shared base and a worktree `<index>.symbols.shared.json`
 pointer. Ordinary map initializes no model.
 
-Format, path, and name selection intersect and apply before query result limits,
+Format, path, and regex/semantic selection intersect and apply before query result limits,
 including to Markdown results. Cross-search is always callable-code-only: omitting
 `code` from `--formats` yields no results, even when config or markup is selected.
-Cross-search applies path, name, and semantic selectors **only to sources**,
+Cross-search applies path, regex, and semantic selectors **only to sources**,
 intersecting `--source-path`, `--changed-since`, and `--uncommitted`; candidate
 neighbors remain eligible regardless of source selectors. `-k` is map-only.
 

@@ -6350,6 +6350,286 @@ fn expanded_detail_defaults_to_one_edge_and_includes_high_similarity_code() -> R
     Ok(())
 }
 
+const CALLABLE_SOURCE_REGEXP: &str = r"assert\(|throw new Error|ǃ\(";
+
+fn write_callable_source_regexp_fixture(repo: &Repo) -> Result<()> {
+    repo.write(
+        "src/a.ts",
+        "import { original as Alias } from './dependency';\nexport const ignored = 'assert( LEXICAL_ONLY';\nexport function references() {\n  const check = assert;\n  const unicode = ǃ;\n  return [check, unicode];\n}\n",
+    )?;
+    repo.write(
+        "src/b.ts",
+        "export function checked() {\n  // VECTOR_NORTH\n  assert(true);\n}\n",
+    )?;
+    repo.write(
+        "src/c.ts",
+        "export class Guard {\n  constructor() { const literal = 'LEXICAL_ONLY'; }\n  fail() {\n    // VECTOR_MID\n    throw new Error('failed');\n  }\n  commented() {\n    // LEXICAL_ONLY is deliberately not a call.\n    return 0;\n  }\n}\n",
+    )?;
+    repo.write(
+        "src/d.ts",
+        "export function* unicode() {\n  // VECTOR_WEST\n  yield ǃ(true);\n}\n",
+    )?;
+    repo.write(
+        "docs/guide.md",
+        "# Guide\n\n## Setup\n\nassert( throw new Error ǃ( LEXICAL_ONLY\n",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn callable_source_regexp_map_has_indexed_unindexed_parity_and_direct_limits() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    write_callable_source_regexp_fixture(&repo)?;
+    let cases = [
+        (
+            CALLABLE_SOURCE_REGEXP,
+            "2",
+            strings(&["checked", "Guard", "fail"]),
+            true,
+        ),
+        (
+            CALLABLE_SOURCE_REGEXP,
+            "3",
+            strings(&["checked", "Guard", "fail", "unicode"]),
+            false,
+        ),
+        (
+            CALLABLE_SOURCE_REGEXP,
+            "none",
+            strings(&["checked", "Guard", "fail", "unicode"]),
+            false,
+        ),
+        (
+            "LEXICAL_ONLY",
+            "none",
+            strings(&["Guard", "constructor", "commented"]),
+            false,
+        ),
+        (
+            "^export function",
+            "none",
+            strings(&["references", "checked", "unicode"]),
+            false,
+        ),
+    ];
+    let mut unindexed = Vec::new();
+    for indexed in [false, true] {
+        if indexed {
+            repo.open_map(&config)?.refresh_structure()?;
+        }
+        for (case, (regexp, limit, expected, omitted)) in cases.iter().enumerate() {
+            let output = repo.cli(&["--no-reindex", "map", "-e", regexp, "--limit", limit])?;
+            ensure!(output.status.success(), "{:?}", output);
+            let rows: Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(map_names(rows.as_array().unwrap()), *expected, "{regexp}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr).contains("omitted"),
+                *omitted,
+                "indexed={indexed}, limit={limit}: {output:?}"
+            );
+            if indexed {
+                assert_eq!(rows, unindexed[case]);
+            } else {
+                unindexed.push(rows);
+                assert!(!repo.index.exists());
+            }
+        }
+        let retained = repo.cli_json(&[
+            "--no-reindex",
+            "map",
+            "-e",
+            r"^Guard\.fail$|^Alias$|^Guide\.Setup$",
+        ])?;
+        let nodes: Vec<_> = retained
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|file| file["nodes"].as_array().unwrap())
+            .collect();
+        assert_eq!(nodes.len(), 5, "{retained}");
+        assert_eq!(
+            nodes.iter().filter(|node| node["kind"] == "import").count(),
+            1,
+            "import aliases retain their existing regex matching"
+        );
+        for name in ["Guard", "fail", "Guide", "Setup"] {
+            assert!(nodes.iter().any(|node| node["name"] == name));
+        }
+    }
+    repo.write("src/b.ts", "export function checked() { return false; }\n")?;
+    repo.write(
+        "src/a.ts",
+        "export function references() { assert(true); }\n",
+    )?;
+    let saved = repo.cli_json(&["--no-reindex", "map", "-e", CALLABLE_SOURCE_REGEXP])?;
+    assert_eq!(
+        saved, unindexed[2],
+        "indexed map must use saved source bytes"
+    );
+    assert_eq!(mock.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn callable_source_regexp_search_filters_all_streams_using_saved_source() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    write_callable_source_regexp_fixture(&repo)?;
+    repo.write(
+        "nearest.rs",
+        &(0..48)
+            .map(|i| function(&format!("distractor_{i}"), "VECTOR_EAST"))
+            .collect::<String>(),
+    )?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    let selected_names = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| {
+                let data = match row["type"].as_str().unwrap() {
+                    "function" => &row["function"],
+                    "symbol" => &row["symbol"],
+                    kind => panic!("unexpected {kind} result: {row}"),
+                };
+                data["qualifiedName"].as_str().unwrap().to_owned()
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let options = json!({"regexp":CALLABLE_SOURCE_REGEXP, "minSimilarity":-1, "limit":"none"});
+    let kinds = [
+        "search-code",
+        "search-descriptions",
+        "search-symbols",
+        "search",
+    ];
+    for kind in kinds {
+        let rows = engine.search("east", kind, &options)?;
+        assert_eq!(
+            selected_names(&rows),
+            strings(&["checked", "Guard.fail", "unicode"]),
+            "{kind}: references and non-callable/Markdown bodies must not qualify"
+        );
+        let mut limited = options.clone();
+        limited["limit"] = json!(1);
+        let limited = engine.search("east", kind, &limited)?;
+        assert_eq!(limited.len(), 1, "{kind}: eligible rows fill the limit");
+        assert!(
+            rows.contains(&limited[0]),
+            "{kind}: callable source eligibility precedes the result limit"
+        );
+        // Equal description/symbol scores need not select the same tied row
+        // when the neighbor request is narrower than the unlimited query.
+        assert_eq!(limited[0]["similarity"], rows[0]["similarity"], "{kind}");
+        let mut exported = options.clone();
+        exported["regexp"] = json!("^export function");
+        assert_eq!(
+            selected_names(&engine.search("east", kind, &exported)?),
+            strings(&["references", "checked", "unicode"]),
+            "{kind}: canonical declaration source includes export wrappers, as in map"
+        );
+    }
+    let code = engine.search("east", "search-code", &options)?;
+    near(&row(&code, "Guard.fail")["similarity"], 0.8);
+    near(&row(&code, "checked")["similarity"], 0.0);
+    near(&row(&code, "unicode")["similarity"], -1.0);
+    assert!(engine.search("east", "search-md", &options)?.is_empty());
+    assert_eq!(
+        selected_names(&engine.search(
+            "east",
+            "search-symbols",
+            &json!({"regexp":"LEXICAL_ONLY", "minSimilarity":-1})
+        )?),
+        strings(&["Guard.constructor", "Guard.commented"]),
+        "callable literals and comments match, but enclosing classes and constants do not"
+    );
+    let calls = mock.count();
+    drop(engine);
+    repo.write("src/b.ts", "export function checked() { return false; }\n")?;
+    repo.write(
+        "src/a.ts",
+        "export function references() { assert(true); }\n",
+    )?;
+    let engine = repo.open(&config)?;
+    // A different expression avoids reusing the search results cached above.
+    let saved = json!({"regexp":r"assert\(true\)", "minSimilarity":-1});
+    for kind in kinds {
+        assert_eq!(
+            selected_names(&engine.search("east", kind, &saved)?),
+            strings(&["checked"]),
+            "{kind}: match indexed source, not edited working-tree text"
+        );
+    }
+    assert_eq!(
+        mock.count(),
+        calls,
+        "saved-source filtering needs no provider work"
+    );
+    Ok(())
+}
+
+#[test]
+fn callable_source_regexp_cross_search_filters_sources_but_not_targets() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(
+        "src/source.ts",
+        "export function Source() {\n  assert(true);\n}\n",
+    )?;
+    repo.write(
+        "src/reference.ts",
+        "export function Reference() {\n  // VECTOR_NORTH\n  return [assert, ǃ];\n}\n",
+    )?;
+    repo.write(
+        "targets/peer.ts",
+        "export function Peer() {\n  return 'VECTOR_MID';\n}\n",
+    )?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let calls = mock.count();
+    let options =
+        json!({"glob":"src/**", "regexp":CALLABLE_SOURCE_REGEXP, "matches":1, "minSimilarity":-1});
+    let rows = engine.cross_search(None, &options)?;
+    assert_eq!(sources(&rows), strings(&["Source"]));
+    assert_eq!(
+        names(rows[0]["matches"].as_array().unwrap()),
+        strings(&["Peer"])
+    );
+    near(&rows[0]["matches"][0]["similarity"], 0.8);
+    assert_eq!(engine.cross_search(None, &options)?, rows);
+    let mut exported = options.clone();
+    exported["regexp"] = json!("^export function Source");
+    assert_eq!(
+        engine.cross_search(None, &exported)?,
+        rows,
+        "cross-search source eligibility includes the declaration's export wrapper"
+    );
+    drop(engine);
+    repo.write(
+        "src/source.ts",
+        "export function Source() { return false; }\n",
+    )?;
+    repo.write(
+        "src/reference.ts",
+        "export function Reference() { assert(true); }\n",
+    )?;
+    let engine = repo.open(&config)?;
+    let mut saved = options.clone();
+    saved["regexp"] = json!(r"assert\(true\)");
+    assert_eq!(engine.cross_search(None, &saved)?, rows);
+    assert_eq!(
+        mock.count(),
+        calls,
+        "cross-search only uses indexed artifacts"
+    );
+    Ok(())
+}
+
 #[test]
 fn map_filters_keep_ancestors_without_siblings_and_cli_combines_paths_kinds_and_repeated_filters()
 -> Result<()> {

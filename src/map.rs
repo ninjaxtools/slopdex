@@ -23,6 +23,11 @@ pub(crate) trait StructureSource {
     fn source(&self, path: &str) -> Option<&str>;
     fn call_graph(&self) -> Result<CallGraph>;
 
+    /// Filtering must not turn unreadable saved source into a silent non-match.
+    fn selection_source(&self, path: &str) -> Result<Option<&str>> {
+        Ok(self.source(path))
+    }
+
     fn selection(&self, options: &Value) -> Result<Selection> {
         Selection::compile(options)
     }
@@ -83,8 +88,12 @@ impl Unindexed {
             // Retain the file proving omission so query_limited can report it,
             // but do not parse any later files unless call resolution needs them.
             let omitted = if callers == 0 && callees == 0 && remaining.is_some() {
-                let selected =
-                    selection.select_structure_limited_at(&path, &parsed.structure, remaining);
+                let selected = selection.select_structure_limited_in(
+                    &path,
+                    &parsed.structure,
+                    Some(&source),
+                    remaining,
+                );
                 remaining = remaining.map(|remaining| remaining - selected.direct_count);
                 selected.omitted
             } else {
@@ -188,7 +197,12 @@ pub(crate) fn query_limited(
             continue;
         }
         if let Some(structure) = source.structure(&path)? {
-            let matches = selection.select_structure_limited_at(&path, &structure, remaining);
+            let text = if selection.has_regex() {
+                source.selection_source(&path)?
+            } else {
+                None
+            };
+            let matches = selection.select_structure_limited_in(&path, &structure, text, remaining);
             direct_count += matches.direct_count;
             remaining = remaining.map(|remaining| remaining - matches.direct_count);
             if !matches.nodes.is_empty() {
@@ -972,6 +986,37 @@ mod tests {
             .flat_map(|row| row["nodes"].as_array().unwrap())
             .map(|node| node["name"].as_str().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn regex_selection_propagates_source_errors_without_loading_source_for_other_queries()
+    -> Result<()> {
+        struct BrokenSource(Unindexed);
+        impl StructureSource for BrokenSource {
+            fn paths(&self) -> Result<Vec<String>> {
+                self.0.paths()
+            }
+            fn structure(&self, path: &str) -> Result<Option<FileStructure>> {
+                self.0.structure(path)
+            }
+            fn source(&self, path: &str) -> Option<&str> {
+                self.0.source(path)
+            }
+            fn call_graph(&self) -> Result<CallGraph> {
+                self.0.call_graph()
+            }
+            fn selection_source(&self, _path: &str) -> Result<Option<&str>> {
+                anyhow::bail!("unreadable saved source")
+            }
+        }
+        let source = BrokenSource(unindexed(&[("source.ts", "export function check() {}")])?);
+        let error = query(&source, Path::new("."), &json!({"regexp": r"assert\("})).unwrap_err();
+        assert!(error.to_string().contains("unreadable saved source"));
+        assert_eq!(
+            query_names(&query(&source, Path::new("."), &json!({}))?),
+            ["check"]
+        );
+        Ok(())
     }
 
     #[test]

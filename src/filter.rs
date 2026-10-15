@@ -121,6 +121,18 @@ impl Selection {
         self.names.as_ref().is_none_or(|names| names.is_match(name))
     }
 
+    pub(crate) fn has_regex(&self) -> bool {
+        self.names.is_some()
+    }
+
+    fn callable_source_matches(&self, kind: &str, source: Option<&str>) -> bool {
+        matches!(kind, "function" | "method" | "constructor" | "generator")
+            && self
+                .names
+                .as_ref()
+                .is_some_and(|names| source.is_some_and(|source| names.is_match(source)))
+    }
+
     /// Resolve the union of normalized names matching the semantic queries.
     pub(crate) fn with_symbol_names(mut self, names: HashSet<String>) -> Self {
         self.semantic_names = Some(names);
@@ -153,6 +165,7 @@ impl Selection {
         path: &str,
         data: &Value,
         structure: Option<&FileStructure>,
+        source: Option<&str>,
     ) -> bool {
         if !self.path_matches(path) {
             return false;
@@ -170,7 +183,10 @@ impl Selection {
                     .max_by_key(|node| node.start_line)
             })
         }) {
-            return self.symbol_matches_at(path, node);
+            let text = source
+                .and_then(|source| source.get(node.start_byte..node.end_byte))
+                .or_else(|| data["source"].as_str());
+            return self.symbol_matches_text(path, node, text);
         }
         let heading = data["headingPath"].as_array().map(|parts| {
             parts
@@ -187,7 +203,16 @@ impl Selection {
             .as_str()
             .or_else(|| data["headingPath"].as_array()?.last()?.as_str())
             .unwrap_or("");
-        self.names_match(qualified, bare) || self.semantic_paths.contains(path)
+        let text = source
+            .and_then(|source| {
+                let start = usize::try_from(data["startByte"].as_u64()?).ok()?;
+                let end = usize::try_from(data["endByte"].as_u64()?).ok()?;
+                source.get(start..end)
+            })
+            .or_else(|| data["source"].as_str());
+        self.names_match(qualified, bare)
+            || self.callable_source_matches(data["kind"].as_str().unwrap_or(""), text)
+            || self.semantic_paths.contains(path)
     }
 
     pub(crate) fn semantic_name_matches(&self, name: &str) -> bool {
@@ -222,6 +247,26 @@ impl Selection {
     }
 
     pub fn symbol_matches_at(&self, path: &str, node: &StructureNode) -> bool {
+        self.symbol_matches_text(path, node, None)
+    }
+
+    /// Also match exact callable source from the same snapshot as the node.
+    /// This is lexical matching, not syntactic call detection. Other kinds keep
+    /// their name-only regex contract, so body matches do not select containers.
+    pub(crate) fn symbol_matches_in(
+        &self,
+        path: &str,
+        node: &StructureNode,
+        source: Option<&str>,
+    ) -> bool {
+        self.symbol_matches_text(
+            path,
+            node,
+            source.and_then(|source| source.get(node.start_byte..node.end_byte)),
+        )
+    }
+
+    fn symbol_matches_text(&self, path: &str, node: &StructureNode, source: Option<&str>) -> bool {
         if !self.format_matches(path) {
             return false;
         }
@@ -234,7 +279,8 @@ impl Selection {
             || node
                 .names
                 .iter()
-                .any(|name| self.name_matches(&format!("{prefix}{name}")));
+                .any(|name| self.name_matches(&format!("{prefix}{name}")))
+            || self.callable_source_matches(&node.kind, source);
         let semantic_matches = self.semantic_paths.contains(path)
             || self.semantic_symbols.contains(&(path.to_owned(), node.id))
             || self.semantic_name_matches(&node.name)
@@ -269,6 +315,16 @@ impl Selection {
         structure: &FileStructure,
         limit: Option<usize>,
     ) -> SelectedStructure {
+        self.select_structure_limited_in(path, structure, None, limit)
+    }
+
+    pub(crate) fn select_structure_limited_in(
+        &self,
+        path: &str,
+        structure: &FileStructure,
+        source: Option<&str>,
+        limit: Option<usize>,
+    ) -> SelectedStructure {
         let parents: HashMap<_, _> = structure
             .nodes
             .iter()
@@ -284,7 +340,7 @@ impl Selection {
             if (!self.private
                 && symbol_is_private(node.id, &nodes, &mut visibility, &mut HashSet::new()))
                 || !self.kind_matches(&node.kind)
-                || !self.symbol_matches_at(path, node)
+                || !self.symbol_matches_in(path, node, source)
             {
                 continue;
             }
@@ -645,6 +701,130 @@ mod tests {
     }
 
     #[test]
+    fn regexes_match_callable_source_without_selecting_siblings_or_containers() {
+        let source = "const marker = 'ǃ';\nexport function check() { assert(value); }\nexport function fail() { throw new Error('failed'); }\nexport function unicode() { ǃ(value); }\nexport function reference() { const a = assert; const b = ǃ; }\nexport class Service { check() { assert(value); } unrelated() {} }\n";
+        let parsed = crate::parse::parse("source.ts", source).unwrap();
+        let selection = Selection::compile(&json!({
+            "regexp": r"assert\(|throw new Error|ǃ\(", "private": true
+        }))
+        .unwrap();
+        let direct: Vec<_> = parsed
+            .structure
+            .nodes
+            .iter()
+            .filter(|node| selection.symbol_matches_in("source.ts", node, Some(source)))
+            .map(|node| node.qualified_name.as_str())
+            .collect();
+        assert_eq!(direct, ["check", "fail", "unicode", "Service.check"]);
+        let selected = selection.select_structure_limited_in(
+            "source.ts",
+            &parsed.structure,
+            Some(source),
+            Some(4),
+        );
+        assert_eq!(selected.direct_count, 4);
+        assert!(!selected.omitted);
+        assert_eq!(
+            selected
+                .nodes
+                .iter()
+                .map(|node| node.qualified_name.as_str())
+                .collect::<Vec<_>>(),
+            ["check", "fail", "unicode", "Service", "Service.check"]
+        );
+        let limited = selection.select_structure_limited_in(
+            "source.ts",
+            &parsed.structure,
+            Some(source),
+            Some(1),
+        );
+        assert_eq!(limited.direct_count, 1);
+        assert!(limited.omitted);
+        assert_eq!(limited.nodes[0].name, "check");
+    }
+
+    #[test]
+    fn callable_source_regexes_preserve_case_anchors_and_semantic_union() {
+        let source = "export class Service { byName() {} bySource() { assert(value); } bySemantic() {} other() {} }";
+        let parsed = crate::parse::parse("source.ts", source).unwrap();
+        let options = json!({
+            "regexp": [r"^Service\.byName$", r"ASSERT\("],
+            "symbolQuery": "by semantic", "ignoreCase": true
+        });
+        let selection = Selection::compile(&options)
+            .unwrap()
+            .with_symbol_names(HashSet::from(["by semantic".into()]));
+        let matches: Vec<_> = parsed
+            .structure
+            .nodes
+            .iter()
+            .filter(|node| selection.symbol_matches_in("source.ts", node, Some(source)))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(matches, ["byName", "bySource", "bySemantic"]);
+        let sensitive = Selection::compile(&json!({"regexp": r"ASSERT\("})).unwrap();
+        assert!(
+            parsed
+                .structure
+                .nodes
+                .iter()
+                .all(|node| { !sensitive.symbol_matches_in("source.ts", node, Some(source)) })
+        );
+        for node in &parsed.structure.nodes {
+            assert_eq!(
+                selection.symbol_matches_in("source.ts", node, Some("ǃ")),
+                selection.symbol_matches_at("source.ts", node),
+                "invalid source ranges must safely fall back to names"
+            );
+        }
+    }
+
+    #[test]
+    fn callable_units_match_source_with_and_without_structure() {
+        let source = "export function check() { ǃ(value); }";
+        let parsed = crate::parse::parse("source.ts", source).unwrap();
+        let data = serde_json::to_value(&parsed.callables[0]).unwrap();
+        let selection = Selection::compile(&json!({"regexp": r"ǃ\("})).unwrap();
+        assert!(selection.unit_matches("source.ts", &data, Some(&parsed.structure), None));
+        assert!(selection.unit_matches("source.ts", &data, None, None));
+        let exported = Selection::compile(&json!({"regexp": "^export function"})).unwrap();
+        assert!(exported.symbol_matches_in("source.ts", &parsed.structure.nodes[0], Some(source)));
+        assert!(exported.unit_matches("source.ts", &data, Some(&parsed.structure), Some(source)));
+        // Symbol-description units have no source field; use their snapshot's range.
+        let symbol = serde_json::to_value(&parsed.structure.nodes[0]).unwrap();
+        assert!(selection.unit_matches(
+            "source.ts",
+            &symbol,
+            Some(&parsed.structure),
+            Some(source)
+        ));
+        assert!(!selection.unit_matches("source.ts", &symbol, Some(&parsed.structure), None));
+        assert!(selection.unit_matches("source.ts", &symbol, None, Some(source)));
+        assert!(exported.unit_matches("source.ts", &symbol, None, Some(source)));
+        let mut invalid = symbol.clone();
+        invalid["startByte"] = json!(1);
+        assert!(!selection.unit_matches("source.ts", &invalid, None, Some("ǃ")));
+        let hidden = Selection::compile(&json!({"regexp": r"ǃ\(", "glob": "*.rs"})).unwrap();
+        assert!(!hidden.unit_matches("source.ts", &data, Some(&parsed.structure), Some(source)));
+    }
+
+    #[test]
+    fn source_regexes_are_lexical_and_keep_original_line_endings() {
+        let source = "// ǃ\r\nexport function example() {\r\n  // assert(value)\r\n  return 'throw new Error';\r\n}\r\n";
+        let parsed = crate::parse::parse("source.ts", source).unwrap();
+        let node = &parsed.structure.nodes[0];
+        for pattern in [r"assert\(", "throw new Error", r"\r\n  // assert\("] {
+            let selection = Selection::compile(&json!({"regexp": pattern})).unwrap();
+            assert!(
+                selection.symbol_matches_in("source.ts", node, Some(source)),
+                "{pattern}"
+            );
+        }
+        let normalized = Selection::compile(&json!({"regexp": r"[^\r]\n  // assert\("})).unwrap();
+        assert!(!normalized.symbol_matches_in("source.ts", node, Some(source)));
+    }
+
+    #[test]
     fn invalid_selection_is_rejected_before_matching() {
         for options in [
             json!({"glob": ["["]}),
@@ -863,8 +1043,8 @@ mod tests {
         assert!(!selected.iter().any(|node| node.qualified_name == "run"));
         assert_eq!(selection.select_structure_at("b.rs", &structure).len(), 1);
         let data = serde_json::to_value(method).unwrap();
-        assert!(selection.unit_matches("a.rs", &data, Some(&structure)));
-        assert!(!selection.unit_matches("b.rs", &data, Some(&structure)));
+        assert!(selection.unit_matches("a.rs", &data, Some(&structure), None));
+        assert!(!selection.unit_matches("b.rs", &data, Some(&structure), None));
     }
 
     #[test]

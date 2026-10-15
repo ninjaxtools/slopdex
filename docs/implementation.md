@@ -229,8 +229,14 @@ validates string queries and a finite scalar threshold in `[-1,1]`; a semantic
 selector starts with empty resolved match sets, so unresolved selection cannot
 silently select everything. The engine fills name, path-qualified symbol, and file
 match sets through `with_semantic_matches`.
-Regex matching remains qualified-name/alias based, while semantic matching uses
-normalized `node.name` or `node.names` and available descriptions.
+Regex matching checks qualified names/aliases and, for functions, methods,
+constructors, and generators, their exact source text. Source matching uses saved
+snapshot byte ranges (or a callable search unit's saved `source`), without changing
+anchors, Unicode, or line endings. It is lexical, including bodies, comments, and
+literals; non-callable containers and Markdown keep name-only regex matching.
+Both unindexed map's early limit probe and its final selection use this same rule.
+Source is loaded lazily only for active regexes. Semantic matching uses normalized
+`node.name` or `node.names` and available descriptions.
 The two active families are ORed; an absent
 family contributes no matches, and with neither supplied all names are eligible.
 Path-aware matching shares this composition across callable, Markdown, and

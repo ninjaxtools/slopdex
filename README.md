@@ -53,6 +53,7 @@ cargo install --path . --locked
 ```console
 $ slopdex map src docs
 $ slopdex map src -g '*.rs' -k fns -e 'refresh|search'
+$ slopdex map src -e 'assert\(|throw new Error|ǃ\('
 $ slopdex map src --private
 $ slopdex map -g '*.md' -e '^Guide\.Setup' -i --output json
 $ slopdex map docs --detail expanded
@@ -63,7 +64,7 @@ $ slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
 
 The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains structurally useful information that can act as an index into the source code, which improves context usage.
 
-Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). The `-q` filter uses vector search on symbol names and markdown heading titles.
+Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). Regexes match qualified names or callable source text, including function bodies. The `-q` filter uses vector search on symbol names and markdown heading titles.
 
 Use `--detail expanded` to show full code or markdown of matched symbols.
 

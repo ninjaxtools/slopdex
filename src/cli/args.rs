@@ -259,7 +259,7 @@ pub(super) struct SelectionArgs {
     /// Repository-relative glob; repeat in order, ! excludes, last match wins
     #[arg(short = 'g', long, value_parser = valid_glob)]
     pub(super) glob: Vec<String>,
-    /// Qualified-name or heading-path regex; repeat for OR; cross-search selects sources
+    /// Qualified-name, callable-source, or heading-path regex; repeat for OR; cross-search selects sources
     #[arg(short = 'e', long, alias = "regex", value_parser = valid_regex)]
     pub(super) regexp: Vec<String>,
     /// Semantic query over symbols, descriptions, and heading titles; repeat for OR; cross-search selects sources
