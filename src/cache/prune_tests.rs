@@ -85,7 +85,6 @@ fn prune_retains_complete_paid_context_and_live_authoritative_graph() -> Result<
     let report = prune(&config, false)?;
     assert_eq!(report.worktrees_removed, 1);
     assert!(report.artifact_rows_deleted > 0);
-    assert_eq!(report.legacy_artifacts_retained, 0);
     assert!(!dead_index.exists());
     let db = Database::open_readonly_with_config(&live_index, &live, &config)?;
     assert_eq!(db.files()?[0].source, source);
@@ -169,13 +168,15 @@ fn provider_prune_flags_are_independent_and_preserve_live_bindings() -> Result<(
 }
 
 #[test]
-fn prune_legacy_store_pins_payloads_for_undiscovered_custom_indexes() -> Result<()> {
+fn prune_ignores_and_removes_obsolete_pins() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let config = json!({"artifactCachePath":temp.path().join("legacy.sqlite")});
+    let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
     let path = store_path(&config)?;
     let conn = open_store(&path, false)?;
     conn.execute_batch(
-        "DROP TABLE workspaces; DROP TABLE legacy_artifacts;
+        "DROP TABLE workspaces;
+        CREATE TABLE legacy_artifacts(kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(kind,key));
+        INSERT INTO legacy_artifacts VALUES('source','old'),('unit-content','old'),('description-content','old'),('embedding','old');
         INSERT INTO sources VALUES('old','old source');
         INSERT INTO cache VALUES('unit-content','old','old payload');
         INSERT INTO description_content VALUES('old','old description');
@@ -189,14 +190,123 @@ fn prune_legacy_store_pins_payloads_for_undiscovered_custom_indexes() -> Result<
             ..PruneOptions::default()
         },
     )?;
-    assert_eq!(report.legacy_artifacts_retained, 4);
+    assert_eq!(report.vector_rows_deleted, 1);
+    assert_eq!(report.artifact_rows_deleted, 3);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='legacy_artifacts'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    assert!(
+        serde_json::to_value(&report)?
+            .get("legacyArtifactsRetained")
+            .is_none()
+    );
     for table in ["sources", "cache", "description_content", "embeddings"] {
         assert_eq!(
             conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
                 .get::<_, i64>(0))?,
-            1
+            0
         );
     }
+    Ok(())
+}
+
+#[test]
+fn obsolete_pins_do_not_change_default_provider_retention_or_opt_in_pruning() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
+    let db = Database::open_with_config(
+        &temp.path().join("index.sqlite"),
+        temp.path(),
+        &config,
+        false,
+    )?;
+    let store = db.global_path().to_owned();
+    let vector = hash("old unbound provider vector");
+    db.put_embedding(&vector, &[1.0, 0.0])?;
+    let (artifact, contents) = generation("untracked.rs", "old source")?;
+    let key = hash("old generated description");
+    db.put_description_artifact(&key, &serde_json::to_string(&artifact)?, &contents)?;
+    db.conn.execute_batch("CREATE TABLE global.legacy_artifacts(kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(kind,key));
+        INSERT INTO global.sources VALUES('old','old source');
+        INSERT INTO global.cache VALUES('unit-content','old','old payload');
+        INSERT INTO global.description_content VALUES('old','unused description content');
+        INSERT INTO global.legacy_artifacts SELECT 'source',hash FROM global.sources;
+        INSERT INTO global.legacy_artifacts SELECT 'unit-content',key FROM global.cache WHERE kind='unit-content';
+        INSERT INTO global.legacy_artifacts SELECT 'description-content',hash FROM global.description_content;
+        INSERT INTO global.legacy_artifacts SELECT 'embedding',key FROM global.embeddings;")?;
+    drop(db);
+    let report = prune(&config, false)?;
+    assert_eq!(report.artifact_rows_deleted, 3);
+    assert_eq!(
+        (report.vector_rows_deleted, report.description_rows_deleted),
+        (0, 0)
+    );
+    let conn = open_store(&store, true)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='legacy_artifacts'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM embeddings WHERE key=?",
+            [&vector],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    let text: String = conn.query_row(
+        "SELECT value FROM cache WHERE kind='description' AND key=?",
+        [&key],
+        |r| r.get(0),
+    )?;
+    assert_eq!(DescriptionArtifact::decode(&text)?.text, artifact.text);
+    for (hash, value) in &contents {
+        assert_eq!(
+            conn.query_row(
+                "SELECT content FROM description_content WHERE hash=?",
+                [hash],
+                |r| r.get::<_, String>(0)
+            )?,
+            *value
+        );
+    }
+    drop(conn);
+    let report = prune_with_options(
+        &config,
+        PruneOptions {
+            prune_vectors: true,
+            prune_descriptions: true,
+            ..PruneOptions::default()
+        },
+    )?;
+    assert_eq!(
+        (report.vector_rows_deleted, report.description_rows_deleted),
+        (1, 1)
+    );
+    let conn = open_store(&store, true)?;
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM embeddings", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM description_content", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM cache", [], |r| r.get::<_, i64>(0))?,
+        0
+    );
     Ok(())
 }
 

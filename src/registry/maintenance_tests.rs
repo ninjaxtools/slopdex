@@ -46,6 +46,20 @@ fn expect_busy(result: Result<ArtifactLock>) -> Result<()> {
     Ok(())
 }
 
+fn assert_no_legacy_artifacts(conn: &Connection, schema: &str) -> Result<()> {
+    assert_eq!(
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {schema}.sqlite_master WHERE type='table' AND name='legacy_artifacts'"
+            ),
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    Ok(())
+}
+
 #[test]
 fn shared_store_users_coexist_and_maintenance_excludes_both_modes() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -223,25 +237,18 @@ fn writable_indexes_register_canonical_paths_without_git_discovery() -> Result<(
 }
 
 #[test]
-fn legacy_stores_gain_workspace_tracking_only_on_writable_open() -> Result<()> {
+fn pretracking_stores_gain_workspace_tracking_only_on_writable_open() -> Result<()> {
     let fixture = Fixture::new()?;
     let db = fixture.db("index.sqlite", &fixture.root)?;
     let path = db.path.clone();
-    assert_eq!(
-        db.conn
-            .query_row("SELECT COUNT(*) FROM global.legacy_artifacts", [], |row| {
-                row.get::<_, i64>(0)
-            })?,
-        0
-    );
+    assert_no_legacy_artifacts(&db.conn, "global")?;
     db.conn.execute_batch(
         "INSERT INTO global.sources VALUES('old-source','source');
          INSERT INTO global.cache VALUES('unit-content','old-unit','payload');
          INSERT INTO global.cache VALUES('explanation','old-answer','answer');
          INSERT INTO global.description_content VALUES('old-description','description');
          INSERT INTO global.embeddings VALUES('old-embedding',x'0000803f');
-         DROP TABLE global.workspaces;
-         DROP TABLE global.legacy_artifacts;",
+         DROP TABLE global.workspaces;",
     )?;
     drop(db);
     let readonly = Database::open_readonly(&path, &fixture.root)?;
@@ -254,6 +261,7 @@ fn legacy_stores_gain_workspace_tracking_only_on_writable_open() -> Result<()> {
         0
     );
     assert_eq!(readonly.conn.total_changes(), 0);
+    assert_no_legacy_artifacts(&readonly.conn, "global")?;
     drop(readonly);
     let db = fixture.db("index.sqlite", &fixture.root)?;
     assert_eq!(
@@ -262,21 +270,23 @@ fn legacy_stores_gain_workspace_tracking_only_on_writable_open() -> Result<()> {
                 .get::<_, i64>(0))?,
         1
     );
-    let pinned = db
-        .conn
-        .prepare("SELECT kind,key FROM global.legacy_artifacts ORDER BY kind")?
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_no_legacy_artifacts(&db.conn, "global")?;
+    let payloads: (String, String, String, Vec<u8>) = db.conn.query_row(
+        "SELECT (SELECT source FROM global.sources WHERE hash='old-source'),
+                (SELECT value FROM global.cache WHERE kind='unit-content' AND key='old-unit'),
+                (SELECT content FROM global.description_content WHERE hash='old-description'),
+                (SELECT vector FROM global.embeddings WHERE key='old-embedding')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
     assert_eq!(
-        pinned,
-        [
-            ("description-content".into(), "old-description".into()),
-            ("embedding".into(), "old-embedding".into()),
-            ("source".into(), "old-source".into()),
-            ("unit-content".into(), "old-unit".into()),
-        ]
+        payloads,
+        (
+            "source".into(),
+            "payload".into(),
+            "description".into(),
+            vec![0, 0, 128, 63]
+        )
     );
     db.conn.execute(
         "INSERT INTO global.sources VALUES('new-source','later source')",
@@ -296,13 +306,7 @@ fn legacy_stores_gain_workspace_tracking_only_on_writable_open() -> Result<()> {
     );
     drop((readonly, db));
     let db = fixture.db("index.sqlite", &fixture.root)?;
-    assert_eq!(
-        db.conn
-            .query_row("SELECT COUNT(*) FROM global.legacy_artifacts", [], |row| {
-                row.get::<_, i64>(0)
-            })?,
-        4
-    );
+    assert_no_legacy_artifacts(&db.conn, "global")?;
     let root: String = db
         .conn
         .query_row("SELECT root FROM global.workspaces", [], |row| row.get(0))?;
@@ -319,63 +323,47 @@ fn legacy_stores_gain_workspace_tracking_only_on_writable_open() -> Result<()> {
 }
 
 #[test]
-fn standalone_tracking_initialization_pins_atomically_and_only_once() -> Result<()> {
+fn standalone_tracking_initialization_needs_no_artifact_tables_or_pins() -> Result<()> {
     let fixture = Fixture::new()?;
-    let conn = cache::open_store(&fixture.store, false)?;
-    conn.execute_batch(
-        "DROP TABLE workspaces;
-         DROP TABLE legacy_artifacts;
-         INSERT INTO sources VALUES('old-source','source');
-         INSERT INTO cache VALUES('unit-content','old-unit','payload');
-         INSERT INTO description_content VALUES('old-description','description');
-         INSERT INTO embeddings VALUES('old-embedding',x'0000803f');",
-    )?;
-    // A failed initialization cannot publish workspaces without its legacy pins.
-    conn.execute_batch(
-        "ALTER TABLE description_content RENAME TO unavailable_description_content;",
-    )?;
-    assert!(ensure_workspace_tracking(&conn, "main").is_err());
+    let conn = Connection::open(&fixture.store)?;
+    assert!(ensure_workspace_tracking(&conn, "not-a-schema").is_err());
     assert!(!workspace_tracking_exists(&conn, "main")?);
+    ensure_workspace_tracking(&conn, "main")?;
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_eq!(tables, ["workspaces"]);
     assert_eq!(
-        conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='legacy_artifacts'",
-            [],
-            |row| row.get::<_, i64>(0)
-        )?,
+        conn.query_row("SELECT COUNT(*) FROM workspaces", [], |row| row
+            .get::<_, i64>(0))?,
         0
     );
-    conn.execute_batch(
-        "ALTER TABLE unavailable_description_content RENAME TO description_content;",
-    )?;
-    ensure_workspace_tracking(&conn, "main")?;
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM legacy_artifacts", [], |row| row
-            .get::<_, i64>(0))?,
-        4
-    );
-    conn.execute(
-        "INSERT INTO sources VALUES('new-source','later source')",
-        [],
-    )?;
+    assert_no_legacy_artifacts(&conn, "main")?;
+    // An initialized tracker is read-only setup even while another connection
+    // owns the write lock; it must neither register nor acquire a transaction.
+    conn.busy_timeout(Duration::from_millis(60))?;
+    let writer = Connection::open(&fixture.store)?;
+    let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
+    tx.execute("INSERT INTO workspaces VALUES('pending','workspace')", [])?;
     let changes = conn.total_changes();
     ensure_workspace_tracking(&conn, "main")?;
     assert_eq!(conn.total_changes(), changes);
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM legacy_artifacts", [], |row| row
+        conn.query_row("SELECT COUNT(*) FROM workspaces", [], |row| row
             .get::<_, i64>(0))?,
-        4
+        0
     );
-    assert!(ensure_workspace_tracking(&conn, "not-a-schema").is_err());
+    assert_no_legacy_artifacts(&conn, "main")?;
     Ok(())
 }
 
 #[test]
-fn concurrent_pretracking_store_opens_pin_once_and_register_every_index() -> Result<()> {
+fn concurrent_pretracking_store_opens_register_every_index_without_pinning() -> Result<()> {
     let fixture = Fixture::new()?;
     let conn = cache::open_store(&fixture.store, false)?;
     conn.execute_batch(
         "DROP TABLE workspaces;
-         DROP TABLE legacy_artifacts;
          INSERT INTO sources VALUES('old-source','source');",
     )?;
     drop(conn);
@@ -419,14 +407,7 @@ fn concurrent_pretracking_store_opens_pin_once_and_register_every_index() -> Res
                 .get::<_, i64>(0),)?,
         6
     );
-    assert_eq!(
-        databases[0].conn.query_row(
-            "SELECT COUNT(*) FROM global.legacy_artifacts WHERE kind='source' AND key='old-source'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?,
-        1
-    );
+    assert_no_legacy_artifacts(&databases[0].conn, "global")?;
     Ok(())
 }
 

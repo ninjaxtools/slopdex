@@ -9100,6 +9100,169 @@ fn prune_deleted_worktree_rebuild_reuses_every_paid_artifact() -> Result<()> {
 }
 
 #[test]
+fn prune_ignores_legacy_pins_and_rebuilds_untracked_custom_index_at_new_path() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let store = repo.home.join("artifacts.sqlite");
+    let mut config = mock.config();
+    config["artifactCachePath"] = json!(store);
+    let config_path = repo.home.join("config.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    repo.write("api.rs", &function("shared", "VECTOR_EAST"))?;
+    repo.write("guide.md", "# Guide\n\nVECTOR_NORTH documentation.\n")?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    drop(engine);
+    let calls = mock.count();
+    let description_calls = mock.requests("/responses").len();
+
+    let payload_counts = |global: &Connection| -> Result<[i64; 6]> {
+        Ok(global.query_row(
+            "SELECT (SELECT count(*) FROM sources),
+                (SELECT count(*) FROM cache WHERE kind='unit-content'),
+                (SELECT count(*) FROM cache WHERE kind IN ('parse','callgraph')),
+                (SELECT count(*) FROM embeddings),
+                (SELECT count(*) FROM cache WHERE kind='description'),
+                (SELECT count(*) FROM description_content)",
+            [],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ])
+            },
+        )?)
+    };
+    let global = Connection::open(&store)?;
+    let before = payload_counts(&global)?;
+    assert!(before.iter().all(|&count| count > 0), "{before:?}");
+    // Simulate a custom index created before workspace tracking, outside the
+    // managed worktree cache. Its obsolete pins must not exempt any payload.
+    global.execute_batch(
+        "DROP TABLE workspaces;
+        CREATE TABLE legacy_artifacts(kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(kind,key));
+        INSERT INTO legacy_artifacts SELECT 'source',hash FROM sources;
+        INSERT INTO legacy_artifacts SELECT kind,key FROM cache;
+        INSERT INTO legacy_artifacts SELECT 'embedding',key FROM embeddings;
+        INSERT INTO legacy_artifacts SELECT 'description-content',hash FROM description_content;",
+    )?;
+    drop(global);
+
+    let prune = || {
+        repo.cli_json(&[
+            "--config",
+            config_path.to_str().unwrap(),
+            "cache",
+            "prune",
+            "--prune-vectors",
+            "--prune-descriptions",
+        ])
+    };
+    let report = prune()?;
+    assert!(report.get("legacyArtifactsRetained").is_none());
+    assert_eq!(report["worktreesRemoved"], 0);
+    assert_eq!(report["worktreesBusy"], 0);
+    assert_eq!(report["vectorRowsDeleted"], before[3]);
+    assert_eq!(report["descriptionRowsDeleted"], before[4]);
+    assert_eq!(mock.count(), calls, "prune must never call providers");
+    assert!(repo.root.is_dir());
+    assert!(
+        repo.index.is_file(),
+        "untracked custom index is not deleted"
+    );
+    let global = Connection::open(&store)?;
+    assert_eq!(payload_counts(&global)?, [0; 6]);
+    assert_eq!(
+        global.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='legacy_artifacts'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0
+    );
+    assert_eq!(
+        global.query_row("SELECT count(*) FROM workspaces", [], |row| row
+            .get::<_, i64>(0))?,
+        0
+    );
+    drop(global);
+
+    // Rebuild from the still-present source, not the dangling old index.
+    let rebuilt = repo.index.with_file_name("rebuilt.sqlite");
+    assert!(!rebuilt.exists());
+    let mut engine = Engine::open(&repo.root, &rebuilt, isolated(&rebuilt, config.clone()))?;
+    engine.refresh()?;
+    engine.generate_descriptions()?;
+    assert!(mock.count() > calls, "pruned provider output may be repaid");
+    assert!(mock.requests("/responses").len() > description_calls);
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["shared"])
+    );
+    let documents = engine.search("east", "search-md", &all())?;
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0]["chunk"]["path"], "guide.md");
+    drop(engine);
+
+    let db = workspace_connection(&rebuilt)?;
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM global.workspaces", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+    let (tracked_index, tracked_root): (String, String) =
+        db.query_row("SELECT index_path,root FROM global.workspaces", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    assert_eq!(
+        Path::new(&tracked_index).canonicalize()?,
+        rebuilt.canonicalize()?
+    );
+    assert_eq!(
+        Path::new(&tracked_root).canonicalize()?,
+        repo.root.canonicalize()?
+    );
+    let live_vectors = db
+        .prepare("SELECT embedding_key FROM unit_embeddings UNION SELECT embedding_key FROM descriptions WHERE embedding_key IS NOT NULL")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(!live_vectors.is_empty());
+    drop(db);
+    let global = Connection::open(&store)?;
+    let live = payload_counts(&global)?;
+    drop(global);
+    let calls = mock.count();
+    let report = prune()?;
+    assert!(report.get("legacyArtifactsRetained").is_none());
+    assert_eq!(report["worktreesRemoved"], 0);
+    assert_eq!(report["worktreesBusy"], 0);
+    assert_eq!(report["artifactRowsDeleted"], 0);
+    assert_eq!(report["descriptionRowsDeleted"], 0);
+    assert_eq!(mock.count(), calls);
+    let global = Connection::open(&store)?;
+    let retained = payload_counts(&global)?;
+    for i in [0, 1, 2, 4, 5] {
+        assert_eq!(retained[i], live[i], "live payload category {i}");
+    }
+    // Query vectors are unreferenced and may be pruned; index vectors are not.
+    for key in live_vectors {
+        assert!(global.query_row(
+            "SELECT EXISTS(SELECT 1 FROM embeddings WHERE key=?)",
+            [&key],
+            |row| row.get::<_, bool>(0)
+        )?);
+    }
+    assert!(rebuilt.is_file());
+    assert!(repo.index.is_file());
+    Ok(())
+}
+
+#[test]
 fn shared_artifacts_reuse_paid_work_across_independent_workspace_indexes() -> Result<()> {
     let mock = Mock::start()?;
     let temp = tempfile::tempdir()?;

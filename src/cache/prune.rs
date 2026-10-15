@@ -25,7 +25,6 @@ pub(super) struct CleanupReport {
     pub description_rows_deleted: u64,
     pub repository_rows_deleted: u64,
     pub index_files_removed: u64,
-    pub legacy_artifacts_retained: u64,
 }
 
 // Index and base locks predate the artifact-lock retirement protocol. Never unlink
@@ -470,19 +469,15 @@ pub(super) fn cleanup_with(
     mut after_missing: impl FnMut(&Path) -> Result<()>,
 ) -> Result<CleanupReport> {
     registry::ensure_workspace_tracking(conn, "main")?;
-    conn.execute_batch("CREATE TEMP TABLE prune_keep(kind TEXT,key TEXT,PRIMARY KEY(kind,key));
+    // Discard obsolete bookkeeping as well as its retention policy. Old,
+    // undiscoverable custom indexes must be rebuilt rather than pinning data.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS legacy_artifacts;
+        CREATE TEMP TABLE prune_keep(kind TEXT,key TEXT,PRIMARY KEY(kind,key));
         CREATE TEMP TABLE prune_files(path TEXT,hash TEXT,PRIMARY KEY(path,hash));
-        CREATE TEMP TABLE prune_bound_descriptions(hash TEXT PRIMARY KEY);
-        INSERT INTO prune_keep SELECT kind,key FROM legacy_artifacts;
-        INSERT INTO prune_bound_descriptions SELECT key FROM legacy_artifacts WHERE kind='description-content';")?;
-    let mut report = CleanupReport {
-        legacy_artifacts_retained: u64::try_from(conn.query_row(
-            "SELECT count(*) FROM legacy_artifacts",
-            [],
-            |r| r.get::<_, i64>(0),
-        )?)?,
-        ..CleanupReport::default()
-    };
+        CREATE TEMP TABLE prune_bound_descriptions(hash TEXT PRIMARY KEY);",
+    )?;
+    let mut report = CleanupReport::default();
     let mut bases = BTreeSet::new();
     let mut locks = Vec::new();
     let indexes = candidates(conn, store, worktrees)?;

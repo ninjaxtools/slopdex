@@ -280,7 +280,7 @@ paths are never imported or used as compatibility seeds. See the
 | Global `cache`, `description_content` | Parse, resolved call-graph, search-unit source/input, and provider artifacts; interned description text, prompts, settings, profiles, and conversation messages. |
 | Global `snapshots` | Unused. Retained, and still validated on open, only so binaries that persisted snapshot manifests can share the schema-1 store; nothing writes or reads it now, and `cache prune` empties it. |
 | Global registry/upload tables | Repository relatedness evidence and best-effort remote upload bookkeeping. |
-| Global `workspaces`, `legacy_artifacts` | Canonical index/root registrations and conservative pre-tracking payload roots for older undiscoverable custom indexes. |
+| Global `workspaces` | Canonical index/root registrations used for reachability and missing-worktree cleanup. |
 
 The worktree connection attaches the global store as `global`. Both databases are
 needed to read a saved snapshot. `artifactCachePath` selects the global store when
@@ -364,10 +364,13 @@ description content (including symbol metadata), and embedding associations.
 All provider embeddings, generated descriptions and their generation fragments
 are additional roots by default; the independent `--prune-vectors` and
 `--prune-descriptions` flags remove only unreferenced results. Explanations,
-rerankings, and unknown artifact kinds are retained conservatively. Old stores
-gain tracking tables lazily and pin pre-tracking authoritative payloads because
-unopened older custom indexes are undiscoverable. Live referenced payloads are
-never swept. Unreferenced parse/call-graph artifacts, repository evidence, upload
+rerankings, and unknown artifact kinds are retained conservatively. Workspace
+tracking is initialized lazily when needed, without legacy pinning or retention
+exemptions; obsolete pin bookkeeping is dropped during pruning. Untracked custom
+indexes must be reopened writable before pruning or rebuilt afterward at a new
+index path. Rebuilding registers the index and may call providers for missing
+artifacts. Live referenced payloads from discovered indexes are never swept.
+Unreferenced parse/call-graph artifacts, repository evidence, upload
 markers, obsolete snapshots, and shared ANN bases are reconstructible cleanup
 targets. Index/base locks are never unlinked; publication markers are removed
 before base payloads, under the exact base lock. Atomic-write temporaries stay.

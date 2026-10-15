@@ -42,7 +42,6 @@ CREATE TABLE snapshots(digest TEXT PRIMARY KEY,manifest TEXT NOT NULL);
 CREATE TABLE remote_uploads(remote TEXT NOT NULL,kind TEXT NOT NULL,key TEXT NOT NULL,digest TEXT NOT NULL,
  PRIMARY KEY(remote,kind,key));
 CREATE TABLE workspaces(index_path TEXT PRIMARY KEY,root TEXT NOT NULL);
-CREATE TABLE legacy_artifacts(kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(kind,key));
 PRAGMA user_version=1;
 ";
 
@@ -308,8 +307,6 @@ pub struct PruneReport {
     pub description_rows_deleted: u64,
     pub repository_rows_deleted: u64,
     pub index_files_removed: u64,
-    /// Pre-tracking authoritative artifacts pinned for undiscovered custom indexes.
-    pub legacy_artifacts_retained: u64,
     pub lock_files_removed: u64,
     /// Lock files left alone because another process holds them.
     pub lock_files_busy: u64,
@@ -510,7 +507,6 @@ fn prune_within(
         description_rows_deleted: cleaned.description_rows_deleted,
         repository_rows_deleted: cleaned.repository_rows_deleted,
         index_files_removed: cleaned.index_files_removed,
-        legacy_artifacts_retained: cleaned.legacy_artifacts_retained,
         lock_files_removed,
         lock_files_busy,
         wal_truncated,

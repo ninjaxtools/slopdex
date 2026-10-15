@@ -31,9 +31,8 @@ pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const PERSISTENT_KINDS: [&str; 1] = ["store"];
 const PERSISTENT_STORE_KEYS: [&str; 2] = ["initialize", "maintenance"];
 
-/// Add tracking to a pretracking store without losing references from old custom
-/// indexes that cannot be discovered. `schema` is `main` for a standalone store
-/// connection or `global` for an attached store. Warm opens are read-only setup.
+/// Ensure current workspace tracking exists. `schema` is `main` for a standalone
+/// store connection or `global` for an attached store. Warm opens are read-only setup.
 pub(crate) fn ensure_workspace_tracking(conn: &Connection, schema: &str) -> Result<()> {
     ensure!(matches!(schema, "main" | "global"), "Invalid store schema");
     if workspace_tracking_exists(conn, schema)? {
@@ -56,18 +55,13 @@ fn workspace_tracking_exists(conn: &Connection, schema: &str) -> Result<bool> {
 }
 
 /// Called under an immediate transaction. Recheck after taking the write lock:
-/// a concurrent initializer may already have completed the one-time pinning.
+/// a concurrent initializer may already have created the tracking table.
 fn initialize_workspace_tracking(conn: &Connection, schema: &str) -> Result<()> {
     if workspace_tracking_exists(conn, schema)? {
         return Ok(());
     }
     conn.execute_batch(&format!(
-        "CREATE TABLE {schema}.workspaces(index_path TEXT PRIMARY KEY,root TEXT NOT NULL);
-         CREATE TABLE {schema}.legacy_artifacts(kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(kind,key));
-         INSERT INTO {schema}.legacy_artifacts SELECT 'source',hash FROM {schema}.sources;
-         INSERT INTO {schema}.legacy_artifacts SELECT 'unit-content',key FROM {schema}.cache WHERE kind='unit-content';
-         INSERT INTO {schema}.legacy_artifacts SELECT 'description-content',hash FROM {schema}.description_content;
-         INSERT INTO {schema}.legacy_artifacts SELECT 'embedding',key FROM {schema}.embeddings;"
+        "CREATE TABLE {schema}.workspaces(index_path TEXT PRIMARY KEY,root TEXT NOT NULL);"
     ))?;
     Ok(())
 }

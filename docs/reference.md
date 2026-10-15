@@ -1065,10 +1065,19 @@ These flags affect the local store, not objects in an optional S3 cache.
 Custom indexes are registered when opened writable. Existing default-cache
 indexes are also discovered during pruning. Open copied or moved custom indexes
 writable at their new paths before pruning. Older custom indexes that have never
-reopened cannot be discovered automatically. When upgrading a pre-tracking store,
-its existing authoritative payloads are conservatively pinned so those indexes
-cannot be damaged, even with the opt-in flags. The report exposes this retained
-legacy count; subsequently created unreferenced payloads can be reclaimed normally.
+reopened cannot be discovered automatically and do not protect artifacts from
+pruning. There are no legacy retention exemptions; prune also drops obsolete
+pin bookkeeping left by earlier versions. If an untracked index loses referenced
+data, rebuild it using a new index path (or, after stopping other users, remove its
+SQLite file and `-wal`/`-shm` companions before rebuilding at the same path):
+
+```bash
+slopdex --index /path/to/new-index.sqlite update
+```
+
+The rebuilt index is registered normally. Matching provider artifacts can still
+be reused; missing results may require new provider calls. See
+[rebuilding an old index](#rebuilding-an-old-index).
 
 Prune also empties the obsolete `snapshots` table, removes unused artifact lock
 files under `<global-store>.locks`, and truncates the write-ahead log.
@@ -1084,7 +1093,6 @@ The JSON report contains:
 | `vectorRowsDeleted`, `descriptionRowsDeleted` | Unused provider results removed by the corresponding opt-in flag. |
 | `repositoryRowsDeleted` | Obsolete repository registrations and family-evidence rows removed. |
 | `indexFilesRemoved` | SQLite/sidecar and unused shared vector-base files removed. |
-| `legacyArtifactsRetained` | Pre-tracking authoritative payloads pinned to protect undiscoverable older custom indexes. |
 | `lockFilesRemoved`, `lockFilesBusy` | Lock files deleted, and those skipped because a process holds them. |
 | `walTruncated` | `false` when a concurrent reader prevented resetting the write-ahead log; rerun later. |
 | `databaseBytes` | Size of the main database file after the run. |

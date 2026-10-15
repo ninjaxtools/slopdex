@@ -326,6 +326,7 @@ fn cache_prune_reports_the_configured_store_without_initializing_an_index() -> R
         store.canonicalize()?
     );
     assert_eq!(report["snapshotRowsDeleted"], 0);
+    assert!(report.get("legacyArtifactsRetained").is_none());
     assert_eq!(report["vacuumed"], false);
     assert_eq!(run(&["--vacuum"])?["vacuumed"], true);
     let conn = crate::cache::open_store(&store, false)?;
