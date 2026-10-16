@@ -1050,6 +1050,52 @@ fn git_policy_changes_force_rescan_and_restoration_reuses_global_artifacts() -> 
 }
 
 #[test]
+fn parser_upgrade_refreshes_nested_type_members_without_source_changes() -> Result<()> {
+    let repo = Repo::new()?;
+    let path = "types.ts";
+    let source = "export type MyType = { config: { prop1: string } };\n";
+    repo.write(path, source)?;
+    let config = repo.isolated_config(&json!({}));
+    let mut db =
+        slopdex::storage::Database::open_with_config(&repo.index, &repo.root, &config, false)?;
+    let mut parsed = slopdex::parse::parse(path, source)?;
+    // The previous parser exposed the direct field, but not its nested member.
+    parsed.structure.nodes.truncate(2);
+    let old_version = "structure-v12-nesting-limit-heading-names";
+    let source_hash = slopdex::hash(source);
+    let file = slopdex::storage::File {
+        path: path.into(),
+        hash: source_hash.clone(),
+        source: source.into(),
+        language: "typescript".into(),
+        source_mode: "working-tree".into(),
+        description: None,
+        description_hash: None,
+        description_embedding: None,
+        errors: Vec::new(),
+    };
+    db.apply_structure_with_version(&[(file, parsed.clone())], &[], None, old_version)?;
+    let old_key = slopdex::hash(json!([old_version, "typescript", source_hash]).to_string());
+    db.cache_put("parse", &old_key, &serde_json::to_string(&parsed)?)?;
+    drop(db);
+
+    let mut engine = repo.open_map(&config)?;
+    assert_eq!(engine.refresh_structure()?["filesUpdated"], 1);
+    let rows = engine.map(&json!({"regexp":"^MyType\\.config\\.prop1$"}))?;
+    assert_eq!(map_names(&rows), strings(&["MyType", "config", "prop1"]));
+    assert_eq!(rows[0]["nodes"][2]["qualifiedName"], "MyType.config.prop1");
+    assert_eq!(engine.refresh_structure()?["filesUpdated"], 0);
+    let db = slopdex::storage::Database::open_readonly(&repo.index, &repo.root)?;
+    assert!(db.structure_current(
+        path,
+        &source_hash,
+        slopdex::storage::STRUCTURE_PARSER_VERSION
+    )?);
+    assert!(db.cache("parse", &old_key)?.is_some());
+    Ok(())
+}
+
+#[test]
 fn global_parses_reuse_renamed_same_dialect_paths_and_isolate_languages() -> Result<()> {
     let mock = Mock::start()?;
     let first = Repo::new()?;

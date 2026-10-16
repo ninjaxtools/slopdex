@@ -256,6 +256,15 @@ Kinds are ORed and restrict the union of regex and semantic matches. Matching no
 retain their ancestors as context; a matching parent does not automatically include
 unmatched children.
 
+TypeScript and TSX type aliases and interfaces include nested object members as
+symbols, including objects inside unions, intersections, and wrapped type
+expressions. Member paths retain their enclosing fields, such as
+`MyType.config.prop1`. Repeated members in separate branches remain distinct
+declarations with their own source ranges. These symbols participate in `-e`,
+`-q`, and symbol search; their attached comments participate in `-q` and
+description search. Anonymous return/callback types outside named type
+declarations do not introduce members into the enclosing executable scope.
+
 `--callers N` and `--callees N` each default to `0` in compact and standard
 detail, or `1` with `--detail expanded`. An explicit `0` disables that direction
 even in expanded mode. When positive, they expand

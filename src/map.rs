@@ -1351,7 +1351,7 @@ mod tests {
         let output = render_nodes(&structure.nodes, Some("result.ts"));
         assert_eq!(
             output,
-            "*** result.ts\n\n@@ 1-3 @@\nexport type Result = | { compacted: false; events: Event[] } | { compacted: true; summary: string }\n"
+            "*** result.ts\n\n@@ 1-3 @@\nexport type Result = | { compacted: false; events: Event[] } | { compacted: true; summary: string }\n  compacted: false\n\n@@ 2-3 @@\n  events: Event[]\n  compacted: true\n\n@@ 3 @@\n  summary: string\n"
         );
     }
 

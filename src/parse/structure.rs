@@ -420,13 +420,24 @@ impl Collector<'_> {
 
     fn walk_inner(&mut self, node: Node<'_>, parent: Option<usize>, in_callable: bool) {
         let syntax = node.kind();
-        // Inline object members belong to their type expression, not the
-        // nearest named scope. Only direct object aliases expose child symbols.
-        if matches!(self.language, "typescript" | "tsx")
-            && syntax == "object_type"
-            && node
-                .parent()
-                .is_none_or(|parent| parent.kind() != "type_alias_declaration")
+        let type_scope = self.typescript_type_scope(parent);
+        // Inline objects expose members within named types, including wrapped
+        // and nested expressions, but not in unrelated executable scopes.
+        if matches!(self.language, "typescript" | "tsx") && syntax == "object_type" && !type_scope {
+            return;
+        }
+        // Anonymous function/constructor types have no classified declaration
+        // to apply the normal parameter exclusions below. Only their result
+        // types contribute members to the enclosing named type.
+        if type_scope
+            && matches!(
+                syntax,
+                "parameters"
+                    | "formal_parameters"
+                    | "parameter_list"
+                    | "type_parameters"
+                    | "type_parameter_list"
+            )
         {
             return;
         }
@@ -572,6 +583,14 @@ impl Collector<'_> {
         let classification = self.classify(node, parent, in_callable);
         if let Some((kind, names)) = classification {
             let id = self.push(node, parent, kind, names, self.signature(node, kind));
+            if type_scope && syntax == "index_signature" {
+                // Index keys and mapped-type clauses describe selection/remapping,
+                // not members of the indexed value.
+                if let Some(ty) = node.child_by_field_name("type") {
+                    self.walk(ty, Some(id), in_callable);
+                }
+                return;
+            }
             // A bound closure/class/object is represented by its binding, not by
             // a second anonymous declaration with the same identity.
             if matches!(
@@ -648,7 +667,10 @@ impl Collector<'_> {
                 ) {
                     continue;
                 }
-                let child_parent = if callable(kind) || container(kind) {
+                let child_parent = if callable(kind)
+                    || container(kind)
+                    || type_scope && syntax == "property_signature"
+                {
                     Some(id)
                 } else {
                     parent
@@ -676,6 +698,20 @@ impl Collector<'_> {
                 self.walk(child, parent, in_callable);
             }
         }
+    }
+
+    fn typescript_type_scope(&self, mut parent: Option<usize>) -> bool {
+        if !matches!(self.language, "typescript" | "tsx") {
+            return false;
+        }
+        while let Some(id) = parent {
+            let node = &self.nodes[id];
+            if matches!(node.kind.as_str(), "type" | "interface") {
+                return true;
+            }
+            parent = node.parent_id;
+        }
+        false
     }
 
     fn walk_bound(&mut self, value: Node<'_>, id: usize, kind: &str, in_callable: bool) {
@@ -1321,9 +1357,8 @@ impl Collector<'_> {
         if node != root
             && matches!(syntax, "object_type" | "interface_type" | "struct_type")
             && container(kind)
-            // Only a direct object alias has its members rendered as separate
-            // declarations. An object inside a union/intersection (or another
-            // type expression) is part of the type signature itself.
+            // Keep compound type expressions intact even when their members
+            // also have symbols: the signature preserves branch relationships.
             && (syntax != "object_type" || node.parent() == Some(root))
         {
             if let Some(body) = node.child_by_field_name("body") {

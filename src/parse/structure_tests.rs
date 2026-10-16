@@ -130,11 +130,30 @@ fn typescript_union_object_branches_remain_in_type_signatures() {
             named(&s, "Combined").signature,
             "type Combined = { left: number } & { right: string }"
         );
-        assert!(s.nodes.iter().all(|node| {
-            node.parent_id != Some(named(&s, "Result").id)
-                && node.parent_id != Some(named(&s, "Event").id)
-                && node.parent_id != Some(named(&s, "Combined").id)
-        }));
+        for name in [
+            "Result.compacted",
+            "Result.events",
+            "Result.summary",
+            "Event.kind",
+            "Event.call",
+            "Event.text",
+            "Box.value.left",
+            "Box.value.right",
+            "Combined.left",
+            "Combined.right",
+        ] {
+            assert_eq!(named(&s, name).kind, "field");
+        }
+        let compacted: Vec<_> = s
+            .nodes
+            .iter()
+            .filter(|node| node.qualified_name == "Result.compacted")
+            .collect();
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted[0].signature, "compacted: false");
+        assert_eq!(compacted[1].signature, "compacted: true");
+        assert_ne!(compacted[0].id, compacted[1].id);
+        assert!(compacted[0].end_byte < compacted[1].start_byte);
     }
 }
 

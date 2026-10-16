@@ -289,7 +289,7 @@ class Store { "constructor"() {} "load"() {} }
 }
 
 #[test]
-fn inline_type_expressions_do_not_promote_members_out_of_their_type_context() {
+fn nested_type_members_keep_their_named_type_context() {
     let source = r#"type Wrapped = Promise<{ inner: number; run(): void }>;
 type Items = { item: number }[];
 type Parenthesized = ({ wrapped: string });
@@ -306,16 +306,28 @@ invoke((): { callbackValue: number } => ({ callbackValue: 1 }));
             declarations(&parsed),
             [
                 ("Wrapped", "type"),
+                ("Wrapped.inner", "field"),
+                ("Wrapped.run", "method"),
                 ("Items", "type"),
+                ("Items.item", "field"),
                 ("Parenthesized", "type"),
+                ("Parenthesized.wrapped", "field"),
                 ("Conditional", "type"),
+                ("Conditional.yes", "field"),
+                ("Conditional.no", "field"),
                 ("Indexed", "type"),
+                ("Indexed.selected", "field"),
                 ("Direct", "type"),
                 ("Direct.nested", "field"),
+                ("Direct.nested.leaf", "field"),
+                ("Direct.nested.run", "method"),
                 ("Direct.call", "method"),
+                ("Direct.call.result", "field"),
                 ("Shape", "interface"),
                 ("Shape.nested", "field"),
+                ("Shape.nested.leaf", "field"),
                 ("Shape.method", "method"),
+                ("Shape.method.result", "field"),
                 ("make", "function"),
                 ("make.method", "method"),
             ],
@@ -351,6 +363,120 @@ invoke((): { callbackValue: number } => ({ callbackValue: 1 }));
             callables(&parsed),
             [("make", "function"), ("make.method", "method")]
         );
+        assert_ranges_and_names(&parsed, source);
+    }
+}
+
+#[test]
+fn nested_type_members_preserve_branches_comments_and_source_ranges() {
+    let source = r#"export namespace API {
+  export type MyType = {
+    readonly config?: {
+      // Café property documentation.
+      "café": { prop1: string };
+      choice: { kind: "left"; left: number } | { kind: "right"; right: string };
+      [key: string]: { indexed: boolean };
+      run(): { returned: string };
+    };
+  } & { extra: { enabled: boolean } };
+  export interface Shape {
+    items: ReadonlyArray<{ nested: { leaf: number } }>;
+    (): { called: boolean };
+    new (): { created: boolean };
+  }
+}
+"#;
+    for path in TYPE_PATHS {
+        let parsed = accepted(path, source);
+        assert_eq!(
+            declarations(&parsed),
+            [
+                ("API", "module"),
+                ("API.MyType", "type"),
+                ("API.MyType.config", "field"),
+                ("API.MyType.config.café", "field"),
+                ("API.MyType.config.café.prop1", "field"),
+                ("API.MyType.config.choice", "field"),
+                ("API.MyType.config.choice.kind", "field"),
+                ("API.MyType.config.choice.left", "field"),
+                ("API.MyType.config.choice.kind", "field"),
+                ("API.MyType.config.choice.right", "field"),
+                ("API.MyType.config.index", "field"),
+                ("API.MyType.config.index.indexed", "field"),
+                ("API.MyType.config.run", "method"),
+                ("API.MyType.config.run.returned", "field"),
+                ("API.MyType.extra", "field"),
+                ("API.MyType.extra.enabled", "field"),
+                ("API.Shape", "interface"),
+                ("API.Shape.items", "field"),
+                ("API.Shape.items.nested", "field"),
+                ("API.Shape.items.nested.leaf", "field"),
+                ("API.Shape.call", "method"),
+                ("API.Shape.call.called", "field"),
+                ("API.Shape.new", "constructor"),
+                ("API.Shape.new.created", "field"),
+            ],
+            "{path}"
+        );
+        let property = named(&parsed, "API.MyType.config.café");
+        assert_eq!(
+            property.description.as_deref(),
+            Some("Café property documentation.")
+        );
+        assert_eq!(property.signature, "\"café\": { prop1: string }");
+        assert_eq!(
+            &source[property.start_byte..property.end_byte],
+            "// Café property documentation.\n      \"café\": { prop1: string }"
+        );
+        let branches: Vec<_> = parsed
+            .structure
+            .nodes
+            .iter()
+            .filter(|node| node.qualified_name == "API.MyType.config.choice.kind")
+            .collect();
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].signature, "kind: \"left\"");
+        assert_eq!(branches[1].signature, "kind: \"right\"");
+        assert_eq!(branches[0].parent_id, branches[1].parent_id);
+        assert_ne!(branches[0].id, branches[1].id);
+        assert!(branches[0].end_byte < branches[1].start_byte);
+        assert!(parsed.callables.is_empty());
+        assert_ranges_and_names(&parsed, source);
+    }
+}
+
+#[test]
+fn nested_type_values_do_not_promote_parameters_or_index_keys() {
+    let source = r#"export type Factory = <T extends { constraint: string }>(arg: { input: number }) => { output: boolean };
+export type Constructor = new <T extends { constraint: string }>(arg: { input: number }) => { output: boolean };
+export type Shape = {
+  [K in keyof { keyOnly: string } as keyof { renamed: boolean }]: { value: boolean };
+};
+export type Indexed = { [key: keyof { keyOnly: string }]: { value: boolean } };
+export type Callbacks = { callback: <T extends { constraint: string }>(arg: { input: number }) => { output: boolean } };
+"#;
+    for path in TYPE_PATHS {
+        let parsed = accepted(path, source);
+        assert_eq!(
+            declarations(&parsed),
+            [
+                ("Factory", "type"),
+                ("Factory.output", "field"),
+                ("Constructor", "type"),
+                ("Constructor.output", "field"),
+                ("Shape", "type"),
+                ("Shape.index", "field"),
+                ("Shape.index.value", "field"),
+                ("Indexed", "type"),
+                ("Indexed.index", "field"),
+                ("Indexed.index.value", "field"),
+                ("Callbacks", "type"),
+                ("Callbacks.callback", "field"),
+                ("Callbacks.callback.output", "field"),
+            ],
+            "{path}"
+        );
+        assert!(parsed.callables.is_empty());
         assert_ranges_and_names(&parsed, source);
     }
 }

@@ -1699,6 +1699,345 @@ fn map_description_queries_skip_punctuation_only_source_prose() -> Result<()> {
     Ok(())
 }
 
+const NESTED_TYPESCRIPT_SOURCE: &str = r#"export type MyType = {
+  config: {
+    /** nested member documentation */
+    prop1: string;
+    prop2: number;
+    nested: {
+      /** nested member documentation */
+      leaf: string;
+      sibling: number;
+    };
+  };
+  choice: {
+    /** nested member documentation */
+    shared: string;
+  } | {
+    /** alternate branch documentation */
+    shared: number;
+  };
+  mixed: ({ left: string } & { right: number });
+  generic: Readonly<{ wrapped: boolean }>;
+  array: ({ entry: string })[];
+};
+
+export interface MyInterface {
+  config: {
+    /** nested member documentation */
+    prop1: boolean;
+  };
+  choice: ({ unionLeaf: string } | { unionLeaf: number });
+  mixed: { left: string } & { right: number };
+  generic: Array<{ wrapped: string }>;
+  array: { entry: string }[];
+}
+
+export type WrappedAlias = Readonly<({ rootLeaf: string } | { rootLeaf: number })[]>;
+export type IntersectedAlias = { intersectionLeft: string } & { intersectionRight: number };
+"#;
+
+fn nested_typescript_fixture() -> Result<Fixture> {
+    let fixture = Fixture::with_sources(false, &[("nested.ts", NESTED_TYPESCRIPT_SOURCE)])?;
+    let db =
+        Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
+    let profile = Providers::new(&fixture.config)?.embedding_profile();
+    let mut symbol_config = fixture.config.clone();
+    symbol_config["dimensions"] = symbol_config["symbolDimensions"].clone();
+    let mut symbol_profile = Providers::new(&symbol_config)?.embedding_profile();
+    symbol_profile["symbolNormalizationVersion"] = json!("symbols-v1");
+    // Seed the entire normalized vocabulary, not just the expected hits: building
+    // a symbol index must never contact the deliberately unreachable provider.
+    for name in [
+        "my type",
+        "my interface",
+        "wrapped alias",
+        "intersected alias",
+        "config",
+        "prop 1",
+        "prop 2",
+        "nested",
+        "leaf",
+        "sibling",
+        "choice",
+        "shared",
+        "mixed",
+        "left",
+        "right",
+        "generic",
+        "wrapped",
+        "array",
+        "entry",
+        "union leaf",
+        "root leaf",
+        "intersection left",
+        "intersection right",
+    ] {
+        let vector = match name {
+            "prop 1" => [1.0, 0.0],
+            "shared" => [0.0, 1.0],
+            _ => [-1.0, 0.0],
+        };
+        db.put_embedding(
+            &Database::embedding_key(&symbol_profile, false, name),
+            &vector,
+        )?;
+    }
+    for file in db.files()? {
+        let structure = db.structure(&file.path)?;
+        for text in structure
+            .nodes
+            .iter()
+            .filter_map(|node| node.description.as_deref())
+            .chain(file.description.as_deref())
+        {
+            let vector = if text == "nested member documentation" {
+                [0.0, -1.0]
+            } else {
+                [-1.0, 0.0]
+            };
+            // Description search and map -q use separate embedding profiles.
+            for profile in [&profile, &symbol_profile] {
+                db.put_embedding(&Database::embedding_key(profile, false, text), &vector)?;
+            }
+        }
+    }
+    for (query, vector) in [
+        ("prop1", [1.0, 0.0]),
+        ("prop 1", [1.0, 0.0]),
+        ("shared", [0.0, 1.0]),
+        ("nested member documentation", [0.0, -1.0]),
+    ] {
+        fixture.seed_query(query, &vector)?;
+    }
+    Ok(fixture)
+}
+
+fn nested_type_map_names(rows: &[Value]) -> Vec<&str> {
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["path"], "nested.ts");
+    rows[0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["qualifiedName"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn typescript_nested_type_members_map_regex_preserves_parents_and_union_occurrences() -> Result<()>
+{
+    let fixture = nested_typescript_fixture()?;
+    let engine = fixture.engine()?;
+    for (qualified, occurrences) in [
+        ("MyType.config.prop1", 1),
+        ("MyType.config.nested.leaf", 1),
+        ("MyType.choice.shared", 2),
+        ("MyType.mixed.left", 1),
+        ("MyType.mixed.right", 1),
+        ("MyType.generic.wrapped", 1),
+        ("MyType.array.entry", 1),
+        ("MyInterface.config.prop1", 1),
+        ("MyInterface.choice.unionLeaf", 2),
+        ("MyInterface.mixed.left", 1),
+        ("MyInterface.mixed.right", 1),
+        ("MyInterface.generic.wrapped", 1),
+        ("MyInterface.array.entry", 1),
+        ("WrappedAlias.rootLeaf", 2),
+        ("IntersectedAlias.intersectionLeft", 1),
+        ("IntersectedAlias.intersectionRight", 1),
+    ] {
+        let options = json!({
+            "regexp":format!("^{}$", regex::escape(qualified)), "private":true, "limit":"none"
+        });
+        let rows = engine.map(&options)?;
+        let mut expected = Vec::new();
+        let mut prefix = String::new();
+        for part in qualified.split('.') {
+            if !prefix.is_empty() {
+                prefix.push('.');
+            }
+            prefix.push_str(part);
+            expected.push(prefix.clone());
+        }
+        expected.extend(std::iter::repeat_n(qualified.to_owned(), occurrences - 1));
+        assert_eq!(nested_type_map_names(&rows), expected, "{qualified}");
+        let nodes = rows[0]["nodes"].as_array().unwrap();
+        for node in nodes {
+            let parent = node["qualifiedName"]
+                .as_str()
+                .unwrap()
+                .rsplit_once('.')
+                .map(|(parent, _)| {
+                    &nodes
+                        .iter()
+                        .find(|candidate| candidate["qualifiedName"] == parent)
+                        .unwrap()["id"]
+                });
+            assert_eq!(&node["parentId"], parent.unwrap_or(&Value::Null));
+        }
+        let selected: Vec<_> = nodes
+            .iter()
+            .filter(|node| node["qualifiedName"] == qualified)
+            .collect();
+        assert_eq!(selected.len(), occurrences);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|node| node["id"].as_u64().unwrap())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            occurrences
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|node| {
+                    let start = node["startByte"].as_u64().unwrap() as usize;
+                    let end = node["endByte"].as_u64().unwrap() as usize;
+                    let name = node["name"].as_str().unwrap();
+                    assert!(NESTED_TYPESCRIPT_SOURCE[start..end].contains(&format!("{name}:")));
+                    (start, end)
+                })
+                .collect::<BTreeSet<_>>()
+                .len(),
+            occurrences
+        );
+        assert_eq!(rows, engine.map(&options)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn typescript_nested_type_members_map_semantic_names_and_comments() -> Result<()> {
+    let fixture = nested_typescript_fixture()?;
+    let engine = fixture.engine()?;
+    let mut options = json!({
+        "symbolQuery":"prop1", "symbolThreshold":0.9, "private":true, "limit":"none"
+    });
+    let names = engine.map(&options)?;
+    assert_eq!(
+        nested_type_map_names(&names),
+        [
+            "MyType",
+            "MyType.config",
+            "MyType.config.prop1",
+            "MyInterface",
+            "MyInterface.config",
+            "MyInterface.config.prop1",
+        ]
+    );
+    options["symbolQuery"] = json!("nested member documentation");
+    let comments = engine.map(&options)?;
+    assert_eq!(
+        nested_type_map_names(&comments),
+        [
+            "MyType",
+            "MyType.config",
+            "MyType.config.prop1",
+            "MyType.config.nested",
+            "MyType.config.nested.leaf",
+            "MyType.choice",
+            "MyType.choice.shared",
+            "MyInterface",
+            "MyInterface.config",
+            "MyInterface.config.prop1",
+        ]
+    );
+    let shared = comments[0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["qualifiedName"] == "MyType.choice.shared")
+        .unwrap();
+    assert_eq!(shared["description"], "nested member documentation");
+    assert!(
+        NESTED_TYPESCRIPT_SOURCE[shared["startByte"].as_u64().unwrap() as usize
+            ..shared["endByte"].as_u64().unwrap() as usize]
+            .contains("shared: string")
+    );
+    assert_eq!(comments, engine.map(&options)?);
+    options["symbolQuery"] = json!(["prop1", "nested member documentation"]);
+    assert_eq!(comments, engine.map(&options)?);
+    Ok(())
+}
+
+#[test]
+fn typescript_nested_type_members_search_names_and_source_descriptions() -> Result<()> {
+    let fixture = nested_typescript_fixture()?;
+    let engine = fixture.engine()?;
+    let options = json!({"minSimilarity":0.9, "limit":"none"});
+    for (query, expected) in [
+        ("prop1", ["MyInterface.config.prop1", "MyType.config.prop1"]),
+        ("shared", ["MyType.choice.shared", "MyType.choice.shared"]),
+    ] {
+        for command in ["search", "search-symbols"] {
+            let rows = engine.search(query, command, &options)?;
+            assert!(rows.iter().all(|row| row["type"] == "symbol"));
+            let mut names: Vec<_> = rows
+                .iter()
+                .map(|row| row["symbol"]["qualifiedName"].as_str().unwrap())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, expected, "{command}: {query}: {rows:?}");
+            assert_eq!(
+                rows.iter()
+                    .map(|row| (
+                        row["symbol"]["startByte"].as_u64().unwrap(),
+                        row["symbol"]["endByte"].as_u64().unwrap(),
+                    ))
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                2,
+                "{command}: {query}: {rows:?}"
+            );
+            assert_eq!(rows, engine.search(query, command, &options)?);
+        }
+    }
+    let rows = engine.search(
+        "nested member documentation",
+        "search-descriptions",
+        &options,
+    )?;
+    let mut names = Vec::new();
+    for row in &rows {
+        assert_eq!(row["type"], "symbol");
+        assert_eq!(row["symbol"]["path"], "nested.ts");
+        assert_eq!(row["symbol"]["description"], "nested member documentation");
+        assert_eq!(row["symbol"]["sourceDescription"], true);
+        assert_eq!(row["descriptionSimilarity"], 1.0);
+        if row["symbol"]["qualifiedName"] == "MyType.choice.shared" {
+            let start = row["symbol"]["startByte"].as_u64().unwrap() as usize;
+            let end = row["symbol"]["endByte"].as_u64().unwrap() as usize;
+            assert!(NESTED_TYPESCRIPT_SOURCE[start..end].contains("shared: string"));
+        }
+        names.push(row["symbol"]["qualifiedName"].as_str().unwrap());
+    }
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "MyInterface.config.prop1",
+            "MyType.choice.shared",
+            "MyType.config.nested.leaf",
+            "MyType.config.prop1",
+        ]
+    );
+    assert_eq!(
+        rows,
+        engine.search(
+            "nested member documentation",
+            "search-descriptions",
+            &options
+        )?
+    );
+    assert_eq!(
+        rows,
+        engine.search("nested member documentation", "search", &options)?
+    );
+    Ok(())
+}
+
 #[test]
 fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Result<()> {
     let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;

@@ -392,13 +392,17 @@ fn symbol_is_private(
     let inherited_private = parent.is_some_and(|parent| {
         parent.kind != "impl" && symbol_is_private(parent.id, nodes, cache, visiting)
     });
-    let private = inherited_private || locally_private(node, parent);
+    let private = inherited_private || locally_private(node, parent, nodes);
     visiting.remove(&id);
     cache.insert(id, private);
     private
 }
 
-fn locally_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
+fn locally_private(
+    node: &StructureNode,
+    parent: Option<&StructureNode>,
+    nodes: &HashMap<usize, &StructureNode>,
+) -> bool {
     if matches!(node.kind.as_str(), "heading" | "import") {
         return false;
     }
@@ -407,7 +411,8 @@ fn locally_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool
             parent.kind.as_str(),
             "function" | "method" | "constructor" | "generator"
         )
-    }) {
+    }) && !typescript_type_member(node, nodes)
+    {
         return true;
     }
     // In languages without a `private` modifier, a leading underscore on a
@@ -439,6 +444,25 @@ fn locally_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool
         "bash" => underscore_private,
         _ => false,
     }
+}
+
+fn typescript_type_member(node: &StructureNode, nodes: &HashMap<usize, &StructureNode>) -> bool {
+    if !matches!(node.language.as_str(), "typescript" | "tsx") {
+        return false;
+    }
+    let mut parent = node.parent_id;
+    // Bound malformed/cyclic stored structures just as visibility resolution does.
+    for _ in 0..nodes.len() {
+        let Some(ancestor) = parent.and_then(|id| nodes.get(&id).copied()) else {
+            return false;
+        };
+        if matches!(ancestor.kind.as_str(), "type" | "interface") {
+            // Return-type members of a bodyless type method aren't callable locals.
+            return true;
+        }
+        parent = ancestor.parent_id;
+    }
+    false
 }
 
 fn rust_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
@@ -698,6 +722,49 @@ mod tests {
                 .unwrap()
                 .name_matches("anything")
         );
+    }
+
+    #[test]
+    fn typescript_type_return_members_inherit_type_visibility_not_callable_privacy() {
+        let source = "export interface Shape { nested: { method(): { result: boolean }; new (): { created: boolean }; (): { called: boolean }; } }\ntype Hidden = { method(): { result: boolean } };\nexport function outer() { type Local = { method(): { result: boolean } }; function nested() {} }\n";
+        for path in ["source.ts", "source.tsx"] {
+            let parsed = crate::parse::parse(path, source).unwrap();
+            let regex = Selection::compile(&json!({
+                "regexp":r"\.(result|created|called|nested)$", "kinds":"fields,functions"
+            }))
+            .unwrap();
+            let semantic = Selection::compile(&json!({
+                "symbolQuery":"result", "kinds":"fields,functions"
+            }))
+            .unwrap()
+            .with_symbol_names(HashSet::from([
+                "result".into(),
+                "created".into(),
+                "called".into(),
+                "nested".into(),
+            ]));
+            for selection in [regex, semantic] {
+                let selected = selection.select_structure(&parsed.structure);
+                let names: Vec<_> = selected
+                    .iter()
+                    .map(|node| node.qualified_name.as_str())
+                    .collect();
+                assert_eq!(
+                    names,
+                    [
+                        "Shape",
+                        "Shape.nested",
+                        "Shape.nested.method",
+                        "Shape.nested.method.result",
+                        "Shape.nested.new",
+                        "Shape.nested.new.created",
+                        "Shape.nested.call",
+                        "Shape.nested.call.called",
+                    ],
+                    "{path}"
+                );
+            }
+        }
     }
 
     #[test]
