@@ -27,7 +27,7 @@ use crate::{
     engine::Engine,
     filter,
     limits::{self, LimitedResults, ResultLimit},
-    map,
+    lines, map,
     providers::Providers,
     ui,
 };
@@ -36,7 +36,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 use std::{
     io::{self as stdio, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +89,8 @@ impl CommandMode {
     fn for_command(command: &Command) -> Self {
         match command {
             Command::Map(args) if args.selection.symbol_query.is_empty() => Self::Structure,
-            Command::Map(_) | Command::SearchSymbols(_) => Self::Symbols,
+            Command::Lines(args) if args.selection.symbol_query.is_empty() => Self::Structure,
+            Command::Map(_) | Command::Lines(_) | Command::SearchSymbols(_) => Self::Symbols,
             Command::Search(args) if args.symbols_only() => Self::Symbols,
             _ => Self::Content,
         }
@@ -143,6 +144,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
     let root = root_path(cli.global.root.as_deref())?;
     let workspaces = match &cli.command {
         Command::Map(args) => map_workspaces(&root, &args.paths)?,
+        Command::Lines(args) => map_workspaces(&root, &args.paths)?,
         Command::CrossSearch(args) if args.source_path.is_some() => {
             vec![source_workspace(&root, args.source_path.as_ref().unwrap())?]
         }
@@ -153,8 +155,17 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
         }],
     };
     let mut map_output = MapOutput::default();
+    let mut line_files = Vec::new();
     for workspace in workspaces {
-        run_workspace(cli, &workspace, &mut out, &mut map_output)?;
+        run_workspace(cli, &workspace, &mut out, &mut map_output, &mut line_files)?;
+    }
+    if let Command::Lines(args) = &cli.command {
+        let tree = lines::Tree::new(line_files, args.limit.and_then(ResultLimit::count));
+        if cli.global.format == Some(Format::Json) {
+            print_json(&mut out, &tree)?;
+        } else {
+            tree.print(&mut out)?;
+        }
     }
     if matches!(cli.command, Command::Map(_)) {
         let format = cli.global.format.unwrap_or(Format::Summary);
@@ -203,6 +214,7 @@ fn run_workspace(
     workspace: &SourceWorkspace,
     mut out: &mut impl Write,
     map_output: &mut MapOutput,
+    line_files: &mut Vec<(PathBuf, usize)>,
 ) -> Result<()> {
     if let Command::Help {
         topic: Some(HelpTopic::Models { provider }),
@@ -298,6 +310,28 @@ fn run_workspace(
         return print_json(&mut out, &serde_json::to_value(report)?);
     }
     let index = index_path(root, cli.global.index.as_deref(), &config)?;
+    if let Command::Lines(args) = &cli.command
+        && !index.exists()
+    {
+        if args.selection.symbol_query.is_empty() {
+            let root = root
+                .canonicalize()
+                .context("Repository root does not exist")?;
+            ensure!(root.is_dir(), "Repository root is not a directory");
+            let Some(options) = args.existing_options(&root, &workspace.paths)? else {
+                return Ok(());
+            };
+            line_files.extend(ui::spin("Counting source lines", || {
+                lines::unindexed(&root, &index, &config, &options)
+            })?);
+            return Ok(());
+        }
+        // Semantic selectors must not silently turn into whole-file counts.
+        // A normal run can create a structure-only index on demand.
+        if cli.global.no_reindex {
+            require_index(&index)?;
+        }
+    }
     if let Command::CrossSearch(args) = &cli.command
         && let Some(target_index) = &args.target_index
     {
@@ -350,6 +384,7 @@ fn run_workspace(
     let read_only_command = matches!(
         &cli.command,
         Command::Map(_)
+            | Command::Lines(_)
             | Command::Status
             | Command::Index {
                 action: IndexAction::Errors
@@ -389,6 +424,33 @@ fn run_workspace(
     warn_errors(&engine, config["ignoreErrors"].as_bool().unwrap_or(false))?;
     let format = cli.global.format.unwrap_or(Format::Summary);
     match &cli.command {
+        Command::Lines(args) => {
+            let root = root
+                .canonicalize()
+                .context("Repository root does not exist")?;
+            let Some(options) = args.existing_options(&root, &workspace.paths)? else {
+                return Ok(());
+            };
+            let counted = ui::spin("Counting source lines", || {
+                lines::indexed(&engine, &root, &options)
+            });
+            let files = match counted {
+                Err(error) if error.is::<crate::engine::NeedsWrite>() => {
+                    drop(engine);
+                    engine = ui::spin("Opening index for update", || {
+                        mode.open(&root, &index, &config, false)
+                    })?;
+                    if !cli.global.no_reindex {
+                        mode.refresh(&mut engine)?;
+                    }
+                    ui::spin("Counting source lines", || {
+                        lines::indexed(&engine, &root, &options)
+                    })?
+                }
+                result => result?,
+            };
+            line_files.extend(files);
+        }
         Command::Map(_) => {
             if let Some(options) = map_options.as_ref() {
                 let mapped = ui::spin("Mapping repository structure", || {

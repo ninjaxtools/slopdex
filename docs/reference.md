@@ -43,6 +43,7 @@ can also follow the command. Quote multiword queries.
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Show selected groups' declarations, keys, sections, elements, and Markdown headings; refresh existing structure or parse directly if no index exists. | Summary |
+| `lines [PATH]...` | Count whole files, or matching symbols/sections with `-e`/`-q`, in a folder tree with aggregate counts. | Tree |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
@@ -195,6 +196,62 @@ use a spinner. Provider notices appear above the progress display. Warnings and
 runtime errors use the same terminal styling. Redirected stderr and `TERM=dumb`
 use plain diagnostics without animations; result data on stdout retains its
  text/JSON/JSONL format.
+
+## Line counts
+
+```bash
+slopdex lines src docs
+slopdex lines src --include-blank-lines
+slopdex lines -g '*.rs' --exclude-comments --exclude-tests
+slopdex lines --formats all --limit 10
+slopdex lines src -e 'refresh|search' -i
+slopdex lines -q 'validate session' --symbol-threshold 0.6 --output json
+```
+
+Without `-e` or `-q`, `lines` counts complete file contents, including private
+code and content outside symbols. Empty and whitespace-only source lines are
+ignored by default; `--include-blank-lines` opts into counting them, for both
+whole-file and selector-based counts. With either selector it counts
+the unique physical source lines covered by matching symbols' full source or
+Markdown headings and their immediate bodies, not display headers, filenames,
+line numbers, generated descriptions, or unmatched ancestor bodies. Overlapping
+matches count once. Unmatched child headings still delimit Markdown bodies;
+trailing section-separator blank lines are not counted. Regex and semantic
+selectors have the same OR composition as `map`, including callable-source regex
+matching. No implicit callable-graph traversal is added.
+
+The shared `-g`, `--formats` (default `code,docs`), `-i`, and semantic-threshold
+options apply. File discovery respects ignore files, configured includes/excludes,
+and `maxFileSize`, just like `map`. Positional paths support multiple workspaces.
+An existing index refreshes only structure; `--no-reindex` uses its saved source.
+Without an index, ordinary counts and regex selectors work locally without
+creating one. `-q` creates a structure-only index if needed and may call the
+embedding provider; with `--no-reindex`, it requires an existing index instead of
+silently ignoring the query.
+
+`--exclude-comments` removes language-specific comment/docstring-only lines.
+Lines with both code and a comment still count; comment-like text inside literals
+is not a comment. With `--include-blank-lines`, ordinary blank lines count, but
+blank lines inside excluded blocks still do not. `--exclude-tests` skips
+conventional language-specific
+test files/directories (for example `.spec.ts`, `.test.ts`, `_test.ts`, `_test.go`,
+and Python test files) and inline test constructs, including Rust test functions
+and `#[cfg(test)]` modules. Both flags also apply to selector-based counts.
+Test detection uses conventional names and syntax, without import-alias
+resolution, macro expansion, or embedded-language parsing.
+
+The tree starts at the common parent directory of the matched files. Folder
+counts aggregate all matching descendants. By default every matched file is
+shown, regardless of `defaultLimit`. `--limit N` ranks files and folders together
+by descending count, excluding the common-root header, and shows the largest N
+in their original hierarchy, with their ancestors retained as context. Folder
+totals still include hidden descendants. Ties are resolved by path; display order
+is alphabetical. `--limit none` explicitly shows everything. `--output json`
+returns the same pruned hierarchy and full aggregates as structured data.
+Each JSON node has `path`, `name`, `lines`, `type` (`file` or `directory`),
+`selected`, and `children`. The root is structural (`selected: false`);
+other unselected nodes are retained ancestors. With no matches, the root is
+`(no files)` with zero lines and no children.
 
 ## Structure map
 

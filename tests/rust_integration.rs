@@ -21,6 +21,9 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "rust_integration/lines.rs"]
+mod lines;
+
 const TEST_KEY: &str = "local-integration-placeholder";
 
 /// Upper bound for one loopback exchange or one fail-fast CLI child. These are

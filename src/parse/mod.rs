@@ -8,6 +8,7 @@ mod code;
 mod data;
 mod descriptions;
 mod imports;
+pub(crate) mod line_exclusions;
 mod markdown;
 mod references;
 mod shell;

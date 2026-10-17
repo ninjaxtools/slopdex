@@ -135,6 +135,8 @@ pub(super) enum Command {
     CrossSearch(CrossArgs),
     /// Show code declarations and Markdown headings; -q matches symbols, descriptions, and heading titles
     Map(MapArgs),
+    /// Count file or matching symbol/section lines in an aggregated folder tree
+    Lines(LinesArgs),
     /// Refresh and show index metadata, counts, and profiles as JSON
     Status,
     /// Inspect indexed data
@@ -316,6 +318,59 @@ pub(super) struct MapArgs {
     pub(super) limit: Option<ResultLimit>,
     #[command(flatten)]
     pub(super) calls: CallArgs,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct LinesArgs {
+    /// Files or recursive directories (default: .); external paths use their own workspace
+    #[arg(default_value = ".")]
+    pub(super) paths: Vec<PathBuf>,
+    #[command(flatten)]
+    pub(super) selection: SelectionArgs,
+    /// Show the N largest files/folders in place, with ancestors; default: all (ignores defaultLimit)
+    #[arg(long)]
+    pub(super) limit: Option<ResultLimit>,
+    /// Include empty and whitespace-only source lines (excluded by default)
+    #[arg(long)]
+    pub(super) include_blank_lines: bool,
+    /// Exclude language-specific comments/docstrings; mixed code/comment lines still count
+    #[arg(long)]
+    pub(super) exclude_comments: bool,
+    /// Exclude conventional test files and inline test declarations/suites
+    #[arg(long)]
+    pub(super) exclude_tests: bool,
+}
+
+impl LinesArgs {
+    pub(super) fn options(&self, paths: &[PathBuf]) -> Value {
+        let mut value = self.selection.options();
+        value["paths"] = json!(paths);
+        // Counts include implementation/private code, unlike a public API map.
+        value["private"] = json!(true);
+        value["includeBlankLines"] = json!(self.include_blank_lines);
+        value["excludeComments"] = json!(self.exclude_comments);
+        value["excludeTests"] = json!(self.exclude_tests);
+        value
+    }
+
+    pub(super) fn existing_options(&self, root: &Path, paths: &[PathBuf]) -> Result<Option<Value>> {
+        let mut existing = Vec::new();
+        for path in paths {
+            if root
+                .join(path)
+                .try_exists()
+                .with_context(|| format!("Cannot inspect lines path {}", path.display()))?
+            {
+                existing.push(path.clone());
+            } else {
+                ui::warning(format!(
+                    "slopdex: warning: lines path does not exist; ignoring: {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok((paths.is_empty() || !existing.is_empty()).then(|| self.options(&existing)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Args)]

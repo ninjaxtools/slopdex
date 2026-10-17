@@ -8,6 +8,64 @@ fn clap_definition_is_consistent() {
 }
 
 #[test]
+fn lines_selectors_exclusions_and_limits_do_not_become_declaration_limits() {
+    let cli = parse(&[
+        "lines",
+        "src",
+        "docs",
+        "-g",
+        "*.rs",
+        "-g",
+        "!generated.rs",
+        "-e",
+        "read",
+        "-q",
+        "parse source",
+        "-i",
+        "--formats",
+        "all",
+        "--exclude-comments",
+        "--exclude-tests",
+        "--include-blank-lines",
+        "--limit",
+        "10",
+    ]);
+    assert_eq!(CommandMode::for_command(&cli.command), CommandMode::Symbols);
+    let Command::Lines(args) = cli.command else {
+        panic!("expected lines")
+    };
+    assert_eq!(args.limit, Some(ResultLimit::Count(10)));
+    let options = args.options(&args.paths);
+    assert_eq!(options["paths"], json!(["src", "docs"]));
+    assert_eq!(options["glob"], json!(["*.rs", "!generated.rs"]));
+    assert_eq!(options["regexp"], json!(["read"]));
+    assert_eq!(options["symbolQuery"], json!(["parse source"]));
+    assert_eq!(options["formats"], json!(["all"]));
+    assert_eq!(options["private"], true);
+    assert_eq!(options["excludeComments"], true);
+    assert_eq!(options["excludeTests"], true);
+    assert_eq!(options["includeBlankLines"], true);
+    assert!(options.get("limit").is_none());
+    assert!(options.get("callers").is_none());
+    let cli = parse(&["lines"]);
+    assert_eq!(
+        CommandMode::for_command(&cli.command),
+        CommandMode::Structure
+    );
+    let Command::Lines(args) = cli.command else {
+        panic!("expected lines")
+    };
+    assert!(args.limit.is_none());
+    assert!(!args.include_blank_lines);
+    assert_eq!(args.options(&args.paths)["includeBlankLines"], false);
+    assert_eq!(args.paths, [PathBuf::from(".")]);
+    for limit in ["0", "-1", "bad"] {
+        assert!(Cli::try_parse_from(["slopdex", "lines", "--limit", limit]).is_err());
+    }
+    assert!(Cli::try_parse_from(["slopdex", "lines", "--limit", "none"]).is_ok());
+}
+
+#[test]
 fn embedding_setup_accepts_global_flags_before_and_after_commands() {
     for args in [
         vec![
@@ -284,6 +342,7 @@ fn shared_selection_arguments_reach_all_search_options() {
 fn formats_are_shared_selection_and_do_not_replace_settings_path() {
     for command in [
         "map",
+        "lines",
         "search",
         "search-code",
         "search-descriptions",
@@ -294,7 +353,7 @@ fn formats_are_shared_selection_and_do_not_replace_settings_path() {
         "cross-search",
     ] {
         let mut argv = vec!["--config", "settings/custom.json", command];
-        if !matches!(command, "map" | "cross-search") {
+        if !matches!(command, "map" | "lines" | "cross-search") {
             argv.push("query");
         }
         let options = |cli: Cli| {
@@ -304,6 +363,7 @@ fn formats_are_shared_selection_and_do_not_replace_settings_path() {
             );
             match cli.command {
                 Command::Map(args) => args.options(),
+                Command::Lines(args) => args.options(&args.paths),
                 Command::Search(args) => args.query.filters.options(),
                 Command::SearchCode(args)
                 | Command::SearchDescriptions(args)

@@ -92,7 +92,7 @@ fn run() -> Result<()> {
             "--help",
         ],
     )?;
-    for name in ["search", "cross-search", "describe"] {
+    for name in ["search", "cross-search", "describe", "lines"] {
         if !help.contains(name) {
             return Err(format!("Native help is missing {name}").into());
         }

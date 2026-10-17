@@ -15,6 +15,8 @@ The main supported functions are
 
 - `slopdex map [PATH]...`
    <br/>show a map/skeleton of the code structure
+- `slopdex lines [PATH]...`
+   <br/>count lines of code/docs
 - `slopdex cross-search`
    <br/>find clusters of similar code
 - `slopdex search "QUERY1" ["QUERY2"...]`
@@ -23,6 +25,8 @@ The main supported functions are
    <br/>explain code relevant to a task
 
 `map` shows a map/skeleton of the code, excluding implementation details like function bodies. This can be helpful to get a concise map of the code to allow an LLM to explore the codebase incrementally.
+
+`lines` shows a folder/file tree with line counts, allowing for ignoring comments and tests and aggregating across top folders.
 
 `search` does a vector search across code/docs and optionally other formats.
 
@@ -70,21 +74,11 @@ Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). Regexes matc
 
 Use `--detail expanded` to show full code or markdown of matched symbols.
 
-`--callers N` and `--callees N` add up to N levels of callable graph context,
-including same-file callees as declarations in grouped file output. Each depth
-defaults to `0`, or `1` with expanded detail; `--expand-callers N` and
-`--expand-callees N` raise the corresponding traversal depth when needed and show
-full code at those depths.
+`--callers N` and `--callees N` add up to N levels of callable graph context. Under `--detail expanded` N defaults to 1.
 
-`--refs none|all|cross-file` independently controls outgoing reference annotations,
-including functions and conservatively resolved non-callable targets. `all` includes
-same-file references; `none` hides annotations without disabling traversal.
-The default is `cross-file` when either effective traversal depth is nonzero,
-otherwise `none`. Explicit `all` or `cross-file` works even at zero traversal
-without adding referenced declarations. See the [reference](docs/reference.md#callable-context-and-outgoing-references)
-for text and JSON output.
-
-See the [selector reference](docs/reference.md#shared-selectors).
+`--refs none|all|cross-file` controls references symbols, including callees, which are displayed as comments below a function.
+Defaults to `cross-file` when `--callers` or `--callees` is non-zero, otherwise `none`. `all` shows intra-file references as well.
+See the [reference](docs/reference.md#callable-context-and-outgoing-references) and [selector reference](docs/reference.md#shared-selectors).
 
 > [!NOTE]
 > Add this to your `AGENTS.md` to let the agent use the map command to explore the codebase:
@@ -94,6 +88,26 @@ See the [selector reference](docs/reference.md#shared-selectors).
 > - Avoid mapping repeatedly, frontload the map in one call.
 > - Don't pipe the output through `head`, instead save it to a file and read from there.
 > ```
+
+## Count lines
+
+```console
+$ slopdex lines src docs
+$ slopdex lines src --include-blank-lines
+$ slopdex lines -g '*.rs' --exclude-comments --exclude-tests
+$ slopdex lines --formats all --limit 10
+$ slopdex lines src -e 'refresh|search' -i
+$ slopdex lines -q 'validate session' --symbol-threshold 0.6 --output json
+```
+
+Counts whole file contents excluding empty lines (or include them with `--include-blank-lines`). With `-e` or `-q` it counts the source lines of matching symbols or documentation sections.
+
+- `-g` can be used to match files and `--formats` to select formats (default: `code,docs`).
+- `--exclude-comments` excludes language-specific comments or docstrings.
+- `--exclude-tests` excludes `*.test.ts`, `*.spec.ts`, and `*_test.go` as well as inline tests, including rust's `#[test]` and `#[cfg(test)]`.
+- `--limit 10` shows the largest files or folders by line count.
+
+See the [line-count reference](docs/reference.md#line-counts) for details.
 
 ## Search
 

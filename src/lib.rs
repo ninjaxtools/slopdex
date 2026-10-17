@@ -6,6 +6,7 @@ pub mod filter;
 pub mod formats;
 pub mod git;
 mod limits;
+mod lines;
 pub mod map;
 pub mod models;
 pub mod parse;
