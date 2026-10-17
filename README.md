@@ -70,15 +70,19 @@ $ slopdex map src --callers 0 --callees 0 --refs all
 
 The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains structurally useful information that can act as an index into the source code, which improves context usage.
 
-Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). Regexes match qualified names or callable source text, including function bodies. The `-q` filter uses vector search on symbol names and markdown heading titles.
+The following can be combined (OR) to show only the matching symbols:
+
+- `-e <regex>` regex over symbols and function bodies
+- `-q <query>` vector search on symbol names and markdown titles.
 
 Use `--detail expanded` to show full code or markdown of matched symbols.
 
 `--callers N` and `--callees N` show up to N levels of callable graph context. Under `--detail expanded` N defaults to 1.
 
-`--refs none|all|cross-file` controls referenced symbols, including callees, which are displayed as comments below a function.
+`--refs none|all|cross-file` controls whether references are displayed as comments below a function.
 Defaults to `cross-file` when `--callers` or `--callees` is non-zero, otherwise `none`. `all` shows intra-file references as well.
-See the [reference](docs/reference.md#callable-context-and-outgoing-references) and [selector reference](docs/reference.md#shared-selectors).
+
+See the [outgoing references](docs/reference.md#callable-context-and-outgoing-references) and [selector reference](docs/reference.md#shared-selectors).
 
 > [!NOTE]
 > Add this to your `AGENTS.md` to let the agent use the map command to explore the codebase:
@@ -107,7 +111,7 @@ Counts whole file contents excluding empty lines (or include them with `--includ
 - `--exclude-comments` excludes language-specific comments or docstrings.
 - `--exclude-tests` excludes `*.test.ts`, `*.spec.ts`, and `*_test.go` as well as inline tests, including rust's `#[test]` and `#[cfg(test)]`.
 - `--limit 10` shows the largest files or folders by line count in the default tree.
-- `--output files` prints a flat text list of files with line counts, sorted by descending count (ties by path ascending). `--limit N` keeps only the top N files across all supplied workspaces; the default and `--limit none` show all files. The default tree and `--output json` hierarchy are unchanged.
+- `--output files` outputs a descending list of files with line counts.
 
 See the [line-count reference](docs/reference.md#line-counts) for details.
 
