@@ -58,13 +58,13 @@ pub(in crate::cli) fn print_cross(
     if format == Format::Json && source_presentation.calls_enabled() {
         for row in &mut rows {
             row["relatedCallables"] = json!(source_presentation.related_json(&row["source"]));
-            row["callees"] = json!(source_presentation.outgoing_json(&row["source"]));
+            row["references"] = json!(source_presentation.outgoing_json(&row["source"]));
             for item in row["matches"].as_array_mut().into_iter().flatten() {
                 let view = target_presentation
                     .as_deref()
                     .unwrap_or(source_presentation);
                 item["relatedCallables"] = json!(view.related_json(&item["function"]));
-                item["callees"] = json!(view.outgoing_json(&item["function"]));
+                item["references"] = json!(view.outgoing_json(&item["function"]));
             }
         }
     }

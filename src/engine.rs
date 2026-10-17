@@ -2558,6 +2558,11 @@ impl Engine {
     }
 
     pub fn describe(&self, query: &str, options: &Value) -> Result<Value> {
+        let expand_callers = options["expandCallers"].as_u64().unwrap_or(2) as usize;
+        let expand_callees = options["expandCallees"].as_u64().unwrap_or(2) as usize;
+        let callers = (options["callers"].as_u64().unwrap_or(0) as usize).max(expand_callers);
+        let callees = (options["callees"].as_u64().unwrap_or(0) as usize).max(expand_callees);
+        let refs = crate::map::reference_mode(options, callers, callees)?;
         let matches = self.search(query, "search", options)?;
         let mut files = BTreeMap::<String, Value>::new();
         for item in &matches {
@@ -2587,16 +2592,8 @@ impl Engine {
         let search = crate::cli::describe_search_context(
             self,
             &matches,
-            (options["callers"]
-                .as_u64()
-                .unwrap_or(0)
-                .max(options["expandCallers"].as_u64().unwrap_or(2))) as usize,
-            (options["callees"]
-                .as_u64()
-                .unwrap_or(0)
-                .max(options["expandCallees"].as_u64().unwrap_or(2))) as usize,
-            options["expandCallers"].as_u64().unwrap_or(2) as usize,
-            options["expandCallees"].as_u64().unwrap_or(2) as usize,
+            (callers, callees, expand_callers, expand_callees),
+            refs,
             options["expandCodeThreshold"].as_f64().unwrap_or(0.9),
         )?;
         let search_budget = DESCRIBE_PROMPT_BYTES - prompt.len();

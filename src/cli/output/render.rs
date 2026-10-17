@@ -126,10 +126,7 @@ impl<'a> Presentation<'a> {
         let path = function["path"].as_str()?;
         let structure = self.graph.as_ref()?.files.get(path)?;
         let node = map::matching_node(structure, function)?;
-        if !matches!(
-            node.kind.as_str(),
-            "function" | "method" | "constructor" | "generator"
-        ) {
+        if node.kind == "heading" {
             return None;
         }
         Some(Key {
@@ -154,13 +151,13 @@ impl<'a> Presentation<'a> {
         }
     }
 
-    fn call_list(&self, path: &str, id: usize, depth: usize) -> Option<String> {
+    fn reference_list(&self, path: &str, id: usize, depth: usize) -> Option<String> {
         let key = Key {
             path: path.to_owned(),
             id,
         };
-        let calls = self.expanded.as_ref()?.comments.get(&key)?;
-        map::render_callees(path, calls.iter().map(String::as_str), depth)
+        let references = self.graph.as_ref()?.references(&key, self.calls.refs);
+        map::render_references(path, references.iter().map(String::as_str), depth)
     }
 
     fn code(
@@ -201,6 +198,7 @@ impl<'a> Presentation<'a> {
             let node = graph.node(other)?;
             let mut value = serde_json::to_value(node).ok()?;
             value.as_object_mut()?.remove("calls");
+            value.as_object_mut()?.remove("referenceSites");
             if code_keys.contains(other) {
                 value["expandedCode"] = json!(true);
                 if let Some(code) = self.engine.and_then(|engine| engine.presentation_source(&other.path))
@@ -208,7 +206,7 @@ impl<'a> Presentation<'a> {
                     value["source"] = json!(code);
                 }
             }
-            Some(json!({"path":other.path,"node":value,"callDepth":depth,"callees":expanded.comments.get(other).cloned().unwrap_or_default()}))
+            Some(json!({"path":other.path,"node":value,"callDepth":depth,"references":graph.references(other, self.calls.refs)}))
         }).collect()
     }
 
@@ -216,11 +214,7 @@ impl<'a> Presentation<'a> {
         let (Some(graph), Some(key)) = (&self.graph, self.key(function)) else {
             return Vec::new();
         };
-        graph
-            .expand([key.clone()], self.calls.callers, self.calls.callees)
-            .comments
-            .remove(&key)
-            .unwrap_or_default()
+        graph.references(&key, self.calls.refs)
     }
 
     #[cfg(test)]
@@ -354,10 +348,10 @@ fn print_function_with_header(
         writeln!(out, "{}{name}{suffix}", map::hunk(start, end, None))?;
     }
     if let Some(key) = presentation.key(function)
-        && let Some(calls) =
-            presentation.call_list(&key.path, key.id, nodes.len().saturating_sub(1))
+        && let Some(references) =
+            presentation.reference_list(&key.path, key.id, nodes.len().saturating_sub(1))
     {
-        write!(out, "{calls}")?;
+        write!(out, "{references}")?;
     }
     if let Some(node) = nodes.last()
         && let Some(code) =
@@ -585,7 +579,7 @@ fn print_ranked_file(
     let structure = presentation.structure(path)?.cloned();
     let mut selected = HashMap::<usize, StructureNode>::new();
     let mut annotations: HashMap<usize, String> = HashMap::new();
-    let mut callees = HashMap::new();
+    let mut references = HashMap::new();
     let mut extras = HashMap::new();
     let mut descriptions = HashMap::new();
     let mut unmatched = Vec::new();
@@ -682,9 +676,6 @@ fn print_ranked_file(
                 for ancestor in map::ancestors(structure, node) {
                     selected.entry(ancestor.id).or_insert(ancestor);
                 }
-                if let Some(calls) = expanded.comments.get(key) {
-                    callees.insert(key.id, calls.clone());
-                }
                 if let Some(code) = presentation.code(path, node, None, detail) {
                     let extra = extras.entry(key.id).or_insert_with(String::new);
                     if !extra.contains("@ code:\n") {
@@ -696,6 +687,18 @@ fn print_ranked_file(
     }
     let mut nodes: Vec<_> = selected.into_values().collect();
     nodes.sort_by_key(StructureNode::source_order_key);
+    if let Some(graph) = &presentation.graph {
+        for node in &nodes {
+            let key = Key {
+                path: path.to_owned(),
+                id: node.id,
+            };
+            let outgoing = graph.references(&key, presentation.calls.refs);
+            if !outgoing.is_empty() {
+                references.insert(node.id, outgoing);
+            }
+        }
+    }
     unmatched.sort_by_key(|hit| {
         (
             hit.item["startLine"].as_u64().unwrap_or(1),
@@ -753,7 +756,7 @@ fn print_ranked_file(
                 },
                 map::HitDetails {
                     annotations: Some(&annotations),
-                    callees: Some(&callees),
+                    references: Some(&references),
                     extras: Some(&extras)
                 },
             )

@@ -68,6 +68,7 @@ pub(super) fn parse(
         ..ParsedFile::default()
     };
     collect_calls(tree.root_node(), source, language, &mut result.structure);
+    super::references::collect(tree.root_node(), source, language, &mut result.structure);
     for candidate in collector.candidates {
         if super::shell::callable_has_error(candidate.node) {
             continue;

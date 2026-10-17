@@ -602,9 +602,108 @@ fn map_symbol_queries_accept_leading_hyphens() {
             "symbolQuery": ["-g glob filter matching", "typescript file patterns"],
             "private": true,
             "callers": 2,
-            "callees": 2
+            "callees": 2,
+            "refs": "cross-file"
         })
     );
+}
+
+#[test]
+fn reference_modes_parse_for_all_call_aware_commands() {
+    for command in [
+        vec!["map"],
+        vec!["search", "query"],
+        vec!["search-code", "query"],
+        vec!["search-descriptions", "query"],
+        vec!["search-md", "query"],
+        vec!["search-symbols", "query"],
+        vec!["describe", "query"],
+        vec!["cross-search"],
+    ] {
+        for mode in ["none", "all", "cross-file"] {
+            let mut args = command.clone();
+            args.extend(["--refs", mode]);
+            let cli = parse(&args);
+            let calls = match cli.command {
+                Command::Map(args) => args.calls,
+                Command::Search(args) => args.query.calls,
+                Command::SearchCode(args)
+                | Command::SearchDescriptions(args)
+                | Command::SearchMd(args)
+                | Command::SearchSymbols(args) => args.calls,
+                Command::Describe(args) => args.query.calls,
+                Command::CrossSearch(args) => args.calls,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                calls.resolve(Detail::Compact).refs,
+                mode.parse::<Refs>().unwrap()
+            );
+            assert_eq!(
+                calls.resolve(Detail::Expanded).refs,
+                mode.parse::<Refs>().unwrap()
+            );
+            assert_eq!(
+                calls.resolve_describe_context().refs,
+                mode.parse::<Refs>().unwrap()
+            );
+        }
+        for mode in ["", "local", "cross_file", "ALL"] {
+            let mut args = command.clone();
+            args.extend(["--refs", mode]);
+            assert!(Cli::try_parse_from(std::iter::once("slopdex").chain(args)).is_err());
+        }
+    }
+}
+
+#[test]
+fn reference_defaults_follow_effective_call_depths() {
+    for (args, detail, expected) in [
+        (vec![], Detail::Compact, Refs::None),
+        (vec![], Detail::Standard, Refs::None),
+        (vec![], Detail::Expanded, Refs::CrossFile),
+        (vec!["--callers", "1"], Detail::Compact, Refs::CrossFile),
+        (vec!["--callees", "2"], Detail::Compact, Refs::CrossFile),
+        (
+            vec!["--expand-callers", "1"],
+            Detail::Compact,
+            Refs::CrossFile,
+        ),
+        (
+            vec!["--expand-callables", "1"],
+            Detail::Compact,
+            Refs::CrossFile,
+        ),
+        (
+            vec!["--callers", "0", "--callees", "0"],
+            Detail::Expanded,
+            Refs::None,
+        ),
+        (
+            vec!["--callers", "1", "--refs", "none"],
+            Detail::Compact,
+            Refs::None,
+        ),
+        (vec!["--refs", "all"], Detail::Compact, Refs::All),
+    ] {
+        let mut argv = vec!["map"];
+        argv.extend(args);
+        let Command::Map(args) = parse(&argv).command else {
+            unreachable!()
+        };
+        assert_eq!(args.calls.resolve(detail).refs, expected, "{argv:?}");
+        let options = args.options_for(detail);
+        assert_eq!(
+            Refs::resolve(
+                options["refs"].as_str(),
+                options["callers"].as_u64().unwrap_or(0) as usize,
+                options["callees"].as_u64().unwrap_or(0) as usize
+            )
+            .unwrap(),
+            expected,
+            "{argv:?}"
+        );
+    }
 }
 
 #[test]

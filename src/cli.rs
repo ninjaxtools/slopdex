@@ -468,6 +468,7 @@ fn run_workspace(
             options["callees"] = json!(context.callees);
             options["expandCallers"] = json!(context.expand_callers);
             options["expandCallees"] = json!(context.expand_callees);
+            options["refs"] = json!(context.refs);
             options["expandCodeThreshold"] = json!(cli.global.expand_code_threshold);
             let mut result = ui::spin("Generating explanation", || {
                 engine.describe(&args.query.query, &options)
@@ -483,7 +484,7 @@ fn run_workspace(
                             let related = presentation.related_json(function);
                             let outgoing = presentation.outgoing_json(function);
                             function["relatedCallables"] = json!(related);
-                            function["callees"] = json!(outgoing);
+                            function["references"] = json!(outgoing);
                         }
                     }
                 }

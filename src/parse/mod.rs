@@ -9,11 +9,12 @@ mod data;
 mod descriptions;
 mod imports;
 mod markdown;
+mod references;
 mod shell;
 mod structure;
 mod syntax;
 
-pub use structure::{CallSite, FileStructure, ImportBinding, StructureNode};
+pub use structure::{CallSite, FileStructure, ImportBinding, ReferenceSite, StructureNode};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

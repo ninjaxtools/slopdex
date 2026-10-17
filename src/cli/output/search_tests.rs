@@ -185,6 +185,7 @@ fn file_hits_group_with_callable_and_symbol_hits_and_preserve_json_with_calls() 
     ];
     let calls = crate::cli::args::CallDepths {
         callees: 1,
+        refs: crate::callgraph::Refs::All,
         ..Default::default()
     };
     for detail in [Detail::Compact, Detail::Standard, Detail::Expanded] {
@@ -205,7 +206,7 @@ fn file_hits_group_with_callable_and_symbol_hits_and_preserve_json_with_calls() 
             enriched[1]["relatedCallables"],
             enriched[3]["relatedCallables"]
         );
-        assert_eq!(enriched[1]["callees"], json!(["api.rs:3:check"]));
+        assert_eq!(enriched[1]["references"], json!(["api.rs:3:check"]));
         out.clear();
         print_search(
             &mut out,
@@ -232,12 +233,124 @@ fn file_hits_group_with_callable_and_symbol_hits_and_preserve_json_with_calls() 
             output.matches("Handles requests.").count(),
             usize::from(detail != Detail::Compact)
         );
-        assert!(output.contains("callees: api.rs:check"), "{output}");
+        assert!(output.contains("  // api.rs:check"), "{output}");
         assert!(!output.contains("pub const TIMEOUT"), "{output}");
     }
-    let context = super::describe_search_context(&engine, &rows, 0, 0, 0, 0, 0.9)?;
+    let context = super::describe_search_context(
+        &engine,
+        &rows,
+        (0, 0, 0, 0),
+        crate::callgraph::Refs::None,
+        0.9,
+    )?;
     assert!(context.contains("*** api.rs  // score=0.98"));
     assert!(context.contains("// Handles requests.\n// Checks permissions."));
+    Ok(())
+}
+
+#[test]
+fn search_reference_modes_work_without_call_traversal_for_functions_and_types() -> Result<()> {
+    use crate::callgraph::Refs;
+    use crate::cli::args::CallDepths;
+
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("api.ts"),
+        "import { Config, LIMIT, helper } from './defs';\nconst LOCAL = 1;\nexport function run(config: Config) { return helper(config) + LIMIT + LOCAL; }\nexport type Options = Config;\n",
+    )?;
+    fs::write(
+        dir.path().join("defs.ts"),
+        "export interface Config { value: number }\nexport const LIMIT = 3;\nexport function helper(config: Config) { return config.value; }\n",
+    )?;
+    let mut engine = Engine::open_map(
+        dir.path(),
+        &dir.path().join("index.sqlite"),
+        map_config(dir.path()),
+    )?;
+    engine.refresh_structure()?;
+    let structure = engine.presentation_structure("api.ts")?.unwrap();
+    let rows: Vec<_> = ["run", "Options"]
+        .into_iter()
+        .map(|name| {
+            let node = structure
+                .nodes
+                .iter()
+                .find(|node| node.name == name)
+                .unwrap();
+            let mut symbol = serde_json::to_value(node).unwrap();
+            symbol["path"] = json!("api.ts");
+            json!({"type":"symbol", "symbol":symbol, "similarity":0.7})
+        })
+        .collect();
+    for refs in [Refs::None, Refs::All, Refs::CrossFile] {
+        let calls = CallDepths {
+            refs,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        print_search(
+            &mut out,
+            &rows,
+            Format::Json,
+            Detail::Compact,
+            false,
+            &mut Presentation::with_calls(&engine, calls, 0.9)?,
+        )?;
+        let rendered: Value = serde_json::from_slice(&out)?;
+        for row in rendered.as_array().unwrap() {
+            assert!(super::super::array(&row["relatedCallables"]).is_empty());
+            assert!(row.get("callees").is_none());
+        }
+        if refs == Refs::None {
+            assert_eq!(rendered, json!(rows));
+        } else {
+            let outgoing = rendered[0]["references"].as_array().unwrap();
+            for name in ["Config", "LIMIT", "helper"] {
+                assert!(
+                    outgoing.iter().any(|reference| reference
+                        .as_str()
+                        .unwrap()
+                        .ends_with(&format!(":{name}"))),
+                    "{rendered}"
+                );
+            }
+            assert_eq!(
+                outgoing
+                    .iter()
+                    .any(|reference| reference.as_str().unwrap().ends_with(":LOCAL")),
+                refs == Refs::All
+            );
+            assert_eq!(rendered[1]["references"], json!(["defs.ts:1:Config"]));
+        }
+        out.clear();
+        print_search(
+            &mut out,
+            &rows,
+            Format::Summary,
+            Detail::Compact,
+            false,
+            &mut Presentation::with_calls(&engine, calls, 0.9)?,
+        )?;
+        let rendered = String::from_utf8(out)?;
+        assert!(
+            rendered.contains("export function run(config: Config)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("export type Options"), "{rendered}");
+        assert_eq!(
+            rendered.contains("// defs.ts:"),
+            refs != Refs::None,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.contains("// api.ts:LOCAL"),
+            refs == Refs::All,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("*** defs.ts"), "{rendered}");
+        assert!(!rendered.contains("const LOCAL"), "{rendered}");
+        assert!(!rendered.contains("callees:"), "{rendered}");
+    }
     Ok(())
 }
 

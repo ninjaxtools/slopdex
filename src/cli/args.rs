@@ -1,6 +1,6 @@
 //! Command-line declarations, parsing, and argument validation.
 
-use crate::{filter, formats::FormatGroup, limits::ResultLimit, map, ui};
+use crate::{callgraph::Refs, filter, formats::FormatGroup, limits::ResultLimit, map, ui};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -326,6 +326,9 @@ pub(super) struct CallArgs {
     /// Include this many levels of functions called by selected callables (expanded default: 1)
     #[arg(long)]
     pub(super) callees: Option<usize>,
+    /// Reference annotations: none, all, or cross-file (default: cross-file with call traversal, otherwise none)
+    #[arg(long, value_name = "MODE")]
+    pub(super) refs: Option<Refs>,
     /// Include this many caller levels with full indexed code in text output
     #[arg(long)]
     pub(super) expand_callers: Option<usize>,
@@ -339,9 +342,16 @@ impl CallArgs {
         let default = usize::from(detail == Detail::Expanded);
         let expand_callers = self.expand_callers.unwrap_or(0);
         let expand_callees = self.expand_callees.unwrap_or(0);
+        let callers = self.callers.unwrap_or(default).max(expand_callers);
+        let callees = self.callees.unwrap_or(default).max(expand_callees);
         CallDepths {
-            callers: self.callers.unwrap_or(default).max(expand_callers),
-            callees: self.callees.unwrap_or(default).max(expand_callees),
+            callers,
+            callees,
+            refs: self.refs.unwrap_or(if callers > 0 || callees > 0 {
+                Refs::CrossFile
+            } else {
+                Refs::None
+            }),
             expand_callers,
             expand_callees,
         }
@@ -361,13 +371,14 @@ impl CallArgs {
 pub(super) struct CallDepths {
     pub(super) callers: usize,
     pub(super) callees: usize,
+    pub(super) refs: Refs,
     pub(super) expand_callers: usize,
     pub(super) expand_callees: usize,
 }
 
 impl CallDepths {
     pub(super) fn enabled(self) -> bool {
-        self.callers > 0 || self.callees > 0
+        self.callers > 0 || self.callees > 0 || self.refs.enabled()
     }
 }
 
@@ -392,9 +403,12 @@ impl MapArgs {
             value["limit"] = limit.value();
         }
         let calls = self.calls.resolve(detail);
-        if calls.enabled() {
+        if calls.callers > 0 || calls.callees > 0 {
             value["callers"] = json!(calls.callers);
             value["callees"] = json!(calls.callees);
+        }
+        if self.calls.refs.is_some() || calls.refs.enabled() {
+            value["refs"] = json!(calls.refs);
         }
         if calls.expand_callers > 0 {
             value["expandCallers"] = json!(calls.expand_callers);

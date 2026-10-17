@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// Bump when the structure or search-unit extraction contract changes.
-pub const STRUCTURE_PARSER_VERSION: &str = "structure-v13-nested-type-members";
+pub const STRUCTURE_PARSER_VERSION: &str = "structure-v14-symbol-references";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -1468,7 +1468,7 @@ fn write_structure(conn: &Connection, path: &str, structure: &FileStructure) -> 
             .as_deref()
             .map(|text| description_reference(conn, text))
             .transpose()?;
-        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level,"calls":node.calls,"descriptionHash":description_hash,"declarationStartLine":node.declaration_start_line,"declarationStartByte":node.declaration_start_byte});
+        let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level,"calls":node.calls,"references":node.references,"descriptionHash":description_hash,"declarationStartLine":node.declaration_start_line,"declarationStartByte":node.declaration_start_byte});
         conn.execute("INSERT INTO symbols(path,id,parent_id,ordinal,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![path, i64::try_from(node.id)?, node.parent_id.map(i64::try_from).transpose()?, i64::try_from(ordinal)?, node.language, node.kind, node.name, node.qualified_name,
                 node.signature, i64::try_from(node.start_byte)?, i64::try_from(node.end_byte)?, i64::try_from(node.start_line)?, i64::try_from(node.start_column)?, i64::try_from(node.end_line)?, i64::try_from(node.end_column)?, metadata.to_string()])?;
@@ -1534,6 +1534,8 @@ fn read_structure(conn: &Connection, path: &str) -> Result<FileStructure> {
                 serde_json::from_value(metadata["declarationStartByte"].clone())?;
             node.calls =
                 serde_json::from_value(metadata.get("calls").cloned().unwrap_or(json!([])))?;
+            node.references =
+                serde_json::from_value(metadata.get("references").cloned().unwrap_or(json!([])))?;
             node.description = metadata["descriptionHash"]
                 .as_str()
                 .map(|key| {

@@ -5,9 +5,48 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    parse::{FileStructure, ImportBinding, ParsedFile, StructureNode},
+    parse::{FileStructure, ImportBinding, ParsedFile, ReferenceSite, StructureNode},
     storage::{Database, STRUCTURE_PARSER_VERSION},
 };
+
+/// Outgoing symbol comments are independent of bounded callable traversal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Refs {
+    #[default]
+    None,
+    All,
+    CrossFile,
+}
+
+impl std::str::FromStr for Refs {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "all" => Ok(Self::All),
+            "cross-file" => Ok(Self::CrossFile),
+            _ => anyhow::bail!("Invalid refs mode {value:?}; expected none, all, or cross-file"),
+        }
+    }
+}
+
+impl Refs {
+    pub fn resolve(value: Option<&str>, callers: usize, callees: usize) -> Result<Self> {
+        value.map(str::parse).unwrap_or_else(|| {
+            Ok(if callers > 0 || callees > 0 {
+                Self::CrossFile
+            } else {
+                Self::None
+            })
+        })
+    }
+
+    pub fn enabled(self) -> bool {
+        self != Self::None
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,7 +67,6 @@ pub struct Depth {
 #[derive(Default)]
 pub struct Expansion {
     pub depths: BTreeMap<Key, Depth>,
-    pub comments: BTreeMap<Key, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -38,6 +76,8 @@ pub struct CallGraph {
     edges: BTreeMap<Key, BTreeSet<Key>>,
     #[serde(with = "edge_map")]
     reverse: BTreeMap<Key, BTreeSet<Key>>,
+    #[serde(default, with = "edge_map")]
+    references: BTreeMap<Key, BTreeSet<Key>>,
 }
 
 mod edge_map {
@@ -135,8 +175,23 @@ impl CallGraph {
             files,
             edges: BTreeMap::new(),
             reverse: BTreeMap::new(),
+            references: BTreeMap::new(),
         };
         for (path, structure) in &graph.files {
+            for node in &structure.nodes {
+                for site in &node.references {
+                    if let Some(to) = resolve_reference(&graph.files, path, node, site) {
+                        graph
+                            .references
+                            .entry(Key {
+                                path: path.clone(),
+                                id: node.id,
+                            })
+                            .or_default()
+                            .insert(to);
+                    }
+                }
+            }
             for node in structure.nodes.iter().filter(|n| callable(n)) {
                 let from = Key {
                     path: path.clone(),
@@ -154,6 +209,16 @@ impl CallGraph {
                         &site.name,
                         site.receiver.as_deref(),
                     ) {
+                        // Shell command lookup has a separate namespace from
+                        // variables. Its static callable sites already supply
+                        // the conservative function references we can support.
+                        if node.language == "bash" {
+                            graph
+                                .references
+                                .entry(from.clone())
+                                .or_default()
+                                .insert(to.clone());
+                        }
                         graph
                             .edges
                             .entry(from.clone())
@@ -169,6 +234,31 @@ impl CallGraph {
 
     pub fn node(&self, key: &Key) -> Option<&StructureNode> {
         node_by_id(self.files.get(&key.path)?, key.id)
+    }
+
+    /// Resolved outgoing symbol locations, regardless of traversal membership.
+    pub fn references(&self, key: &Key, refs: Refs) -> Vec<String> {
+        if !refs.enabled() {
+            return Vec::new();
+        }
+        self.references
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|target| refs != Refs::CrossFile || target.path != key.path)
+            .filter_map(|target| {
+                self.node(target).map(|node| {
+                    crate::map::symbol_location(
+                        &target.path,
+                        node.start_line,
+                        node.end_line,
+                        &node.qualified_name,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub fn expand(
@@ -208,25 +298,6 @@ impl CallGraph {
                 };
                 for neighbor in neighbors.into_iter().flatten() {
                     queue.push_back((neighbor.clone(), level + 1));
-                }
-            }
-        }
-        for (caller, callees) in &self.edges {
-            if !result.depths.contains_key(caller) {
-                continue;
-            }
-            for callee in callees {
-                if result.depths.contains_key(callee)
-                    && let Some(node) = self.node(callee)
-                {
-                    result.comments.entry(caller.clone()).or_default().push(
-                        crate::map::symbol_location(
-                            &callee.path,
-                            node.start_line,
-                            node.end_line,
-                            &node.qualified_name,
-                        ),
-                    );
                 }
             }
         }
@@ -342,6 +413,325 @@ fn module_binding(language: &str, binding: &ImportBinding) -> bool {
     !matches!(language, "javascript" | "jsx" | "typescript" | "tsx")
         || binding.wildcard
         || binding.name.is_none()
+}
+
+/// General references use the parser's lexical binding, not the callable
+/// resolver's candidate search. In particular, an unknown local must never
+/// fall back to a same-named import or a globally unique declaration.
+fn resolve_reference(
+    files: &BTreeMap<String, FileStructure>,
+    path: &str,
+    owner: &StructureNode,
+    site: &ReferenceSite,
+) -> Option<Key> {
+    let structure = files.get(path)?;
+    let binding = site.binding_id.and_then(|id| node_by_id(structure, id));
+    let mut candidates = BTreeSet::new();
+    if let Some(binding) = binding {
+        if binding.kind == "import" {
+            for import in &binding.imports {
+                let root = site.receiver.as_deref().unwrap_or(&site.name);
+                if local_name(&owner.language, import) != Some(root)
+                    || import.wildcard && site.receiver.is_none()
+                {
+                    continue;
+                }
+                for target in
+                    local_import_targets(structure, binding, import, site, &owner.language)
+                {
+                    candidates.insert(Key {
+                        path: path.to_owned(),
+                        id: target,
+                    });
+                }
+                for (other_path, other) in files {
+                    let namespace = site.receiver.is_some()
+                        && reference_namespace_matches(&owner.language, path, other_path, import);
+                    let matches_path = import_path_matches(
+                        path,
+                        other_path,
+                        import.source.as_deref(),
+                        &import.path,
+                        site.receiver.is_none() && owner.language != "java",
+                    ) || owner.language == "java"
+                        && site.receiver.is_none()
+                        && import_path_matches(path, other_path, None, &import.path, true);
+                    if !namespace && !matches_path {
+                        continue;
+                    }
+                    let target_name = if site.receiver.is_some() {
+                        site.name.as_str()
+                    } else {
+                        import.name.as_deref().unwrap_or(&site.name)
+                    };
+                    for target in &other.nodes {
+                        let named = target.names.iter().any(|name| name == target_name)
+                            || target.name == target_name
+                            || target_name == "default"
+                                && target.attributes.iter().any(|attr| attr == "default");
+                        if !named || matches!(target.kind.as_str(), "import" | "impl") {
+                            continue;
+                        }
+                        let valid = if let Some(receiver) = site.receiver.as_deref() {
+                            if target.parent_id.is_none() {
+                                namespace && (owner.language != "go" || target.kind != "method")
+                            } else {
+                                let container = import.name.as_deref().unwrap_or(receiver);
+                                target
+                                    .parent_id
+                                    .and_then(|id| node_by_id(other, id))
+                                    .is_some_and(|parent| {
+                                        container_named(parent, container)
+                                            && reference_static_member(target, parent)
+                                    })
+                            }
+                        } else {
+                            target.parent_id.is_none()
+                                || owner.language == "java"
+                                    && target
+                                        .parent_id
+                                        .and_then(|id| node_by_id(other, id))
+                                        .is_some_and(|parent| {
+                                            import.path.rsplit('.').nth(1) == Some(&parent.name)
+                                                && reference_static_member(target, parent)
+                                        })
+                        };
+                        if valid {
+                            candidates.insert(Key {
+                                path: other_path.clone(),
+                                id: target.id,
+                            });
+                        }
+                    }
+                }
+            }
+        } else if site.receiver.is_none() {
+            candidates.insert(Key {
+                path: path.to_owned(),
+                id: binding.id,
+            });
+        } else {
+            for target in &structure.nodes {
+                if target.name != site.name && !target.names.contains(&site.name) {
+                    continue;
+                }
+                let parent = target.parent_id.and_then(|id| node_by_id(structure, id));
+                let valid = parent.is_some_and(|parent| {
+                    (parent.id == binding.id
+                        || parent.kind == "impl"
+                            && binding.parent_id == parent.parent_id
+                            && impl_type(&parent.name) == binding.name)
+                        && reference_static_member(target, parent)
+                });
+                if valid {
+                    candidates.insert(Key {
+                        path: path.to_owned(),
+                        id: target.id,
+                    });
+                }
+            }
+        }
+    } else if owner.language == "c" && site.receiver.is_none() {
+        // Includes provide explicit cross-file evidence, unlike a globally
+        // unique name. Several headers defining the name remain ambiguous.
+        for import in structure.nodes.iter().filter(|node| node.kind == "import") {
+            for binding in &import.imports {
+                for (other_path, other) in files {
+                    if other_path == path || !header_path_matches(path, other_path, &binding.path) {
+                        continue;
+                    }
+                    for target in &other.nodes {
+                        if (target.name == site.name || target.names.contains(&site.name))
+                            && (target.parent_id.is_none()
+                                || target.kind == "variant"
+                                    && target
+                                        .parent_id
+                                        .and_then(|id| node_by_id(other, id))
+                                        .is_some_and(|parent| {
+                                            parent.kind == "enum" && parent.parent_id.is_none()
+                                        }))
+                            && !matches!(target.kind.as_str(), "import" | "impl")
+                        {
+                            candidates.insert(Key {
+                                path: other_path.clone(),
+                                id: target.id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    } else if matches!(
+        site.receiver.as_deref(),
+        Some("self" | "this" | "Self" | "cls")
+    ) {
+        let scope = std::iter::successors(owner.parent_id, |id| {
+            node_by_id(structure, *id).and_then(|node| node.parent_id)
+        })
+        .filter_map(|id| node_by_id(structure, id))
+        .find(|node| {
+            matches!(
+                node.kind.as_str(),
+                "class" | "struct" | "impl" | "interface"
+            )
+        });
+        if let Some(scope) = scope {
+            for target in &structure.nodes {
+                if target.parent_id == Some(scope.id)
+                    && (target.name == site.name || target.names.contains(&site.name))
+                    && (!matches!(site.receiver.as_deref(), Some("Self" | "cls"))
+                        || reference_static_member(target, scope))
+                {
+                    candidates.insert(Key {
+                        path: path.to_owned(),
+                        id: target.id,
+                    });
+                }
+            }
+        }
+    }
+    (candidates.len() == 1)
+        .then(|| candidates.into_iter().next())
+        .flatten()
+}
+
+/// Inline modules/namespaces are still same-file declarations. Resolve an
+/// explicit item path, never a bare-name search across unrelated containers.
+fn local_import_targets(
+    structure: &FileStructure,
+    declaration: &StructureNode,
+    import: &ImportBinding,
+    site: &ReferenceSite,
+    language: &str,
+) -> Vec<usize> {
+    let mut path: Vec<String> = match language {
+        "rust" => {
+            let mut module = std::iter::successors(declaration.parent_id, |id| {
+                node_by_id(structure, *id).and_then(|node| node.parent_id)
+            })
+            .filter_map(|id| node_by_id(structure, id))
+            .find(|node| node.kind == "module")
+            .map(|node| {
+                node.qualified_name
+                    .split('.')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+            let mut segments = import.path.split("::").peekable();
+            match segments.peek().copied() {
+                Some("self") => {
+                    segments.next();
+                }
+                Some("super") => {
+                    while segments.peek() == Some(&"super") {
+                        segments.next();
+                        if module.pop().is_none() {
+                            return Vec::new();
+                        }
+                    }
+                }
+                _ => {
+                    module.clear();
+                    if segments.peek() == Some(&"crate") {
+                        segments.next();
+                    }
+                }
+            }
+            module.extend(segments.map(str::to_owned));
+            module
+        }
+        "typescript" | "tsx" if import.source.is_none() && import.name.is_none() => {
+            import.path.split('.').map(str::to_owned).collect()
+        }
+        _ => return Vec::new(),
+    };
+    if site.receiver.is_some() {
+        path.push(site.name.clone());
+    }
+    let qualified = path.join(".");
+    structure
+        .nodes
+        .iter()
+        .filter(|target| {
+            target.qualified_name == qualified
+                && !matches!(target.kind.as_str(), "import" | "impl")
+                && (site.receiver.is_none()
+                    || target
+                        .parent_id
+                        .and_then(|id| node_by_id(structure, id))
+                        .is_some_and(|parent| reference_static_member(target, parent)))
+        })
+        .map(|target| target.id)
+        .collect()
+}
+
+fn header_path_matches(from: &str, target: &str, include: &str) -> bool {
+    let base = std::path::Path::new(from)
+        .parent()
+        .unwrap_or(std::path::Path::new(""));
+    let mut parts = Vec::new();
+    for part in base.join(include).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            _ => {}
+        }
+    }
+    target == parts.join("/") || target == include || target.ends_with(&format!("/{include}"))
+}
+
+fn reference_static_member(node: &StructureNode, parent: &StructureNode) -> bool {
+    parent.kind == "module"
+        || matches!(parent.kind.as_str(), "variable" | "constant")
+        || node.kind == "variant"
+        || callable(node)
+            && (node.kind == "constructor"
+                || if node.language == "rust" {
+                    node.kind == "method" && !rust_self_receiver(&node.signature)
+                } else {
+                    node.signature
+                        .split_whitespace()
+                        .any(|word| word == "static")
+                        || node.attributes.iter().any(|attribute| {
+                            attribute.contains("staticmethod") || attribute.contains("classmethod")
+                        })
+                })
+        || !callable(node)
+            && (node.language == "python"
+                || node.language == "rust" && matches!(node.kind.as_str(), "constant" | "type")
+                || node
+                    .signature
+                    .split_whitespace()
+                    .any(|word| word == "static")
+                || matches!(node.kind.as_str(), "class" | "struct" | "enum" | "type"))
+}
+
+/// A value imported from a module is not itself that module. Verify the full
+/// module path before accepting top-level members through a receiver.
+fn reference_namespace_matches(
+    language: &str,
+    from: &str,
+    target: &str,
+    binding: &ImportBinding,
+) -> bool {
+    match language {
+        "rust" => rust_import_matches(from, target, &format!("{}::__member", binding.path), true),
+        "python" => import_path_matches(from, target, None, &binding.path, false),
+        "java" => false,
+        _ => {
+            module_binding(language, binding)
+                && import_path_matches(
+                    from,
+                    target,
+                    binding.source.as_deref(),
+                    &binding.path,
+                    false,
+                )
+        }
+    }
 }
 
 fn resolve(
@@ -677,6 +1067,384 @@ mod tests {
             .collect();
         result.sort();
         result
+    }
+
+    fn key(graph: &CallGraph, path: &str, name: &str) -> Key {
+        Key {
+            path: path.to_owned(),
+            id: graph.files[path]
+                .nodes
+                .iter()
+                .find(|node| node.qualified_name == name)
+                .unwrap_or_else(|| panic!("missing {path}:{name}"))
+                .id,
+        }
+    }
+
+    fn reference_names(graph: &CallGraph, path: &str, name: &str, mode: Refs) -> Vec<String> {
+        graph.references(&key(graph, path, name), mode)
+    }
+
+    #[test]
+    fn refs_modes_parse_serialize_and_default_from_effective_depths() {
+        assert_eq!(Refs::default(), Refs::None);
+        for (value, mode) in [
+            ("none", Refs::None),
+            ("all", Refs::All),
+            ("cross-file", Refs::CrossFile),
+        ] {
+            assert_eq!(value.parse::<Refs>().unwrap(), mode);
+            assert_eq!(Refs::resolve(Some(value), 4, 9).unwrap(), mode);
+            assert_eq!(
+                serde_json::to_string(&mode).unwrap(),
+                format!("\"{value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<Refs>(&format!("\"{value}\"")).unwrap(),
+                mode
+            );
+            assert_eq!(mode.enabled(), mode != Refs::None);
+        }
+        for value in ["", "crossFile", "ALL", "other"] {
+            assert!(
+                Refs::resolve(Some(value), 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("none, all, or cross-file")
+            );
+        }
+        assert_eq!(Refs::resolve(None, 0, 0).unwrap(), Refs::None);
+        assert_eq!(Refs::resolve(None, 1, 0).unwrap(), Refs::CrossFile);
+        assert_eq!(Refs::resolve(None, 0, 1).unwrap(), Refs::CrossFile);
+    }
+
+    #[test]
+    fn general_references_are_mode_filtered_and_do_not_expand_the_callable_graph() {
+        let graph = build(&[
+            (
+                "src/dep.rs",
+                "pub const LIMIT: usize = 4;\npub struct Config;\npub fn helper() {}\n",
+            ),
+            (
+                "src/main.rs",
+                "use crate::dep::{LIMIT, Config, helper};\nconst LOCAL: usize = 1;\nconst COPY: usize = LIMIT;\ntype Alias = Config;\nfn leaf() {}\nfn run(config: Config) { let callback = helper; let count = LIMIT + LIMIT + LOCAL; leaf(); }\n",
+            ),
+        ]);
+        let run = key(&graph, "src/main.rs", "run");
+        let all = graph.references(&run, Refs::All);
+        assert_eq!(all.len(), 5, "{all:?}");
+        for target in ["Config", "LIMIT", "helper", "LOCAL", "leaf"] {
+            assert!(
+                all.iter()
+                    .any(|location| location.ends_with(&format!(":{target}"))),
+                "{target}: {all:?}"
+            );
+        }
+        assert!(graph.references(&run, Refs::None).is_empty());
+        let cross = graph.references(&run, Refs::CrossFile);
+        assert_eq!(cross.len(), 3, "{cross:?}");
+        assert!(
+            cross
+                .iter()
+                .all(|location| location.starts_with("src/dep.rs:"))
+        );
+        assert_eq!(
+            reference_names(&graph, "src/main.rs", "COPY", Refs::All).len(),
+            1
+        );
+        assert_eq!(
+            reference_names(&graph, "src/main.rs", "Alias", Refs::All).len(),
+            1
+        );
+        assert_eq!(edges(&graph), ["src/main.rs:run -> src/main.rs:leaf"]);
+        let expansion = graph.expand([run.clone()], 0, 1);
+        assert!(
+            expansion
+                .depths
+                .contains_key(&key(&graph, "src/main.rs", "leaf"))
+        );
+        assert_eq!(
+            graph.code_keys(&expansion, 0, 1),
+            BTreeSet::from([key(&graph, "src/main.rs", "leaf")])
+        );
+        assert_eq!(graph.references(&run, Refs::CrossFile), cross);
+        assert!(
+            graph
+                .expand([key(&graph, "src/main.rs", "COPY")], 2, 2)
+                .depths
+                .is_empty()
+        );
+        let restored: CallGraph =
+            serde_json::from_value(serde_json::to_value(&graph).unwrap()).unwrap();
+        assert_eq!(restored.references(&run, Refs::All), all);
+    }
+
+    #[test]
+    fn typescript_imported_types_constants_variables_and_function_values() {
+        let graph = build(&[
+            (
+                "lib/dep.ts",
+                "export type Options = { value: number };\nexport const LIMIT = 4;\nexport let current = 0;\nexport function helper() {}\n",
+            ),
+            (
+                "lib/main.ts",
+                "import { Options as Settings, LIMIT, current, helper } from './dep';\ntype Alias = Settings;\nconst NEXT = LIMIT;\nconst callback = helper;\nfunction run(options: Settings) { return [LIMIT, current, helper, helper]; }\n",
+            ),
+        ]);
+        assert!(edges(&graph).is_empty());
+        let refs = reference_names(&graph, "lib/main.ts", "run", Refs::CrossFile);
+        assert_eq!(refs.len(), 4, "{refs:?}");
+        for (owner, target) in [
+            ("Alias", "Options"),
+            ("NEXT", "LIMIT"),
+            ("callback", "helper"),
+        ] {
+            let refs = reference_names(&graph, "lib/main.ts", owner, Refs::All);
+            assert_eq!(refs.len(), 1, "{owner}: {refs:?}");
+            assert!(refs[0].ends_with(&format!(":{target}")), "{refs:?}");
+        }
+    }
+
+    #[test]
+    fn reference_lookup_obeys_parameters_locals_blocks_and_nearest_lexical_scope() {
+        let graph = build(&[
+            (
+                "dep.ts",
+                "export const VALUE = 1;\nexport class Type {}\nexport function helper() {}\n",
+            ),
+            (
+                "main.ts",
+                "import { VALUE, Type, helper } from './dep';\nfunction shadow(VALUE: number, helper: unknown) { const Type = 0; return [VALUE, helper, Type]; }\nfunction outer(helper: unknown) { function inner() { return helper; } return inner; }\nfunction blocks() { { const helper = 0; helper; } return helper; }\nfunction generic<Type>(x: Type): Type { return x; }\nfunction nearest() { function helper() {} function nested() { return helper; } return helper; }\n",
+            ),
+        ]);
+        for owner in ["shadow", "outer.inner", "generic"] {
+            assert!(
+                reference_names(&graph, "main.ts", owner, Refs::All).is_empty(),
+                "{owner}"
+            );
+        }
+        let block_refs = reference_names(&graph, "main.ts", "blocks", Refs::All);
+        assert_eq!(block_refs.len(), 1, "{block_refs:?}");
+        assert!(block_refs[0].starts_with("dep.ts:"));
+        for owner in ["nearest", "nearest.nested"] {
+            let refs = reference_names(&graph, "main.ts", owner, Refs::All);
+            assert_eq!(refs.len(), 1, "{owner}: {refs:?}");
+            assert!(refs[0].ends_with(":nearest.helper"), "{refs:?}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_unimported_and_dynamic_references_are_not_guessed() {
+        let graph = build(&[
+            (
+                "dep.ts",
+                "export function validate() {}\nexport const config = {};\nexport class Config { static validate() {} run() {} }\n",
+            ),
+            (
+                "main.ts",
+                "import { config, Config } from './dep';\nfunction run(value: unknown) { config.validate(); value.validate(); Config.run(); validate; }\nfunction shadow(Config: unknown) { Config.validate(); }\nfunction overload(x: string): void;\nfunction overload(x: number): void;\nfunction overload(x: unknown) {}\nfunction ambiguous() { return overload; }\n",
+            ),
+        ]);
+        let refs = reference_names(&graph, "main.ts", "run", Refs::All);
+        assert!(
+            refs.iter()
+                .all(|location| !location.ends_with(":validate")
+                    && !location.ends_with(":Config.run")),
+            "{refs:?}"
+        );
+        assert!(reference_names(&graph, "main.ts", "shadow", Refs::All).is_empty());
+        assert!(reference_names(&graph, "main.ts", "ambiguous", Refs::All).is_empty());
+    }
+
+    #[test]
+    fn namespace_imports_and_static_noncallable_members_are_references() {
+        let graph = build(&[
+            (
+                "dep.ts",
+                "export const LIMIT = 1;\nexport function helper() {}\nexport class Config { static VALUE = 1; field = 0; static create() {} }\n",
+            ),
+            (
+                "main.ts",
+                "import * as dep from './dep';\nimport { Config } from './dep';\nfunction run() { const callback = dep.helper; return [dep.LIMIT, Config.VALUE, Config.create, Config.field]; }\n",
+            ),
+            (
+                "src/dep.rs",
+                "pub const LIMIT: usize = 1;\npub struct Config;\nimpl Config { pub const VALUE: usize = 2; pub fn new() -> Self { Config } }\n",
+            ),
+            (
+                "src/main.rs",
+                "use crate::dep;\nuse crate::dep::Config;\nfn run() { let f = Config::new; let n = dep::LIMIT + Config::VALUE; }\n",
+            ),
+        ]);
+        let ts = reference_names(&graph, "main.ts", "run", Refs::CrossFile);
+        assert_eq!(ts.len(), 5, "{ts:?}");
+        assert!(
+            ts.iter()
+                .all(|location| !location.ends_with(":Config.field"))
+        );
+        let rust = reference_names(&graph, "src/main.rs", "run", Refs::CrossFile);
+        assert_eq!(rust.len(), 4, "{rust:?}");
+        assert!(edges(&graph).is_empty());
+    }
+
+    #[test]
+    fn noncallable_references_resolve_in_python_go_java_and_c() {
+        let graph = build(&[
+            (
+                "dep.py",
+                "LIMIT = 1\nclass Config:\n    pass\ndef helper():\n    pass\n",
+            ),
+            (
+                "main.py",
+                "from dep import LIMIT, Config, helper\ndef run(value: Config):\n    return LIMIT, helper, Config\ndef shadow(LIMIT):\n    return LIMIT\n",
+            ),
+            (
+                "config/config.go",
+                "package config\nconst LIMIT = 1\ntype Config struct{}\nfunc Helper() {}\n",
+            ),
+            (
+                "cmd/main.go",
+                "package main\nimport cfg \"example.com/app/config\"\nfunc run(value cfg.Config) { f := cfg.Helper; _ = f; _ = cfg.LIMIT }\n",
+            ),
+            (
+                "pkg/Config.java",
+                "package pkg; public class Config { public static int VALUE = 1; }",
+            ),
+            (
+                "pkg/Constants.java",
+                "package pkg; public class Constants { public static final int LIMIT = 1; }",
+            ),
+            (
+                "Main.java",
+                "import pkg.Config; import static pkg.Constants.LIMIT; class Main { void run(Config value) { int n = Config.VALUE + LIMIT; } }",
+            ),
+            (
+                "include/dep.h",
+                "#define LIMIT 1\ntypedef int Config;\nextern int current;\nvoid helper(void);\n",
+            ),
+            (
+                "src/main.c",
+                "#include \"../include/dep.h\"\nvoid run(Config value) { int n = LIMIT + current; void (*f)(void) = helper; }\n",
+            ),
+        ]);
+        for (path, owner, count) in [
+            ("main.py", "run", 3),
+            ("cmd/main.go", "run", 3),
+            ("Main.java", "Main.run", 3),
+            ("src/main.c", "run", 4),
+        ] {
+            let refs = reference_names(&graph, path, owner, Refs::CrossFile);
+            assert_eq!(refs.len(), count, "{path}: {refs:?}");
+        }
+        assert!(reference_names(&graph, "main.py", "shadow", Refs::All).is_empty());
+        assert!(edges(&graph).is_empty());
+    }
+
+    #[test]
+    fn scoped_imports_wildcards_and_ambiguous_headers_do_not_escape_their_scope() {
+        let graph = build(&[
+            ("dep.py", "VALUE = 1\n"),
+            (
+                "main.py",
+                "def imported():\n    from dep import VALUE\n    return VALUE\ndef absent():\n    return VALUE\n",
+            ),
+            (
+                "wild.py",
+                "from dep import *\ndef run():\n    return VALUE\n",
+            ),
+            ("one.h", "extern int VALUE;\n"),
+            ("two.h", "extern int VALUE;\n"),
+            (
+                "main.c",
+                "#include \"one.h\"\n#include \"two.h\"\nint run(void) { return VALUE; }\n",
+            ),
+        ]);
+        assert_eq!(
+            reference_names(&graph, "main.py", "imported", Refs::CrossFile).len(),
+            1
+        );
+        assert!(reference_names(&graph, "main.py", "absent", Refs::All).is_empty());
+        assert!(reference_names(&graph, "wild.py", "run", Refs::All).is_empty());
+        assert!(reference_names(&graph, "main.c", "run", Refs::All).is_empty());
+    }
+
+    #[test]
+    fn explicit_same_file_aliases_resolve_to_inline_module_items() {
+        let graph = build(&[
+            (
+                "main.rs",
+                "mod inner { pub const VALUE: usize = 1; pub struct Config; impl Config { pub const LIMIT: usize = 2; pub fn new() -> Self { Config } pub fn run(&self) {} } }\nuse crate::inner::{VALUE as LIMIT, Config as Settings};\nfn run() { let f = Settings::new; let n = LIMIT + Settings::LIMIT; Settings::run(); }\n",
+            ),
+            (
+                "main.ts",
+                "namespace Inner { export const VALUE = 1; export class Config {} }\nimport Settings = Inner.Config;\nconst selected: Settings = null;\n",
+            ),
+        ]);
+        let rust = reference_names(&graph, "main.rs", "run", Refs::All);
+        assert_eq!(rust.len(), 4, "{rust:?}");
+        assert!(
+            rust.iter()
+                .all(|location| !location.ends_with(":inner.Config.run"))
+        );
+        assert!(reference_names(&graph, "main.rs", "run", Refs::CrossFile).is_empty());
+        let ts = reference_names(&graph, "main.ts", "selected", Refs::All);
+        assert_eq!(ts.len(), 1, "{ts:?}");
+        assert!(ts[0].ends_with(":Inner.Config"));
+    }
+
+    #[test]
+    fn rust_static_lifetimes_do_not_make_instance_members_static_references() {
+        let graph = build(&[
+            (
+                "src/dep.rs",
+                "pub struct Config { pub name: &'static str }\nimpl Config { pub fn run(&self) -> &'static str { self.name } }\n",
+            ),
+            (
+                "src/main.rs",
+                "use crate::dep::Config;\nfn run() { let f = Config::run; let name = Config::name; }\n",
+            ),
+        ]);
+        let refs = reference_names(&graph, "src/main.rs", "run", Refs::All);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert!(refs[0].ends_with(":Config"));
+        assert!(edges(&graph).is_empty());
+    }
+
+    #[test]
+    fn shell_static_function_commands_remain_outgoing_references() {
+        let graph = build(&[(
+            "main.sh",
+            "helper() { :; }\nrun() { helper; helper; \"$DYNAMIC\"; }\n",
+        )]);
+        let refs = reference_names(&graph, "main.sh", "run", Refs::All);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert!(refs[0].ends_with(":helper"));
+        assert!(reference_names(&graph, "main.sh", "run", Refs::CrossFile).is_empty());
+        assert_eq!(edges(&graph), ["main.sh:run -> main.sh:helper"]);
+    }
+
+    #[test]
+    fn typescript_namespaces_bind_static_references_without_expanding_constants() {
+        let graph = build(&[(
+            "main.ts",
+            "namespace Values { export const LIMIT = 1; export function helper() {} }\nexport function run() { Values.helper(); return Values.LIMIT; }\n",
+        )]);
+        let run = key(&graph, "main.ts", "run");
+        let refs = graph.references(&run, Refs::All);
+        for target in ["Values.helper", "Values.LIMIT"] {
+            assert!(
+                refs.iter()
+                    .any(|location| location.ends_with(&format!(":{target}"))),
+                "{refs:?}"
+            );
+        }
+        assert!(graph.references(&run, Refs::CrossFile).is_empty());
+        assert_eq!(edges(&graph), ["main.ts:run -> main.ts:Values.helper"]);
+        let expansion = graph.expand([run.clone()], 0, 1);
+        assert_eq!(
+            expansion.depths.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([run, key(&graph, "main.ts", "Values.helper")])
+        );
     }
 
     #[test]

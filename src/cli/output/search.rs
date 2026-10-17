@@ -3,6 +3,7 @@ use super::{
     render::{Presentation, RankedHit, print_ranked_files, rank, score_details},
 };
 use crate::{
+    callgraph::Refs,
     cli::{
         args::{CallDepths, Detail, Format},
         io::print_json,
@@ -38,7 +39,7 @@ pub(in crate::cli) fn print_search(
                 let related = presentation.related_json(item);
                 let outgoing = presentation.outgoing_json(item);
                 row["relatedCallables"] = json!(related);
-                row["callees"] = json!(outgoing);
+                row["references"] = json!(outgoing);
             }
         }
         return print_json(out, &rows);
@@ -95,12 +96,11 @@ pub(in crate::cli) fn print_search(
 pub(crate) fn describe_search_context(
     engine: &Engine,
     rows: &[Value],
-    callers: usize,
-    callees: usize,
-    expand_callers: usize,
-    expand_callees: usize,
+    depths: (usize, usize, usize, usize),
+    refs: Refs,
     expand_code_threshold: f64,
 ) -> Result<String> {
+    let (callers, callees, expand_callers, expand_callees) = depths;
     let mut out = Vec::new();
     print_search(
         &mut out,
@@ -113,6 +113,7 @@ pub(crate) fn describe_search_context(
             CallDepths {
                 callers,
                 callees,
+                refs,
                 expand_callers,
                 expand_callees,
             },

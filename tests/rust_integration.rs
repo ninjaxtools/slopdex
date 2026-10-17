@@ -730,6 +730,13 @@ fn map_names(rows: &[Value]) -> BTreeSet<String> {
         .collect()
 }
 
+fn map_node<'a>(rows: &'a [Value], name: &str) -> &'a Value {
+    rows.iter()
+        .flat_map(|row| row["nodes"].as_array().unwrap())
+        .find(|node| node["name"] == name)
+        .unwrap_or_else(|| panic!("missing map node {name}"))
+}
+
 fn row<'a>(rows: &'a [Value], name: &str) -> &'a Value {
     rows.iter()
         .find(|r| r["function"]["qualifiedName"] == name)
@@ -5212,7 +5219,7 @@ fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_art
         );
     }
     assert!(
-        expanded_text.contains("\ndef middle():\n  # callees: c.py:leaf\n"),
+        expanded_text.contains("\ndef middle():\n  # c.py:leaf\n"),
         "{expanded_text}"
     );
     for name in ["outermost", "middle", "deepest"] {
@@ -5666,12 +5673,12 @@ fn map_call_graph_expands_cross_file_chains_and_rebuilds_after_edits() -> Result
         .iter()
         .find(|row| row["path"] == "b.py")
         .context("middle file")?;
-    assert_eq!(middle["nodes"][0]["callees"][0], "c.py:3-4:leaf");
+    assert_eq!(middle["nodes"][0]["references"][0], "c.py:3-4:leaf");
     let outer = rows
         .iter()
         .find(|row| row["path"] == "a.py")
         .context("outer file")?;
-    assert_eq!(outer["nodes"][0]["callees"][0], "b.py:3-4:middle");
+    assert_eq!(outer["nodes"][0]["references"][0], "b.py:3-4:middle");
     let two_levels = engine.map(&json!({"kinds":["functions"],"regexp":["^middle$"],"glob":["b.py"],"callers":2,"callees":2}))?;
     assert_eq!(
         map_names(&two_levels),
@@ -5702,6 +5709,647 @@ fn map_call_graph_expands_cross_file_chains_and_rebuilds_after_edits() -> Result
         map_names(&engine.map(&options)?),
         strings(&["outer", "middle"])
     );
+    Ok(())
+}
+
+fn write_reference_traversal_fixture(repo: &Repo) -> Result<()> {
+    repo.write(
+        "a.py",
+        "from b import middle\n\ndef outer():\n    return middle()\n",
+    )?;
+    repo.write("b.py", "from c import leaf\n\ndef middle():\n    return helper()\n\ndef helper():\n    return leaf()\n")?;
+    repo.write(
+        "c.py",
+        "from d import deepest\n\ndef leaf():\n    return deepest()\n",
+    )?;
+    repo.write("d.py", "def deepest():\n    return 42\n")?;
+    Ok(())
+}
+
+#[test]
+fn cli_map_refs_modes_are_independent_of_traversal_with_indexed_unindexed_parity() -> Result<()> {
+    let repo = Repo::new()?;
+    write_reference_traversal_fixture(&repo)?;
+    struct Case<'a> {
+        name: &'a str,
+        pattern: &'a str,
+        args: &'a [&'a str],
+        declarations: &'a [&'a str],
+        references: &'a [(&'a str, &'a str)],
+    }
+    let cases = [
+        Case {
+            name: "compact defaults to no references",
+            pattern: "^helper$",
+            args: &[],
+            declarations: &["helper"],
+            references: &[],
+        },
+        Case {
+            name: "callers enable cross-file references",
+            pattern: "^middle$",
+            args: &["--callers", "1"],
+            declarations: &["outer", "middle"],
+            references: &[("outer", "b.py:3-4:middle")],
+        },
+        Case {
+            name: "same-file callees remain declarations but not reference annotations",
+            pattern: "^middle$",
+            args: &["--callees", "1"],
+            declarations: &["middle", "helper"],
+            references: &[("helper", "c.py:3-4:leaf")],
+        },
+        Case {
+            name: "none suppresses references without suppressing traversal",
+            pattern: "^middle$",
+            args: &["--callers", "1", "--callees", "1", "--refs", "none"],
+            declarations: &["outer", "middle", "helper"],
+            references: &[],
+        },
+        Case {
+            name: "all includes same-file references",
+            pattern: "^middle$",
+            args: &["--callers", "1", "--callees", "1", "--refs", "all"],
+            declarations: &["outer", "middle", "helper"],
+            references: &[
+                ("outer", "b.py:3-4:middle"),
+                ("middle", "b.py:6-7:helper"),
+                ("helper", "c.py:3-4:leaf"),
+            ],
+        },
+        Case {
+            name: "cross-file references reach beyond the traversal boundary",
+            pattern: "^middle$",
+            args: &["--callers", "1", "--callees", "1", "--refs", "cross-file"],
+            declarations: &["outer", "middle", "helper"],
+            references: &[("outer", "b.py:3-4:middle"), ("helper", "c.py:3-4:leaf")],
+        },
+        Case {
+            name: "all works without traversal",
+            pattern: "^middle$",
+            args: &["--callers", "0", "--callees", "0", "--refs", "all"],
+            declarations: &["middle"],
+            references: &[("middle", "b.py:6-7:helper")],
+        },
+        Case {
+            name: "cross-file works without traversal",
+            pattern: "^helper$",
+            args: &["--callers", "0", "--callees", "0", "--refs", "cross-file"],
+            declarations: &["helper"],
+            references: &[("helper", "c.py:3-4:leaf")],
+        },
+        Case {
+            name: "expanded detail defaults to cross-file references",
+            pattern: "^middle$",
+            args: &["--detail", "expanded"],
+            declarations: &["outer", "middle", "helper"],
+            references: &[("outer", "b.py:3-4:middle"), ("helper", "c.py:3-4:leaf")],
+        },
+        Case {
+            name: "explicit zero depths disable expanded reference defaults",
+            pattern: "^helper$",
+            args: &["--detail", "expanded", "--callers", "0", "--callees", "0"],
+            declarations: &["helper"],
+            references: &[],
+        },
+        Case {
+            name: "expanded callees raise zero depth and enable cross-file references",
+            pattern: "^middle$",
+            args: &["--callers", "0", "--callees", "0", "--expand-callees", "1"],
+            declarations: &["middle", "helper"],
+            references: &[("helper", "c.py:3-4:leaf")],
+        },
+        Case {
+            name: "expanded callers raise zero depth and enable cross-file references",
+            pattern: "^middle$",
+            args: &["--callers", "0", "--callees", "0", "--expand-callers", "1"],
+            declarations: &["outer", "middle"],
+            references: &[("outer", "b.py:3-4:middle")],
+        },
+    ];
+    let before = filesystem_snapshot(repo._temp.path())?;
+    let mut unindexed = Vec::new();
+    for indexed in [false, true] {
+        if indexed {
+            repo.open_map(&json!({}))?.refresh_structure()?;
+        }
+        for (index, case) in cases.iter().enumerate() {
+            let mut args = vec![
+                "--no-reindex",
+                "map",
+                "b.py",
+                "-k",
+                "fns",
+                "-e",
+                case.pattern,
+            ];
+            args.extend_from_slice(case.args);
+            let rows = repo.cli_json(&args)?;
+            let files = rows.as_array().unwrap();
+            assert_eq!(
+                map_names(files),
+                strings(case.declarations),
+                "{}",
+                case.name
+            );
+            for node in files
+                .iter()
+                .flat_map(|file| file["nodes"].as_array().unwrap())
+            {
+                let expected: Vec<_> = case
+                    .references
+                    .iter()
+                    .filter(|(name, _)| node["name"] == *name)
+                    .map(|(_, location)| json!(location))
+                    .collect();
+                assert_eq!(
+                    node.get("references").cloned().unwrap_or_else(|| json!([])),
+                    json!(expected),
+                    "{}: {}",
+                    case.name,
+                    node["name"]
+                );
+                assert!(node.get("callees").is_none(), "legacy field: {node}");
+            }
+            // Same-file graph edges still carry the original directional depths.
+            if case.declarations.contains(&"helper") && case.pattern == "^middle$" {
+                assert_eq!(map_node(files, "helper")["callDepth"]["callee"], 1);
+                assert_eq!(map_node(files, "middle")["callDepth"]["callee"], 0);
+            }
+            if case.declarations.contains(&"outer") {
+                assert_eq!(map_node(files, "outer")["callDepth"]["caller"], 1);
+                assert_eq!(map_node(files, "middle")["callDepth"]["caller"], 0);
+            }
+            if indexed {
+                assert_eq!(rows, unindexed[index], "indexed parity: {}", case.name);
+            } else {
+                unindexed.push(rows);
+                assert!(!repo.index.exists());
+                assert_eq!(filesystem_snapshot(repo._temp.path())?, before);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_map_refs_include_constants_types_and_function_values_without_expansion() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("b.ts", "import { REMOTE_LIMIT, RemoteInput, remoteCallback } from './values';\nexport const LOCAL_LIMIT = 2;\nexport interface LocalInput { value: number; }\nexport function callback() { return 1; }\nexport function helper() { return 3; }\nexport function middle(input: LocalInput, remote: RemoteInput) {\n  return [helper(), callback, remoteCallback, LOCAL_LIMIT, REMOTE_LIMIT, input, remote];\n}\n")?;
+    repo.write("values.ts", "export const REMOTE_LIMIT = 5;\nexport interface RemoteInput { value: number; }\nexport function remoteCallback() { return 7; }\n")?;
+    let local = strings(&[
+        "b.ts:2:LOCAL_LIMIT",
+        "b.ts:3:LocalInput",
+        "b.ts:4:callback",
+        "b.ts:5:helper",
+    ]);
+    let remote = strings(&[
+        "values.ts:1:REMOTE_LIMIT",
+        "values.ts:2:RemoteInput",
+        "values.ts:3:remoteCallback",
+    ]);
+    let mut unindexed = Vec::new();
+    for indexed in [false, true] {
+        if indexed {
+            repo.open_map(&json!({}))?.refresh_structure()?;
+        }
+        for (index, mode) in ["none", "all", "cross-file"].into_iter().enumerate() {
+            let args = [
+                "--no-reindex",
+                "map",
+                "b.ts",
+                "-k",
+                "fns",
+                "-e",
+                "^middle$",
+                "--callers",
+                "0",
+                "--callees",
+                "0",
+                "--refs",
+                mode,
+            ];
+            let rows = repo.cli_json(&args)?;
+            assert_eq!(map_names(rows.as_array().unwrap()), strings(&["middle"]));
+            let node = map_node(rows.as_array().unwrap(), "middle");
+            let references: BTreeSet<_> = node["references"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|location| location.as_str().unwrap().to_owned())
+                .collect();
+            let expected = match mode {
+                "all" => local.union(&remote).cloned().collect(),
+                "cross-file" => remote.clone(),
+                _ => BTreeSet::new(),
+            };
+            assert_eq!(references, expected, "{mode}, indexed={indexed}");
+            assert!(
+                node.get("callDepth").is_none(),
+                "refs must not traverse: {node}"
+            );
+            assert!(node.get("callees").is_none(), "legacy field: {node}");
+            let output = repo.cli_format(&args, "text")?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout)?;
+            assert!(!text.contains("callees:"), "{text}");
+            for declaration in [
+                "export function callback",
+                "export function helper",
+                "export function remoteCallback",
+                "export interface",
+                "export const",
+            ] {
+                assert!(!text.contains(declaration), "{text}");
+            }
+            if mode != "none" {
+                assert!(
+                    text.contains("  // values.ts:\n  //   REMOTE_LIMIT\n  //   RemoteInput\n  //   remoteCallback\n"),
+                    "{text}"
+                );
+            }
+            if mode == "all" {
+                assert!(
+                    text.contains("  // b.ts:\n  //   LOCAL_LIMIT\n  //   LocalInput\n  //   callback\n  //   helper\n"),
+                    "{text}"
+                );
+            } else {
+                assert!(!text.contains("  // b.ts:"), "{text}");
+            }
+            if indexed {
+                assert_eq!((rows, text), unindexed[index], "indexed parity: {mode}");
+            } else {
+                unindexed.push((rows, text));
+                assert!(!repo.index.exists());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_search_refs_control_annotations_without_changing_related_callables() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    write_reference_traversal_fixture(&repo)?;
+    repo.cli_json(&["update"])?;
+    let base = [
+        "--no-reindex",
+        "search-code",
+        "middle",
+        "-e",
+        "^middle$",
+        "--threshold",
+        "-1",
+    ];
+    let compact = repo.cli_json(&base)?;
+    assert!(compact[0].get("references").is_none());
+    assert!(compact[0].get("relatedCallables").is_none());
+    for mode in ["none", "all", "cross-file"] {
+        for depth in ["0", "1"] {
+            let mut args = base.to_vec();
+            args.extend(["--callers", "0", "--callees", depth, "--refs", mode]);
+            let rows = repo.cli_json(&args)?;
+            assert_eq!(rows.as_array().unwrap().len(), 1);
+            let hit = &rows[0];
+            let expected = if mode == "all" {
+                json!(["b.py:6-7:helper"])
+            } else {
+                json!([])
+            };
+            assert_eq!(
+                hit.get("references").cloned().unwrap_or_else(|| json!([])),
+                expected,
+                "mode={mode}, depth={depth}"
+            );
+            assert!(hit.get("callees").is_none(), "legacy field: {hit}");
+            let related = hit["relatedCallables"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if depth == "0" {
+                assert!(related.is_empty(), "refs must not expand targets: {hit}");
+            } else {
+                assert_eq!(related.len(), 1);
+                assert_eq!(related[0]["node"]["name"], "helper");
+                assert_eq!(related[0]["callDepth"]["callee"], 1);
+                assert_eq!(
+                    related[0]["references"],
+                    if mode == "none" {
+                        json!([])
+                    } else {
+                        json!(["c.py:3-4:leaf"])
+                    }
+                );
+                assert!(related[0].get("callees").is_none());
+                assert!(related[0]["node"].get("callees").is_none());
+            }
+            let output = repo.cli_format(&args, "text")?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout)?;
+            assert_eq!(text.contains("  # b.py:helper\n"), mode == "all", "{text}");
+            assert_eq!(text.contains("def helper():"), depth == "1", "{text}");
+            assert_eq!(
+                text.contains("  # c.py:leaf\n"),
+                depth == "1" && mode != "none",
+                "{text}"
+            );
+            assert!(
+                !text.contains("def leaf():"),
+                "reference-only target expanded: {text}"
+            );
+            assert!(!text.contains("callees:"), "{text}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    write_reference_traversal_fixture(&repo)?;
+    repo.cli_json(&["update"])?;
+    let cases: [(&str, &str, &str, &[&str]); 5] = [
+        ("^middle$", "all", "0", &["b.py:6-7:helper"]),
+        ("^helper$", "cross-file", "0", &["c.py:3-4:leaf"]),
+        ("^middle$", "none", "1", &[]),
+        ("^middle$", "cross-file", "1", &[]),
+        ("^middle$", "all", "1", &["b.py:6-7:helper"]),
+    ];
+    for (pattern, mode, depth, references) in cases {
+        let before = mock.requests("/responses").len();
+        let result = repo.cli_json(&[
+            "--no-reindex",
+            "describe",
+            "middle",
+            "-e",
+            pattern,
+            "--threshold",
+            "-1",
+            "--callers",
+            "0",
+            "--callees",
+            depth,
+            "--expand-callers",
+            "0",
+            "--expand-callees",
+            "0",
+            "--expand-code-threshold",
+            "1",
+            "--refs",
+            mode,
+        ])?;
+        assert_eq!(result["functions"].as_array().unwrap().len(), 1);
+        let function = &result["functions"][0];
+        assert_eq!(function["references"], json!(references), "{mode}, {depth}");
+        assert!(
+            function.get("callees").is_none(),
+            "legacy field: {function}"
+        );
+        let related = function["relatedCallables"].as_array().unwrap();
+        if depth == "0" {
+            assert!(
+                related.is_empty(),
+                "refs-only describe expanded targets: {result}"
+            );
+        } else {
+            assert_eq!(related.len(), 1);
+            assert_eq!(related[0]["node"]["name"], "helper");
+            assert_eq!(related[0]["callDepth"]["callee"], 1);
+            assert_eq!(
+                related[0]["references"],
+                if mode == "none" {
+                    json!([])
+                } else {
+                    json!(["c.py:3-4:leaf"])
+                }
+            );
+        }
+        let requests = mock.requests("/responses");
+        assert_eq!(
+            requests.len(),
+            before + 1,
+            "describe must generate this distinct context"
+        );
+        let prompt = description_prompt(&requests.last().unwrap().body);
+        assert_eq!(
+            prompt.contains("  # b.py:helper\n"),
+            mode == "all",
+            "{mode}, {depth}: {prompt}"
+        );
+        assert_eq!(
+            prompt.contains("  # c.py:leaf\n"),
+            mode != "none" && (depth == "1" || pattern == "^helper$"),
+            "{mode}, {depth}: {prompt}"
+        );
+        assert_eq!(
+            prompt.contains("def helper():"),
+            depth == "1" || pattern == "^helper$",
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("def leaf():"),
+            "reference-only target expanded: {prompt}"
+        );
+        assert!(!prompt.contains("def deepest():"), "{prompt}");
+        assert!(!prompt.contains("callees:"), "{prompt}");
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_cross_search_refs_use_each_index_and_do_not_expand_reference_only_targets() -> Result<()> {
+    let mock = Mock::start()?;
+    let source = Repo::new()?;
+    let target = Repo::new()?;
+    for (repo, prefix) in [(&source, "source"), (&target, "target")] {
+        repo.write(".slopdex/config.json", &mock.config().to_string())?;
+        // Both indexes deliberately use the same paths, but different symbols.
+        // Only entry has three lines, so match selection cannot choose a helper.
+        repo.write("b.py", &format!("from c import {prefix}_leaf\n\ndef {prefix}_entry():\n    # VECTOR_EAST\n    return {prefix}_helper() + {prefix}_leaf()\n\ndef {prefix}_helper():\n    return {prefix}_leaf()\n"))?;
+        repo.write("c.py", &format!("from d import {prefix}_deepest\n\ndef {prefix}_leaf():\n    return {prefix}_deepest()\n"))?;
+        repo.write("d.py", &format!("def {prefix}_deepest():\n    return 42\n"))?;
+        repo.cli_json(&["update"])?;
+    }
+    let calls = mock.count();
+    for mode in ["none", "all", "cross-file"] {
+        for depth in ["0", "1"] {
+            let args = [
+                "--no-reindex",
+                "cross-search",
+                "--source-path",
+                "b.py",
+                "-e",
+                "^source_entry$",
+                "--target-root",
+                target.root.to_str().unwrap(),
+                "--target-index",
+                target.index.to_str().unwrap(),
+                "--lines",
+                "3",
+                "--threshold",
+                "0.9",
+                "--matches",
+                "1",
+                "--callers",
+                "0",
+                "--callees",
+                depth,
+                "--refs",
+                mode,
+            ];
+            let output = source.cli(&args)?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rows: Vec<Value> = String::from_utf8(output.stdout)?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<serde_json::Result<_>>()?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["source"]["qualifiedName"], "source_entry");
+            assert_eq!(rows[0]["matches"].as_array().unwrap().len(), 1);
+            let matched = &rows[0]["matches"][0];
+            assert_eq!(matched["function"]["qualifiedName"], "target_entry");
+            for (item, prefix) in [(&rows[0], "source"), (matched, "target")] {
+                let expected = match mode {
+                    "all" => json!([
+                        format!("b.py:7-8:{prefix}_helper"),
+                        format!("c.py:3-4:{prefix}_leaf"),
+                    ]),
+                    "cross-file" => json!([format!("c.py:3-4:{prefix}_leaf")]),
+                    _ => json!([]),
+                };
+                assert_eq!(
+                    item.get("references").cloned().unwrap_or_else(|| json!([])),
+                    expected,
+                    "{prefix}, {mode}, {depth}"
+                );
+                assert!(item.get("callees").is_none(), "legacy field: {item}");
+                let related = item["relatedCallables"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                if depth == "0" {
+                    assert!(
+                        related.is_empty(),
+                        "refs-only cross-search expanded targets: {item}"
+                    );
+                } else {
+                    assert_eq!(related.len(), 2, "{item}");
+                    for (name, location, referenced_name) in [
+                        ("helper", "c.py:3-4", "leaf"),
+                        ("leaf", "d.py:1-2", "deepest"),
+                    ] {
+                        let name = format!("{prefix}_{name}");
+                        let related = related
+                            .iter()
+                            .find(|item| item["node"]["name"] == name)
+                            .unwrap_or_else(|| panic!("missing {name}: {item}"));
+                        assert_eq!(related["callDepth"]["callee"], 1);
+                        assert_eq!(
+                            related["references"],
+                            if mode == "none" {
+                                json!([])
+                            } else {
+                                json!([format!("{location}:{prefix}_{referenced_name}")])
+                            }
+                        );
+                    }
+                }
+            }
+            let output = source.cli_format(&args, "text")?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout)?;
+            for prefix in ["source", "target"] {
+                assert_eq!(
+                    text.contains(&format!("  # b.py:{prefix}_helper\n")),
+                    mode == "all",
+                    "{text}"
+                );
+                assert_eq!(
+                    text.contains(&format!("  # c.py:{prefix}_leaf\n")),
+                    mode != "none",
+                    "{text}"
+                );
+                assert_eq!(
+                    text.contains(&format!("def {prefix}_helper():")),
+                    depth == "1",
+                    "{text}"
+                );
+                assert_eq!(
+                    text.contains(&format!("def {prefix}_leaf():")),
+                    depth == "1",
+                    "{text}"
+                );
+                assert_eq!(
+                    text.contains(&format!("  # d.py:{prefix}_deepest\n")),
+                    depth == "1" && mode != "none",
+                    "{text}"
+                );
+                assert!(
+                    !text.contains(&format!("def {prefix}_deepest():")),
+                    "reference-only target expanded: {text}"
+                );
+            }
+            assert!(!text.contains("callees:"), "{text}");
+            assert_eq!(
+                mock.count(),
+                calls,
+                "saved cross-search must not call providers"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn describe_rejects_invalid_refs_before_searching_or_calling_providers() -> Result<()> {
+    let repo = Repo::new()?;
+    let engine = repo.open_map(&json!({}))?;
+    for refs in [json!("invalid"), json!(0), json!(true), Value::Null] {
+        let error = engine
+            .describe("middle", &json!({"refs": refs}))
+            .unwrap_err();
+        assert!(error.to_string().contains("refs"), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_rejects_invalid_refs_modes_for_map_and_search() -> Result<()> {
+    let repo = Repo::new()?;
+    for command in [&["map"][..], &["search-code", "middle"][..]] {
+        let mut args = command.to_vec();
+        args.extend(["--refs", "invalid"]);
+        let output = repo.cli(&args)?;
+        assert!(
+            !output.status.success(),
+            "accepted invalid refs: {command:?}"
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        for expected in ["--refs", "invalid", "none", "all", "cross-file"] {
+            assert!(stderr.contains(expected), "{stderr}");
+        }
+        assert!(!repo.index.exists());
+    }
     Ok(())
 }
 
@@ -6140,7 +6788,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     );
     let text = String::from_utf8(output.stdout)?;
     assert!(
-        text.contains("*** a.py") && text.contains("\ndef outer():\n  # callees: b.py:middle\n"),
+        text.contains("*** a.py") && text.contains("\ndef outer():\n  # b.py:middle\n"),
         "{text}"
     );
     assert!(
@@ -6172,7 +6820,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     );
     let map_text = String::from_utf8(map_text.stdout)?;
     assert!(
-        map_text.contains("\ndef outer():\n  # callees: b.py:middle\n"),
+        map_text.contains("\ndef outer():\n  # b.py:middle\n"),
         "{map_text}"
     );
     let describe = repo.cli_json(&[
@@ -6253,7 +6901,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
         cluster.contains("a.py:3-4:outer\nb.py:1-2:middle\n"),
         "{cluster}"
     );
-    assert!(!cluster.contains("callees:"), "{cluster}");
+    assert!(!cluster.contains("  # b.py:middle"), "{cluster}");
     Ok(())
 }
 
@@ -6352,7 +7000,7 @@ fn expanded_detail_defaults_to_one_edge_and_includes_high_similarity_code() -> R
         "{with_code}"
     );
     assert!(
-        with_code.contains("\ndef outer():\n  # callees: b.py:middle\n"),
+        with_code.contains("\ndef outer():\n  # b.py:middle\n"),
         "{with_code}"
     );
     let without_code = run("1")?;

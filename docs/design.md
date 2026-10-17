@@ -88,3 +88,6 @@ provider caches accelerate work but do not define the live repository snapshot.
    `describe` sends search context to an LLM. `map.rs`
    renders declaration excerpts, and `callgraph.rs` expands conservatively
    resolved caller/callee context from saved structure.
+   Callable graph depths control declaration/code expansion; independent `--refs`
+   modes control outgoing annotations, including resolvable non-callable targets,
+   without expanding referenced declarations.

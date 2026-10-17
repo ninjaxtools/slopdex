@@ -24,6 +24,18 @@ pub struct CallSite {
     pub receiver: Option<String>,
 }
 
+/// A lexical symbol use, independent of whether it is called. `binding_id`
+/// identifies its file-local declaration or explicit import. An absent binding
+/// represents implicit `self`/`this` receivers or C header lookups; unknown
+/// locals are omitted rather than mistaken for imported symbols.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceSite {
+    pub name: String,
+    pub receiver: Option<String>,
+    pub binding_id: Option<usize>,
+}
+
 /// One imported binding; `path` is the fully expanded source path when known.
 /// `name` is the imported name, `alias` the local binding, and `source` the
 /// module specifier (without quotes). Side-effect imports have no name/alias.
@@ -73,6 +85,12 @@ pub struct StructureNode {
     pub heading_level: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<CallSite>,
+    #[serde(
+        default,
+        rename = "referenceSites",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub references: Vec<ReferenceSite>,
 }
 
 impl StructureNode {
@@ -354,6 +372,7 @@ impl Collector<'_> {
             imports: Vec::new(),
             heading_level: None,
             calls: Vec::new(),
+            references: Vec::new(),
         });
         id
     }

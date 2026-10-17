@@ -13,3 +13,4 @@ evals/swebench/.venv/
 evals/typescript/jobs/
 evals/typescript/cache/
 evals/typescript/results/*.lock
+.opencode

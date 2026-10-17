@@ -2,7 +2,7 @@
 //! Ranges refer to the original file; signatures deliberately omit bodies.
 
 use crate::{
-    callgraph::{CallGraph, Key},
+    callgraph::{CallGraph, Key, Refs},
     engine,
     filter::Selection,
     limits::{self, LimitedResults},
@@ -56,15 +56,17 @@ impl Unindexed {
         let selection = Selection::compile(options)?;
         let paths = selected_paths(root, options)?;
         let (callers, callees) = call_depths(options);
+        let refs = reference_mode(options, callers, callees)?;
+        let needs_graph = callers > 0 || callees > 0 || refs.enabled();
         let mut remaining = limits::resolve(&Value::Null, options)?.count();
         let max_size = config["maxFileSize"].as_u64().unwrap_or(1_048_576);
         let mut result = Self::default();
         let mut source_paths = engine::source_paths(root, index, config)?;
         source_paths.sort();
         for path in source_paths {
-            // Call resolution needs the whole workspace; otherwise parse only
+            // Call/reference resolution needs the whole workspace; otherwise parse only
             // files that can contribute to the requested map.
-            if callers == 0 && callees == 0 && !path_matches(&selection, &paths, &path) {
+            if !needs_graph && !path_matches(&selection, &paths, &path) {
                 continue;
             }
             let source = match engine::read_source(root, &path, max_size) {
@@ -87,7 +89,7 @@ impl Unindexed {
             }
             // Retain the file proving omission so query_limited can report it,
             // but do not parse any later files unless call resolution needs them.
-            let omitted = if callers == 0 && callees == 0 && remaining.is_some() {
+            let omitted = if !needs_graph && remaining.is_some() {
                 let selected = selection.select_structure_limited_in(
                     &path,
                     &parsed.structure,
@@ -169,6 +171,18 @@ fn call_depths(options: &Value) -> (usize, usize) {
     )
 }
 
+pub(crate) fn reference_mode(options: &Value, callers: usize, callees: usize) -> Result<Refs> {
+    let value = options
+        .get("refs")
+        .map(|value| {
+            value
+                .as_str()
+                .context("refs must be none, all, or cross-file")
+        })
+        .transpose()?;
+    Refs::resolve(value, callers, callees)
+}
+
 pub(crate) fn query(
     source: &dyn StructureSource,
     root: &Path,
@@ -189,6 +203,7 @@ pub(crate) fn query_limited(
     let selection = source.selection(options)?;
     let paths = selected_paths(root, options)?;
     let (callers, callees) = call_depths(options);
+    let refs = reference_mode(options, callers, callees)?;
     let mut selected = BTreeMap::<String, Vec<StructureNode>>::new();
     let mut source_paths = source.paths()?;
     source_paths.sort();
@@ -214,7 +229,7 @@ pub(crate) fn query_limited(
             }
         }
     }
-    let expansion = if callers > 0 || callees > 0 {
+    let expansion = if callers > 0 || callees > 0 || refs.enabled() {
         let graph = source.call_graph()?;
         let expand_callers = options["expandCallers"].as_u64().unwrap_or(0) as usize;
         let expand_callees = options["expandCallees"].as_u64().unwrap_or(0) as usize;
@@ -246,7 +261,7 @@ pub(crate) fn query_limited(
                 }
             }
         }
-        Some((expanded, code_keys))
+        Some((graph, expanded, code_keys))
     } else {
         None
     };
@@ -261,12 +276,14 @@ pub(crate) fn query_limited(
             };
             let mut value = serde_json::to_value(&node)?;
             value.as_object_mut().unwrap().remove("calls");
-            if let Some((expansion, code_keys)) = &expansion {
+            value.as_object_mut().unwrap().remove("referenceSites");
+            if let Some((graph, expansion, code_keys)) = &expansion {
                 if let Some(depth) = expansion.depths.get(&key) {
                     value["callDepth"] = json!(depth);
                 }
-                if let Some(calls) = expansion.comments.get(&key) {
-                    value["callees"] = json!(calls);
+                let references = graph.references(&key, refs);
+                if !references.is_empty() {
+                    value["references"] = json!(references);
                 }
                 if code_keys.contains(&key) {
                     value["expandedCode"] = json!(true);
@@ -306,7 +323,7 @@ pub struct Descriptions<'a> {
 #[derive(Default)]
 pub struct HitDetails<'a> {
     pub annotations: Option<&'a HashMap<usize, String>>,
-    pub callees: Option<&'a HashMap<usize, Vec<String>>>,
+    pub references: Option<&'a HashMap<usize, Vec<String>>>,
     pub extras: Option<&'a HashMap<usize, String>>,
 }
 
@@ -350,12 +367,12 @@ pub(crate) fn group_symbol_locations<'a>(
         .collect()
 }
 
-pub(crate) fn render_callees<'a>(
+pub(crate) fn render_references<'a>(
     language: &str,
-    callees: impl IntoIterator<Item = &'a str>,
+    references: impl IntoIterator<Item = &'a str>,
     depth: usize,
 ) -> Option<String> {
-    let files = group_symbol_locations(callees);
+    let files = group_symbol_locations(references);
     if files.is_empty() {
         return None;
     }
@@ -367,29 +384,26 @@ pub(crate) fn render_callees<'a>(
     {
         return Some(format!(
             "{indent}{}\n",
-            comment(
-                language,
-                &format!("callees: {path}:{}", symbol_name(symbol))
-            )
+            comment(language, &format!("{path}:{}", symbol_name(symbol)))
         ));
     }
-    let mut output = format!("{indent}{}\n", comment(language, "callees:"));
+    let mut output = String::new();
     for (path, symbols) in files {
         if let [symbol] = symbols.as_slice() {
             output.push_str(&format!(
                 "{indent}{}\n",
-                comment_with_indent(language, &format!("{path}:{}", symbol_name(symbol)), "  ")
+                comment(language, &format!("{path}:{}", symbol_name(symbol)))
             ));
             continue;
         }
         output.push_str(&format!(
             "{indent}{}\n",
-            comment_with_indent(language, &format!("{path}:"), "  ")
+            comment(language, &format!("{path}:"))
         ));
         for symbol in symbols {
             output.push_str(&format!(
                 "{indent}{}\n",
-                comment_with_indent(language, &symbol_name(symbol), "    ")
+                comment_with_indent(language, &symbol_name(symbol), "  ")
             ));
         }
     }
@@ -641,11 +655,13 @@ fn append_group(
             hits.annotations
                 .and_then(|scores| scores.get(&node.id).map(String::as_str)),
         ));
-        if let Some(callees) = hits.callees.and_then(|callees| callees.get(&node.id))
-            && let Some(calls) =
-                render_callees(&node.language, callees.iter().map(String::as_str), depth)
+        if let Some(references) = hits
+            .references
+            .and_then(|references| references.get(&node.id))
+            && let Some(references) =
+                render_references(&node.language, references.iter().map(String::as_str), depth)
         {
-            output.push_str(&calls);
+            output.push_str(&references);
         }
         if let Some(extra) = hits.extras.and_then(|extras| extras.get(&node.id)) {
             output.push_str(extra);
@@ -1210,17 +1226,62 @@ mod tests {
             &json!({"limit": 1, "callees": 1}),
         )?;
         assert_eq!(graph.paths()?.len(), 4);
+        for mode in ["all", "cross-file"] {
+            let source = Unindexed::parse(
+                root,
+                &root.join("index.sqlite"),
+                &config,
+                &json!({"limit": 1, "refs": mode}),
+            )?;
+            assert_eq!(source.paths()?.len(), 4);
+        }
         Ok(())
     }
 
     #[test]
-    fn callee_comments_omit_line_numbers() {
+    fn reference_options_reject_unknown_modes_and_nonstrings() -> Result<()> {
+        let source = unindexed(&[("api.rs", "pub fn run() {}")])?;
+        for refs in [
+            json!("local"),
+            json!("ALL"),
+            json!(0),
+            json!(true),
+            Value::Null,
+        ] {
+            assert!(query(&source, Path::new("."), &json!({"refs": refs})).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_reference_annotations_do_not_collide_with_saved_reference_sites() -> Result<()> {
+        let source = unindexed(&[("api.rs", "pub fn run() { helper(); }\nfn helper() {}\n")])?;
+        let rows = query(
+            &source,
+            Path::new("."),
+            &json!({"regexp": "^run$", "callees": 1, "refs": "all"}),
+        )?;
         assert_eq!(
-            render_callees("rust", ["src/api.rs:12-24:Api::run"], 0).unwrap(),
-            "  // callees: src/api.rs:Api::run\n"
+            rows[0]["nodes"][0]["references"],
+            json!(["api.rs:2:helper"])
+        );
+        let nodes: Vec<StructureNode> = serde_json::from_value(rows[0]["nodes"].clone())?;
+        assert_eq!(nodes.len(), 2);
+        for node in rows[0]["nodes"].as_array().unwrap() {
+            assert!(node.get("calls").is_none());
+            assert!(node.get("referenceSites").is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reference_comments_omit_labels_line_numbers_and_extra_indentation() {
+        assert_eq!(
+            render_references("rust", ["src/api.rs:12-24:Api::run"], 0).unwrap(),
+            "  // src/api.rs:Api::run\n"
         );
         assert_eq!(
-            render_callees(
+            render_references(
                 "python",
                 [
                     "src/api.rs:12-24:Api::run",
@@ -1231,11 +1292,10 @@ mod tests {
             )
             .unwrap(),
             concat!(
-                "    # callees:\n",
-                "    #   src/api.rs:\n",
-                "    #     check\n",
-                "    #     Api::run\n",
-                "    #   src:other.rs:Other::go\n",
+                "    # src/api.rs:\n",
+                "    #   check\n",
+                "    #   Api::run\n",
+                "    # src:other.rs:Other::go\n",
             )
         );
     }
@@ -1587,7 +1647,7 @@ mod tests {
             Descriptions::default(),
             HitDetails {
                 annotations: Some(&annotations),
-                callees: None,
+                references: None,
                 extras: None,
             },
         );
@@ -1869,7 +1929,7 @@ mod tests {
                 Descriptions::default(),
                 HitDetails {
                     annotations: Some(&HashMap::from([(node.id, "score=0.90".to_owned())])),
-                    callees: None,
+                    references: None,
                     extras: None,
                 },
             ),

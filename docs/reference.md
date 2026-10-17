@@ -199,7 +199,7 @@ use plain diagnostics without animations; result data on stdout retains its
 ## Structure map
 
 ```text
-slopdex map [PATH]... [--formats GROUPS]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--symbol-threshold NUMBER] [--limit N|none] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--detail compact|standard|expanded] [--output text|json]
+slopdex map [PATH]... [--formats GROUPS]... [-g GLOB]... [-e REGEXP]... [-i] [-q SYMBOL_QUERY]... [--symbol-threshold NUMBER] [--limit N|none] [-k KIND]... [--private] [--callers N] [--callees N] [--expand-callers N] [--expand-callees N] [--refs none|all|cross-file] [--detail compact|standard|expanded] [--output text|json]
 ```
 
 With no paths, map implies `.` and maps the selected root: the Git checkout root
@@ -265,19 +265,23 @@ declarations with their own source ranges. These symbols participate in `-e`,
 description search. Anonymous return/callback types outside named type
 declarations do not introduce members into the enclosing executable scope.
 
+### Callable context and outgoing references
+
 `--callers N` and `--callees N` each default to `0` in compact and standard
 detail, or `1` with `--detail expanded`. An explicit `0` disables that direction
 even in expanded mode. When positive, they expand
-selected callables by up to N call-graph edges in the specified direction. Related
-callables are shown even when they are outside the requested paths, glob, name,
-kind, visibility, or result limit. Expansion stops at cycles and deduplicates
-symbols. It is also available on `search`, `search-code`, `search-descriptions`,
-`search-docs` (alias `search-md`), `describe`, and `cross-search`; Markdown-only
-results have no callable to expand. Cross-index results expand within their respective indexes. Calls are
-extracted from indexed source; only uniquely resolved static targets, including
-supported explicit imports, form edges. Dynamic receivers and unresolved calls
-do not create speculative links. Run without `--no-reindex` once after upgrading
-to build the new call metadata.
+selected callables by up to N call-graph levels in the specified direction.
+Callees are the functions a symbol calls; callers are the functions that call it.
+Same-file callees are included as declarations in grouped file output, just like
+cross-file callees. Related callables are shown even when they are outside the
+requested paths, glob, name, kind, visibility, or result limit. Expansion stops at
+cycles and deduplicates symbols. It is also available on `search`, `search-code`,
+`search-descriptions`, `search-symbols`, `search-docs` (alias `search-md`),
+`describe`, and `cross-search`; Markdown-only results have no callable to expand.
+Cross-index results expand within their respective indexes. Calls are extracted
+from indexed source; only uniquely resolved static targets, including supported
+explicit imports, form edges. Dynamic receivers and unresolved calls do not
+create speculative links.
 
 Resolution is language-aware. A bare name reaches enclosing functions and
 namespaces and the file's top level; in Python, JavaScript, and TypeScript it
@@ -307,55 +311,79 @@ cross-search clusters. Map JSON and related callable JSON nodes include indexed
 `callDepth` metadata.
 `--expand-callables` is an alias for `--expand-callees`.
 
-Callees are the functions a symbol calls; callers are the functions that call it.
-In text output, each function's displayed callees appear immediately below its
-declaration, indented two spaces deeper than the declaration. A single callee
-appears on the same line as `callees:`, separated by one space:
+`--refs none|all|cross-file` is shared by the same commands and controls outgoing
+reference annotations independently of callable graph traversal. References
+include functions and conservatively resolved non-callable symbols, such as
+constants and types; non-callable reference targets do not become call-graph
+neighbors. Unresolved or ambiguous targets are omitted.
+Resolution is syntactic: it does not infer runtime receiver types or follow bare
+wildcard imports, indirect re-exports, or member chains.
+
+| Mode | Outgoing reference annotations |
+| --- | --- |
+| `none` | Hide annotations without disabling caller/callee traversal or code expansion. |
+| `all` | Show resolvable references, including targets in the same file. |
+| `cross-file` | Show only targets outside the referencing symbol's file. |
+
+Without an explicit `--refs`, the default is `cross-file` when either resolved
+caller or callee depth is nonzero, and `none` when both are zero. Depth resolution
+includes expanded detail's default of `1` in each direction and any higher
+`--expand-callers`/`--expand-callees` depth. Explicit `all` or `cross-file` also
+works at zero traversal: it annotates the selected output without expanding
+referenced targets into declarations. Conversely, `--refs none` leaves all
+requested graph levels and same-file declarations intact.
+
+In text output, outgoing references appear immediately below the owning
+declaration, with comment markers indented two spaces deeper than the declaration.
+A single reference uses `path:qualifiedName`, with no line numbers or ranges:
 
 ```text
 def outer():
-  # callees: b.py:middle
+  # b.py:middle
 ```
 
-Multiple callees appear under a standalone `callees:` header, grouped under one
-repository-relative `path:` header per file. Paths are sorted lexically, with
-symbols in numeric source order within each file. After each comment marker,
-file-header text is indented
-two spaces deeper than `callees:`; symbol text is indented another two spaces and
-uses just `qualifiedName`, without line numbers or ranges.
+Multiple references are grouped under one repository-relative `path:` header per
+file. Paths are sorted lexically, with symbols in numeric source order within
+each file. File headers follow the comment
+marker and one space; symbol text is indented another two spaces and uses just
+`qualifiedName`, without line numbers or ranges.
 When a file has only one displayed symbol, its name follows the file's colon
 on the same line with no intervening space, for example `c.py:leaf`.
-All comment markers align with the `callees:` marker; only the nested contents
-after the markers are indented. The whole block follows the owning function's
-indentation, including for nested declarations. These lines use language-specific
-comment markers, such as `#` for Python and `//` for Rust, and are generated
+All comment markers align; only the nested contents after the markers are
+indented. There is no annotation label or extra header level. The whole block
+follows the owning declaration's indentation, including for nested declarations.
+These lines use language-specific comment markers, such as `#` for Python and
+`//` for Rust, and are generated
 comments, not source lines. For example, a top-level `outer` calling `middle`
-defined on lines 1–2 and a single-line `helper` on line 5 in `b.py`, plus `leaf`
-on line 7 in `c.py`, renders:
+defined on lines 1–2 and a single-line `helper` on line 5 in `b.py`, and referencing
+the constant `DEFAULT_LIMIT` on line 7 in `c.py`, renders:
 
 ```text
 def outer():
-  # callees:
-  #   b.py:
-  #     middle
-  #     helper
-  #   c.py:leaf
+  # b.py:
+  #   middle
+  #   helper
+  # c.py:DEFAULT_LIMIT
 ```
 
-JSON `callees` string arrays remain flat locations in `path:start-end:qualifiedName`
-format, or `path:line:qualifiedName` for single-line functions, for example
-`["b.py:1-2:middle", "b.py:5:helper"]`, without file grouping, a `calls ` prefix,
-or a ` :: ` separator.
-JSON adds `callDepth` and `callees` to expanded map nodes and
-`relatedCallables`/`callees` to callable search results when expansion is enabled.
-Cross-search adds the same information to source and match objects; describe adds
-it to returned functions. With both depths zero, existing output is unchanged.
+JSON `references` string arrays contain flat locations in `path:start-end:qualifiedName`
+format, or `path:line:qualifiedName` for single-line symbols, for example
+`["b.py:1-2:middle", "b.py:5:helper", "c.py:7:DEFAULT_LIMIT"]`, without file grouping.
+`--refs` controls these annotations on map nodes, callable search results,
+cross-search source and match objects, and describe's returned functions,
+independently of traversal. Graph expansion uses `callDepth` on map nodes and
+`relatedCallables` on callable search results; caller/callee depth fields retain
+their graph meaning. With both depths zero and no explicit `--refs`, outgoing
+annotations are omitted.
+
 In expanded text output, `--expand-code-threshold` (default `0.9`) adds the actual
 indexed source code of a matched callable when its similarity is **strictly above**
 the threshold. The option accepts a finite value in `[-1,1]`; it does not change
 search filtering, result limits, or JSON output. For cross-search, a source or
 cluster member uses its highest displayed match similarity. Unscored map entries
 and call-graph-only neighbors remain declaration-only.
+
+### Map output
 
 Text output prints declarations in source order using `*** path` file headers and
 `@@ start-end @@` source ranges. Adjacent code declarations of the same kind and
@@ -403,6 +431,8 @@ slopdex map -k imports -e 'HashMap|MapAlias' --output json
 slopdex map docs -k headings -e '^Guide\.Setup' -i --no-reindex
 slopdex map src -q 'validate session' -q 'authenticate user' -g '*.rs' -k fns
 slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
+slopdex map src -e '^Engine\.map$' --callers 2 --callees 2 --refs none
+slopdex map src --callers 0 --callees 0 --refs all
 ```
 
 ## Shared selectors
@@ -447,6 +477,11 @@ Map, query searches, `describe`, and cross-search accept:
 - `--symbol-threshold <NUMBER>`: optional finite scalar in `[-1,1]`, default
   `0.5`; inclusive minimum semantic selector similarity, independent of `--threshold`.
   Ranges are not accepted.
+
+Callable traversal and outgoing annotations have separate shared controls:
+`--callers`/`--callees` and `--expand-callers`/`--expand-callees` select callable
+graph levels; `--refs none|all|cross-file` selects reference annotations without
+changing traversal. See [callable context and outgoing references](#callable-context-and-outgoing-references).
 
 | Format group | Supported formats |
 | --- | --- |
@@ -604,6 +639,8 @@ slopdex search-symbols 'validate session' --threshold 0.6 --limit 20
 slopdex search 'installation' --symbols -g '*.md' --detail expanded
 slopdex search 'validate session' --code --symbols
 slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
+slopdex search-code 'validate session' --callers 1 --callees 1 --refs none
+slopdex search-symbols 'read settings' --callers 0 --callees 0 --refs cross-file
 slopdex config set descriptionProvider opencode-go
 slopdex generate descriptions
 slopdex search-descriptions "keep the repository index synchronized"
@@ -775,8 +812,10 @@ Symbol JSON rows have this shape:
 The abbreviated `symbol` above contains the full serialized `StructureNode` in
 actual output (ranges, signature, parent, aliases, and other metadata), plus
 `path` and `sourceMode`. Its `id` is **file-local**, not a name-vocabulary/vector
-ID. Callable symbol rows can include `relatedCallables` and `callees` when call
-expansion is requested, as function rows do; noncallable symbols do not seed it.
+ID. Callable symbol rows can include `relatedCallables` when call expansion is
+requested, as function rows do; noncallable symbols do not seed it. Outgoing
+`references` annotations follow `--refs`, independently of expansion, and may
+include non-callable targets.
 
 Cross-search clusters retain their cluster header and group members under one
 repository-relative `path:` header per file. File paths are sorted lexically;
@@ -798,7 +837,7 @@ Cross-index members append `[source]` or `[target]` to their individual symbol
 lines to keep their identities distinct. Identical paths share one file header
 even when the symbols come from different indexes. The similarity range belongs
 to observed edges, not individual members. File grouping is a text presentation;
-JSON `callees` arrays keep flat `path:start-end:qualifiedName` locations. With
+JSON `references` arrays keep flat `path:start-end:qualifiedName` locations. With
 `--cohesion` or `--output text`, cross-search can instead print source/match groups
 with per-match scores and optional filesystem distance.
 
@@ -856,6 +895,9 @@ by default, even below `--expand-code-threshold`. Use `--expand-callers N` and
 `--expand-callees N` (or `--expand-callables N`) to override either depth;
 explicit `0` disables that direction's automatic code expansion. These defaults
 apply to the LLM context, not describe's JSON result or text references.
+`--refs` controls outgoing annotations in both the context and returned excerpts
+independently of traversal. Its implicit default follows the resolved depths for
+each output, including the context's code-expansion depths.
 The entire prompt is limited to 128 KiB; expanded search output is marked if
 truncated on a UTF-8 boundary. Complete files are not appended to the prompt.
 The instruction asks for an explanation of existing code/docs with paths and

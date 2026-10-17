@@ -137,7 +137,10 @@ fn symbol_search_renders_saved_nodes_heading_bodies_and_independent_scores() -> 
         0.9,
     )?;
     for row in &rows[..4] {
-        assert!(presentation.key(&row["symbol"]).is_none());
+        assert_eq!(
+            presentation.key(&row["symbol"]).is_some(),
+            row["symbol"]["kind"] != "heading"
+        );
     }
     presentation.prepare(
         &rows[..4]
@@ -157,14 +160,14 @@ fn symbol_search_renders_saved_nodes_heading_bodies_and_independent_scores() -> 
     )?;
     let enriched: Value = serde_json::from_slice(&output)?;
     for row in &array(&enriched)[..4] {
-        assert!(row.get("relatedCallables").is_none());
+        assert!(array(&row["relatedCallables"]).is_empty());
     }
     assert_eq!(enriched[4]["symbol"], rows[4]["symbol"]);
     assert_eq!(
         enriched[4]["relatedCallables"],
         enriched[5]["relatedCallables"]
     );
-    assert_eq!(enriched[4]["callees"], enriched[5]["callees"]);
+    assert_eq!(enriched[4]["references"], enriched[5]["references"]);
     assert!(!array(&enriched[4]["relatedCallables"]).is_empty());
     assert_eq!(
         score_details(&json!({"symbolSimilarity":0.4639})),

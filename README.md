@@ -60,6 +60,8 @@ $ slopdex map docs --detail expanded
 $ slopdex map --no-reindex
 $ slopdex map src -q 'validate session' -q 'authenticate user' -k fns
 $ slopdex map docs -q 'installation' --symbol-threshold 0.6 --detail expanded
+$ slopdex map src -e '^Engine\.map$' --callers 2 --callees 2 --refs none
+$ slopdex map src --callers 0 --callees 0 --refs all
 ```
 
 The `map` command can be used to generate a source code skeleton that strips most of the code implementation but retains structurally useful information that can act as an index into the source code, which improves context usage.
@@ -67,6 +69,20 @@ The `map` command can be used to generate a source code skeleton that strips mos
 Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). Regexes match qualified names or callable source text, including function bodies. The `-q` filter uses vector search on symbol names and markdown heading titles.
 
 Use `--detail expanded` to show full code or markdown of matched symbols.
+
+`--callers N` and `--callees N` add up to N levels of callable graph context,
+including same-file callees as declarations in grouped file output. Each depth
+defaults to `0`, or `1` with expanded detail; `--expand-callers N` and
+`--expand-callees N` raise the corresponding traversal depth when needed and show
+full code at those depths.
+
+`--refs none|all|cross-file` independently controls outgoing reference annotations,
+including functions and conservatively resolved non-callable targets. `all` includes
+same-file references; `none` hides annotations without disabling traversal.
+The default is `cross-file` when either effective traversal depth is nonzero,
+otherwise `none`. Explicit `all` or `cross-file` works even at zero traversal
+without adding referenced declarations. See the [reference](docs/reference.md#callable-context-and-outgoing-references)
+for text and JSON output.
 
 See the [selector reference](docs/reference.md#shared-selectors).
 

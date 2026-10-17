@@ -29,14 +29,14 @@ pub(in crate::cli) fn print_map(
         let path = row["path"].as_str().context("map result is missing path")?;
         let nodes: Vec<StructureNode> = serde_json::from_value(row["nodes"].clone())
             .with_context(|| format!("decode map nodes for {path}"))?;
-        let callees: HashMap<usize, Vec<String>> = array(&row["nodes"])
+        let references: HashMap<usize, Vec<String>> = array(&row["nodes"])
             .iter()
             .filter_map(|node| {
                 let id = usize::try_from(node["id"].as_u64()?).ok()?;
-                let calls = node["callees"].as_array()?;
+                let references = node["references"].as_array()?;
                 Some((
                     id,
-                    calls
+                    references
                         .iter()
                         .filter_map(Value::as_str)
                         .map(str::to_owned)
@@ -104,7 +104,7 @@ pub(in crate::cli) fn print_map(
                 },
                 map::HitDetails {
                     annotations: None,
-                    callees: Some(&callees),
+                    references: Some(&references),
                     extras: Some(&extras),
                 },
             )

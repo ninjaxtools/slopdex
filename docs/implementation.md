@@ -29,7 +29,7 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/parse/markdown.rs` | Structural heading hierarchy and separate bounded Markdown search chunks, fence and comment handling; heading names collapse whitespace and fall back to `<anonymous@line:col>`. |
 | `src/parse/data.rs` | Configuration/markup structure (iterative work-stack walk, no depth limit) and bounded document search chunks. |
 | `src/parse/shell.rs` | Bash heredoc/function recovery; expansion boundaries are matched by parsing exponentially growing windows so bodies with thousands of expansions stay linear. |
-| `src/callgraph.rs` | Snapshot call resolution: language-aware bare-name scoping, `impl`/static receiver matching, namespace-only `.` receivers through imports, Rust `super::` and Go package import paths. |
+| `src/callgraph.rs` | Snapshot callable graph and outgoing symbol-reference resolution: language-aware bare-name scoping, `impl`/static receiver matching, namespace-only `.` receivers through imports, Rust `super::` and Go package import paths. |
 | `src/parse/descriptions.rs` | Shared source-comment attachment, Python function/class docstrings, and file/symbol description extraction. |
 | `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits, hosted implementations and local Ollama embeddings, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
 | `src/storage.rs` | Worktree SQLite bindings, attached global artifacts, streamed snapshot digests, transactional live-state reconciliation, schema validation. |
@@ -176,6 +176,20 @@ as semantic map does; mixed content/symbol searches use normal engine refresh.
 All search commands require an existing index. Read-only `NeedsWrite` retries
 reopen the same mode writable, retaining structural-only refresh for pure symbols.
 `--no-reindex` skips refresh but allows lazy name/query cache writes.
+
+Callable graph traversal and outgoing reference annotations are independent.
+`--callers`/`--callees` select graph levels, including same-file callees in grouped
+declarations; `--expand-callers`/`--expand-callees` can raise those depths and force
+indexed code. `--refs none|all|cross-file` filters annotations for conservatively
+resolved callable and non-callable targets without adding declarations. Its
+implicit default follows the resolved graph depths: `cross-file` when either is
+positive, otherwise `none`, including expanded-detail and forced-code defaults.
+JSON annotations use `references`; graph metadata keeps caller/callee depths and
+`relatedCallables`. Text groups references by file in language-specific comments
+directly beneath declarations, without an annotation label.
+Serialized structural nodes use `referenceSites` for syntactic uses; resolved
+output locations use `references`, so map declarations remain decodable as
+structural nodes.
 
 Only general `search` accepts one or more positional queries; dedicated search
 variants and `describe` retain their single-query arguments. Multiword queries
