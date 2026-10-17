@@ -202,6 +202,16 @@ pub(crate) fn query_limited(
     root: &Path,
     options: &Value,
 ) -> Result<LimitedResults<Value>> {
+    query_limited_with_reference_labels(source, root, options, false)
+}
+
+/// Text output decorates invocation labels; JSON/API output keeps symbol locations unchanged.
+pub(crate) fn query_limited_with_reference_labels(
+    source: &dyn StructureSource,
+    root: &Path,
+    options: &Value,
+    label_invocations: bool,
+) -> Result<LimitedResults<Value>> {
     let limit = limits::resolve(&Value::Null, options)?.count();
     let mut remaining = limit;
     let mut omitted = false;
@@ -287,7 +297,11 @@ pub(crate) fn query_limited(
                 if let Some(depth) = expansion.depths.get(&key) {
                     value["callDepth"] = json!(depth);
                 }
-                let references = graph.references(&key, refs);
+                let references = if label_invocations {
+                    graph.reference_labels(&key, refs)
+                } else {
+                    graph.references(&key, refs)
+                };
                 if !references.is_empty() {
                     value["references"] = json!(references);
                 }
@@ -1283,16 +1297,17 @@ mod tests {
     #[test]
     fn reference_comments_omit_labels_line_numbers_and_extra_indentation() {
         assert_eq!(
-            render_references("rust", ["src/api.rs:12-24:Api::run"], 0).unwrap(),
-            "  // src/api.rs:Api::run\n"
+            render_references("rust", ["src/api.rs:12-24:Api::run()"], 0).unwrap(),
+            "  // src/api.rs:Api::run()\n"
         );
         assert_eq!(
             render_references(
                 "python",
                 [
-                    "src/api.rs:12-24:Api::run",
+                    "src/api.rs:12-24:Api::run()",
                     "src/api.rs:3:check",
-                    "src:other.rs:8-10:Other::go",
+                    "src/api.rs:6:LIMIT",
+                    "src:other.rs:8-10:Other::go()",
                 ],
                 1,
             )
@@ -1300,8 +1315,9 @@ mod tests {
             concat!(
                 "    # src/api.rs:\n",
                 "    #   check\n",
-                "    #   Api::run\n",
-                "    # src:other.rs:Other::go\n",
+                "    #   LIMIT\n",
+                "    #   Api::run()\n",
+                "    # src:other.rs:Other::go()\n",
             )
         );
     }

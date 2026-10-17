@@ -5222,7 +5222,7 @@ fn cli_unindexed_map_matches_indexed_filters_expansion_and_rendering_without_art
         );
     }
     assert!(
-        expanded_text.contains("\ndef middle():\n  # c.py:leaf\n"),
+        expanded_text.contains("\ndef middle():\n  # c.py:leaf()\n"),
         "{expanded_text}"
     );
     for name in ["outermost", "middle", "deepest"] {
@@ -5977,11 +5977,127 @@ fn cli_map_refs_include_constants_types_and_function_values_without_expansion() 
             }
             if mode == "all" {
                 assert!(
-                    text.contains("  // b.ts:\n  //   LOCAL_LIMIT\n  //   LocalInput\n  //   callback\n  //   helper\n"),
+                    text.contains("  // b.ts:\n  //   LOCAL_LIMIT\n  //   LocalInput\n  //   callback\n  //   helper()\n"),
                     "{text}"
                 );
             } else {
                 assert!(!text.contains("  // b.ts:"), "{text}");
+            }
+            if indexed {
+                assert_eq!((rows, text), unindexed[index], "indexed parity: {mode}");
+            } else {
+                unindexed.push((rows, text));
+                assert!(!repo.index.exists());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_map_reference_comments_distinguish_rust_calls_from_function_values() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("src/main.rs", "use crate::dep::{Config, LIMIT, helper as invoke, callback};\nfn direct() {}\nfn run(config: Config) {\n    direct();\n    invoke();\n    let _created = Config::new();\n    let _callback = callback;\n    let _limit = LIMIT;\n}\nfn values() { let _local = direct; let _imported = invoke; }\n")?;
+    repo.write("src/dep.rs", "pub const LIMIT: usize = 4;\npub struct Config;\npub fn helper() {}\npub fn callback() {}\nimpl Config {\n    pub fn new() -> Self { Config }\n}\n")?;
+    let mut unindexed = Vec::new();
+    for indexed in [false, true] {
+        if indexed {
+            repo.open_map(&json!({}))?.refresh_structure()?;
+        }
+        for (index, mode) in ["none", "all", "cross-file"].into_iter().enumerate() {
+            let args = [
+                "--no-reindex",
+                "map",
+                "src/main.rs",
+                "-k",
+                "fns",
+                "-e",
+                "^(run|values)$",
+                "--callers",
+                "0",
+                "--callees",
+                "0",
+                "--refs",
+                mode,
+            ];
+            let rows = repo.cli_json(&args)?;
+            let files = rows.as_array().unwrap();
+            assert_eq!(files.len(), 1, "refs must not add target files: {rows}");
+            assert_eq!(map_names(files), strings(&["run", "values"]));
+            for (name, locations) in [
+                (
+                    "run",
+                    strings(&[
+                        "src/dep.rs:1:LIMIT",
+                        "src/dep.rs:2:Config",
+                        "src/dep.rs:3:helper",
+                        "src/dep.rs:4:callback",
+                        "src/dep.rs:6:Config.new",
+                        "src/main.rs:2:direct",
+                    ]),
+                ),
+                (
+                    "values",
+                    strings(&["src/dep.rs:3:helper", "src/main.rs:2:direct"]),
+                ),
+            ] {
+                let node = map_node(files, name);
+                let actual: BTreeSet<_> = node["references"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|location| location.as_str().unwrap().to_owned())
+                    .collect();
+                let expected: BTreeSet<_> = locations
+                    .into_iter()
+                    .filter(|location| {
+                        mode == "all"
+                            || (mode == "cross-file" && location.starts_with("src/dep.rs:"))
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "{name}, {mode}, indexed={indexed}");
+                assert!(
+                    node.get("callDepth").is_none(),
+                    "refs must not traverse: {node}"
+                );
+                assert!(node.get("callees").is_none(), "legacy field: {node}");
+            }
+            let output = repo.cli_format(&args, "text")?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout)?;
+            assert_eq!(
+                text.contains("  // src/dep.rs:\n  //   LIMIT\n  //   Config\n  //   helper()\n  //   callback\n  //   Config.new()\n"),
+                mode != "none",
+                "{text}"
+            );
+            assert_eq!(
+                text.contains("  // src/dep.rs:helper\n"),
+                mode != "none",
+                "{text}"
+            );
+            for reference in ["direct()", "direct"] {
+                assert_eq!(
+                    text.contains(&format!("  // src/main.rs:{reference}\n")),
+                    mode == "all",
+                    "{text}"
+                );
+            }
+            for declaration in [
+                "fn direct",
+                "pub fn helper",
+                "pub fn callback",
+                "impl Config",
+                "pub struct Config",
+                "pub const LIMIT",
+            ] {
+                assert!(
+                    !text.contains(declaration),
+                    "reference-only target expanded: {text}"
+                );
             }
             if indexed {
                 assert_eq!((rows, text), unindexed[index], "indexed parity: {mode}");
@@ -6059,10 +6175,14 @@ fn cli_search_refs_control_annotations_without_changing_related_callables() -> R
                 String::from_utf8_lossy(&output.stderr)
             );
             let text = String::from_utf8(output.stdout)?;
-            assert_eq!(text.contains("  # b.py:helper\n"), mode == "all", "{text}");
+            assert_eq!(
+                text.contains("  # b.py:helper()\n"),
+                mode == "all",
+                "{text}"
+            );
             assert_eq!(text.contains("def helper():"), depth == "1", "{text}");
             assert_eq!(
-                text.contains("  # c.py:leaf\n"),
+                text.contains("  # c.py:leaf()\n"),
                 depth == "1" && mode != "none",
                 "{text}"
             );
@@ -6147,12 +6267,12 @@ fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result
         );
         let prompt = description_prompt(&requests.last().unwrap().body);
         assert_eq!(
-            prompt.contains("  # b.py:helper\n"),
+            prompt.contains("  # b.py:helper()\n"),
             mode == "all",
             "{mode}, {depth}: {prompt}"
         );
         assert_eq!(
-            prompt.contains("  # c.py:leaf\n"),
+            prompt.contains("  # c.py:leaf()\n"),
             mode != "none" && (depth == "1" || pattern == "^helper$"),
             "{mode}, {depth}: {prompt}"
         );
@@ -6283,12 +6403,12 @@ fn cli_cross_search_refs_use_each_index_and_do_not_expand_reference_only_targets
             let text = String::from_utf8(output.stdout)?;
             for prefix in ["source", "target"] {
                 assert_eq!(
-                    text.contains(&format!("  # b.py:{prefix}_helper\n")),
+                    text.contains(&format!("  # b.py:{prefix}_helper()\n")),
                     mode == "all",
                     "{text}"
                 );
                 assert_eq!(
-                    text.contains(&format!("  # c.py:{prefix}_leaf\n")),
+                    text.contains(&format!("  # c.py:{prefix}_leaf()\n")),
                     mode != "none",
                     "{text}"
                 );
@@ -6303,7 +6423,7 @@ fn cli_cross_search_refs_use_each_index_and_do_not_expand_reference_only_targets
                     "{text}"
                 );
                 assert_eq!(
-                    text.contains(&format!("  # d.py:{prefix}_deepest\n")),
+                    text.contains(&format!("  # d.py:{prefix}_deepest()\n")),
                     depth == "1" && mode != "none",
                     "{text}"
                 );
@@ -6791,7 +6911,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     );
     let text = String::from_utf8(output.stdout)?;
     assert!(
-        text.contains("*** a.py") && text.contains("\ndef outer():\n  # b.py:middle\n"),
+        text.contains("*** a.py") && text.contains("\ndef outer():\n  # b.py:middle()\n"),
         "{text}"
     );
     assert!(
@@ -6823,7 +6943,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     );
     let map_text = String::from_utf8(map_text.stdout)?;
     assert!(
-        map_text.contains("\ndef outer():\n  # b.py:middle\n"),
+        map_text.contains("\ndef outer():\n  # b.py:middle()\n"),
         "{map_text}"
     );
     let describe = repo.cli_json(&[
@@ -7003,7 +7123,7 @@ fn expanded_detail_defaults_to_one_edge_and_includes_high_similarity_code() -> R
         "{with_code}"
     );
     assert!(
-        with_code.contains("\ndef outer():\n  # b.py:middle\n"),
+        with_code.contains("\ndef outer():\n  # b.py:middle()\n"),
         "{with_code}"
     );
     let without_code = run("1")?;

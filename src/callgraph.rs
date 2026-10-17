@@ -238,6 +238,16 @@ impl CallGraph {
 
     /// Resolved outgoing symbol locations, regardless of traversal membership.
     pub fn references(&self, key: &Key, refs: Refs) -> Vec<String> {
+        self.reference_locations(key, refs, false)
+    }
+
+    /// Comment labels distinguish actual invocations from function values without
+    /// changing the symbol identities returned in JSON.
+    pub(crate) fn reference_labels(&self, key: &Key, refs: Refs) -> Vec<String> {
+        self.reference_locations(key, refs, true)
+    }
+
+    fn reference_locations(&self, key: &Key, refs: Refs, label_invocations: bool) -> Vec<String> {
         if !refs.enabled() {
             return Vec::new();
         }
@@ -248,12 +258,17 @@ impl CallGraph {
             .filter(|target| refs != Refs::CrossFile || target.path != key.path)
             .filter_map(|target| {
                 self.node(target).map(|node| {
-                    crate::map::symbol_location(
-                        &target.path,
-                        node.start_line,
-                        node.end_line,
-                        &node.qualified_name,
-                    )
+                    let name = if label_invocations
+                        && self
+                            .edges
+                            .get(key)
+                            .is_some_and(|calls| calls.contains(target))
+                    {
+                        format!("{}()", node.qualified_name)
+                    } else {
+                        node.qualified_name.clone()
+                    };
+                    crate::map::symbol_location(&target.path, node.start_line, node.end_line, &name)
                 })
             })
             .collect::<BTreeSet<_>>()
@@ -1180,6 +1195,99 @@ mod tests {
     }
 
     #[test]
+    fn rust_invocation_references_distinguish_calls_from_function_values() {
+        let graph = build(&[
+            (
+                "src/dep.rs",
+                "pub const LIMIT: usize = 4;\npub struct Config;\npub fn helper() {}\npub fn callback() {}\npub fn mixed() {}\nimpl Config { pub fn new() -> Self { Config } pub fn factory() -> Self { Config } }\n",
+            ),
+            (
+                "src/main.rs",
+                "use crate::dep::{LIMIT, Config, helper as invoke, callback, mixed};\nfn run(config: Config) { let f = callback; let g = mixed; let constructor = Config::factory; invoke(); mixed(); mixed(); Config::new(); let count = LIMIT; }\nfn value_only() { let f = invoke; }\nstruct Runner;\nimpl Runner { fn step(&self) {} fn run(&self) { self.step(); self.run(); } }\n",
+            ),
+        ]);
+        let run = key(&graph, "src/main.rs", "run");
+        let refs = graph.reference_labels(&run, Refs::CrossFile);
+        assert_eq!(
+            refs,
+            [
+                "src/dep.rs:1:LIMIT",
+                "src/dep.rs:2:Config",
+                "src/dep.rs:3:helper()",
+                "src/dep.rs:4:callback",
+                "src/dep.rs:5:mixed()",
+                "src/dep.rs:6:Config.factory",
+                "src/dep.rs:6:Config.new()",
+            ]
+        );
+        assert_eq!(graph.reference_labels(&run, Refs::All), refs);
+        assert!(graph.reference_labels(&run, Refs::None).is_empty());
+        assert!(
+            graph
+                .references(&run, Refs::All)
+                .iter()
+                .all(|location| !location.ends_with("()"))
+        );
+        assert_eq!(
+            graph.reference_labels(&key(&graph, "src/main.rs", "value_only"), Refs::CrossFile),
+            ["src/dep.rs:3:helper"]
+        );
+        assert_eq!(
+            graph.reference_labels(&key(&graph, "src/main.rs", "Runner.run"), Refs::All),
+            ["src/main.rs:5:Runner.run()", "src/main.rs:5:Runner.step()"]
+        );
+        assert!(reference_names(&graph, "src/main.rs", "Runner.run", Refs::CrossFile).is_empty());
+        let restored: CallGraph =
+            serde_json::from_value(serde_json::to_value(&graph).unwrap()).unwrap();
+        assert_eq!(restored.reference_labels(&run, Refs::CrossFile), refs);
+    }
+
+    #[test]
+    fn invocation_reference_suffix_is_shared_across_languages() {
+        for (path, source, owner) in [
+            (
+                "a.ts",
+                "function helper() {}\nfunction callback() {}\nfunction run() { helper(); return callback; }\n",
+                "run",
+            ),
+            (
+                "a.py",
+                "def helper():\n    pass\ndef callback():\n    pass\ndef run():\n    helper()\n    return callback\n",
+                "run",
+            ),
+            (
+                "a.go",
+                "package a\nfunc helper() {}\nfunc callback() {}\nfunc run() { helper(); f := callback; _ = f }\n",
+                "run",
+            ),
+            (
+                "A.java",
+                "class A { static void helper() {} void run() { A.helper(); } }\n",
+                "A.run",
+            ),
+            (
+                "a.c",
+                "void helper(void) {}\nvoid callback(void) {}\nvoid run(void) { helper(); void (*f)(void) = callback; }\n",
+                "run",
+            ),
+        ] {
+            let graph = build(&[(path, source)]);
+            let refs = graph.reference_labels(&key(&graph, path, owner), Refs::All);
+            assert!(
+                refs.iter().any(|location| location.ends_with("helper()")),
+                "{path}: {refs:?}"
+            );
+            if owner == "run" {
+                assert!(
+                    refs.iter().any(|location| location.ends_with(":callback")),
+                    "{path}: {refs:?}"
+                );
+                assert_eq!(refs.len(), 2, "{path}: {refs:?}");
+            }
+        }
+    }
+
+    #[test]
     fn typescript_imported_types_constants_variables_and_function_values() {
         let graph = build(&[
             (
@@ -1419,6 +1527,10 @@ mod tests {
         let refs = reference_names(&graph, "main.sh", "run", Refs::All);
         assert_eq!(refs.len(), 1, "{refs:?}");
         assert!(refs[0].ends_with(":helper"));
+        assert_eq!(
+            graph.reference_labels(&key(&graph, "main.sh", "run"), Refs::All),
+            ["main.sh:1:helper()"]
+        );
         assert!(reference_names(&graph, "main.sh", "run", Refs::CrossFile).is_empty());
         assert_eq!(edges(&graph), ["main.sh:run -> main.sh:helper"]);
     }

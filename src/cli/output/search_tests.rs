@@ -233,7 +233,7 @@ fn file_hits_group_with_callable_and_symbol_hits_and_preserve_json_with_calls() 
             output.matches("Handles requests.").count(),
             usize::from(detail != Detail::Compact)
         );
-        assert!(output.contains("  // api.rs:check"), "{output}");
+        assert!(output.contains("  // api.rs:check()\n"), "{output}");
         assert!(!output.contains("pub const TIMEOUT"), "{output}");
     }
     let context = super::describe_search_context(

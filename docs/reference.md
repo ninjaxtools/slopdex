@@ -392,20 +392,25 @@ requested graph levels and same-file declarations intact.
 
 In text output, outgoing references appear immediately below the owning
 declaration, with comment markers indented two spaces deeper than the declaration.
-A single reference uses `path:qualifiedName`, with no line numbers or ranges:
+A single reference uses `path:qualifiedName`, with no line numbers or ranges.
+An actual invocation appends `()` to the resolved callable's name; references to
+function values, constants, and types remain bare. This is determined per owning
+symbol: the same function can appear as `helper()` under a caller and `helper`
+under a symbol that only references its value. A target both called and referenced
+as a value by the same symbol appears once, with `()`. For example:
 
 ```text
 def outer():
-  # b.py:middle
+  # b.py:middle()
 ```
 
 Multiple references are grouped under one repository-relative `path:` header per
 file. Paths are sorted lexically, with symbols in numeric source order within
 each file. File headers follow the comment
 marker and one space; symbol text is indented another two spaces and uses just
-`qualifiedName`, without line numbers or ranges.
+`qualifiedName` with the same invocation suffix, without line numbers or ranges.
 When a file has only one displayed symbol, its name follows the file's colon
-on the same line with no intervening space, for example `c.py:leaf`.
+on the same line with no intervening space, for example `c.py:leaf()`.
 All comment markers align; only the nested contents after the markers are
 indented. There is no annotation label or extra header level. The whole block
 follows the owning declaration's indentation, including for nested declarations.
@@ -418,14 +423,16 @@ the constant `DEFAULT_LIMIT` on line 7 in `c.py`, renders:
 ```text
 def outer():
   # b.py:
-  #   middle
-  #   helper
+  #   middle()
+  #   helper()
   # c.py:DEFAULT_LIMIT
 ```
 
 JSON `references` string arrays contain flat locations in `path:start-end:qualifiedName`
 format, or `path:line:qualifiedName` for single-line symbols, for example
 `["b.py:1-2:middle", "b.py:5:helper", "c.py:7:DEFAULT_LIMIT"]`, without file grouping.
+All JSON reference locations remain unchanged: callable names never gain `()`,
+even when the corresponding text annotation marks an invocation.
 `--refs` controls these annotations on map nodes, callable search results,
 cross-search source and match objects, and describe's returned functions,
 independently of traversal. Graph expansion uses `callDepth` on map nodes and

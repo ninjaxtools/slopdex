@@ -844,10 +844,19 @@ impl Engine {
         crate::map::query(self, &self.root, &options)
     }
 
-    pub(crate) fn map_limited(&self, options: &Value) -> Result<LimitedResults<Value>> {
+    pub(crate) fn map_limited(
+        &self,
+        options: &Value,
+        label_invocations: bool,
+    ) -> Result<LimitedResults<Value>> {
         let mut options = options.clone();
         options["limit"] = limits::resolve(&self.config, &options)?.value();
-        crate::map::query_limited(self, &self.root, &options)
+        crate::map::query_limited_with_reference_labels(
+            self,
+            &self.root,
+            &options,
+            label_invocations,
+        )
     }
 
     /// Resolve name and description selectors against the current structural snapshot.

@@ -370,7 +370,12 @@ fn run_workspace(
         let source = ui::spin("Parsing structure", || {
             map::Unindexed::parse(&root, &index, &config, &options)
         })?;
-        let results = map::query_limited(&source, &root, &options)?;
+        let results = map::query_limited_with_reference_labels(
+            &source,
+            &root,
+            &options,
+            cli.global.format != Some(Format::Json),
+        )?;
         return emit_map(
             cli,
             &mut out,
@@ -454,7 +459,10 @@ fn run_workspace(
         Command::Map(_) => {
             if let Some(options) = map_options.as_ref() {
                 let mapped = ui::spin("Mapping repository structure", || {
-                    Ok((engine.map_limited(options)?, engine.selection(options)?))
+                    Ok((
+                        engine.map_limited(options, format != Format::Json)?,
+                        engine.selection(options)?,
+                    ))
                 });
                 let (rows, selection) = match mapped {
                     Err(error) if error.is::<crate::engine::NeedsWrite>() => {
@@ -466,7 +474,10 @@ fn run_workspace(
                             mode.refresh(&mut engine)?;
                         }
                         ui::spin("Mapping repository structure", || {
-                            Ok((engine.map_limited(options)?, engine.selection(options)?))
+                            Ok((
+                                engine.map_limited(options, format != Format::Json)?,
+                                engine.selection(options)?,
+                            ))
                         })?
                     }
                     result => result?,

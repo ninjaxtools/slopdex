@@ -156,7 +156,7 @@ impl<'a> Presentation<'a> {
             path: path.to_owned(),
             id,
         };
-        let references = self.graph.as_ref()?.references(&key, self.calls.refs);
+        let references = self.graph.as_ref()?.reference_labels(&key, self.calls.refs);
         map::render_references(path, references.iter().map(String::as_str), depth)
     }
 
@@ -693,7 +693,7 @@ fn print_ranked_file(
                 path: path.to_owned(),
                 id: node.id,
             };
-            let outgoing = graph.references(&key, presentation.calls.refs);
+            let outgoing = graph.reference_labels(&key, presentation.calls.refs);
             if !outgoing.is_empty() {
                 references.insert(node.id, outgoing);
             }
