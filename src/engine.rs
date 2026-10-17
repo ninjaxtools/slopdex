@@ -1170,6 +1170,34 @@ impl Engine {
         self.source(path).ok()
     }
 
+    fn cached_line_totals(&self, path: &str) -> Result<crate::lines::Totals> {
+        let file = self.files.get(path).context("Missing indexed file")?;
+        let key = crate::lines::cache_key(
+            &file.language,
+            &file.hash,
+            parse::line_exclusions::is_test_file(path),
+        );
+        if let Some(cached) = self.db.cache(crate::lines::CACHE_KIND, &key)? {
+            return serde_json::from_str(&cached)
+                .with_context(|| format!("Invalid cached line totals for {path}"));
+        }
+        if self.readonly {
+            return Err(NeedsWrite.into());
+        }
+        let _lock = registry::artifact_lock(&self.db, crate::lines::CACHE_KIND, &key)?;
+        if let Some(cached) = self.db.cache(crate::lines::CACHE_KIND, &key)? {
+            return serde_json::from_str(&cached)
+                .with_context(|| format!("Invalid cached line totals for {path}"));
+        }
+        let totals = crate::lines::Totals::compute(path, self.source(path)?)?;
+        self.db.cache_put(
+            crate::lines::CACHE_KIND,
+            &key,
+            &serde_json::to_string(&totals)?,
+        )?;
+        Ok(totals)
+    }
+
     fn source(&self, path: &str) -> Result<&str> {
         let file = self.files.get(path).context("Missing indexed file")?;
         let source = self
@@ -2775,6 +2803,10 @@ impl crate::map::StructureSource for Engine {
 
     fn selection_source(&self, path: &str) -> Result<Option<&str>> {
         self.source(path).map(Some)
+    }
+
+    fn line_totals(&self, path: &str) -> Result<Option<crate::lines::Totals>> {
+        self.cached_line_totals(path).map(Some)
     }
 
     fn call_graph(&self) -> Result<crate::callgraph::CallGraph> {

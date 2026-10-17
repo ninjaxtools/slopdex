@@ -67,6 +67,21 @@ pub(crate) fn is_test_file(path: &str) -> bool {
     }
 }
 
+/// Independent, sorted, disjoint, half-open UTF-8 byte ranges. Comment spans
+/// include comments and Python docstrings inside tests; test spans include
+/// attached documentation and only the outermost recognized tests.
+#[derive(Default)]
+pub(crate) struct Exclusions {
+    pub comments: Vec<Range<usize>>,
+    pub tests: Vec<Range<usize>>,
+}
+
+/// Collect both exclusion categories from the same parse. The categories may
+/// overlap; merge their union when excluding comments and tests together.
+pub(crate) fn all_ranges(path: &str, source: &str) -> Result<Exclusions> {
+    collect_ranges(path, source, true, true)
+}
+
 /// Return sorted, disjoint, half-open UTF-8 byte ranges. Unknown file types are
 /// unchanged. Recoverable syntax errors retain tree-sitter's recognized spans;
 /// only parser initialization/failure is an error. Test recognition uses
@@ -83,8 +98,34 @@ pub(crate) fn excluded_ranges(
     if exclude_tests && is_test_file(path) {
         return Ok(std::iter::once(0..source.len()).collect());
     }
+    let mut exclusions = collect_ranges(path, source, exclude_comments, exclude_tests)?;
+    if exclusions.comments.is_empty() {
+        return Ok(exclusions.tests);
+    }
+    if exclusions.tests.is_empty() {
+        return Ok(exclusions.comments);
+    }
+    exclusions.comments.extend(exclusions.tests);
+    Ok(merge(exclusions.comments))
+}
+
+fn collect_ranges(
+    path: &str,
+    source: &str,
+    exclude_comments: bool,
+    exclude_tests: bool,
+) -> Result<Exclusions> {
+    let mut exclusions = Exclusions::default();
+    if source.is_empty() || !(exclude_comments || exclude_tests) {
+        return Ok(exclusions);
+    }
+    let whole_test_file = exclude_tests && is_test_file(path);
+    if whole_test_file && !exclude_comments {
+        exclusions.tests.push(0..source.len());
+        return Ok(exclusions);
+    }
     let Some(language) = super::language_for_path(path) else {
-        return Ok(Vec::new());
+        return Ok(exclusions);
     };
     if !matches!(
         language,
@@ -100,7 +141,7 @@ pub(crate) fn excluded_ranges(
             | "bash"
     ) {
         if !exclude_comments {
-            return Ok(Vec::new());
+            return Ok(exclusions);
         }
         // Reuse the data/document parsers' literal protection, Markdown inline
         // grammar, container markers, and byte-preserving grammar recovery.
@@ -110,7 +151,8 @@ pub(crate) fn excluded_ranges(
         } else {
             super::data::parse(language, path, source, &mut descriptions)?;
         }
-        return Ok(merge(descriptions.comments));
+        exclusions.comments = merge(descriptions.comments);
+        return Ok(exclusions);
     }
     let grammar: Language = match language {
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
@@ -134,23 +176,35 @@ pub(crate) fn excluded_ranges(
         tree = super::shell::recover(&mut parser, tree, source);
     }
     let root = tree.root_node();
-    if exclude_tests && language == "rust" && rust_inner_test_cfg(root, source) {
-        return Ok(std::iter::once(0..source.len()).collect());
+    let whole_test_file = whole_test_file
+        || (exclude_tests && language == "rust" && rust_inner_test_cfg(root, source));
+    if whole_test_file {
+        exclusions.tests.push(0..source.len());
+        if !exclude_comments {
+            return Ok(exclusions);
+        }
     }
-    let mut ranges = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(root, whole_test_file)];
+    while let Some((node, mut inside_test)) = stack.pop() {
         if comment(node) {
             // A shebang selects an interpreter; it is not a prose comment.
             if exclude_comments && !(node.start_byte() == 0 && text(source, node).starts_with("#!"))
             {
-                ranges.push(node.byte_range());
+                exclusions.comments.push(node.byte_range());
             }
             continue;
         }
-        if exclude_tests && let Some(range) = test_range(node, source, language) {
-            ranges.push(range);
-            continue;
+        if exclude_tests
+            && !inside_test
+            && let Some(range) = test_range(node, source, language)
+        {
+            exclusions.tests.push(range);
+            if !exclude_comments {
+                continue;
+            }
+            // Keep tests outermost, but still collect their nested comments
+            // and docstrings independently for comment-only line totals.
+            inside_test = true;
         }
         if exclude_comments && language == "python" {
             let body = match node.kind() {
@@ -177,15 +231,20 @@ pub(crate) fn excluded_ranges(
                     .next_sibling()
                     .filter(|next| next.kind() == ";")
                     .map_or(statement.end_byte(), |semicolon| semicolon.end_byte());
-                ranges.push(statement.start_byte()..end);
+                exclusions.comments.push(statement.start_byte()..end);
             }
         }
         // An explicit stack makes deeply nested input independent of Rust's
         // call-stack limit. Literal contents never undergo textual scanning.
         let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+        stack.extend(
+            node.named_children(&mut cursor)
+                .map(|child| (child, inside_test)),
+        );
     }
-    Ok(merge(ranges))
+    exclusions.comments = merge(exclusions.comments);
+    exclusions.tests = merge(exclusions.tests);
+    Ok(exclusions)
 }
 
 fn comment(node: Node<'_>) -> bool {
@@ -514,6 +573,34 @@ fn cfg_value(expression: &[Node<'_>], source: &str, test: bool, depth: usize) ->
 mod tests {
     use super::*;
 
+    fn assert_all_modes(path: &str, source: &str) -> Exclusions {
+        let exclusions = all_ranges(path, source).unwrap();
+        for ranges in [&exclusions.comments, &exclusions.tests] {
+            for (index, range) in ranges.iter().enumerate() {
+                assert!(range.start < range.end && range.end <= source.len());
+                assert!(source.is_char_boundary(range.start) && source.is_char_boundary(range.end));
+                if index > 0 {
+                    assert!(ranges[index - 1].end < range.start);
+                }
+            }
+        }
+        for (comments, tests) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut expected = Vec::new();
+            if comments {
+                expected.extend_from_slice(&exclusions.comments);
+            }
+            if tests {
+                expected.extend_from_slice(&exclusions.tests);
+            }
+            assert_eq!(
+                excluded_ranges(path, source, comments, tests).unwrap(),
+                merge(expected),
+                "{path}: comments={comments}, tests={tests}"
+            );
+        }
+        exclusions
+    }
+
     fn remaining(path: &str, source: &str, comments: bool, tests: bool) -> String {
         let ranges = excluded_ranges(path, source, comments, tests).unwrap();
         for (index, range) in ranges.iter().enumerate() {
@@ -647,6 +734,7 @@ mod tests {
                 "# literal heredoc",
             ),
         ] {
+            assert_all_modes(path, source);
             let kept = remaining(path, source, true, false);
             assert!(!kept.contains("remove"), "{path}: {kept}");
             assert!(kept.contains(literal), "{path}: {kept}");
@@ -706,6 +794,7 @@ mod tests {
                 "<!-- literal fence -->",
             ),
         ] {
+            assert_all_modes(path, source);
             let kept = remaining(path, source, true, false);
             assert!(!kept.contains("remove"), "{path}: {kept}");
             assert!(kept.contains(literal), "{path}: {kept}");
@@ -824,6 +913,9 @@ mod remove_inner {
     #[test]
     fn overlapping_comment_and_test_spans_are_unioned_without_external_blanks() {
         let source = "\n// ordinary comment\n\n/// test docs\n#[test]\nfn case() {\n    /* inside\n\n    comment */\n}\n\n";
+        let exclusions = assert_all_modes("main.rs", source);
+        assert_eq!(exclusions.comments.len(), 3);
+        assert_eq!(exclusions.tests.len(), 1);
         let ranges = excluded_ranges("main.rs", source, true, true).unwrap();
         assert_eq!(ranges.len(), 2);
         assert!(source[ranges[0].clone()].starts_with("// ordinary"));
@@ -831,6 +923,143 @@ mod remove_inner {
         assert!(source[ranges[1].clone()].ends_with('}'));
         assert_eq!(source[ranges[0].end..ranges[1].start].trim(), "");
         assert!(ranges[0].start > 0 && ranges[1].end < source.len() - 1);
+    }
+
+    #[test]
+    fn independent_comments_descend_into_outermost_tests_and_preserve_attached_docs() {
+        for (path, source, expected_comments, following) in [
+            (
+                "main.rs",
+                "// ordinary\n\n/// attached\n#[cfg(test)]\nmod checks {\n    // inside module\n    #[test]\n    fn nested() { /* nested comment */ }\n}\nfn keep() {}\n",
+                &[
+                    "// ordinary",
+                    "/// attached",
+                    "// inside module",
+                    "/* nested comment */",
+                ][..],
+                "\nfn keep",
+            ),
+            (
+                "main.py",
+                "# ordinary\n\n# attached\nclass TestOuter:\n    \"\"\"class docs\"\"\"\n    # inside class\n    def test_nested(self):\n        (\"function docs\");\n        # inside function\n        return '# literal'\n\ndef keep():\n    return 1\n",
+                &[
+                    "# ordinary",
+                    "# attached",
+                    "\"\"\"class docs\"\"\"",
+                    "# inside class",
+                    "(\"function docs\");",
+                    "# inside function",
+                ][..],
+                "\n\ndef keep",
+            ),
+            (
+                "main.ts",
+                "// ordinary\n\n// attached\ndescribe('outer', () => {\n    /* inside suite */\n    it('nested', () => {\n        // inside case\n        use('/* literal */');\n    });\n});\nconst keep = 1;\n",
+                &[
+                    "// ordinary",
+                    "// attached",
+                    "/* inside suite */",
+                    "// inside case",
+                ][..],
+                "\nconst keep",
+            ),
+            (
+                "Main.java",
+                "// ordinary\n\n/** attached */\nclass WidgetTests {\n    // inside class\n    @Test void nested() {\n        /* inside method */\n    }\n}\nclass Main {}\n",
+                &[
+                    "// ordinary",
+                    "/** attached */",
+                    "// inside class",
+                    "/* inside method */",
+                ][..],
+                "\nclass Main",
+            ),
+        ] {
+            let exclusions = assert_all_modes(path, source);
+            assert_eq!(
+                exclusions
+                    .comments
+                    .iter()
+                    .map(|range| source[range.clone()].trim_end())
+                    .collect::<Vec<_>>(),
+                expected_comments,
+                "{path}"
+            );
+            assert_eq!(
+                exclusions.tests,
+                std::iter::once(
+                    source.find(expected_comments[1]).unwrap()..source.find(following).unwrap()
+                )
+                .collect::<Vec<_>>(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_test_files_still_collect_independent_comments_and_docstrings() {
+        for (path, source, expected_comments) in [
+            (
+                "src/widget.test.ts",
+                "// comment\ntest('case', () => { /* nested */ });\n",
+                &["// comment", "/* nested */"][..],
+            ),
+            (
+                "tests/helper.py",
+                "#!/usr/bin/env python3\n\"\"\"module docs\"\"\"\n# comment\n\ndef helper():\n    \"\"\"helper docs\"\"\"\n    return '# literal'\n",
+                &[
+                    "\"\"\"module docs\"\"\"",
+                    "# comment",
+                    "\"\"\"helper docs\"\"\"",
+                ][..],
+            ),
+            (
+                "tests/helper.rs",
+                "// comment\nfn helper() { let value = \"// literal\"; }\n",
+                &["// comment"][..],
+            ),
+            (
+                "src/main.rs",
+                "//! module docs\n#![cfg(test)]\n\nfn helper() {\n    // comment\n}\n",
+                &["//! module docs", "// comment"][..],
+            ),
+            (
+                "widget_test.go",
+                "package main\n// comment\nvar value = `// literal`\n",
+                &["// comment"][..],
+            ),
+            (
+                "WidgetTest.java",
+                "// comment\nclass WidgetTest { String value = \"// literal\"; }\n",
+                &["// comment"][..],
+            ),
+            (
+                "tests/helper.c",
+                "/* comment */\nchar *value = \"// literal\";\n",
+                &["/* comment */"][..],
+            ),
+            (
+                "tests/check.sh",
+                "#!/bin/sh\n# comment\nvalue='# literal'\n",
+                &["# comment"][..],
+            ),
+        ] {
+            let exclusions = assert_all_modes(path, source);
+            assert_eq!(
+                exclusions.tests,
+                std::iter::once(0..source.len()).collect::<Vec<_>>(),
+                "{path}"
+            );
+            assert_eq!(
+                exclusions
+                    .comments
+                    .iter()
+                    .map(|range| source[range.clone()].trim_end())
+                    .collect::<Vec<_>>(),
+                expected_comments,
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -896,6 +1125,10 @@ test.extend({ keep: true });
 
     #[test]
     fn unsupported_sources_and_interpreter_directives_remain_unchanged() {
+        for (path, source) in [("file.txt", "// keep\n"), ("main.rs", "")] {
+            let exclusions = assert_all_modes(path, source);
+            assert!(exclusions.comments.is_empty() && exclusions.tests.is_empty());
+        }
         assert!(
             excluded_ranges("file.txt", "// keep\n", true, true)
                 .unwrap()

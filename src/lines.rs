@@ -11,12 +11,77 @@ use crate::{
     ui,
 };
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
 };
+
+pub(crate) const CACHE_KIND: &str = "line-stats";
+// Bump when counting or comment/test recognition changes. Parser changes also
+// invalidate these artifacts through STRUCTURE_PARSER_VERSION in the key.
+const STATISTICS_VERSION: &str = "line-totals-v1";
+
+/// Bit 0 includes blanks, bit 1 excludes comments, and bit 2 excludes tests.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Totals([usize; 8]);
+
+impl Totals {
+    pub(crate) fn compute(path: &str, source: &str) -> Result<Self> {
+        let exclusions = line_exclusions::all_ranges(path, source)?;
+        let mut totals = [0; 8];
+        for exclude_tests in [false, true] {
+            for exclude_comments in [false, true] {
+                let mut excluded = Vec::new();
+                if exclude_comments {
+                    excluded.extend_from_slice(&exclusions.comments);
+                }
+                if exclude_tests {
+                    excluded.extend_from_slice(&exclusions.tests);
+                }
+                for include_blank_lines in [false, true] {
+                    let index = Self::index(include_blank_lines, exclude_comments, exclude_tests);
+                    totals[index] = count_ranges(
+                        source,
+                        std::iter::once(0..source.len()).collect(),
+                        excluded.clone(),
+                        include_blank_lines,
+                    );
+                }
+            }
+        }
+        Ok(Self(totals))
+    }
+
+    fn index(include_blank_lines: bool, exclude_comments: bool, exclude_tests: bool) -> usize {
+        usize::from(include_blank_lines)
+            | (usize::from(exclude_comments) << 1)
+            | (usize::from(exclude_tests) << 2)
+    }
+
+    fn selected(&self, options: &Value) -> usize {
+        self.0[Self::index(
+            options["includeBlankLines"] == true,
+            options["excludeComments"] == true,
+            options["excludeTests"] == true,
+        )]
+    }
+}
+
+pub(crate) fn cache_key(language: &str, source_hash: &str, test_file: bool) -> String {
+    crate::hash(
+        serde_json::json!([
+            STATISTICS_VERSION,
+            crate::storage::STRUCTURE_PARSER_VERSION,
+            language,
+            source_hash,
+            test_file
+        ])
+        .to_string(),
+    )
+}
 
 pub(crate) fn unindexed(
     root: &Path,
@@ -77,6 +142,7 @@ pub(crate) fn indexed(
 ) -> Result<Vec<(PathBuf, usize)>> {
     let selection = source.selection(options)?;
     let paths = selected_paths(root, options)?;
+    let filtered = filtered(options)?;
     let mut result = Vec::new();
     for path in source.paths()? {
         if !matches_path(&selection, &paths, &path)
@@ -84,10 +150,14 @@ pub(crate) fn indexed(
         {
             continue;
         }
+        if !filtered && let Some(totals) = source.line_totals(&path)? {
+            result.push((root.join(path), totals.selected(options)));
+            continue;
+        }
         let text = source.selection_source(&path)?.with_context(|| {
             format!("Source for {path} requires refresh; run lines without --no-reindex")
         })?;
-        let structure = if filtered(options)? {
+        let structure = if filtered {
             source.structure(&path)?
         } else {
             None
@@ -285,6 +355,80 @@ mod tests {
         let selection = Selection::compile(&options)?;
         let parsed = parse::parse(path, source)?;
         count_file(path, source, Some(&parsed.structure), &selection, &options)
+    }
+
+    #[test]
+    fn cached_totals_match_range_counting_for_every_flag_combination() -> Result<()> {
+        for (path, source) in [
+            ("empty.rs", ""),
+            ("blank.rs", "\n \t\r\n\u{a0}\u{2003}\n"),
+            (
+                "file.rs",
+                "// header\r\n\r\nfn keep() { /* first\r\n\r\nlast */ work(); }\r\n// test docs\r\n#[test]\r\nfn check() {\r\n // comment\r\n\r\n}\r\n",
+            ),
+            ("mixed.rs", "fn keep() {} #[test] fn check() {} // trailing"),
+            ("inner.rs", "#![cfg(test)]\n// header\nfn check() {}\n"),
+            ("tests/check.rs", "// header\n\nfn helper() {}\n"),
+            (
+                "file.py",
+                "\"\"\"Module docs.\"\"\"\n\ndef keep():\n    return 1  # trailing\n\ndef test_check():\n    \"\"\"Test docs.\"\"\"\n    # comment\n\n    assert keep()\n",
+            ),
+            (
+                "file.ts",
+                "const value = 1; /* note */\n\ndescribe('suite', () => {\n // comment\n\n test('check', () => {});\n});\n",
+            ),
+            (
+                "file_test.go",
+                "package example\n\n// header\nfunc helper() {}\n",
+            ),
+            (
+                "guide.md",
+                "# Guide\n\n<!-- comment\n\nend -->\nProse. <!-- trailing -->\n",
+            ),
+            ("settings.yaml", "# header\n\nvalue: 1 # trailing\n"),
+        ] {
+            let totals = Totals::compute(path, source)?;
+            for include_blank_lines in [false, true] {
+                for exclude_comments in [false, true] {
+                    for exclude_tests in [false, true] {
+                        let options = json!({
+                            "includeBlankLines": include_blank_lines,
+                            "excludeComments": exclude_comments,
+                            "excludeTests": exclude_tests,
+                        });
+                        assert_eq!(
+                            Some(totals.selected(&options)),
+                            count(path, source, options.clone())?,
+                            "{path}, {options}"
+                        );
+                    }
+                }
+            }
+            let encoded = serde_json::to_string(&totals)?;
+            assert_eq!(serde_json::from_str::<Totals>(&encoded)?, totals);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cache_identity_preserves_source_bytes_language_and_test_path_classification() {
+        let source = crate::hash("fn code() {}\n");
+        let key = cache_key("rust", &source, false);
+        assert_eq!(key, cache_key("rust", &source, false));
+        assert_ne!(
+            key,
+            cache_key("rust", &crate::hash("fn code() {}\r\n"), false)
+        );
+        assert_ne!(key, cache_key("typescript", &source, false));
+        assert_ne!(key, cache_key("rust", &source, true));
+        for invalid in [
+            "[]",
+            "[0,0,0,0,0,0,0]",
+            "[0,0,0,0,0,0,0,0,0]",
+            "[-1,0,0,0,0,0,0,0]",
+        ] {
+            assert!(serde_json::from_str::<Totals>(invalid).is_err());
+        }
     }
 
     #[test]

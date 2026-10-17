@@ -14,7 +14,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
 
 use super::{DescriptionArtifact, PRUNE_BATCH_ROWS, PruneOptions, valid_hash};
-use crate::{formats::FormatGroup, hash, registry};
+use crate::{formats::FormatGroup, hash, lines, parse::line_exclusions, registry};
 
 #[derive(Default)]
 pub(super) struct CleanupReport {
@@ -200,6 +200,11 @@ fn mark_workspace(store: &Connection, index: &Connection) -> Result<()> {
     })? {
         let (path, source, language, parser) = row?;
         mark(store, "source", &source)?;
+        mark(
+            store,
+            lines::CACHE_KIND,
+            &lines::cache_key(&language, &source, line_exclusions::is_test_file(&path)),
+        )?;
         store.execute(
             "INSERT OR IGNORE INTO prune_files VALUES(?,?)",
             params![path, source],
@@ -603,7 +608,7 @@ pub(super) fn cleanup_with(
         ),
         (
             "cache",
-            "kind IN ('unit-content','parse','callgraph') AND NOT EXISTS(SELECT 1 FROM prune_keep k WHERE k.kind=cache.kind AND k.key=cache.key)",
+            "kind IN ('unit-content','parse','callgraph','line-stats') AND NOT EXISTS(SELECT 1 FROM prune_keep k WHERE k.kind=cache.kind AND k.key=cache.key)",
         ),
         (
             "remote_uploads",

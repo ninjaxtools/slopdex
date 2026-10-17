@@ -74,9 +74,9 @@ Symbols can be filtered by using `-e <regex>` or `-q <query>` (OR). Regexes matc
 
 Use `--detail expanded` to show full code or markdown of matched symbols.
 
-`--callers N` and `--callees N` add up to N levels of callable graph context. Under `--detail expanded` N defaults to 1.
+`--callers N` and `--callees N` show up to N levels of callable graph context. Under `--detail expanded` N defaults to 1.
 
-`--refs none|all|cross-file` controls references symbols, including callees, which are displayed as comments below a function.
+`--refs none|all|cross-file` controls referenced symbols, including callees, which are displayed as comments below a function.
 Defaults to `cross-file` when `--callers` or `--callees` is non-zero, otherwise `none`. `all` shows intra-file references as well.
 See the [reference](docs/reference.md#callable-context-and-outgoing-references) and [selector reference](docs/reference.md#shared-selectors).
 
@@ -125,12 +125,7 @@ $ slopdex config embeddings --provider ollama
 
 To create a vector index, the `update` command needs to be run once in a Git repository. Any subsequent attempts to use the index will determine what needs to be updated using Git and update the index incrementally (use `--no-reindex` to skip this).
 
-Each worktree has its own index in `$XDG_CACHE_HOME/slopdex/worktrees-v1/<root-hash>/index.sqlite` (normally under `~/.cache`). There is also a global cache that is reused across worktrees, so hash-identical code will not cause unneeded model provider requests. Configuaration is stored in `$XDG_CONFIG_HOME/slopdex/config.json`. Global configuration can be overridden with a repository local `.slopdex/config.json` file. See also [cache configuration](docs/reference.md#shared-provider-artifacts).
-
-`slopdex cache prune` removes missing-worktree indexes and unused rebuildable data,
-but preserves provider-generated vectors and descriptions for reuse. Add
-`--prune-vectors` or `--prune-descriptions` to explicitly remove unused results of
-that kind, and `--vacuum` to return freed database space to the filesystem.
+Each worktree has its own index under `~/.cache/slopdex`. There is also a global cache that is reused across worktrees, so hash-identical code will not cause unneeded model provider requests. Configuaration is stored in `~/.config/slopdex/config.json`. Global configuration can be overridden with a repository local `.slopdex/config.json` file. These folder respect the `$XDG_*` settings. See also [cache configuration](docs/reference.md#shared-provider-artifacts).
 
 By default code and docs indexes are searched and ranked together, see `--formats` to enable other file types.
 
@@ -335,7 +330,7 @@ $ slopdex cross-search \
 
 Pass the target's `indexPath` from `slopdex --root /path/to/other/repo --output json status` (or a custom `--index` path) as `--target-index`.
 
-## Inspect index health
+## Index maintenance
 
 If some functions can't be indexed a warning is printed. Index errors can be investigated and fixed with the `index errors` command to ensure the index is complete.
 
@@ -343,6 +338,12 @@ If some functions can't be indexed a warning is printed. Index errors can be inv
 $ slopdex status
 $ slopdex index errors --output text
 $ slopdex --version
+```
+
+`slopdex cache prune` removes unused rebuildable data, and preserves any generated vectors or descriptions. Add `--prune-vectors` or `--prune-descriptions` to explicitly remove unused results of that kind. To return all space to the filesystem sqlite databases need to be vacuumed with `--vacuum`.
+
+```console
+$ slopdex cache prune --vacuum
 ```
 
 ## Related Work

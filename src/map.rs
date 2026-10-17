@@ -28,6 +28,12 @@ pub(crate) trait StructureSource {
         Ok(self.source(path))
     }
 
+    /// Whole-file counts may be served without loading source; symbol selections
+    /// still use source bytes and declaration ranges.
+    fn line_totals(&self, _path: &str) -> Result<Option<crate::lines::Totals>> {
+        Ok(None)
+    }
+
     fn selection(&self, options: &Value) -> Result<Selection> {
         Selection::compile(options)
     }

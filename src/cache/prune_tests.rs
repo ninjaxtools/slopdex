@@ -115,6 +115,48 @@ fn prune_retains_complete_paid_context_and_live_authoritative_graph() -> Result<
 }
 
 #[test]
+fn prune_retains_live_line_totals_and_sweeps_unreachable_or_obsolete_statistics() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let base = temp.path().canonicalize()?;
+    let config = json!({"artifactCachePath": base.join("global.sqlite")});
+    let index = base.join("index.sqlite");
+    let mut db = Database::open_with_config(&index, &base, &config, false)?;
+    let old_source = "fn old() {}\n";
+    let source = "// header\n\nfn current() {}\n";
+    let old_key = crate::lines::cache_key("rust", &hash(old_source), false);
+    let live_key = crate::lines::cache_key("rust", &hash(source), false);
+    let test_key = crate::lines::cache_key("rust", &hash(source), true);
+    let obsolete_key = hash("obsolete line statistics version");
+    publish(&mut db, old_source)?;
+    db.cache_put(
+        crate::lines::CACHE_KIND,
+        &old_key,
+        &serde_json::to_string(&crate::lines::Totals::compute("code.rs", old_source)?)?,
+    )?;
+    publish(&mut db, source)?;
+    for (key, path) in [
+        (&live_key, "code.rs"),
+        (&test_key, "tests/code.rs"),
+        (&obsolete_key, "code.rs"),
+    ] {
+        db.cache_put(
+            crate::lines::CACHE_KIND,
+            key,
+            &serde_json::to_string(&crate::lines::Totals::compute(path, source)?)?,
+        )?;
+    }
+    drop(db);
+    let report = prune(&config, false)?;
+    assert!(report.artifact_rows_deleted >= 3);
+    let db = Database::open_readonly_with_config(&index, &base, &config)?;
+    assert!(db.cache(crate::lines::CACHE_KIND, &live_key)?.is_some());
+    for key in [&old_key, &test_key, &obsolete_key] {
+        assert!(db.cache(crate::lines::CACHE_KIND, key)?.is_none());
+    }
+    Ok(())
+}
+
+#[test]
 fn provider_prune_flags_are_independent_and_preserve_live_bindings() -> Result<()> {
     for (vectors, descriptions) in [(true, false), (false, true), (true, true)] {
         let temp = tempfile::tempdir()?;
