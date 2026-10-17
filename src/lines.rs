@@ -1,6 +1,8 @@
 //! Unique physical source-line counts, independent of presentation metadata.
 
+mod files;
 mod tree;
+pub(crate) use files::print_files;
 pub(crate) use tree::Tree;
 
 use crate::{
@@ -14,7 +16,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -167,6 +169,19 @@ pub(crate) fn indexed(
         }
     }
     Ok(result)
+}
+
+fn unique_files(files: impl IntoIterator<Item = (PathBuf, usize)>) -> Vec<(PathBuf, usize)> {
+    // Overlapping positional paths can select the same file through more
+    // than one workspace group. It is still one file, not extra lines.
+    let mut unique = BTreeMap::<PathBuf, usize>::new();
+    for (path, lines) in files {
+        unique
+            .entry(path)
+            .and_modify(|count| *count = (*count).max(lines))
+            .or_insert(lines);
+    }
+    unique.into_iter().collect()
 }
 
 fn selected_paths(root: &Path, options: &Value) -> Result<Vec<String>> {

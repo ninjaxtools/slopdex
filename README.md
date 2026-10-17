@@ -26,7 +26,7 @@ The main supported functions are
 
 `map` shows a map/skeleton of the code, excluding implementation details like function bodies. This can be helpful to get a concise map of the code to allow an LLM to explore the codebase incrementally.
 
-`lines` shows a folder/file tree with line counts, allowing for ignoring comments and tests and aggregating across top folders.
+`lines` shows a folder/file tree with line counts, or a ranked file list with `--output files`, allowing for ignoring comments and tests and aggregating across top folders.
 
 `search` does a vector search across code/docs and optionally other formats.
 
@@ -96,6 +96,7 @@ $ slopdex lines src docs
 $ slopdex lines src --include-blank-lines
 $ slopdex lines -g '*.rs' --exclude-comments --exclude-tests
 $ slopdex lines --formats all --limit 10
+$ slopdex lines src docs --output files --limit 10
 $ slopdex lines src -e 'refresh|search' -i
 $ slopdex lines -q 'validate session' --symbol-threshold 0.6 --output json
 ```
@@ -105,7 +106,8 @@ Counts whole file contents excluding empty lines (or include them with `--includ
 - `-g` can be used to match files and `--formats` to select formats (default: `code,docs`).
 - `--exclude-comments` excludes language-specific comments or docstrings.
 - `--exclude-tests` excludes `*.test.ts`, `*.spec.ts`, and `*_test.go` as well as inline tests, including rust's `#[test]` and `#[cfg(test)]`.
-- `--limit 10` shows the largest files or folders by line count.
+- `--limit 10` shows the largest files or folders by line count in the default tree.
+- `--output files` prints a flat text list of files with line counts, sorted by descending count (ties by path ascending). `--limit N` keeps only the top N files across all supplied workspaces; the default and `--limit none` show all files. The default tree and `--output json` hierarchy are unchanged.
 
 See the [line-count reference](docs/reference.md#line-counts) for details.
 

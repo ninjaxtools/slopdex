@@ -66,6 +66,37 @@ fn lines_selectors_exclusions_and_limits_do_not_become_declaration_limits() {
 }
 
 #[test]
+fn files_output_is_only_available_for_lines_with_global_flag_placement() {
+    for args in [
+        vec!["lines", "--output", "files", "--limit", "3"],
+        vec!["--output", "files", "lines", "--limit", "3"],
+    ] {
+        let cli = parse(&args);
+        assert_eq!(cli.global.format, Some(Format::Files));
+        let Command::Lines(args) = cli.command else {
+            panic!("expected lines")
+        };
+        assert_eq!(args.limit, Some(ResultLimit::Count(3)));
+        assert!(args.options(&args.paths).get("limit").is_none());
+    }
+    for command in [
+        vec!["map"],
+        vec!["search", "query"],
+        vec!["cross-search"],
+        vec!["status"],
+        vec!["config"],
+    ] {
+        let cli = Cli::try_parse_from(["slopdex", "--output", "files"].into_iter().chain(command))
+            .unwrap();
+        let error = cli.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("--output files is only available for lines"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn embedding_setup_accepts_global_flags_before_and_after_commands() {
     for args in [
         vec![

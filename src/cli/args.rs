@@ -59,7 +59,7 @@ pub(super) struct Global {
     /// OpenAI reranker candidate count (1..=100; default: 10)
     #[arg(long, global = true, value_parser = candidates)]
     pub(super) reranker_candidates: Option<usize>,
-    /// Text excerpts by default; cross-search uses clusters, cohesion uses source/match groups; cross JSON is JSONL
+    /// Text excerpts by default; lines accepts files, cross-search uses clusters, cohesion uses source/match groups; cross JSON is JSONL
     #[arg(long = "output", global = true, value_enum)]
     pub(super) format: Option<Format>,
     /// Compact by default; expanded includes descriptions and high-similarity callable code
@@ -97,6 +97,7 @@ pub(super) enum Format {
     Summary,
     Json,
     Clusters,
+    Files,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -135,7 +136,7 @@ pub(super) enum Command {
     CrossSearch(CrossArgs),
     /// Show code declarations and Markdown headings; -q matches symbols, descriptions, and heading titles
     Map(MapArgs),
-    /// Count file or matching symbol/section lines in an aggregated folder tree
+    /// Count file or matching symbol/section lines as a folder tree or ranked files
     Lines(LinesArgs),
     /// Refresh and show index metadata, counts, and profiles as JSON
     Status,
@@ -327,7 +328,7 @@ pub(super) struct LinesArgs {
     pub(super) paths: Vec<PathBuf>,
     #[command(flatten)]
     pub(super) selection: SelectionArgs,
-    /// Show the N largest files/folders in place, with ancestors; default: all (ignores defaultLimit)
+    /// Show N largest files/folders in the tree, or N largest files with --output files; default: all (ignores defaultLimit)
     #[arg(long)]
     pub(super) limit: Option<ResultLimit>,
     /// Include empty and whitespace-only source lines (excluded by default)
@@ -809,6 +810,12 @@ impl Cli {
             ensure!(
                 matches!(&self.command, Command::CrossSearch(args) if !args.cohesion),
                 "--output clusters is only available for cross-search without --cohesion; use --output text or --output json"
+            );
+        }
+        if self.global.format == Some(Format::Files) {
+            ensure!(
+                matches!(&self.command, Command::Lines(_)),
+                "--output files is only available for lines; use --output text or --output json"
             );
         }
         match &self.command {

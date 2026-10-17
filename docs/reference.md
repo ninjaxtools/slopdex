@@ -43,7 +43,7 @@ can also follow the command. Quote multiword queries.
 | `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Show selected groups' declarations, keys, sections, elements, and Markdown headings; refresh existing structure or parse directly if no index exists. | Summary |
-| `lines [PATH]...` | Count whole files, or matching symbols/sections with `-e`/`-q`, in a folder tree with aggregate counts. | Tree |
+| `lines [PATH]...` | Count whole files, or matching symbols/sections with `-e`/`-q`, in a folder tree with aggregate counts; `--output files` gives a ranked file list. | Tree |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
@@ -204,6 +204,8 @@ slopdex lines src docs
 slopdex lines src --include-blank-lines
 slopdex lines -g '*.rs' --exclude-comments --exclude-tests
 slopdex lines --formats all --limit 10
+slopdex lines src docs --output files
+slopdex lines /path/to/repo-a /path/to/repo-b --output files --limit 10
 slopdex lines src -e 'refresh|search' -i
 slopdex lines -q 'validate session' --symbol-threshold 0.6 --output json
 ```
@@ -240,8 +242,8 @@ and `#[cfg(test)]` modules. Both flags also apply to selector-based counts.
 Test detection uses conventional names and syntax, without import-alias
 resolution, macro expansion, or embedded-language parsing.
 
-The tree starts at the common parent directory of the matched files. Folder
-counts aggregate all matching descendants. By default every matched file is
+The default text tree starts at the common parent directory of the matched files.
+Folder counts aggregate all matching descendants. By default every matched file is
 shown, regardless of `defaultLimit`. `--limit N` ranks files and folders together
 by descending count, excluding the common-root header, and shows the largest N
 in their original hierarchy, with their ancestors retained as context. Folder
@@ -252,6 +254,13 @@ Each JSON node has `path`, `name`, `lines`, `type` (`file` or `directory`),
 `selected`, and `children`. The root is structural (`selected: false`);
 other unselected nodes are retained ancestors. With no matches, the root is
 `(no files)` with zero lines and no children.
+
+`--output files` instead prints a flat text list of files with line counts,
+sorted by descending line count, with ties by ascending path. There are no folder
+rows or aggregate totals. `--limit N` keeps only the top N files across all
+supplied workspaces. By default all files are shown, regardless of `defaultLimit`;
+`--limit none` explicitly shows all. The default tree and `--output json`
+hierarchy are unchanged.
 
 ## Structure map
 
@@ -941,10 +950,13 @@ Cohesion changes the order of each source's selected semantic matches. Distance
 is `0` in one file, `1` between files in one directory, and `1` plus directory-tree
 hops otherwise. It does not alter similarity or the neighbor selection score.
 
-`--output json` produces map/query/diagnostic/model arrays, configuration/status
-objects, and **JSONL for cross-search** (one object per matched source).
-`--output text` (legacy alias `summary`) selects the text view;
-`--output clusters` is valid only for cross-search without cohesion. Results go
+The global `--output` accepts `text` (legacy alias `summary`), `json`, `clusters`,
+or `files`. `--output json` produces map/query/diagnostic/model arrays,
+configuration/status objects, the line-count hierarchy, and **JSONL for
+cross-search** (one object per matched source).
+`--output text` selects the text view;
+`--output clusters` is valid only for cross-search without cohesion, and
+`--output files` is valid only for `lines`. Results go
 to stdout and warnings/errors to stderr. Clap argument errors exit with `2`;
 runtime/configuration/domain failures exit with `1`; success/help/version exit
 with `0`.

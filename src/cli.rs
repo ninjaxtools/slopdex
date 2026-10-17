@@ -160,11 +160,16 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
         run_workspace(cli, &workspace, &mut out, &mut map_output, &mut line_files)?;
     }
     if let Command::Lines(args) = &cli.command {
-        let tree = lines::Tree::new(line_files, args.limit.and_then(ResultLimit::count));
-        if cli.global.format == Some(Format::Json) {
-            print_json(&mut out, &tree)?;
+        let limit = args.limit.and_then(ResultLimit::count);
+        if cli.global.format == Some(Format::Files) {
+            lines::print_files(&mut out, line_files, limit)?;
         } else {
-            tree.print(&mut out)?;
+            let tree = lines::Tree::new(line_files, limit);
+            if cli.global.format == Some(Format::Json) {
+                print_json(&mut out, &tree)?;
+            } else {
+                tree.print(&mut out)?;
+            }
         }
     }
     if matches!(cli.command, Command::Map(_)) {

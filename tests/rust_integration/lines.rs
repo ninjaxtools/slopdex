@@ -27,6 +27,39 @@ fn counts(value: &Value) -> Vec<(String, u64)> {
     result
 }
 
+fn files_output(repo: &Repo, args: &[&str]) -> Result<Vec<(PathBuf, usize)>> {
+    let output = repo.cli_format(args, "files")?;
+    ensure!(
+        output.status.success(),
+        "CLI {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    assert!(text.is_empty() || text.ends_with('\n'), "{text:?}");
+    let mut files = Vec::new();
+    for line in text.split_terminator('\n') {
+        let (path, count) = line
+            .strip_suffix(" lines")
+            .and_then(|line| line.rsplit_once("  "))
+            .with_context(|| format!("expected a flat file-count line, got {line:?}"))?;
+        let path = PathBuf::from(path);
+        assert!(path.is_absolute(), "{path:?}");
+        let count = count.parse::<usize>()?;
+        assert_eq!(line, format!("{}  {count} lines", path.display()));
+        files.push((path, count));
+    }
+    for pair in files.windows(2) {
+        assert!(
+            pair[0].1 > pair[1].1 || pair[0].1 == pair[1].1 && pair[0].0 < pair[1].0,
+            "files must be unique and sorted by descending count, then PathBuf: {files:?}"
+        );
+    }
+    files
+        .into_iter()
+        .map(|(path, count)| Ok((path.canonicalize()?, count)))
+        .collect()
+}
+
 fn line_flags(bits: usize) -> Vec<&'static str> {
     [
         (1, "--include-blank-lines"),
@@ -145,6 +178,145 @@ fn lines_cli_full_file_counts_formats_globs_and_exclusions_match_indexed_counts(
     let text = String::from_utf8(output.stdout)?;
     assert!(text.contains("main.rs"), "{text}");
     assert!(!text.contains("small.ts"), "{text}");
+    Ok(())
+}
+
+#[test]
+fn lines_cli_files_are_flat_sorted_and_ignore_configured_default_limit() -> Result<()> {
+    let repo = Repo::new()?;
+    let config = json!({
+        "artifactCachePath": repo.home.join("cache/slopdex/global-v1.sqlite"),
+        "defaultLimit": 1
+    });
+    let settings = repo.home.join("settings.json");
+    fs::write(&settings, config.to_string())?;
+    repo.write(
+        "src with spaces/largest.rs",
+        "fn largest() {\n    one();\n    two();\n    three();\n}\n",
+    )?;
+    repo.write("a/tie.rs", "fn first() {\n    work();\n}\n")?;
+    repo.write("z/tie.rs", "fn last() {\n    work();\n}\n")?;
+    repo.write("empty.rs", "")?;
+    let expected = vec![
+        (
+            repo.root
+                .join("src with spaces/largest.rs")
+                .canonicalize()?,
+            5,
+        ),
+        (repo.root.join("a/tie.rs").canonicalize()?, 3),
+        (repo.root.join("z/tie.rs").canonicalize()?, 3),
+        (repo.root.join("empty.rs").canonicalize()?, 0),
+    ];
+    for indexed in [false, true] {
+        if indexed {
+            repo.open_map(&config)?.refresh_structure()?;
+        }
+        let mut args = vec!["--config", settings.to_str().unwrap()];
+        if indexed {
+            args.push("--no-reindex");
+        }
+        args.push("lines");
+        assert_eq!(files_output(&repo, &args)?, expected);
+        args.extend(["--limit", "none"]);
+        assert_eq!(files_output(&repo, &args)?, expected);
+        *args.last_mut().unwrap() = "2";
+        assert_eq!(files_output(&repo, &args)?, expected[..2]);
+        if !indexed {
+            assert!(!repo.index.exists(), "file output must remain cache-free");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn lines_cli_files_apply_filters_exclusions_blank_counts_and_empty_selection() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write(
+        "src/selected.rs",
+        "// Header\n\nfn wanted() {\n \t\n    work();\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn check() {}\n}\n",
+    )?;
+    repo.write("src/compact.rs", "fn unrelated() {}\n\n\n\n\n \t")?;
+    repo.write("src/api_test.rs", "#[test]\nfn check() {}\n")?;
+    repo.write(
+        "src/ignored.rs",
+        "fn ignored() {\n    one();\n    two();\n    three();\n    four();\n}\n",
+    )?;
+    repo.write("docs/guide.md", "# Guide\n\nProse.\n")?;
+    let selected = repo.root.join("src/selected.rs").canonicalize()?;
+    let compact = repo.root.join("src/compact.rs").canonicalize()?;
+    for indexed in [false, true] {
+        if indexed {
+            repo.open_map(&json!({}))?.refresh_structure()?;
+        }
+        let mut args = Vec::new();
+        if indexed {
+            args.push("--no-reindex");
+        }
+        args.extend([
+            "lines",
+            "--exclude-comments",
+            "--exclude-tests",
+            "-g",
+            "*.rs",
+            "-g",
+            "!ignored.rs",
+        ]);
+        assert_eq!(
+            files_output(&repo, &args)?,
+            vec![(selected.clone(), 3), (compact.clone(), 1)]
+        );
+        args.extend(["--include-blank-lines", "--limit", "1"]);
+        assert_eq!(files_output(&repo, &args)?, vec![(compact.clone(), 6)]);
+        let mut query = if indexed {
+            vec!["--no-reindex", "lines"]
+        } else {
+            vec!["lines"]
+        };
+        query.extend(["-e", "WANTED", "-i", "--include-blank-lines"]);
+        assert_eq!(files_output(&repo, &query)?, vec![(selected.clone(), 4)]);
+        let pattern = query.len() - 3;
+        query[pattern] = "no_matching_symbol";
+        assert!(files_output(&repo, &query)?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn lines_cli_files_limit_unique_files_globally_across_overlapping_workspaces() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.write("src/small.rs", "fn small() {}\n")?;
+    repo.write("src/tie.rs", "fn local() {\n    work();\n}\n")?;
+    let external = repo._temp.path().canonicalize()?.join("external");
+    fs::create_dir_all(external.join("src"))?;
+    fs::write(
+        external.join("src/largest.rs"),
+        "fn largest() {\n    one();\n    two();\n    three();\n}\n",
+    )?;
+    fs::write(
+        external.join("src/tie.rs"),
+        "fn external() {\n    work();\n}\n",
+    )?;
+    let largest = external.join("src/largest.rs");
+    let external_src = external.join("src");
+    let mut args = vec![
+        "lines",
+        ".",
+        "src/small.rs",
+        external.to_str().unwrap(),
+        external_src.to_str().unwrap(),
+        largest.to_str().unwrap(),
+        external.to_str().unwrap(),
+    ];
+    let expected = vec![
+        (largest.canonicalize()?, 5),
+        (external.join("src/tie.rs").canonicalize()?, 3),
+        (repo.root.join("src/tie.rs").canonicalize()?, 3),
+        (repo.root.join("src/small.rs").canonicalize()?, 1),
+    ];
+    assert_eq!(files_output(&repo, &args)?, expected);
+    args.extend(["--limit", "2"]);
+    assert_eq!(files_output(&repo, &args)?, expected[..2]);
     Ok(())
 }
 

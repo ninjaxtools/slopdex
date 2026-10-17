@@ -50,16 +50,7 @@ impl Tree {
         files: impl IntoIterator<Item = (PathBuf, usize)>,
         limit: Option<usize>,
     ) -> Self {
-        // Overlapping positional paths can select the same file through more
-        // than one workspace group. It is still one file, not extra lines.
-        let mut unique = BTreeMap::<PathBuf, usize>::new();
-        for (path, lines) in files {
-            unique
-                .entry(path)
-                .and_modify(|count| *count = (*count).max(lines))
-                .or_insert(lines);
-        }
-        let files: Vec<_> = unique.into_iter().collect();
+        let files = super::unique_files(files);
         let path = common_parent(&files);
         let name = if files.is_empty() {
             "(no files)".to_owned()

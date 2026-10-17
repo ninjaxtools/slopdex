@@ -6009,6 +6009,7 @@ fn cli_map_reference_comments_distinguish_rust_calls_from_function_values() -> R
                 "--no-reindex",
                 "map",
                 "src/main.rs",
+                "--private",
                 "-k",
                 "fns",
                 "-e",
