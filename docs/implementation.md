@@ -403,11 +403,24 @@ temporary directory; otherwise it refuses before rewriting anything.
 
 ### Refresh snapshots and locking
 
-Engine lifetime locks at `<index>.lock` are shared for read-only opens and exclusive
-for writers, with a bounded 10-second contention wait. `NeedsWrite` allows CLI
-operations to reopen writable and retry in the same command mode. SQLite uses WAL,
-foreign keys for worktree bindings, and a 30-second busy timeout; read-only opens
-also attach the global store read-only. Config-only actions acquire no index lock.
+Engine lifetime locks at `<index>.lock` are shared in both read-only and writable
+engines. `write_index` upgrades only around workspace publication and restores the
+shared lock on success or failure. It checks workspace metadata before and after
+lock conversion to reject stale prepared work. Required writes wait up to 10
+seconds. Optional query-result and vector-pointer publication uses a nonblocking
+exclusive attempt and is skipped when readers are active.
+
+Warm writable opens use `Database::open_existing_with_config` without workspace
+initialization writes. Cold opens briefly acquire exclusivity and recheck whether
+a peer has already initialized the index rather than waiting for that peer's
+subsequent reads. Provider work and global artifact preparation retain only the
+shared workspace lock. `SharedIndex::prepare` builds or loads the global base
+before the short exclusive workspace-pointer publication.
+
+`NeedsWrite` allows CLI operations to reopen writable and retry in the same command
+mode without making the whole command exclusive. SQLite uses WAL and foreign keys
+for worktree bindings, with a 30-second busy timeout. Read-only opens also attach
+the global store read-only. Config-only actions acquire no index lock.
 
 1. Git refresh combines current status, the checkpoint-to-HEAD tree diff, previous
    dirty paths (including restored edits), missing parser structures, and saved

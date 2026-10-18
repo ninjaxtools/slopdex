@@ -97,7 +97,17 @@ impl Database {
     }
 
     pub fn open_with_config(path: &Path, root: &Path, config: &Value, force: bool) -> Result<Self> {
-        Self::open_internal(path, root, config, force, false)
+        Self::open_internal(path, root, config, force, false, true)
+    }
+
+    /// Open an initialized index without changing its schema or workspace binding.
+    /// Engine callers hold a shared index lock and retry initialization exclusively.
+    pub(crate) fn open_existing_with_config(
+        path: &Path,
+        root: &Path,
+        config: &Value,
+    ) -> Result<Self> {
+        Self::open_internal(path, root, config, false, false, false)
     }
 
     pub fn open_readonly(path: &Path, root: &Path) -> Result<Self> {
@@ -105,7 +115,7 @@ impl Database {
     }
 
     pub fn open_readonly_with_config(path: &Path, root: &Path, config: &Value) -> Result<Self> {
-        Self::open_internal(path, root, config, false, true)
+        Self::open_internal(path, root, config, false, true, false)
     }
 
     pub fn global_path(&self) -> &Path {
@@ -118,6 +128,7 @@ impl Database {
         config: &Value,
         force: bool,
         readonly: bool,
+        initialize: bool,
     ) -> Result<Self> {
         let initial_file = match std::fs::metadata(path) {
             Ok(metadata) => Some(metadata),
@@ -129,8 +140,13 @@ impl Database {
                 path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )?
-        } else {
+        } else if initialize {
             Connection::open(path)?
+        } else {
+            if initial_file.is_none() {
+                return Err(crate::engine::NeedsWrite.into());
+            }
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?
         };
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         const HAS_TABLES: &str = "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')";
@@ -140,11 +156,14 @@ impl Database {
         // least completed WAL activation and can be inspected without a lock.
         // Initialized indexes never take this lock.
         let mut initialization = None;
-        if !readonly && std::fs::metadata(path).map_or(true, |file| file.len() == 0) {
+        if initialize && std::fs::metadata(path).map_or(true, |file| file.len() == 0) {
             initialization = Some(initialization_lock(path, config)?);
         }
         let mut has_tables: bool = conn.query_row(HAS_TABLES, [], |r| r.get(0))?;
-        if !readonly && !has_tables && initialization.is_none() {
+        if !readonly && !has_tables && !initialize {
+            return Err(crate::engine::NeedsWrite.into());
+        }
+        if initialize && !has_tables && initialization.is_none() {
             // A peer may be between WAL activation and its schema commit.
             initialization = Some(initialization_lock(path, config)?);
             has_tables = conn.query_row(HAS_TABLES, [], |r| r.get(0))?;
@@ -277,6 +296,9 @@ impl Database {
         )?;
         let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
         if journal != "wal" {
+            if !initialize {
+                return Err(crate::engine::NeedsWrite.into());
+            }
             conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         }
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -294,6 +316,9 @@ impl Database {
                 |r| r.get::<_, bool>(0),
             )?;
         if !current {
+            if !initialize {
+                return Err(crate::engine::NeedsWrite.into());
+            }
             let tx = rusqlite::Transaction::new_unchecked(
                 &conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -2619,6 +2644,15 @@ mod tests {
                     );
                     incarnation = reopened.meta("incarnation")?;
                     Database::open_readonly_with_config(&path, &root, &config)?;
+                    let existing = Database::open_existing_with_config(&path, &root, &config)?;
+                    ensure!(
+                        existing.conn.total_changes() == 0,
+                        "Opening an existing index must not write during shared access"
+                    );
+                    ensure!(
+                        existing.paths()? == ["code.rs"] && existing.meta("pending")?.is_none(),
+                        "Existing-index opens must read the committed workspace snapshot"
+                    );
                 }
                 Ok(incarnation)
             })();

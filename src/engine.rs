@@ -28,6 +28,9 @@ use crate::{
     vectors::SharedIndex,
 };
 
+mod locking;
+use locking::IndexLock;
+
 const EXCLUDED: &[&str] = &[
     ".git",
     ".slopdex",
@@ -101,8 +104,8 @@ pub struct Engine {
     structures: RefCell<HashMap<String, Option<Arc<parse::FileStructure>>>>,
     symbol_index: RefCell<Option<SymbolIndex>>,
     structural_only: bool,
-    // Readers share a lock; writers hold it across SQLite and USearch publication.
-    _lock: fs::File,
+    // Shared while reading/preparing, exclusive only during workspace writes.
+    lock: IndexLock,
     readonly: bool,
 }
 
@@ -191,6 +194,7 @@ fn lock_index_with_timeout(lock: &fs::File, readonly: bool, timeout: Duration) -
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error).context("Lock index"),
         }
     }
@@ -293,17 +297,31 @@ impl Engine {
         };
         let mut lock_path = index.as_os_str().to_os_string();
         lock_path.push(".lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(PathBuf::from(lock_path))?;
-        lock_index(&lock, readonly)?;
+        let lock = IndexLock::open(&PathBuf::from(lock_path))?;
         let db = if readonly {
             Database::open_readonly_with_config(&index, &root, &config)?
+        } else if flag(&config, "forceReindex") {
+            let _write = lock.write()?;
+            Database::open_with_config(&index, &root, &config, true)?
         } else {
-            Database::open_with_config(&index, &root, &config, flag(&config, "forceReindex"))?
+            let started = Instant::now();
+            loop {
+                match Database::open_existing_with_config(&index, &root, &config) {
+                    Err(error) if error.is::<NeedsWrite>() => {
+                        ensure!(
+                            started.elapsed() < Duration::from_secs(10),
+                            "Index is in use by another slopdex command (waited 10.00 seconds)"
+                        );
+                        // A peer may initialize and then keep reading. Recheck
+                        // after short waits rather than waiting exclusively for
+                        // an initialization that is no longer necessary.
+                        if let Some(_write) = lock.write_for(Duration::from_millis(50))? {
+                            break Database::open_with_config(&index, &root, &config, false)?;
+                        }
+                    }
+                    result => break result?,
+                }
+            }
         };
         config["artifactCachePath"] = json!(db.global_path());
         let artifacts = if readonly {
@@ -338,9 +356,6 @@ impl Engine {
         } else {
             &config
         })?;
-        if !structural_only && !readonly {
-            db.set_projection_profile(&providers.vector().profile())?;
-        }
         let mut engine = Self {
             root,
             db,
@@ -355,11 +370,84 @@ impl Engine {
             structures: RefCell::new(HashMap::new()),
             symbol_index: RefCell::new(None),
             structural_only,
-            _lock: lock,
+            lock,
             readonly,
         };
+        if !structural_only && !readonly {
+            let profile = engine.providers.vector().profile();
+            if engine.db.meta("active_embedding_profile")?.as_deref() != Some(&profile.to_string())
+            {
+                engine.write_index(|engine| engine.db.set_projection_profile(&profile))?;
+            }
+        }
         engine.load()?;
         Ok(engine)
+    }
+
+    fn workspace_stamp(&self) -> Result<Vec<(String, String)>> {
+        // Derived vector plans may be published by another query for the same
+        // snapshot. Everything else must still match before prepared work commits.
+        Ok(self
+            .db
+            .conn
+            .prepare(
+                "SELECT key,value FROM metadata WHERE key NOT GLOB 'index_state_*' ORDER BY key",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn write_index<T>(&mut self, write: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        ensure!(!self.readonly, "Cannot write a read-only index");
+        let before = self.workspace_stamp()?;
+        let guard = self.lock.write()?;
+        ensure!(
+            self.workspace_stamp()? == before,
+            "Index changed while waiting to write; rerun the command"
+        );
+        let result = write(self);
+        self.restore_index_read(guard, result)
+    }
+
+    /// Query caches and derived pointers are optional. A read must not wait for
+    /// other readers merely to persist a reconstructible optimization.
+    fn try_write_index(&self, write: impl FnOnce() -> Result<()>) -> Result<()> {
+        ensure!(!self.readonly, "Cannot write a read-only index");
+        let before = self.workspace_stamp()?;
+        match self.lock.try_write()? {
+            Some(guard) => self.finish_index_write(before, guard, write),
+            None => {
+                ensure!(
+                    self.workspace_stamp()? == before,
+                    "Index changed while restoring its read lock; rerun the command"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn finish_index_write<T>(
+        &self,
+        before: Vec<(String, String)>,
+        guard: locking::WriteLock,
+        write: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        ensure!(
+            self.workspace_stamp()? == before,
+            "Index changed while waiting to write; rerun the command"
+        );
+        let result = write();
+        self.restore_index_read(guard, result)
+    }
+
+    fn restore_index_read<T>(&self, guard: locking::WriteLock, result: Result<T>) -> Result<T> {
+        let after = self.workspace_stamp()?;
+        drop(guard);
+        ensure!(
+            self.workspace_stamp()? == after,
+            "Index changed while restoring its read lock; rerun the command"
+        );
+        result
     }
 
     pub fn refresh(&mut self) -> Result<Value> {
@@ -425,7 +513,7 @@ impl Engine {
                 file.path
             );
         }
-        self.db.apply(&changed, &[], checkpoint.as_deref())?;
+        self.write_index(|engine| engine.db.apply(&changed, &[], checkpoint.as_deref()))?;
         self.load()?;
         self.artifacts.backfill_remote(&self.db);
         Ok(
@@ -756,8 +844,10 @@ impl Engine {
         }
         if changed.is_empty() && removed.is_empty() && previous_checkpoint == checkpoint {
             if !self.readonly {
-                self.save_refresh_state(&dirty, &fingerprints, &policy, &directories)?;
-                self.db.apply_structure(&[], &[], checkpoint.as_deref())?;
+                self.write_index(|engine| {
+                    engine.save_refresh_state(&dirty, &fingerprints, &policy, &directories)?;
+                    engine.db.apply_structure(&[], &[], checkpoint.as_deref())
+                })?;
             }
             return Ok(
                 json!({"filesUpdated":0,"filesDeleted":0,"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
@@ -768,17 +858,23 @@ impl Engine {
         // the information required to notice a later restore of a dirty path.
         let mut pending_dirty = previous_dirty;
         pending_dirty.extend(dirty.iter().cloned());
-        self.db
-            .set_meta("dirty_paths", &serde_json::to_string(&pending_dirty)?)?;
-        self.db
-            .set_meta("selection_policy", &selection_contract(&self.config))?;
-        self.db
-            .set_meta("source_directories", &serde_json::to_string(&directories)?)?;
-        let published = self
-            .db
-            .apply_structure(&changed, &removed, checkpoint.as_deref())?;
-        self.save_refresh_state(&dirty, &fingerprints, &policy, &directories)?;
-        registry::observe_checkpoint(&self.db, &self.root, checkpoint.as_deref())?;
+        let published = self.write_index(|engine| {
+            engine
+                .db
+                .set_meta("dirty_paths", &serde_json::to_string(&pending_dirty)?)?;
+            engine
+                .db
+                .set_meta("selection_policy", &selection_contract(&engine.config))?;
+            engine
+                .db
+                .set_meta("source_directories", &serde_json::to_string(&directories)?)?;
+            let published = engine
+                .db
+                .apply_structure(&changed, &removed, checkpoint.as_deref())?;
+            engine.save_refresh_state(&dirty, &fingerprints, &policy, &directories)?;
+            registry::observe_checkpoint(&engine.db, &engine.root, checkpoint.as_deref())?;
+            Ok(published)
+        })?;
         if published {
             self.load()?;
         }
@@ -971,10 +1067,12 @@ impl Engine {
             }
         }
         if !self.readonly {
-            self.db.put_search_cache(
-                &cache_key()?,
-                &[json!({"names":matched, "symbols":matched_symbols, "paths":matched_paths})],
-            )?;
+            self.try_write_index(|| {
+                self.db.put_search_cache(
+                    &cache_key()?,
+                    &[json!({"names":matched, "symbols":matched_symbols, "paths":matched_paths})],
+                )
+            })?;
         }
         Ok(selection.with_semantic_matches(matched, matched_symbols, matched_paths))
     }
@@ -1044,17 +1142,24 @@ impl Engine {
         let mut profile = profile;
         profile["dimensions"] = json!(vector.dimensions());
         profile["indexChannel"] = json!("symbols");
-        let index = SharedIndex::open(
+        let prepared = SharedIndex::prepare(
             &self.global_indexes(),
             &path,
             &profile,
             &vectors,
             self.readonly,
         )?;
-        if !self.readonly {
-            self.db
-                .set_meta("index_state_symbols", index.fingerprint())?;
+        if !self.readonly
+            && (prepared.needs_publication()
+                || self.db.meta("index_state_symbols")?.as_deref() != Some(prepared.fingerprint()))
+        {
+            self.try_write_index(|| {
+                prepared.publish_pointer()?;
+                self.db
+                    .set_meta("index_state_symbols", prepared.fingerprint())
+            })?;
         }
+        let index = prepared.into_index();
         Ok(SymbolIndex { names, index })
     }
 
@@ -1906,17 +2011,24 @@ impl Engine {
         if let Ok(group) = FormatGroup::from_name(kind) {
             profile["formatGroup"] = json!(group);
         }
-        let index = SharedIndex::open(
+        let prepared = SharedIndex::prepare(
             &self.global_indexes(),
             &PathBuf::from(path),
             &profile,
             &vectors,
             self.readonly,
         )?;
-        if !self.readonly {
-            self.db
-                .set_meta(&format!("index_state_{kind}"), index.fingerprint())?;
+        let state = format!("index_state_{kind}");
+        if !self.readonly
+            && (prepared.needs_publication()
+                || self.db.meta(&state)?.as_deref() != Some(prepared.fingerprint()))
+        {
+            self.try_write_index(|| {
+                prepared.publish_pointer()?;
+                self.db.set_meta(&state, prepared.fingerprint())
+            })?;
         }
+        let index = prepared.into_index();
         self.indexes.borrow_mut().insert(kind.into(), index);
         Ok(())
     }
@@ -2310,8 +2422,10 @@ impl Engine {
                 results.push(json!({"type": OMISSION_MARKER}));
             }
         }
-        self.db
-            .put_search_cache(&self.query_key(query, kind, options)?, &results)?;
+        self.try_write_index(|| {
+            self.db
+                .put_search_cache(&self.query_key(query, kind, options)?, &results)
+        })?;
         Ok(results)
     }
 
@@ -2348,6 +2462,16 @@ impl Engine {
     }
 
     fn index_fingerprint(&self, role: &str) -> Option<String> {
+        // A query can use a newly prepared plan without publishing its pointer
+        // when other readers are active. Cache its actual plan, not the old one.
+        if role == "symbols"
+            && let Some(symbols) = self.symbol_index.borrow().as_ref()
+        {
+            return Some(symbols.index.fingerprint().to_owned());
+        }
+        if let Some(index) = self.indexes.borrow().get(role) {
+            return Some(index.fingerprint().to_owned());
+        }
         // The authoritative snapshot pins its plan independently of disposable
         // pointer/base files. A cached answer needs neither loading nor repair.
         self.db.meta(&format!("index_state_{role}")).ok().flatten()
@@ -2631,7 +2755,7 @@ impl Engine {
             searching.inc(1);
         }
         searching.finish();
-        self.db.put_search_cache(&cache_key()?, &results)?;
+        self.try_write_index(|| self.db.put_search_cache(&cache_key()?, &results))?;
         Ok(results)
     }
 
@@ -2792,13 +2916,17 @@ impl Engine {
                 file.path
             );
         }
-        self.db.apply(&changed, &[], checkpoint.as_deref())?;
-        self.db
-            .set_meta("description_generation_profile", &profile)?;
-        self.db.set_meta(
-            "description_profile",
-            &self.providers.llm().profile().to_string(),
-        )?;
+        self.write_index(|engine| {
+            engine.db.apply(&changed, &[], checkpoint.as_deref())?;
+            engine
+                .db
+                .set_meta("description_generation_profile", &profile)?;
+            engine.db.set_meta(
+                "description_profile",
+                &engine.providers.llm().profile().to_string(),
+            )?;
+            Ok(())
+        })?;
         self.load()?;
         self.artifacts.backfill_remote(&self.db);
         Ok(
@@ -3754,6 +3882,105 @@ mod tests {
         let dirty: HashSet<String> =
             serde_json::from_str(&engine.db.meta("dirty_paths")?.unwrap())?;
         assert!(dirty.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn writable_engines_share_reads_and_scope_exclusivity_to_writes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir(&root)?;
+        fs::write(root.join("source.rs"), "pub fn indexed() {}\n")?;
+        let index = temp.path().join("index.sqlite");
+        let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
+        let mut first = Engine::open_map(&root, &index, config.clone())?;
+        first.refresh_structure()?;
+        let second = Engine::open_map(&root, &index, config)?;
+        assert_eq!(first.status()?, second.status()?);
+
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.path().join("index.sqlite.lock"))?;
+        FileExt::try_lock_shared(&probe)?;
+        FileExt::unlock(&probe)?;
+        assert!(FileExt::try_lock_exclusive(&probe).is_err());
+        first.try_write_index(|| {
+            anyhow::bail!("optional write must be skipped with another reader")
+        })?;
+        drop(second);
+
+        first.write_index(|engine| {
+            assert!(FileExt::try_lock_shared(&probe).is_err());
+            assert!(FileExt::try_lock_exclusive(&probe).is_err());
+            engine.db.set_meta("write-test", "published")
+        })?;
+        FileExt::try_lock_shared(&probe)?;
+        FileExt::unlock(&probe)?;
+        assert!(FileExt::try_lock_exclusive(&probe).is_err());
+
+        let stale = first.workspace_stamp()?;
+        first.write_index(|engine| engine.db.set_meta("write-test", "newer publication"))?;
+        let guard = first.lock.write()?;
+        let rejected = first.finish_index_write::<()>(stale, guard, || {
+            anyhow::bail!("stale prepared work must not run")
+        });
+        assert!(
+            rejected
+                .unwrap_err()
+                .to_string()
+                .contains("Index changed while waiting to write")
+        );
+
+        let failed = first.write_index::<()>(|_| anyhow::bail!("write failed"));
+        assert_eq!(failed.unwrap_err().to_string(), "write failed");
+        FileExt::try_lock_shared(&probe)?;
+        FileExt::unlock(&probe)?;
+        assert!(FileExt::try_lock_exclusive(&probe).is_err());
+        drop(first);
+        FileExt::try_lock_exclusive(&probe)?;
+        FileExt::unlock(&probe)?;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_cold_engine_opens_do_not_wait_for_initialized_readers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir(&root)?;
+        let index = temp.path().join("index.sqlite");
+        let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let (root, index, config) = (root.clone(), index.clone(), config.clone());
+                let (barrier, tx) = (barrier.clone(), tx.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = Engine::open_map(&root, &index, config);
+                    tx.send(result).expect("engine opener receiver");
+                })
+            })
+            .collect();
+        drop(tx);
+        // Keep every successful engine open while its peers finish initialization.
+        let results: Vec<_> = (0..4)
+            .map(|_| rx.recv_timeout(Duration::from_secs(15)))
+            .collect();
+        for worker in workers {
+            worker.join().expect("engine opener");
+        }
+        let engines = results
+            .into_iter()
+            .map(|result| result.context("cold engine open stalled")?)
+            .collect::<Result<Vec<_>>>()?;
+        for engine in &engines {
+            assert_eq!(
+                engine.db.meta("incarnation")?,
+                engines[0].db.meta("incarnation")?
+            );
+        }
         Ok(())
     }
 

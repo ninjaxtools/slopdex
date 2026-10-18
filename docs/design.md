@@ -57,8 +57,10 @@ provider caches accelerate work but do not define the live repository snapshot.
    `ui.rs` reports progress separately from result output. Search variants and
    cross-search require an existing source index (`slopdex update` creates it).
    Cross-search checks target existence before opening or refreshing the source.
-   Existing indexes normally refresh before running. Read-oriented commands try
-   a shared lock and reopen with an exclusive lock if refresh or a query needs a write.
+    Existing indexes normally refresh before running. All engines read under a
+    shared lock. Exclusive locking covers workspace writes, not provider work
+    or query execution. Queries skip optional workspace cache writes when other
+    readers are active.
 2. Refresh walks eligible working-tree files; `git.rs` supplies HEAD and dirty-file
    provenance, not the source text. `parse/` extracts canonical declarations,
    callable and document/Markdown search units, attached source descriptions, and diagnostics. `storage.rs`

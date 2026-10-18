@@ -4005,7 +4005,82 @@ fn read_errors_are_persisted_and_clear_when_the_source_is_repaired() -> Result<(
 }
 
 #[test]
-fn open_waits_for_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot() -> Result<()> {
+fn uncached_queries_share_the_index_and_skip_optional_workspace_writes() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let config = mock.config();
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    repo.write("code.rs", &function("indexed", "VECTOR_EAST"))?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh_structure()?;
+    let (root, index, reader_config) = (repo.root.clone(), repo.index.clone(), config.clone());
+    mock.on_next_request(move || {
+        let reader = Engine::open_map_readonly(&root, &index, reader_config)?;
+        ensure!(
+            reader.status()?["fileCount"] == 1,
+            "reader lost the published structure"
+        );
+        Ok(())
+    });
+    engine.refresh()?;
+
+    let reader = Engine::open_map_readonly(&repo.root, &repo.index, config.clone())?;
+    let db = repo.db()?;
+    let before: i64 = db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+    assert_eq!(
+        names(&engine.search("east", "search-code", &all())?),
+        strings(&["indexed"])
+    );
+    let selected =
+        engine.map(&json!({"symbolQuery":["indexed"], "symbolThreshold":-1, "private":true}))?;
+    assert_eq!(selected[0]["nodes"][0]["name"], "indexed");
+    engine.describe("explain the indexed function", &all())?;
+    let output = repo.cli_json(&["--no-reindex", "search-code", "uncached CLI query"])?;
+    assert!(!output.as_array().unwrap().is_empty());
+    repo.cli_json(&["--no-reindex", "lines"])?;
+    assert_eq!(
+        db.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?,
+        before
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM search_cache", [], |row| row
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert!(
+        !repo
+            .index
+            .with_extension("sqlite.code.shared.json")
+            .exists()
+    );
+    assert!(
+        !repo
+            .index
+            .with_extension("sqlite.symbols.shared.json")
+            .exists()
+    );
+    assert_eq!(reader.status()?["fileCount"], 1);
+    drop(reader);
+    drop(engine);
+
+    // An uncontended query still persists its derived pointer and result cache.
+    let engine = repo.open(&config)?;
+    engine.search("cache after readers finish", "search-code", &all())?;
+    assert!(
+        repo.index
+            .with_extension("sqlite.code.shared.json")
+            .exists()
+    );
+    assert!(
+        db.query_row("SELECT count(*) FROM search_cache", [], |row| row
+            .get::<_, i64>(0))?
+            > 0
+    );
+    Ok(())
+}
+
+#[test]
+fn open_waits_for_index_writes_and_no_reindex_uses_the_persisted_snapshot() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     let config = mock.config();
@@ -4014,6 +4089,12 @@ fn open_waits_for_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot
     engine.refresh()?;
     let expected = engine.search("east", "search-code", &all())?;
     let status = engine.status()?;
+    drop(engine);
+    let writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(repo.index.with_extension("sqlite.lock"))?;
+    fs2::FileExt::lock_exclusive(&writer)?;
     #[cfg(not(unix))]
     let second_index = repo.index.clone();
     #[cfg(unix)]
@@ -4044,7 +4125,8 @@ fn open_waits_for_exclusive_ownership_and_no_reindex_uses_the_persisted_snapshot
         early = opened_rx.recv_timeout(Duration::from_millis(10)).ok();
     }
     let released = Instant::now();
-    drop(engine);
+    fs2::FileExt::unlock(&writer)?;
+    drop(writer);
     let acquired = match early {
         Some(acquired) => Ok(acquired),
         None => opened_rx.recv_timeout(HANG_GUARD),

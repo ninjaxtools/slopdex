@@ -23,6 +23,34 @@ pub struct SharedIndex {
     fingerprint: String,
 }
 
+/// Global base preparation is independent of workspace publication. Engine
+/// callers acquire their exclusive index lock only for `publish_pointer`.
+pub(crate) struct PreparedIndex {
+    index: SharedIndex,
+    pointer: Option<(PathBuf, Vec<u8>)>,
+}
+
+impl PreparedIndex {
+    pub(crate) fn needs_publication(&self) -> bool {
+        self.pointer.is_some()
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        self.index.fingerprint()
+    }
+
+    pub(crate) fn publish_pointer(&self) -> Result<()> {
+        if let Some((path, bytes)) = &self.pointer {
+            atomic_write(path, bytes)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn into_index(self) -> SharedIndex {
+        self.index
+    }
+}
+
 struct Delta {
     vector: Vec<f32>,
     occurrences: Vec<u64>,
@@ -219,6 +247,24 @@ impl SharedIndex {
         vectors: &[(u64, String, Vec<f32>)],
         readonly: bool,
     ) -> Result<Self> {
+        let prepared = Self::prepare(
+            global_directory,
+            workspace_pointer,
+            profile,
+            vectors,
+            readonly,
+        )?;
+        prepared.publish_pointer()?;
+        Ok(prepared.into_index())
+    }
+
+    pub(crate) fn prepare(
+        global_directory: &Path,
+        workspace_pointer: &Path,
+        profile: &Value,
+        vectors: &[(u64, String, Vec<f32>)],
+        readonly: bool,
+    ) -> Result<PreparedIndex> {
         let dimensions = match profile.get("dimensions") {
             Some(value) => usize::try_from(value.as_u64().context("invalid profile dimensions")?)?,
             None => vectors
@@ -326,13 +372,15 @@ impl SharedIndex {
             fingerprint: String::new(),
         };
         pointer.fingerprint = pointer.identity()?;
-        if !readonly
+        let publication = if !readonly
             && old_pointer
                 .as_ref()
                 .is_none_or(|old| old.fingerprint != pointer.fingerprint)
         {
-            atomic_write(workspace_pointer, &serde_json::to_vec(&pointer)?)?;
-        }
+            Some((workspace_pointer.to_owned(), serde_json::to_vec(&pointer)?))
+        } else {
+            None
+        };
 
         let mut base_occurrences: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         let mut delta = BTreeMap::new();
@@ -359,15 +407,18 @@ impl SharedIndex {
                     .push(*occurrence);
             }
         }
-        Ok(Self {
-            base: VectorIndex {
-                index: base_index,
-                dimensions,
+        Ok(PreparedIndex {
+            index: Self {
+                base: VectorIndex {
+                    index: base_index,
+                    dimensions,
+                },
+                base_occurrences,
+                delta,
+                len: pointer.membership.len(),
+                fingerprint: pointer.fingerprint,
             },
-            base_occurrences,
-            delta,
-            len: pointer.membership.len(),
-            fingerprint: pointer.fingerprint,
+            pointer: publication,
         })
     }
 

@@ -1260,10 +1260,14 @@ Missing, corrupt, or incompatible derived caches can be rebuilt from authoritati
 SQLite vectors without model calls; missing embeddings are a separate provider
 operation. F32 vectors use bounds-checked copies into owned memory, not mmap.
 
-An engine holds `<index>.lock` for its lifetime: shared for read-only opens,
-exclusive for writers. Contention waits up to 10 seconds before an index-in-use
-error; retry after it finishes. Operations needing writes can reopen writable and
-retry. SQLite uses WAL and a 30-second busy timeout. See [architecture](implementation.md#architecture-and-code-map)
+An engine holds `<index>.lock` shared while reading, including in writable engines.
+Only workspace initialization and writes take an exclusive lock, released back to
+shared afterward. Provider calls and query execution do not hold it exclusively.
+Queries skip optional result-cache and vector-pointer writes when other readers
+are active. Global artifacts use separate per-key locks.
+Contention waits up to 10 seconds before an index-in-use error. A workspace change
+while switching locks rejects prepared work with rerun guidance rather than
+publishing stale results. SQLite uses WAL and a 30-second busy timeout. See [architecture](implementation.md#architecture-and-code-map)
 for transaction and sidecar publication details.
 
 ### Pruning the global store
