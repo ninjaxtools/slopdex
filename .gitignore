@@ -1,5 +1,5 @@
 target/
-native/
+/native/
 .slopdex/
 *.sqlite-shm
 *.sqlite-wal
