@@ -8,6 +8,24 @@ fn clap_definition_is_consistent() {
 }
 
 #[test]
+fn refactor_uses_two_targets_and_structure_only_without_stale_snapshots() {
+    let cli = parse(&["refactor", "src/a.ts::parse", "lib/b.ts::read", "--dry-run"]);
+    assert_eq!(
+        CommandMode::for_command(&cli.command),
+        CommandMode::Structure
+    );
+    let Command::Refactor(args) = cli.command else {
+        panic!("expected refactor");
+    };
+    assert_eq!(args.source, "src/a.ts::parse");
+    assert_eq!(args.destination, "lib/b.ts::read");
+    assert!(args.dry_run);
+    let cli = Cli::try_parse_from(["slopdex", "refactor", "a.ts", "b.ts", "--no-reindex"]).unwrap();
+    assert!(cli.validate().is_err());
+    assert!(Cli::try_parse_from(["slopdex", "refactor", "a.ts"]).is_err());
+}
+
+#[test]
 fn lines_selectors_exclusions_and_limits_do_not_become_declaration_limits() {
     let cli = parse(&[
         "lines",

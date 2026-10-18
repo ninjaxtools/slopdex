@@ -15,6 +15,8 @@ mod shell;
 mod structure;
 mod syntax;
 
+pub(crate) use references::{EditSite, edit_sites};
+
 pub use structure::{CallSite, FileStructure, ImportBinding, ReferenceSite, StructureNode};
 
 use anyhow::Result;

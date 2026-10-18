@@ -90,6 +90,7 @@ impl CommandMode {
         match command {
             Command::Map(args) if args.selection.symbol_query.is_empty() => Self::Structure,
             Command::Lines(args) if args.selection.symbol_query.is_empty() => Self::Structure,
+            Command::Refactor(_) => Self::Structure,
             Command::Map(_) | Command::Lines(_) | Command::SearchSymbols(_) => Self::Symbols,
             Command::Search(args) if args.symbols_only() => Self::Symbols,
             _ => Self::Content,
@@ -434,6 +435,36 @@ fn run_workspace(
     warn_errors(&engine, config["ignoreErrors"].as_bool().unwrap_or(false))?;
     let format = cli.global.format.unwrap_or(Format::Summary);
     match &cli.command {
+        Command::Refactor(args) => {
+            let plan =
+                engine.plan_refactor(&args.source, &args.destination, &std::env::current_dir()?)?;
+            if !args.dry_run {
+                plan.apply()?;
+                // Persist only structure, never embeddings or generated descriptions.
+                if let Err(error) = engine.refresh_structure() {
+                    ui::warning(format!(
+                        "slopdex: source refactored, but index refresh failed: {error:#}; run update"
+                    ));
+                }
+            }
+            if format == Format::Json {
+                print_json(&mut out, &plan.report(args.dry_run))?;
+            } else {
+                if args.dry_run {
+                    plan.print_diff(&mut out)?;
+                }
+                writeln!(
+                    out,
+                    "{} {} file(s)",
+                    if args.dry_run {
+                        "Would change"
+                    } else {
+                        "Changed"
+                    },
+                    plan.changes.len()
+                )?;
+            }
+        }
         Command::Lines(args) => {
             let root = root
                 .canonicalize()

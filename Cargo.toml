@@ -64,8 +64,6 @@ tree-sitter-bash = "0.25.1"
 tree-sitter-md-025 = "0.5.6"
 usearch = "2.26.2"
 zstd = { version = "0.14", default-features = false }
-
-[dev-dependencies]
 tempfile = "3"
 
 [profile.release]

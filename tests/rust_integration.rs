@@ -24,6 +24,9 @@ use tempfile::TempDir;
 #[path = "rust_integration/lines.rs"]
 mod lines;
 
+#[path = "rust_integration/refactor.rs"]
+mod refactor;
+
 const TEST_KEY: &str = "local-integration-placeholder";
 
 /// Upper bound for one loopback exchange or one fail-fast CLI child. These are

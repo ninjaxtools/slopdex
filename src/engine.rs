@@ -1128,6 +1128,47 @@ impl Engine {
             .map(|structure| (*structure).clone()))
     }
 
+    /// Plan source edits against current indexed structure. CLI callers refresh
+    /// first; library callers get an error if source bytes have become stale.
+    pub fn plan_refactor(
+        &self,
+        source: &str,
+        destination: &str,
+        cwd: &Path,
+    ) -> Result<crate::refactor::Plan> {
+        let mut files = BTreeMap::new();
+        for (path, file) in &self.files {
+            if !crate::refactor::supported(path)
+                || !crate::refactor::same_family(
+                    source.split_once("::").map_or(source, |(path, _)| path),
+                    path,
+                )
+            {
+                continue;
+            }
+            ensure!(
+                file.errors.is_empty(),
+                "Cannot refactor with indexing errors in {path}"
+            );
+            let text = read_source(
+                &self.root,
+                path,
+                self.config["maxFileSize"].as_u64().unwrap_or(1_048_576),
+            )?;
+            ensure!(
+                hash(&text) == file.hash,
+                "Stale source for {path}; refresh structure before refactoring"
+            );
+            let structure = self.presentation_structure(path)?.with_context(|| {
+                format!(
+                    "Missing current structure for {path}; refresh structure before refactoring"
+                )
+            })?;
+            files.insert(path.clone(), (text, structure));
+        }
+        crate::refactor::plan(&self.root, cwd, files, source, destination)
+    }
+
     /// Committed structure for one file, loaded at most once per snapshot load.
     fn cached_structure(&self, path: &str) -> Result<Option<Arc<parse::FileStructure>>> {
         if let Some(cached) = self.structures.borrow().get(path) {

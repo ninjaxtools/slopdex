@@ -11,6 +11,7 @@ pub mod map;
 pub mod models;
 pub mod parse;
 pub mod providers;
+pub mod refactor;
 mod registry;
 pub mod storage;
 mod symbols;

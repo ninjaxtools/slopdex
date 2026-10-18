@@ -8,6 +8,39 @@ use tree_sitter::Node;
 use super::syntax::{children, text};
 use super::{FileStructure, ReferenceSite};
 
+/// Uncollapsed lexical locations for source edits. Unlike the stored graph,
+/// these include top-level uses and unknown bindings, and are never persisted.
+#[derive(Clone, Debug)]
+pub(crate) struct EditSite {
+    pub range: std::ops::Range<usize>,
+    pub name: String,
+    pub receiver: Option<String>,
+    pub binding_id: Option<usize>,
+    /// Several indexed declarations may denote one C linkage identity (a
+    /// prototype and its definition). Empty for an unknown local/parameter.
+    pub binding_ids: Vec<usize>,
+    pub bound: bool,
+    pub declaration: bool,
+    pub shorthand: bool,
+}
+
+pub(crate) fn edit_sites(
+    root: Node<'_>,
+    source: &str,
+    language: &str,
+    structure: &FileStructure,
+) -> Vec<EditSite> {
+    let mut sites = Vec::new();
+    collect_inner(
+        root,
+        source,
+        language,
+        &mut structure.clone(),
+        Some(&mut sites),
+    );
+    sites
+}
+
 #[derive(Default)]
 struct Scope {
     parent: Option<usize>,
@@ -26,7 +59,7 @@ struct Binding {
 enum Lookup {
     Symbol(usize),
     Implicit,
-    Unknown,
+    Unknown(Vec<usize>),
     Missing,
 }
 
@@ -34,6 +67,16 @@ enum Lookup {
 /// do not add recursion. Each reference belongs to its innermost declaration;
 /// container references do not accidentally include their children's bodies.
 pub(super) fn collect(root: Node<'_>, source: &str, language: &str, structure: &mut FileStructure) {
+    collect_inner(root, source, language, structure, None);
+}
+
+fn collect_inner(
+    root: Node<'_>,
+    source: &str,
+    language: &str,
+    structure: &mut FileStructure,
+    mut sites: Option<&mut Vec<EditSite>>,
+) {
     if language == "bash" {
         // Shell expansion, command lookup, and dynamic sourcing require their
         // own binding model. Preserve the existing callable graph unchanged.
@@ -179,6 +222,18 @@ pub(super) fn collect(root: Node<'_>, source: &str, language: &str, structure: &
                     )
                     && enclosing_callable(&scopes, outer);
                 let id = symbol_id(structure, &by_start, &by_end, node, name);
+                if let Some(sites) = sites.as_deref_mut() {
+                    sites.push(EditSite {
+                        range: target.byte_range(),
+                        name: name.to_owned(),
+                        receiver: None,
+                        binding_id: id,
+                        binding_ids: id.into_iter().collect(),
+                        bound: true,
+                        declaration: true,
+                        shorthand: target.kind() == "shorthand_property_identifier_pattern",
+                    });
+                }
                 scopes[binding_scope]
                     .bindings
                     .entry(name.to_owned())
@@ -210,7 +265,43 @@ pub(super) fn collect(root: Node<'_>, source: &str, language: &str, structure: &
             continue;
         };
         let root_name = receiver.unwrap_or(name);
-        let binding_id = match lookup(&scopes, scope, root_name, node.start_byte(), language) {
+        let binding = lookup(&scopes, scope, root_name, node.start_byte(), language);
+        if let Some(sites) = sites.as_deref_mut() {
+            // Static member targets end in the selected property/type name.
+            // Use its own token range, not the receiver or the whole expression.
+            let end = node.end_byte();
+            let range = if receiver.is_some() {
+                ["property", "attribute", "field", "name"]
+                    .iter()
+                    .find_map(|field| node.child_by_field_name(field))
+                    .map(|name| name.byte_range())
+                    .unwrap_or(end - name.len()..end)
+            } else if node.kind() == "method_invocation" {
+                node.child_by_field_name("name")
+                    .map(|name| name.byte_range())
+                    .unwrap_or(node.byte_range())
+            } else {
+                node.byte_range()
+            };
+            sites.push(EditSite {
+                range,
+                name: name.to_owned(),
+                receiver: receiver.map(str::to_owned),
+                binding_id: match binding {
+                    Lookup::Symbol(id) => Some(id),
+                    _ => None,
+                },
+                binding_ids: match &binding {
+                    Lookup::Symbol(id) => vec![*id],
+                    Lookup::Unknown(ids) => ids.clone(),
+                    _ => Vec::new(),
+                },
+                bound: !matches!(binding, Lookup::Missing),
+                declaration: false,
+                shorthand: node.kind() == "shorthand_property_identifier",
+            });
+        }
+        let binding_id = match binding {
             Lookup::Symbol(id) => Some(id),
             Lookup::Missing | Lookup::Implicit
                 if receiver.is_some()
@@ -316,7 +407,11 @@ fn lookup(scopes: &[Scope], mut scope: usize, name: &str, at: usize, language: &
                 } else if bindings.iter().all(|binding| binding.implicit) {
                     Lookup::Implicit
                 } else {
-                    Lookup::Unknown
+                    Lookup::Unknown(if bindings.iter().all(|binding| binding.id.is_some()) {
+                        ids.into_iter().collect()
+                    } else {
+                        Vec::new()
+                    })
                 };
             }
         }

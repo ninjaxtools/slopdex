@@ -44,6 +44,7 @@ can also follow the command. Quote multiword queries.
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Show selected groups' declarations, keys, sections, elements, and Markdown headings; refresh existing structure or parse directly if no index exists. | Summary |
 | `lines [PATH]...` | Count whole files, or matching symbols/sections with `-e`/`-q`, in a folder tree with aggregate counts; `--output files` gives a ranked file list. | Tree |
+| `refactor <source> <destination>` | Rename/move indexed JS/TS, Rust, Go, Java, or C code with language-specific reference updates. | Changed-file count; diff with `--dry-run` |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
@@ -55,6 +56,108 @@ can also follow the command. Quote multiword queries.
 | `config [prefix]` | Configure matching settings interactively without opening an index. | Updated-setting summary |
 | `config embeddings` | Focused embedding setup without opening an index; `--provider`, `--model`, and `--dimensions` are saved rather than temporary. | Updated-setting summary |
 | `config set <key> <value>` | Set a documented configuration key directly; JSON literals support booleans, numbers, arrays and objects. Unknown keys are rejected with the closest documented names. | Updated-setting summary |
+
+## Source refactoring
+
+```sh
+slopdex refactor src/utils.ts src/helpers.ts
+slopdex refactor src/utils.ts src/lib/utils.ts
+slopdex refactor src/utils.ts::parse parseConfig
+slopdex refactor src/utils.ts::parse src/parser.ts
+slopdex refactor src/utils.ts::parse src/parser.ts::parseConfig --dry-run
+slopdex refactor src/utils.rs::parse src/parser.rs::parse_config --dry-run
+slopdex refactor parser.go::Parse helpers.go
+slopdex refactor Parser.java::Parser.parse Helpers.java
+slopdex refactor include/api.h include/parser.h
+```
+
+Both operands are positional; no `rename` or `move` verb is needed. A source
+without `::` denotes a file. A symbol destination that is a bare identifier is
+a new name in the same file. A path moves the symbol, preserving its name unless
+the destination includes `::newName`. All paths resolve from **cwd**, including
+when `--root` selects a different repository root. Use `./helpers` to distinguish
+an extensionless path from a symbol name (extensionless source files are not yet
+supported). Paths must stay inside the selected repository.
+
+The same syntax covers every statically typed language currently indexed with
+Tree-sitter: **TypeScript/TSX, Rust, Go, Java, and C** (including `.h` files).
+Existing JavaScript/JSX support remains available. This does not add grammars for
+other languages such as C++, C#, or Kotlin. Member selectors use the index's
+qualified spelling, e.g. `Parser.java::Parser.parse`.
+
+| Language | Files | Symbol renames and function moves |
+| --- | --- | --- |
+| JS/TS | Update relative ES-module specifiers and rebase imports in moved files. | Rename top-level functions, variables/constants, classes, interfaces, types, and enums. Move free functions/single-binding arrow functions; transfer imports and follow named imports, re-exports, and static namespace references. |
+| Rust | Update standard `mod` registration, `use` paths, and qualified references; preserve explicit aliases and rebase moved-file imports. | Rename declarations and types through lexical bindings and re-exports. Move file-level free functions; transfer accessible dependencies and register destination modules. Newly exposed private functions use `pub(crate)` so existing crate callers remain valid. |
+| Go | Same-package file moves preserve package-level references. Cross-package file moves currently require a single free function. | Rename package declarations across package files and imports. Free-function moves transfer/prune imports and update package selectors. Cross-package callers require exported names; moves creating import cycles fail. `go.mod` supplies generated local package paths. |
+| Java | Update packages and imports. Renaming a public type also renames its constructors and matching `.java` filename; changing that filename similarly renames its public type. | Rename top-level types and unambiguous static members. Move static methods into existing destination classes, updating static imports/callers and required dependencies. Access is promoted to `public` when necessary to keep callers valid. |
+| C | Update literal includes and rebase quoted includes in moved files. Headers and translation units retain their respective roles. | Rename declarations through lexical bindings, explicit headers, and external-linkage prototypes. Move function definitions; retain a prototype for remaining callers and copy required indexed includes. Static linkage is never silently turned into external linkage. |
+
+All adapters use indexed declarations and lexical bindings, not global text
+replacement. Unrelated names, comments, literal strings, explicit aliases, and
+object keys remain unchanged. Ignored/excluded files and external consumers are
+outside the operation's scope. Cross-language moves, name capture, ambiguous
+resolution, inaccessible dependencies, and unsupported constructs fail before
+source writes. No language compiler or model provider is needed at runtime.
+
+Important conservative limits:
+
+- **JS/TS:** relative ES modules only, including extensionless/index imports and
+  `.js` specifiers resolving to TS. Default-export moves, ambient module exports,
+  computed/escaping namespaces, and affected dynamic imports/`require` block
+  symbol operations. Literal module paths can still be updated by file moves.
+  Nonliteral loads/direct `eval` and custom resolution (`paths`, `baseUrl`,
+  `rootDirs`, `moduleSuffixes`, inherited configs, package
+  `imports`/`exports`/`workspaces`, and self-imports) are rejected. These JS/TS
+  restrictions do **not** block operations on other languages in a mixed repo.
+- **Rust:** standard module layouts, not custom `#[path]` registration,
+  moves across conditional module contexts, or Cargo entrypoint moves. Unrelated
+  `#[cfg]` modules do not block ordinary refactors. Create/register intermediate
+  destination modules first. Moving a file with external child modules requires
+  a module-tree operation rather than a single-file move. Supported standard
+  expression macros are parsed without expansion; opaque/shadowed macros,
+  `include!` source expansion, custom derives/procedural attributes, implicit
+  format captures, attributed import-group splitting, block-local glob imports,
+  and macro-local imports
+  are rejected when they prevent reliable edits. Receiver-method moves and
+  generic-qualified path relocations require further type-aware support.
+- **Go:** preserve test/platform build roles. Conditional/build-variant package
+  layouts, lifecycle/side-effect import changes, receiver methods, and moves
+  depending on private cross-package names, dot imports, or cgo state are rejected
+  rather than guessed. External imports whose package name differs from their
+  path need an explicit alias before moving a function. Program (`main`) packages
+  cannot be imported as libraries.
+- **Java:** instance dispatch, overload selection, inherited/unknown receivers,
+  inaccessible package-private types, annotation references to renamed types,
+  and annotated-method moves need additional
+  semantic resolution and are rejected. New destination class files are not
+  generated by a method move; create the destination class first.
+- **C:** explicit, unambiguous includes and one external definition per indexed
+  build target. Same-spelled typedefs/tags do not share external linkage.
+  Preprocessor-generated symbols, opaque macro/assembly references, unresolved
+  include search paths/dependencies, and linkage-changing static/inline moves
+  are rejected. Function moves require indexed includes and no file-local
+  preprocessor state beyond ordinary include guards/`#pragma once`; system-header
+  preprocessing needs a future build-context backend. Build-system source lists
+  are not rewritten.
+
+`--dry-run` prints a unified diff and creates no source files/directories.
+`--output json` returns `{ "dryRun": boolean, "changes": [...] }`, with each
+change's repository-relative `path` and full `before`/`after` text (`null` for
+creation/deletion). Without `--dry-run`, writes are staged, input bytes are
+validated again before applying, and publication failures attempt to restore
+completed writes. This is **not** a crash-atomic filesystem transaction; avoid
+concurrent workspace edits and inspect files after an interrupted command.
+
+Refactoring creates/refreshes only the existing Tree-sitter structure index,
+without provider requests. `--no-reindex` is rejected. Successful changes refresh
+structure again; an index-refresh failure after source publication is reported
+as a warning, not as an unperformed refactoring.
+
+Review the diff and run the project's own checks after applying. This command
+does not run a type checker or prove module-initialization/side-effect behavior.
+
+## Configuration
 
 Configuration examples:
 
