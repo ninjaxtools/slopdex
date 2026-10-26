@@ -28,6 +28,8 @@ use crate::{
     vectors::SharedIndex,
 };
 
+pub(crate) mod faq;
+mod inspect;
 mod locking;
 use locking::IndexLock;
 
@@ -87,7 +89,7 @@ const EXCLUDED_LOCK_FILES: &[&str] = &[
 const DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. When asked about a file, return exactly one concise paragraph about its purpose, responsibilities, and important relationships. When asked about a callable, return exactly one sentence describing what it does, including relevant inputs, outputs, or side effects. Use plain text without a heading, bullets, or a preamble. Do not propose changes.";
 // A byte cap is deliberately conservative even for providers with different tokenizers.
 // Leave room for the task, expanded search context, and the model's response.
-const DESCRIBE_PROMPT_BYTES: usize = 128 * 1024;
+const FAQ_PROMPT_BYTES: usize = 128 * 1024;
 
 pub struct Engine {
     root: PathBuf,
@@ -278,6 +280,7 @@ impl Engine {
         readonly: bool,
     ) -> Result<Self> {
         limits::validate_config(&config)?;
+        faq::threshold(&config, &json!({}))?;
         let root = root
             .canonicalize()
             .context("Repository root does not exist")?;
@@ -2759,13 +2762,18 @@ impl Engine {
         Ok(results)
     }
 
-    pub fn describe(&self, query: &str, options: &Value) -> Result<Value> {
+    fn answer_faq(
+        &self,
+        query: &str,
+        options: &Value,
+    ) -> Result<(Value, BTreeMap<String, String>)> {
         let expand_callers = options["expandCallers"].as_u64().unwrap_or(2) as usize;
         let expand_callees = options["expandCallees"].as_u64().unwrap_or(2) as usize;
         let callers = (options["callers"].as_u64().unwrap_or(0) as usize).max(expand_callers);
         let callees = (options["callees"].as_u64().unwrap_or(0) as usize).max(expand_callees);
         let refs = crate::map::reference_mode(options, callers, callees)?;
-        let matches = self.search(query, "search", options)?;
+        let results = self.search_limited(query, "search", options)?;
+        let mut matches = results.rows;
         let mut files = BTreeMap::<String, Value>::new();
         for item in &matches {
             let data = match item["type"].as_str() {
@@ -2788,17 +2796,27 @@ impl Engine {
         let mut prompt = format!("Task: {query}\n\n");
         let marker = "\n[Search results truncated to fit the prompt size limit]\n";
         ensure!(
-            prompt.len() + marker.len() <= DESCRIBE_PROMPT_BYTES,
-            "Describe query exceeds the prompt size limit"
+            prompt.len() + marker.len() <= FAQ_PROMPT_BYTES,
+            "FAQ question exceeds the prompt size limit"
         );
-        let search = crate::cli::describe_search_context(
+        let (search, dependencies) = crate::cli::faq_search_context(
             self,
             &matches,
             (callers, callees, expand_callers, expand_callees),
             refs,
             options["expandCodeThreshold"].as_f64().unwrap_or(0.9),
         )?;
-        let search_budget = DESCRIBE_PROMPT_BYTES - prompt.len();
+        let dependencies: BTreeMap<_, _> = dependencies
+            .into_iter()
+            .map(|path| {
+                let file = self.files.get(&path).context("Missing FAQ context file")?;
+                files
+                    .entry(path.clone())
+                    .or_insert_with(|| json!({"path":path,"description":file.description}));
+                Ok((path, file.hash.clone()))
+            })
+            .collect::<Result<_>>()?;
+        let search_budget = FAQ_PROMPT_BYTES - prompt.len();
         if search.len() <= search_budget {
             prompt.push_str(&search);
         } else {
@@ -2810,34 +2828,39 @@ impl Engine {
             prompt.push_str(marker);
         }
         ui::progress("Generating explanation from search results");
-        let system = "Explain the existing code and documentation relevant to the user's task using only the supplied search context. Cite paths and symbols. Do not propose an implementation. If there is insufficient context, say so.";
+        let system = faq::SYSTEM;
         let key = hash(
             json!([
-                "explanation-v2",
+                "explanation-v3",
                 self.providers.llm().profile(),
                 self.config["descriptionBaseUrl"],
                 self.config["descriptionFallbackModel"],
                 self.config["fallbackModel"],
                 system,
-                prompt
+                prompt,
+                dependencies
             ])
             .to_string(),
         );
         self.artifacts
             .hydrate_text(&self.db, "explanation", std::slice::from_ref(&key))?;
         let _lock = registry::artifact_lock(&self.db, "explanation", &key)?;
-        let description = if let Some(cached) = self.db.cache("explanation", &key)? {
-            cached
-        } else {
-            let description = self.providers.llm().describe(system, &prompt)?;
-            self.db.cache_put("explanation", &key, &description)?;
-            self.artifacts
-                .put_text(&self.db, "explanation", &key, &description);
-            description
-        };
+        let current = self.faq_files_current(&dependencies, &mut HashMap::new());
+        let description =
+            if let Some(cached) = self.db.cache("explanation", &key)?.filter(|_| current) {
+                cached
+            } else {
+                let description = self.providers.llm().describe(system, &prompt)?;
+                if current {
+                    self.db.cache_put("explanation", &key, &description)?;
+                    self.artifacts
+                        .put_text(&self.db, "explanation", &key, &description);
+                }
+                description
+            };
         let files: Vec<_> = files.into_values().collect();
         let functions: Vec<_> = matches
-            .into_iter()
+            .iter()
             .filter(|r| r["type"] == "function")
             .map(|r| {
                 let mut f = r["function"].clone();
@@ -2847,7 +2870,19 @@ impl Engine {
                 f
             })
             .collect();
-        Ok(json!({"query":query,"description":description,"files":files,"functions":functions}))
+        for row in &mut matches {
+            for key in ["function", "symbol", "file", "chunk"] {
+                if let Some(data) = row.get_mut(key).and_then(Value::as_object_mut) {
+                    data.remove("source");
+                    data.remove("embeddingInput");
+                }
+            }
+        }
+        Ok((
+            json!({"query":query,"question":query,"description":description,"files":files,"functions":functions,
+            "searchResults":matches,"omitted":results.omitted,"limit":results.limit}),
+            dependencies,
+        ))
     }
 
     fn description_generation_profile(&self) -> Value {

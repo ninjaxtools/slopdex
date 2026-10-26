@@ -247,6 +247,16 @@ impl CallGraph {
         self.reference_locations(key, refs, true)
     }
 
+    pub(crate) fn reference_paths(&self, key: &Key, refs: Refs) -> Vec<String> {
+        self.references
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|target| refs.enabled() && (refs != Refs::CrossFile || target.path != key.path))
+            .map(|target| target.path.clone())
+            .collect()
+    }
+
     fn reference_locations(&self, key: &Key, refs: Refs, label_invocations: bool) -> Vec<String> {
         if !refs.enabled() {
             return Vec::new();

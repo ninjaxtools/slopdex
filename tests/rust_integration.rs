@@ -27,6 +27,12 @@ mod lines;
 #[path = "rust_integration/refactor.rs"]
 mod refactor;
 
+#[path = "rust_integration/faq.rs"]
+mod faq;
+
+#[path = "rust_integration/index.rs"]
+mod index;
+
 const TEST_KEY: &str = "local-integration-placeholder";
 
 /// Upper bound for one loopback exchange or one fail-fast CLI child. These are
@@ -3337,9 +3343,9 @@ fn describe_uses_indexed_search_context_without_whole_files() -> Result<()> {
     repo.write("unrelated.rs", &function("other", "VECTOR_WEST"))?;
     let mut engine = repo.open(&mock.config())?;
     engine.refresh()?;
-    // describe must use its indexed snapshot, not a fresh read of the working tree.
+    // FAQ context uses its indexed snapshot, not a fresh read of the working tree.
     repo.write("a.rs", "fn not_indexed_yet() {}\n")?;
-    let answer = engine.describe("east", &json!({"minSimilarity": 0.9, "code":true}))?;
+    let answer = engine.faq("east", &json!({"minSimilarity": 0.9, "code":true}))?;
     assert!(
         answer["description"]
             .as_str()
@@ -3384,7 +3390,7 @@ fn describe_keeps_search_skeletons_without_appending_large_files() -> Result<()>
     }
     let mut engine = repo.open(&mock.config())?;
     engine.refresh()?;
-    engine.describe("east", &json!({"minSimilarity":0.9}))?;
+    engine.faq("east", &json!({"minSimilarity":0.9}))?;
     let requests = mock.requests("/responses");
     let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
         .as_str()
@@ -3408,7 +3414,7 @@ fn describe_bounds_expanded_markdown_search_on_utf8_boundary() -> Result<()> {
     repo.write("guide.md", &format!("# Guide\n{sections}"))?;
     let mut engine = repo.open(&mock.config())?;
     engine.refresh()?;
-    engine.describe("east", &json!({"minSimilarity":0.9}))?;
+    engine.faq("east", &json!({"minSimilarity":0.9}))?;
     let requests = mock.requests("/responses");
     let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
         .as_str()
@@ -4034,7 +4040,7 @@ fn uncached_queries_share_the_index_and_skip_optional_workspace_writes() -> Resu
     let selected =
         engine.map(&json!({"symbolQuery":["indexed"], "symbolThreshold":-1, "private":true}))?;
     assert_eq!(selected[0]["nodes"][0]["name"], "indexed");
-    engine.describe("explain the indexed function", &all())?;
+    engine.faq("explain the indexed function", &all())?;
     let output = repo.cli_json(&["--no-reindex", "search-code", "uncached CLI query"])?;
     assert!(!output.as_array().unwrap().is_empty());
     repo.cli_json(&["--no-reindex", "lines"])?;
@@ -6300,7 +6306,7 @@ fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result
         let before = mock.requests("/responses").len();
         let result = repo.cli_json(&[
             "--no-reindex",
-            "describe",
+            "faq",
             "middle",
             "-e",
             pattern,
@@ -6534,9 +6540,7 @@ fn describe_rejects_invalid_refs_before_searching_or_calling_providers() -> Resu
     let repo = Repo::new()?;
     let engine = repo.open_map(&json!({}))?;
     for refs in [json!("invalid"), json!(0), json!(true), Value::Null] {
-        let error = engine
-            .describe("middle", &json!({"refs": refs}))
-            .unwrap_err();
+        let error = engine.faq("middle", &json!({"refs": refs})).unwrap_err();
         assert!(error.to_string().contains("refs"), "{error}");
     }
     Ok(())
@@ -6762,7 +6766,7 @@ fn expanded_call_depths_force_code_only_within_their_own_levels() -> Result<()> 
     assert!(clusters.contains("a.py:\n  3-4:outer\n"), "{clusters}");
     assert!(!clusters.contains("@ code:"), "{clusters}");
     repo.cli_json(&[
-        "describe",
+        "faq",
         "middle",
         "-e",
         "^middle$",
@@ -6801,7 +6805,7 @@ fn describe_prompt_defaults_to_two_expanded_call_levels_with_explicit_overrides(
     repo.write("d.py", "def deepest():\n    return 1\n")?;
     repo.cli_json(&["update"])?;
     let base = [
-        "describe",
+        "faq",
         "middle",
         "-e",
         "^middle$",
@@ -7033,7 +7037,7 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
         "{map_text}"
     );
     let describe = repo.cli_json(&[
-        "describe",
+        "faq",
         "middle",
         "-e",
         "^middle$",
@@ -10137,10 +10141,10 @@ fn rerank_and_task_description_caches_survive_restart_and_unrelated_generation_c
     engine.refresh()?;
     let options = json!({"glob":"selected.rs", "minSimilarity":-1});
     let ranked = engine.search("east", "search-code", &options)?;
-    let answer = engine.describe("east", &options)?;
+    let answer = engine.faq("east", &options)?;
     assert_eq!(mock.requests("/responses").len(), 1);
     let calls = mock.count();
-    assert_eq!(engine.describe("east", &options)?, answer);
+    assert_eq!(engine.faq("east", &options)?, answer);
     assert_eq!(
         mock.count(),
         calls,
@@ -10155,7 +10159,7 @@ fn rerank_and_task_description_caches_survive_restart_and_unrelated_generation_c
     engine.refresh()?;
     assert!(engine.status()?["generation"].as_u64().unwrap() > generation);
     assert_eq!(engine.search("east", "search-code", &options)?, ranked);
-    assert_eq!(engine.describe("east", &options)?, answer);
+    assert_eq!(engine.faq("east", &options)?, answer);
     assert_eq!(
         mock.count(),
         calls,
@@ -10166,7 +10170,7 @@ fn rerank_and_task_description_caches_survive_restart_and_unrelated_generation_c
     repo.db()?.execute("DELETE FROM search_cache", [])?;
     let engine = repo.open(&config)?;
     assert_eq!(engine.search("east", "search-code", &options)?, ranked);
-    assert_eq!(engine.describe("east", &options)?, answer);
+    assert_eq!(engine.faq("east", &options)?, answer);
     assert_eq!(mock.count(), calls);
     Ok(())
 }

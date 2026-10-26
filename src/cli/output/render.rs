@@ -9,6 +9,7 @@ use crate::{
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Write,
 };
@@ -89,6 +90,7 @@ pub(in crate::cli) struct Presentation<'a> {
     graph: Option<CallGraph>,
     expanded: Option<Expansion>,
     force_code: BTreeSet<Key>,
+    pub(super) dependencies: RefCell<BTreeSet<String>>,
 }
 
 impl<'a> Presentation<'a> {
@@ -101,6 +103,7 @@ impl<'a> Presentation<'a> {
             graph: None,
             expanded: None,
             force_code: BTreeSet::new(),
+            dependencies: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -156,7 +159,11 @@ impl<'a> Presentation<'a> {
             path: path.to_owned(),
             id,
         };
-        let references = self.graph.as_ref()?.reference_labels(&key, self.calls.refs);
+        let graph = self.graph.as_ref()?;
+        self.dependencies
+            .borrow_mut()
+            .extend(graph.reference_paths(&key, self.calls.refs));
+        let references = graph.reference_labels(&key, self.calls.refs);
         map::render_references(path, references.iter().map(String::as_str), depth)
     }
 
@@ -227,10 +234,12 @@ impl<'a> Presentation<'a> {
             graph: None,
             expanded: None,
             force_code: BTreeSet::new(),
+            dependencies: RefCell::new(BTreeSet::new()),
         }
     }
 
     fn structure(&mut self, path: &str) -> Result<Option<&FileStructure>> {
+        self.dependencies.borrow_mut().insert(path.into());
         if !self.structures.contains_key(path) {
             self.structures.insert(
                 path.to_owned(),
@@ -694,6 +703,10 @@ fn print_ranked_file(
                 id: node.id,
             };
             let outgoing = graph.reference_labels(&key, presentation.calls.refs);
+            presentation
+                .dependencies
+                .borrow_mut()
+                .extend(graph.reference_paths(&key, presentation.calls.refs));
             if !outgoing.is_empty() {
                 references.insert(node.id, outgoing);
             }

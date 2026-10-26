@@ -1,15 +1,17 @@
-//! Result presentation shared by CLI commands and describe context generation.
+//! Result presentation shared by CLI commands and FAQ context generation.
 
 mod clusters;
 mod cross;
+mod index;
 mod map;
 mod render;
 mod search;
 
 pub(in crate::cli) use cross::{CrossOutput, print_cross};
+pub(in crate::cli) use index::{print_index_entries, print_indexes};
 pub(in crate::cli) use map::print_map;
 pub(in crate::cli) use render::Presentation;
-pub(crate) use search::describe_search_context;
+pub(crate) use search::faq_search_context;
 pub(in crate::cli) use search::print_search;
 
 use super::{args::Format, io::print_json};
@@ -30,7 +32,7 @@ pub(in crate::cli) fn print_limit_notice(
         "slopdex: notice: results omitted by limit {}; use --limit none to show all results.",
         limit.expect("omitted results have a finite limit")
     );
-    if format == Format::Json {
+    if matches!(format, Format::Json | Format::Csv) {
         writeln!(std::io::stderr().lock(), "{message}")?;
     } else {
         writeln!(out, "{message}")?;

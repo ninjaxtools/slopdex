@@ -37,6 +37,7 @@ const ADVANCED_KEYS: &[&str] = &[
     "artifactCachePath",
     "artifactS3",
     "symbolDimensions",
+    "faqThreshold",
     "jinaTask",
     "providerTimeoutMs",
     "providerMaxRetries",
@@ -331,6 +332,7 @@ fn apply_embedding_overrides(config: &mut Value, global: &Global) {
 fn validate_config(config: &Value) -> Result<()> {
     ensure!(config.is_object(), "config must be a JSON object");
     crate::limits::validate_config(config)?;
+    crate::engine::faq::threshold(config, &json!({}))?;
     cross_search_exclusions(config)?;
     ensure!(
         config.get("descriptionsEnabled").is_none(),

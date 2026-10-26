@@ -40,7 +40,8 @@ can also follow the command. Quote multiword queries.
 | `search-descriptions <query>` | Search only available source/generated callable, symbol, and file descriptions. | Ranked declaration/file excerpts |
 | `search-docs <query>` (alias `search-md`) | Search only the heading-aware Markdown content index, never config or markup content. | Ranked heading paths |
 | `search-symbols <query>` | Search only the bare symbol-name/alias and Markdown heading-title index. | Ranked declaration/heading excerpts |
-| `describe <query>` | Search, then ask the configured description model to explain the existing code/docs relevant to the query. | Explanation text |
+| `faq <query>` | Reuse a similar valid answer, or search and ask the description model; index both the question and plain-text answer. | Explanation text |
+| `index list [index]` | Discover saved index channels or inspect/export their entries; `-q` ranks stored embeddings and `-e` filters entry text. Never refreshes. | Compact text; expanded text, CSV, or JSON |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Show selected groups' declarations, keys, sections, elements, and Markdown headings; refresh existing structure or parse directly if no index exists. | Summary |
 | `lines [PATH]...` | Count whole files, or matching symbols/sections with `-e`/`-q`, in a folder tree with aggregate counts; `--output files` gives a ranked file list. | Tree |
@@ -446,7 +447,7 @@ cross-file callees. Related callables are shown even when they are outside the
 requested paths, glob, name, kind, visibility, or result limit. Expansion stops at
 cycles and deduplicates symbols. It is also available on `search`, `search-code`,
 `search-descriptions`, `search-symbols`, `search-docs` (alias `search-md`),
-`describe`, and `cross-search`; Markdown-only results have no callable to expand.
+`faq`, and `cross-search`; Markdown-only results have no callable to expand.
 Cross-index results expand within their respective indexes. Calls are extracted
 from indexed source; only uniquely resolved static targets, including supported
 explicit imports, form edges. Dynamic receivers and unresolved calls do not
@@ -474,7 +475,7 @@ regardless of `--detail` or `--expand-code-threshold`. The corresponding
 `--callers`/`--callees` depth can be higher: levels beyond the expanded depth
 still show declarations. The larger depth wins when both flags are given; a root
 that is also another root's caller or callee can receive forced code. These flags
-work wherever `--callers` and `--callees` work, including describe context and
+work wherever `--callers` and `--callees` work, including FAQ context and
 cross-search clusters. Map JSON and related callable JSON nodes include indexed
 `source` and `expandedCode: true` at forced-code depths alongside their existing
 `callDepth` metadata.
@@ -546,7 +547,7 @@ format, or `path:line:qualifiedName` for single-line symbols, for example
 All JSON reference locations remain unchanged: callable names never gain `()`,
 even when the corresponding text annotation marks an invocation.
 `--refs` controls these annotations on map nodes, callable search results,
-cross-search source and match objects, and describe's returned functions,
+cross-search source and match objects, and FAQ's returned functions,
 independently of traversal. Graph expansion uses `callDepth` on map nodes and
 `relatedCallables` on callable search results; caller/callee depth fields retain
 their graph meaning. With both depths zero and no explicit `--refs`, outgoing
@@ -613,7 +614,7 @@ slopdex map src --callers 0 --callees 0 --refs all
 
 ## Shared selectors
 
-Map, query searches, `describe`, and cross-search accept:
+Map, query searches, `faq`, and cross-search accept:
 
 - `--formats <GROUPS>`: comma-separated or repeated `code`, `docs`, `config`,
   or `markup`; `all` selects every group. An explicit selection replaces the
@@ -648,7 +649,7 @@ Map, query searches, `describe`, and cross-search accept:
   match selects its symbol; a matching file description selects declarations in
   that file, still subject to globs and map kind/private filters. A parent-name
   match alone does not select children. Ancestors have no expanded heading body unless
-  they directly match. The positional search/describe query ranks the chosen
+  they directly match. The positional search/FAQ query ranks the chosen
   streams; with `search-symbols` or `search --symbols` alone it ranks names.
 - `--symbol-threshold <NUMBER>`: optional finite scalar in `[-1,1]`, default
   `0.5`; inclusive minimum semantic selector similarity, independent of `--threshold`.
@@ -713,7 +714,7 @@ neighbors remain eligible regardless of source selectors. `-k` is map-only.
 
 Only general `search <query> [<query>...]` accepts multiple positional queries.
 Dedicated `search-code`, `search-descriptions`, `search-docs` (alias `search-md`),
-and `search-symbols`, as well as `describe`, still accept one positional query.
+and `search-symbols`, as well as `faq`, still accept one positional query.
 Quote multiword queries: `search "validate session" "reject expired credentials"`
 runs two searches, while unquoted words become separate queries.
 
@@ -729,12 +730,12 @@ queries return the same result array, not separate per-query arrays.
 Common query/cross-search filters:
 
 - `--threshold <number|min-max>`: default `0.8` for cross-search and `0.3` for
-  query commands (including `describe`); finite endpoints in `[-1,1]`,
+  query commands (including `faq`); finite endpoints in `[-1,1]`,
   inclusive minimum and exclusive maximum. A range requires minimum < maximum.
 - `--limit <positive integer|none>`: default `4096`, configurable with
   `defaultLimit` in the selected config file. `--limit none` disables the output
   limit, overriding the config. Caps query results (including Markdown), or the
-  context matches for `describe`. For `map`, it caps direct declaration matches
+  context matches for `faq`. For `map`, it caps direct declaration matches
   across files and mapped workspaces; ancestor and call-graph context do not count.
   When mapping multiple workspaces, the first workspace supplies the configured
   default unless `--limit` is explicit. For cross-search it caps
@@ -820,7 +821,7 @@ slopdex search-symbols 'read settings' --callers 0 --callees 0 --refs cross-file
 slopdex config set descriptionProvider opencode-go
 slopdex generate descriptions
 slopdex search-descriptions "keep the repository index synchronized"
-slopdex describe "I want to implement a new rpc endpoint"
+slopdex faq "How are RPC endpoints registered?"
 slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 slopdex cross-search --uncommitted --cross-file-only --threshold 0.9
 slopdex cross-search --changed-since origin/main --threshold 0.9
@@ -897,7 +898,7 @@ Similarity is model-dependent, not a probability of duplication.
 
 ### Reranking, clusters, and output
 
-Text is the default for `map`, `search`, `cross-search`, and `describe`.
+Text is the default for `map`, `search`, `cross-search`, and `faq`.
 `--detail compact` (default) prints declaration signatures and scores only;
 `--detail standard` also shows declaration attributes, file-hit description prose,
 and a 160-character Markdown body preview; `--detail expanded` additionally shows full signatures,
@@ -1017,7 +1018,7 @@ JSON `references` arrays keep flat `path:start-end:qualifiedName` locations. Wit
 `--cohesion` or `--output text`, cross-search can instead print source/match groups
 with per-match scores and optional filesystem distance.
 
-Reranking applies to query commands, including the search inside `describe`, not
+Reranking applies to query commands, including the search inside `faq`, not
 cross-search. Embedding thresholds are applied first. Cohere/Jina receive up to
 five times the effective result limit, or all retrieved threshold-passing candidates
 without a limit. OpenAI receives up to
@@ -1053,8 +1054,8 @@ Cohesion changes the order of each source's selected semantic matches. Distance
 is `0` in one file, `1` between files in one directory, and `1` plus directory-tree
 hops otherwise. It does not alter similarity or the neighbor selection score.
 
-The global `--output` accepts `text` (legacy alias `summary`), `json`, `clusters`,
-or `files`. `--output json` produces map/query/diagnostic/model arrays,
+The global `--output` accepts `text` (legacy alias `summary`), `json`, `csv`, `clusters`,
+or `files`. CSV is available only for `index list`. `--output json` produces map/query/diagnostic/model arrays,
 configuration/status objects, the line-count hierarchy, and **JSONL for
 cross-search** (one object per matched source).
 `--output text` selects the text view;
@@ -1064,16 +1065,16 @@ to stdout and warnings/errors to stderr. Clap argument errors exit with `2`;
 runtime/configuration/domain failures exit with `1`; success/help/version exit
 with `0`.
 
-### Task explanations
+### Frequently asked questions
 
-`describe` sends the query and the expanded text search output (file headers,
+`faq` replaces `describe`. On a cache miss it sends the query and expanded text search output (file headers,
 declaration skeletons, scores, available source or generated descriptions, and
 Markdown content) to the configured description provider. The prompt includes
 indexed code for callers and callees up to two edges away
 by default, even below `--expand-code-threshold`. Use `--expand-callers N` and
 `--expand-callees N` (or `--expand-callables N`) to override either depth;
 explicit `0` disables that direction's automatic code expansion. These defaults
-apply to the LLM context, not describe's JSON result or text references.
+apply to the LLM context, not FAQ's JSON result or text references.
 `--refs` controls outgoing annotations in both the context and returned excerpts
 independently of traversal. Its implicit default follows the resolved depths for
 each output, including the context's code-expansion depths.
@@ -1082,14 +1083,107 @@ truncated on a UTF-8 boundary. Complete files are not appended to the prompt.
 The instruction asks for an explanation of existing code/docs with paths and
 symbols, not an implementation proposal.
 
-The engine does not reread live files for this context. Provider retries/failover
-still apply. JSON output contains
-`query`, `description`, `files`, and `functions`; full source and embedding input
+Context uses the indexed snapshot. Provider retries/failover still apply.
+JSON output contains `query` (the current question), `question` (the original
+cached question), `description`, `files`, `functions`, `searchResults` (the original
+references), `omitted`, and `limit`; full source and embedding input
 are stripped from returned function metadata. Reranker order informs the prompt,
 but `rerankScore` is not copied to the returned `functions` array.
 Text output labels the generated prose `Explanation` and follows it with
 `References` in the shared excerpt syntax. The prose is model-generated; its
 format and wording are not deterministic.
+
+Each workspace maintains a separate `faq` vector index backed by SQLite entries.
+An entry stores the original question, the complete answer/reference result, the
+content hashes of context files, and two vector references: the question embedding
+(query mode) and the plain-text LLM answer embedding (document mode). Map output,
+scores, and reference excerpts are not included in the answer embedding.
+
+Before searching code, FAQ compares the incoming question to both embeddings and
+returns the best valid entry whose cosine similarity is **strictly greater than
+`0.9`**. `--faq-threshold N` overrides config `faqThreshold`; both accept a finite
+number in `[-1,1]`. This is independent of `--threshold`, which filters source
+search results on a miss. A cutoff of `1` disables semantic reuse.
+
+FAQ hits reuse the original references without searching, reranking, or calling
+the LLM again; a new question may still require a query embedding. Entries persist
+across restarts and unrelated snapshot changes. Embedding/LLM profiles and search
+filters/context options isolate answers; changing only the FAQ cutoff does not.
+Every context file (including caller/callee expansion and reference-only targets)
+must still match both the indexed and on-disk content hash. Changes, deletions,
+and renames invalidate entries before matching. Live files are read for this
+validation even with `--no-reindex`; that flag still uses the saved snapshot on a
+miss, but a stale snapshot cannot publish a reusable FAQ entry. Empty-file-context
+answers are not added to the FAQ index. The FAQ table is created on demand in
+existing schema-4 indexes; no rebuild is needed. A live-state reset clears FAQ entries.
+Like other query caches, FAQ membership and derived-pointer writes are best-effort
+when another reader holds the workspace lock; answers still return, and stale
+entries are excluded even if their deletion has to be deferred.
+
+### Inspecting and exporting indexes
+
+`slopdex index list` shows the logical index catalog: `code`, `docs`, `config`,
+`markup`, `descriptions`, `symbols`, and `faq`. Empty channels are included so all
+selectable names are discoverable. Each has `entryCount`, `vectorCount`,
+`pendingCount` (entries missing a required vector), `exists`, and `state`
+(`empty`, `pending`, or `ready`). `docs` also accepts `md` and `markdown`.
+
+```sh
+slopdex index list
+slopdex index list faq
+slopdex index list code -q "session validation" --threshold 0.7
+slopdex index list descriptions -e "authentication" -i
+slopdex index list faq -q "session validation" -e "token"
+slopdex index list symbols --detail expanded
+slopdex index list faq --output json > faq.json
+slopdex index list code --output csv > code.csv
+```
+
+Listing always inspects the saved snapshot, even without `--no-reindex`. It requires
+an existing SQLite index and never creates one, refreshes source files, generates
+indexed vectors/descriptions, invokes a reranker, or calls an LLM. Explicit rebuild
+flags are rejected. Query-less and regex-only listings are offline; a new semantic
+query may call the embedding provider and cache only its query vector.
+
+Without `-q`, entries remain in stable logical index order: content units by saved
+unit ID; callable/symbol descriptions by unit ID followed by file descriptions in
+path order; symbols by native hashed vocabulary ID; FAQ entries by SQLite entry ID.
+Symbol entries are unique normalized names/aliases with their declaration locations,
+not duplicated declaration occurrences. Both file and callable descriptions are
+included in `descriptions`. Pending entries remain inspectable without generating
+their missing vectors.
+
+`-q` / `--query` matches the selected channel's **stored embeddings**, not the map
+symbol selector. Results are scored by exact cosine and ordered by decreasing score,
+with original order breaking ties. Repeated queries use the best score (OR). FAQ
+entries use the best score across both question and answer embeddings. Missing or
+profile-incompatible vectors cannot match; they are never generated by inspection.
+`--threshold N` or `MIN-MAX` optionally filters semantic scores (inclusive minimum,
+exclusive maximum), independently of FAQ's answer-reuse cutoff. By default every
+scored entry is included, even with negative similarity.
+
+`-e` / `--regexp` (alias `--regex`) matches entry paths, names, and text, with repeated
+expressions combined by OR and `-i` / `--ignore-case` for case-insensitive matching.
+For FAQ, text means the original question plus plain answer, not attached map output.
+Regex filters are applied before semantic ranking; combining `-q` and `-e` uses AND.
+
+Default text is compact: one truncated preview per entry, with rank, ID, location,
+and similarity when queried. `--detail expanded` prints complete text and metadata
+and describes vector references/dimensions. `--output csv` and `--output json`
+automatically export the complete, untruncated representation regardless of text
+detail. Exports contain `rank`, original `order`, `index`, `id`, `kind`, `path`,
+`name`, `similarity` (null without a query), `text`, full `data`, and `embeddings`
+(role, key, presence, profile compatibility, and actual vector values). CSV uses
+RFC-style quoting, including embedded quotes/newlines; nested data and vectors are
+JSON cells. Catalogs can also be exported as CSV or JSON.
+
+Listings and exports have **no implicit result cap**, regardless of `defaultLimit`.
+Use `--limit N` to cap matches explicitly; omission notices go to stderr for CSV/JSON
+so exported stdout stays machine-readable. FAQ exports include every saved retrieval
+contract/profile and its dependency hashes. Semantic queries use only embeddings
+compatible with the effective configured profile. A FAQ entry's `data.valid` reports
+whether its saved dependencies still match the snapshot and on-disk files; inspection
+does not delete stale entries, and they remain available for diagnosis/export.
 
 ## Index lifecycle and persistence
 
@@ -1416,7 +1510,7 @@ with or without Git, even for an empty index. It uses the saved snapshot and its
 bound global store, regardless of later working-tree changes. It supports offline
 inspection and cross-search of an existing native index; missing derived USearch
 files can still be reconstructed locally. It does not make the database read-only or disable all
-network operations: uncached query/selector vectors, reranking, `describe`, and
+network operations: uncached query/selector vectors, reranking, `faq`, and
 explicit description regeneration may consult artifact caches/S3 or call their
 providers. Cached queries can run offline when the matching artifacts/results
 exist. Catalog commands still fetch
@@ -1619,7 +1713,8 @@ Example `config.json` (user or repository settings):
 | `descriptionFallbackModel` | Optional same-provider fallback; CLI `--description-fallback-model`. Successful fallback stays active within that provider instance until it fails. |
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel` | Disabled by default; models default to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, OpenAI `gpt-5.6-luna`. |
 | `rerankerCandidates` | OpenAI candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
-| `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, describe, map direct matches, and cross-search output. `--limit` overrides it. |
+| `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, FAQ, map direct matches, and cross-search output. `--limit` overrides it. |
+| `faqThreshold` | FAQ cache cosine cutoff in `[-1,1]`, default `0.9`; the best question or answer score must be strictly greater. `--faq-threshold` overrides it. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
 | `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`, Ollama `8` (maximum `64`); larger configured values are capped. The full config wizard defaults to `8` for Ollama and `32` otherwise; embedding-only setup leaves batching defaults to the provider. |

@@ -92,35 +92,39 @@ pub(in crate::cli) fn print_search(
     )
 }
 
-/// Describe uses exactly the expanded text search presentation as its LLM context.
-pub(crate) fn describe_search_context(
+/// FAQ uses expanded search presentation; dependencies include traversal and reference targets.
+pub(crate) fn faq_search_context(
     engine: &Engine,
     rows: &[Value],
     depths: (usize, usize, usize, usize),
     refs: Refs,
     expand_code_threshold: f64,
-) -> Result<String> {
+) -> Result<(String, std::collections::BTreeSet<String>)> {
     let (callers, callees, expand_callers, expand_callees) = depths;
     let mut out = Vec::new();
+    let mut presentation = Presentation::with_calls(
+        engine,
+        CallDepths {
+            callers,
+            callees,
+            refs,
+            expand_callers,
+            expand_callees,
+        },
+        expand_code_threshold,
+    )?;
     print_search(
         &mut out,
         rows,
         Format::Summary,
         Detail::Expanded,
         false,
-        &mut Presentation::with_calls(
-            engine,
-            CallDepths {
-                callers,
-                callees,
-                refs,
-                expand_callers,
-                expand_callees,
-            },
-            expand_code_threshold,
-        )?,
+        &mut presentation,
     )?;
-    Ok(String::from_utf8(out)?)
+    Ok((
+        String::from_utf8(out)?,
+        presentation.dependencies.into_inner(),
+    ))
 }
 
 #[cfg(test)]

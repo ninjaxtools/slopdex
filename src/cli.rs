@@ -6,7 +6,7 @@ mod io;
 mod output;
 mod workspace;
 
-pub(crate) use output::describe_search_context;
+pub(crate) use output::faq_search_context;
 
 use self::{
     args::{
@@ -15,8 +15,8 @@ use self::{
     config::{effective_config, mark_repository_config, run_config},
     io::{print_json, with_stdout},
     output::{
-        CrossOutput, Presentation, print_cross, print_errors, print_limit_notice, print_map,
-        print_search,
+        CrossOutput, Presentation, print_cross, print_errors, print_index_entries, print_indexes,
+        print_limit_notice, print_map, print_search,
     },
     workspace::{
         SourceWorkspace, absolute, config_path, index_path, map_workspaces,
@@ -392,6 +392,28 @@ fn run_workspace(
         );
     }
     let mode = CommandMode::for_command(&cli.command);
+    if let Command::Index {
+        action: IndexAction::List(args),
+    } = &cli.command
+    {
+        require_index(&index)?;
+        let engine = ui::spin("Opening saved index", || {
+            Engine::open_symbol_map(root, &index, config.clone(), args.query.is_empty())
+        })?;
+        let format = cli.global.format.unwrap_or(Format::Summary);
+        if let Some(name) = &args.name {
+            let mut options = args.options();
+            options["includeVectors"] = json!(matches!(format, Format::Json | Format::Csv));
+            let results = ui::spin("Reading index entries", || {
+                engine.index_entries_limited(name, &options)
+            })?;
+            print_index_entries(&mut out, &results.rows, format, cli.global.detail)?;
+            print_limit_notice(&mut out, format, results.omitted, results.limit)?;
+        } else {
+            print_indexes(&mut out, &engine.index_catalog()?, format)?;
+        }
+        return Ok(());
+    }
     let read_only_command = matches!(
         &cli.command,
         Command::Map(_)
@@ -569,21 +591,22 @@ fn run_workspace(
             )?;
             print_limit_notice(&mut out, format, rows.omitted, rows.limit)?;
         }
-        Command::Describe(args) => {
+        Command::Faq(args) => {
             let mut options = args.query.filters.options();
             let calls = args.query.calls.resolve(cli.global.detail);
-            let context = args.query.calls.resolve_describe_context();
+            let context = args.query.calls.resolve_faq_context();
             options["callers"] = json!(context.callers);
             options["callees"] = json!(context.callees);
             options["expandCallers"] = json!(context.expand_callers);
             options["expandCallees"] = json!(context.expand_callees);
             options["refs"] = json!(context.refs);
             options["expandCodeThreshold"] = json!(cli.global.expand_code_threshold);
-            let mut result = ui::spin("Generating explanation", || {
-                engine.describe(&args.query.query, &options)
-            })?;
-            // Reuse the cached query results used as explanation context, including omission metadata.
-            let references = engine.search_limited(&args.query.query, "search", &options)?;
+            if let Some(threshold) = args.faq_threshold {
+                options["faqThreshold"] = json!(threshold);
+            }
+            let mut result = ui::spin("Answering FAQ", || engine.faq(&args.query.query, &options))?;
+            // A semantic hit returns the original references, never a fresh search.
+            let references: Vec<Value> = serde_json::from_value(result["searchResults"].clone())?;
             if format == Format::Json {
                 if calls.enabled() {
                     let presentation =
@@ -604,11 +627,11 @@ fn run_workspace(
                     "Explanation\n{}",
                     result["description"].as_str().unwrap_or("")
                 )?;
-                if !references.rows.is_empty() {
+                if !references.is_empty() {
                     writeln!(out, "\nReferences")?;
                     print_search(
                         &mut out,
-                        &references.rows,
+                        &references,
                         format,
                         cli.global.detail,
                         false,
@@ -620,7 +643,12 @@ fn run_workspace(
                     )?;
                 }
             }
-            print_limit_notice(&mut out, format, references.omitted, references.limit)?;
+            print_limit_notice(
+                &mut out,
+                format,
+                result["omitted"].as_bool().unwrap_or(false),
+                result["limit"].as_u64().map(|n| n as usize),
+            )?;
         }
         Command::CrossSearch(args) => {
             let mut target = None;
@@ -703,6 +731,9 @@ fn run_workspace(
         Command::Index {
             action: IndexAction::Errors,
         } => print_errors(&mut out, &engine.errors()?, format)?,
+        Command::Index {
+            action: IndexAction::List(_),
+        } => unreachable!(),
         Command::Update(_) => print_json(
             &mut out,
             &refreshed.unwrap_or(json!({"refreshed": false, "noReindex": true})),

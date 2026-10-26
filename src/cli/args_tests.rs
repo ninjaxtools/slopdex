@@ -321,7 +321,7 @@ fn shared_selection_arguments_reach_all_search_options() {
         "search-docs",
         "search-md",
         "search-symbols",
-        "describe",
+        "faq",
         "cross-search",
     ] {
         let mut argv = vec![command];
@@ -358,7 +358,7 @@ fn shared_selection_arguments_reach_all_search_options() {
             | Command::SearchDescriptions(args)
             | Command::SearchMd(args)
             | Command::SearchSymbols(args) => args.filters.options(),
-            Command::Describe(args) => args.query.filters.options(),
+            Command::Faq(args) => args.query.filters.options(),
             Command::CrossSearch(args) => args.options(),
             _ => unreachable!(),
         };
@@ -398,7 +398,7 @@ fn formats_are_shared_selection_and_do_not_replace_settings_path() {
         "search-docs",
         "search-md",
         "search-symbols",
-        "describe",
+        "faq",
         "cross-search",
     ] {
         let mut argv = vec!["--config", "settings/custom.json", command];
@@ -418,7 +418,7 @@ fn formats_are_shared_selection_and_do_not_replace_settings_path() {
                 | Command::SearchDescriptions(args)
                 | Command::SearchMd(args)
                 | Command::SearchSymbols(args) => args.filters.options(),
-                Command::Describe(args) => args.query.filters.options(),
+                Command::Faq(args) => args.query.filters.options(),
                 Command::CrossSearch(args) => args.options(),
                 _ => unreachable!(),
             }
@@ -565,7 +565,7 @@ fn search_accepts_multiple_nonempty_queries_with_shared_options() {
         vec!["slopdex", "search"],
         vec!["slopdex", "search", "query", ""],
         vec!["slopdex", "search", "query", "   "],
-        vec!["slopdex", "describe", "first", "second"],
+        vec!["slopdex", "faq", "first", "second"],
     ] {
         assert!(Cli::try_parse_from(args).is_err());
     }
@@ -580,7 +580,7 @@ fn symbol_selection_defaults_and_scalar_threshold_validation() {
         "search-descriptions",
         "search-md",
         "search-symbols",
-        "describe",
+        "faq",
         "cross-search",
     ] {
         let mut argv = vec![command];
@@ -594,7 +594,7 @@ fn symbol_selection_defaults_and_scalar_threshold_validation() {
             | Command::SearchDescriptions(args)
             | Command::SearchMd(args)
             | Command::SearchSymbols(args) => args.filters.options(),
-            Command::Describe(args) => args.query.filters.options(),
+            Command::Faq(args) => args.query.filters.options(),
             Command::CrossSearch(args) => args.options(),
             _ => unreachable!(),
         };
@@ -726,7 +726,7 @@ fn reference_modes_parse_for_all_call_aware_commands() {
         vec!["search-descriptions", "query"],
         vec!["search-md", "query"],
         vec!["search-symbols", "query"],
-        vec!["describe", "query"],
+        vec!["faq", "query"],
         vec!["cross-search"],
     ] {
         for mode in ["none", "all", "cross-file"] {
@@ -740,7 +740,7 @@ fn reference_modes_parse_for_all_call_aware_commands() {
                 | Command::SearchDescriptions(args)
                 | Command::SearchMd(args)
                 | Command::SearchSymbols(args) => args.calls,
-                Command::Describe(args) => args.query.calls,
+                Command::Faq(args) => args.query.calls,
                 Command::CrossSearch(args) => args.calls,
                 _ => unreachable!(),
             };
@@ -753,7 +753,7 @@ fn reference_modes_parse_for_all_call_aware_commands() {
                 mode.parse::<Refs>().unwrap()
             );
             assert_eq!(
-                calls.resolve_describe_context().refs,
+                calls.resolve_faq_context().refs,
                 mode.parse::<Refs>().unwrap()
             );
         }
@@ -895,7 +895,7 @@ fn readme_commands_parse() {
             "muse-spark-1.3-contributor",
         ],
         vec!["config"],
-        vec!["describe", "I want to implement a new rpc endpoint"],
+        vec!["faq", "I want to implement a new rpc endpoint"],
         vec![
             "cross-search",
             "--cross-file-only",
@@ -1058,7 +1058,7 @@ fn cross_search_has_a_selective_default_without_changing_query_defaults() {
         "search-descriptions",
         "search-md",
         "search-symbols",
-        "describe",
+        "faq",
     ] {
         let cli = parse(&[command, "query"]);
         let filters = match cli.command {
@@ -1067,7 +1067,7 @@ fn cross_search_has_a_selective_default_without_changing_query_defaults() {
             | Command::SearchDescriptions(args)
             | Command::SearchMd(args)
             | Command::SearchSymbols(args) => args.filters,
-            Command::Describe(args) => args.query.filters,
+            Command::Faq(args) => args.query.filters,
             _ => unreachable!(),
         };
         assert_eq!(filters.options()["minSimilarity"], 0.3, "{command}");
@@ -1097,7 +1097,7 @@ fn limits_accept_none_preserve_unspecified_and_resolve_config_defaults() {
         "search-descriptions",
         "search-docs",
         "search-symbols",
-        "describe",
+        "faq",
         "map",
         "cross-search",
     ] {
@@ -1124,7 +1124,7 @@ fn limits_accept_none_preserve_unspecified_and_resolve_config_defaults() {
                     assert!(args.options().get("limit").is_none());
                     args.filters.options()
                 }
-                Command::Describe(args) => args.query.filters.options(),
+                Command::Faq(args) => args.query.filters.options(),
                 command => command.search_request().unwrap().2,
             };
             assert_eq!(options.get("limit"), expected.as_ref(), "{argv:?}");
@@ -1178,7 +1178,7 @@ fn options_defaults_and_limit_validation() {
     assert!(
         Cli::try_parse_from([
             "slopdex",
-            "describe",
+            "faq",
             "query",
             "--describe-full-file-threshold",
             "0.8"

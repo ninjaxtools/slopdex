@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
     version,
     disable_help_subcommand = true,
     about = "Semantic code, documentation, and configuration search",
-    after_help = "Examples:\n  slopdex update\n  slopdex generate descriptions\n  slopdex search \"validate an authenticated session\"\n  slopdex search-symbols \"validate session\"\n  slopdex search \"validate session\" --code --symbols\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex describe \"I want to implement a new rpc endpoint\"\n  slopdex config\n\nSearch and cross-search require an existing index; run update first. Plain search includes all indexes; selectors restrict it to explicit indexes. Descriptions are generated only by generate descriptions. Pure symbol searches refresh only structure. --no-reindex reuses saved snapshots; queries and explicit generation may call providers. Map without -q parses directly when no index exists."
+    after_help = "Examples:\n  slopdex update\n  slopdex generate descriptions\n  slopdex search \"validate an authenticated session\"\n  slopdex search-symbols \"validate session\"\n  slopdex search \"validate session\" --code --symbols\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex faq \"How are RPC endpoints registered?\"\n  slopdex config\n\nSearch and cross-search require an existing index; run update first. Plain search includes all indexes; selectors restrict it to explicit indexes. Descriptions are generated only by generate descriptions. Pure symbol searches refresh only structure. --no-reindex reuses saved snapshots; queries and explicit generation may call providers. Map without -q parses directly when no index exists."
 )]
 pub(super) struct Cli {
     #[command(flatten)]
@@ -59,7 +59,7 @@ pub(super) struct Global {
     /// OpenAI reranker candidate count (1..=100; default: 10)
     #[arg(long, global = true, value_parser = candidates)]
     pub(super) reranker_candidates: Option<usize>,
-    /// Text excerpts by default; lines accepts files, cross-search uses clusters, cohesion uses source/match groups; cross JSON is JSONL
+    /// Text by default; index list exports CSV/JSON, lines accepts files, cross-search JSON is JSONL
     #[arg(long = "output", global = true, value_enum)]
     pub(super) format: Option<Format>,
     /// Compact by default; expanded includes descriptions and high-similarity callable code
@@ -96,6 +96,7 @@ pub(super) enum Format {
     #[value(name = "text", alias = "summary")]
     Summary,
     Json,
+    Csv,
     Clusters,
     Files,
 }
@@ -130,8 +131,8 @@ pub(super) enum Command {
     SearchMd(QueryArgs),
     /// Search only the symbol-name/alias and heading-title index
     SearchSymbols(QueryArgs),
-    /// Explain existing code relevant to a task using the description model
-    Describe(DescribeArgs),
+    /// Answer codebase questions; reuse answers with similar questions or answer text
+    Faq(FaqArgs),
     /// Compare functions; clusters are connected components of observed matches
     CrossSearch(CrossArgs),
     /// Show code declarations and Markdown headings; -q matches symbols, descriptions, and heading titles
@@ -193,6 +194,50 @@ pub(super) struct RefactorArgs {
 pub(super) enum IndexAction {
     /// Refresh and inspect saved file/function indexing failures
     Errors,
+    /// List available indexes, or inspect/export one saved index without refreshing it
+    List(IndexListArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  slopdex index list\n  slopdex index list faq\n  slopdex index list code -q 'validate a session'\n  slopdex index list descriptions -e 'authentication' -i\n  slopdex index list faq --detail expanded\n  slopdex index list faq --output csv\n  slopdex index list symbols --output json\n\nWithout -q, entries retain stable index order. Repeated -q queries use the best cosine score; -e filters entry text before ranking. CSV/JSON always export complete entries and vector values. Listings use the saved snapshot, never refresh or generate missing index entries, and have no default result limit."
+)]
+pub(super) struct IndexListArgs {
+    /// Index name; omit to list channels and entry/vector counts
+    #[arg(value_name = "INDEX", value_parser = ["code", "docs", "md", "markdown", "config", "markup", "descriptions", "symbols", "faq"])]
+    pub(super) name: Option<String>,
+    /// Match the selected index's stored embeddings; repeat for OR with best-score ranking
+    #[arg(short = 'q', long, requires = "name", allow_hyphen_values = true, value_parser = nonempty)]
+    pub(super) query: Vec<String>,
+    /// Filter entry names, paths, and text; repeat for OR, combined with -q using AND
+    #[arg(short = 'e', long, alias = "regex", requires = "name", value_parser = valid_regex)]
+    pub(super) regexp: Vec<String>,
+    /// Match entry regexes case-insensitively
+    #[arg(short = 'i', long, requires = "regexp")]
+    pub(super) ignore_case: bool,
+    /// Inclusive minimum, or inclusive-min/exclusive-max cosine range (default: all scores)
+    #[arg(long, requires = "query", allow_hyphen_values = true, value_parser = threshold)]
+    pub(super) threshold: Option<Threshold>,
+    /// Positive result limit or 'none' (default: none, including exports)
+    #[arg(long, requires = "name")]
+    pub(super) limit: Option<ResultLimit>,
+}
+
+impl IndexListArgs {
+    pub(super) fn options(&self) -> Value {
+        let mut value =
+            json!({"query":self.query,"regexp":self.regexp,"ignoreCase":self.ignore_case});
+        if let Some(threshold) = &self.threshold {
+            value["minSimilarity"] = json!(threshold.min);
+            if let Some(max) = threshold.max {
+                value["maxSimilarity"] = json!(max);
+            }
+        }
+        if let Some(limit) = self.limit {
+            value["limit"] = limit.value();
+        }
+        value
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -431,7 +476,7 @@ impl CallArgs {
         }
     }
 
-    pub(super) fn resolve_describe_context(self) -> CallDepths {
+    pub(super) fn resolve_faq_context(self) -> CallDepths {
         Self {
             expand_callers: Some(self.expand_callers.unwrap_or(2)),
             expand_callees: Some(self.expand_callees.unwrap_or(2)),
@@ -601,9 +646,12 @@ impl Command {
 }
 
 #[derive(Debug, Args)]
-pub(super) struct DescribeArgs {
+pub(super) struct FaqArgs {
     #[command(flatten)]
     pub(super) query: QueryArgs,
+    /// Reuse the best question/answer cosine match strictly above this value (config faqThreshold; default: 0.9)
+    #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
+    pub(super) faq_threshold: Option<f64>,
 }
 
 #[derive(Debug, Args)]
@@ -810,6 +858,28 @@ fn valid_kind(input: &str) -> std::result::Result<String, String> {
 
 impl Cli {
     pub(super) fn validate(&self) -> Result<()> {
+        if matches!(
+            self.command,
+            Command::Index {
+                action: IndexAction::List(_)
+            }
+        ) {
+            ensure!(
+                !self.global.force_reindex && !self.global.rebuild_on_divergence,
+                "index list inspects saved data and cannot rebuild the index"
+            );
+        }
+        if self.global.format == Some(Format::Csv) {
+            ensure!(
+                matches!(
+                    self.command,
+                    Command::Index {
+                        action: IndexAction::List(_)
+                    }
+                ),
+                "--output csv is only available for index list"
+            );
+        }
         if matches!(self.command, Command::Refactor(_)) {
             ensure!(
                 !self.global.no_reindex,

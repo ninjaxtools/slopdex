@@ -14,6 +14,9 @@ use crate::{
     registry,
 };
 
+mod faq;
+pub(crate) use faq::FaqEntry;
+
 /// Bump when the structure or search-unit extraction contract changes.
 pub const STRUCTURE_PARSER_VERSION: &str = "structure-v14-symbol-references";
 
@@ -978,6 +981,9 @@ fn initialization_lock(path: &Path, config: &Value) -> Result<crate::registry::A
 }
 
 fn reset_live(conn: &Connection) -> Result<()> {
+    if faq::exists(conn)? {
+        conn.execute("DELETE FROM faq_entries", [])?;
+    }
     conn.execute_batch("DELETE FROM search_units; DELETE FROM files; DELETE FROM search_cache; DELETE FROM metadata WHERE key NOT IN ('identity','global_path');")?;
     conn.execute(
         "INSERT INTO metadata VALUES('incarnation',lower(hex(randomblob(16))))",

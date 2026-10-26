@@ -192,7 +192,7 @@ output locations use `references`, so map declarations remain decodable as
 structural nodes.
 
 Only general `search` accepts one or more positional queries; dedicated search
-variants and `describe` retain their single-query arguments. Multiword queries
+variants and `faq` retain their single-query arguments. Multiword queries
 must be quoted to remain one query. Each query runs independently through the
 existing search/result-cache and optional reranking paths. The CLI OR-merges
 results, deduplicating by indexed hit and result type and retaining the complete

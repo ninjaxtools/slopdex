@@ -241,6 +241,19 @@ fn mark_workspace(store: &Connection, index: &Connection) -> Result<()> {
         "embedding",
         "SELECT embedding_key FROM unit_embeddings UNION SELECT embedding_key FROM descriptions WHERE embedding_key IS NOT NULL",
     )?;
+    let has_faq: bool = index.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='faq_entries')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_faq {
+        mark_query(
+            store,
+            index,
+            "embedding",
+            "SELECT question_embedding FROM faq_entries UNION SELECT answer_embedding FROM faq_entries",
+        )?;
+    }
     Ok(())
 }
 
@@ -248,7 +261,7 @@ fn pointer_suffixes() -> Vec<String> {
     FormatGroup::ALL
         .into_iter()
         .map(FormatGroup::as_str)
-        .chain(["markdown", "descriptions", "symbols"])
+        .chain(["markdown", "descriptions", "symbols", "faq"])
         .map(|role| format!(".{role}.shared.json"))
         .collect()
 }

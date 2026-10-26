@@ -18,7 +18,7 @@ provider caches accelerate work but do not define the live repository snapshot.
                   +-------------------------------+
                   | Engine (engine.rs)            |
                   | refresh, map, search, compare, |
-                  | describe; index locking       |
+                  | faq; index locking            |
                   +---+-----------+-----------+---+
                        |           |           |
                        v           |           | semantic preparation / queries
@@ -87,7 +87,7 @@ provider caches accelerate work but do not define the live repository snapshot.
    and ranks indexed callables by code similarity; available callable/file
    description similarities are supplementary scores and do not affect ranking
    or thresholds.
-   `describe` sends search context to an LLM. `map.rs`
+   `faq` reuses answers through a separate question/answer vector index, checking context-file hashes before reuse; on a miss it sends search context to an LLM. `map.rs`
    renders declaration excerpts, and `callgraph.rs` expands conservatively
    resolved caller/callee context from saved structure.
    Callable graph depths control declaration/code expansion; independent `--refs`
