@@ -2766,6 +2766,7 @@ impl Engine {
         &self,
         query: &str,
         options: &Value,
+        previous_files: Option<&BTreeMap<String, String>>,
     ) -> Result<(Value, BTreeMap<String, String>)> {
         let expand_callers = options["expandCallers"].as_u64().unwrap_or(2) as usize;
         let expand_callees = options["expandCallees"].as_u64().unwrap_or(2) as usize;
@@ -2829,35 +2830,56 @@ impl Engine {
         }
         ui::progress("Generating explanation from search results");
         let system = faq::SYSTEM;
-        let key = hash(
-            json!([
-                "explanation-v3",
-                self.providers.llm().profile(),
-                self.config["descriptionBaseUrl"],
-                self.config["descriptionFallbackModel"],
-                self.config["fallbackModel"],
-                system,
-                prompt,
-                dependencies
-            ])
-            .to_string(),
-        );
+        let request = json!([
+            "explanation-request-v1",
+            self.providers.llm().profile(),
+            self.config["descriptionBaseUrl"],
+            self.config["descriptionFallbackModel"],
+            self.config["fallbackModel"],
+            system,
+            prompt
+        ]);
+        // Request identity is independent of FAQ file hashes, index generations,
+        // and the incoming paraphrase. Successful paid results live in global.cache.
+        let key = hash(request.to_string());
         self.artifacts
             .hydrate_text(&self.db, "explanation", std::slice::from_ref(&key))?;
         let _lock = registry::artifact_lock(&self.db, "explanation", &key)?;
-        let current = self.faq_files_current(&dependencies, &mut HashMap::new());
-        let description =
-            if let Some(cached) = self.db.cache("explanation", &key)?.filter(|_| current) {
-                cached
-            } else {
-                let description = self.providers.llm().describe(system, &prompt)?;
-                if current {
-                    self.db.cache_put("explanation", &key, &description)?;
-                    self.artifacts
-                        .put_text(&self.db, "explanation", &key, &description);
+        let description = if let Some(cached) = self.db.cache("explanation", &key)? {
+            cached
+        } else {
+            // Promote old exact-request results when their old identity can
+            // still be reconstructed. Never reuse one whose prompt differs.
+            let mut legacy = request.clone();
+            legacy[0] = json!("explanation-v2");
+            let mut keys = vec![hash(legacy.to_string())];
+            legacy[0] = json!("explanation-v3");
+            for files in std::iter::once(&dependencies).chain(previous_files) {
+                let mut legacy = legacy.clone();
+                legacy.as_array_mut().unwrap().push(json!(files));
+                let key = hash(legacy.to_string());
+                if !keys.contains(&key) {
+                    keys.push(key);
                 }
-                description
+            }
+            self.artifacts
+                .hydrate_text(&self.db, "explanation", &keys)?;
+            let mut cached = None;
+            for key in keys {
+                cached = self.db.cache("explanation", &key)?;
+                if cached.is_some() {
+                    break;
+                }
+            }
+            let description = match cached {
+                Some(cached) => cached,
+                None => self.providers.llm().describe(system, &prompt)?,
             };
+            self.db.cache_put("explanation", &key, &description)?;
+            self.artifacts
+                .put_text(&self.db, "explanation", &key, &description);
+            description
+        };
         let files: Vec<_> = files.into_values().collect();
         let functions: Vec<_> = matches
             .iter()

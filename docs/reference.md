@@ -1100,8 +1100,9 @@ content hashes of context files, and two vector references: the question embeddi
 scores, and reference excerpts are not included in the answer embedding.
 
 Before searching code, FAQ compares the incoming question to both embeddings and
-returns the best valid entry whose cosine similarity is **strictly greater than
-`0.9`**. `--faq-threshold N` overrides config `faqThreshold`; both accept a finite
+selects the best entry whose cosine similarity is **strictly greater than
+`0.9`**. If its dependencies are still valid, its answer is returned immediately.
+`--faq-threshold N` overrides config `faqThreshold`; both accept a finite
 number in `[-1,1]`. This is independent of `--threshold`, which filters source
 search results on a miss. A cutoff of `1` disables semantic reuse.
 
@@ -1111,14 +1112,37 @@ across restarts and unrelated snapshot changes. Embedding/LLM profiles and searc
 filters/context options isolate answers; changing only the FAQ cutoff does not.
 Every context file (including caller/callee expansion and reference-only targets)
 must still match both the indexed and on-disk content hash. Changes, deletions,
-and renames invalidate entries before matching. Live files are read for this
+and renames invalidate cached answers, but their entries remain as canonical-question
+anchors. A matching paraphrase refreshes the same entry using its **original
+question**, not a newly worded prompt. `query` reports the incoming question;
+`question` reports the canonical one used for search and the LLM request. Entries
+are updated in place, without accumulating duplicates for paraphrases.
+Live files are read for this
 validation even with `--no-reindex`; that flag still uses the saved snapshot on a
 miss, but a stale snapshot cannot publish a reusable FAQ entry. Empty-file-context
-answers are not added to the FAQ index. The FAQ table is created on demand in
+answers are not added to the FAQ index; an existing stale question anchor is
+retained until it can be refreshed with valid file dependencies. The FAQ table is created on demand in
 existing schema-4 indexes; no rebuild is needed. A live-state reset clears FAQ entries.
 Like other query caches, FAQ membership and derived-pointer writes are best-effort
-when another reader holds the workspace lock; answers still return, and stale
-entries are excluded even if their deletion has to be deferred.
+when another reader holds the workspace lock; refreshed answers still return,
+but a stale entry can never directly serve its old answer while its update is deferred.
+
+FAQ freshness and LLM request reuse are separate cache layers. After rebuilding
+the search context, an exact-request lookup uses the configured LLM profile,
+endpoint/fallback settings, system instruction, and complete final prompt. File
+hashes, snapshot generations, index paths, and incoming paraphrases are **not**
+part of that key. An edit outside the supplied context may therefore invalidate
+the FAQ entry without requiring another LLM call. A changed prompt or model
+requires a different response. Successful LLM results are saved even when the
+snapshot is stale or a later FAQ/vector publication fails.
+
+The request cache is stored in the shared global artifact database (with optional
+S3 reuse), not in `faq_entries` or the workspace SQLite index. Deleting/resetting
+and rebuilding the workspace index retains completed explanation and description
+requests, provided the same global store and request configuration are used.
+Default `cache prune` preserves these paid results. Known legacy exact-request
+and file-keyed explanation responses are promoted when their matching request
+identities can still be reconstructed; no new LLM call is needed for promotion.
 
 ### Inspecting and exporting indexes
 
@@ -1290,6 +1314,9 @@ line range, and preceding conversation. Renames, line shifts, surrounding-file
 changes, or earlier answers can change the key; reuse requires an identical
 effective request, not merely matching callable source. Source
 descriptions are extracted locally and never sent to a generator for replacement.
+FAQ explanation keys cover the final system/prompt request and LLM configuration,
+not file dependencies. The semantic FAQ entry separately tracks file freshness
+and preserves the original question when a paraphrase triggers regeneration.
 Map without `-q` never contacts S3. An uncached
 semantic query with `--no-reindex` may consult S3 before its provider call.
 When S3 is enabled later, the next successful semantic refresh uploads existing

@@ -66,38 +66,37 @@ impl Engine {
         );
         let question_embedding = self.embed_one(query, true)?;
         let query_vector = self.vector(&question_embedding)?;
-        let mut entries = Vec::new();
-        let mut stale = Vec::new();
-        let mut checked = HashMap::new();
-        for entry in self.db.faq_entries(&contract)? {
-            if self.faq_files_current(&entry.files, &mut checked) {
-                entries.push(entry);
-            } else {
-                stale.push(entry.id);
-            }
-        }
-        if !stale.is_empty() {
-            self.try_write_index(|| self.db.remove_faq(&stale))?;
-        }
+        // Retain stale entries as question anchors, never as authoritative answers.
+        // A paraphrase can refresh the same question instead of changing the LLM request.
+        let entries = self.db.faq_entries(&contract)?;
         ui::progress("Searching FAQ answers");
         let index = self.faq_index(&entries)?;
         // Both occurrences point at the same entry: the best of either embedding wins.
-        if let Some((id, _)) = index
+        let matched = index
             .search_filtered(&query_vector, 1, |_| true)?
             .first()
             .filter(|(_, similarity)| *similarity > cutoff)
+            .map(|(id, _)| {
+                entries
+                    .iter()
+                    .find(|entry| entry.id == id / 2)
+                    .context("Missing FAQ entry")
+            })
+            .transpose()?;
+        if let Some(entry) = matched
+            && self.faq_files_current(&entry.files, &mut HashMap::new())
         {
-            let entry = entries
-                .iter()
-                .find(|entry| entry.id == id / 2)
-                .context("Missing FAQ entry")?;
             let mut result = entry.result.clone();
             result["query"] = json!(query);
             ui::progress("Reusing FAQ answer");
             return Ok(result);
         }
 
-        let (result, files) = self.answer_faq(query, options)?;
+        let question = matched.map_or(query, |entry| entry.question.as_str());
+        let question_embedding =
+            matched.map_or(question_embedding, |entry| entry.question_embedding.clone());
+        let (mut result, files) =
+            self.answer_faq(question, options, matched.map(|entry| &entry.files))?;
         // A saved snapshot may deliberately differ from disk under --no-reindex.
         // It can still answer, but must never publish a stale semantic cache entry.
         if !files.is_empty() && self.faq_files_current(&files, &mut HashMap::new()) {
@@ -109,7 +108,7 @@ impl Engine {
             if self.faq_files_current(&files, &mut HashMap::new()) {
                 let entry = FaqEntry {
                     id: 0,
-                    question: query.into(),
+                    question: question.into(),
                     result: result.clone(),
                     files,
                     question_embedding,
@@ -119,6 +118,7 @@ impl Engine {
                 self.faq_index(&self.db.faq_entries(&contract)?)?;
             }
         }
+        result["query"] = json!(query);
         Ok(result)
     }
 

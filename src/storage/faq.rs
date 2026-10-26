@@ -85,13 +85,4 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
-
-    pub(crate) fn remove_faq(&self, ids: &[u64]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for id in ids {
-            tx.execute("DELETE FROM faq_entries WHERE id=?", [i64::try_from(*id)?])?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
 }

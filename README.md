@@ -32,7 +32,7 @@ The main supported functions are
 
 `cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
 
-`faq` reuses answers to similar questions when their source files are unchanged. On a miss, it searches and asks the configured LLM for an explanation.
+`faq` caches LLM responses in a vector index.
 
 ## Installation
 
@@ -247,17 +247,17 @@ $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 
 ## Frequently asked questions
 
-The `faq` command replaces `describe`. It uses a low-cost model to explain vector search findings and remembers the question, answer, references, and source-file hashes for similar future questions.
-
-The `faq` command requires an LLM to be configured (see below).
+The `faq` command sends the given question together with a `map` to the configured LLM and caches the response in a vector index.
 
 ```console
 $ slopdex faq "How are RPC endpoints registered?"
 ```
 
-First a `search` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation which generates an explanation which will be emitted along with the `compact` search references. This provides a tailored explanation for the query based on the `expanded` search result along with the `compact` search result and thereby acts as a compaction of the `expanded` result.
+First a `map` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation which generates an explanation which will be emitted along with the `compact` map output.
 
-The separate FAQ vector index embeds both the original question and the plain-text LLM answer (never the map/excerpts). A later question reuses the best match strictly above `0.9` against either embedding, without another search or LLM request. Set `faqThreshold` in configuration, or override it with `--faq-threshold 0.95`. Every context file, including expanded callables and reference targets, is checked by content hash before reuse; changed or missing files invalidate the entry. Unrelated edits do not invalidate it.
+The result is indexed under the embeddings of the original question as well as the LLM response. Any subsequent questions will be use the index to try and get a match above the configured threshold (0.9 by default, configured with `--faq-threshold`), and reuse the response.
+
+Changes in the files involved invalidate the FAQ answer and repeat the LLM request.
 
 ## Inspect and export indexes
 
@@ -270,8 +270,6 @@ slopdex index list faq --detail expanded        # full text and metadata
 slopdex index list faq --output json > faq.json # full entries and vectors
 slopdex index list code --output csv > code.csv
 ```
-
-Available channels are `code`, `docs` (aliases `md`, `markdown`), `config`, `markup`, `descriptions`, `symbols`, and `faq`. Inspection always uses the saved index: it does not refresh files, generate missing vectors, rerank, or call an LLM. Semantic `-q` may embed the query; regex-only and query-less listings are offline. Repeat queries for best-score OR matching; repeat regexes for OR filtering, applied before semantic ranking. Compact text truncates entries; expanded text and CSV/JSON exports do not. There is no default result cap; use `--limit N` explicitly when needed.
 
 ## Configure an LLM
 
