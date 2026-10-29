@@ -25,6 +25,16 @@ pub struct Selection {
 
 pub(crate) struct SelectedStructure {
     pub(crate) nodes: Vec<StructureNode>,
+    /// Read by the selection limit tests; map queries use `SelectedIndexes`.
+    #[allow(dead_code)]
+    pub(crate) direct_count: usize,
+    #[allow(dead_code)]
+    pub(crate) omitted: bool,
+}
+
+/// A selection as positions in the originating structure's `nodes`.
+pub(crate) struct SelectedIndexes {
+    pub(crate) indexes: Vec<usize>,
     pub(crate) direct_count: usize,
     pub(crate) omitted: bool,
 }
@@ -325,6 +335,27 @@ impl Selection {
         source: Option<&str>,
         limit: Option<usize>,
     ) -> SelectedStructure {
+        let selected = self.select_structure_limited_indexes(path, structure, source, limit);
+        SelectedStructure {
+            nodes: selected
+                .indexes
+                .iter()
+                .map(|&index| structure.nodes[index].clone())
+                .collect(),
+            direct_count: selected.direct_count,
+            omitted: selected.omitted,
+        }
+    }
+
+    /// The same selection as positions in `structure.nodes`, for callers
+    /// scanning many files that must not clone every selected declaration.
+    pub(crate) fn select_structure_limited_indexes(
+        &self,
+        path: &str,
+        structure: &FileStructure,
+        source: Option<&str>,
+        limit: Option<usize>,
+    ) -> SelectedIndexes {
         let parents: HashMap<_, _> = structure
             .nodes
             .iter()
@@ -332,11 +363,12 @@ impl Selection {
             .collect();
         let nodes: HashMap<_, _> = structure.nodes.iter().map(|node| (node.id, node)).collect();
         let mut visibility = HashMap::new();
-        let mut ordered: Vec<_> = structure.nodes.iter().collect();
-        ordered.sort_by_key(|node| node.source_order_key());
+        let mut ordered: Vec<(usize, &StructureNode)> =
+            structure.nodes.iter().enumerate().collect();
+        ordered.sort_by_key(|(_, node)| node.source_order_key());
         let mut direct = Vec::new();
         let mut omitted = false;
-        for node in &ordered {
+        for (_, node) in &ordered {
             if (!self.private
                 && symbol_is_private(node.id, &nodes, &mut visibility, &mut HashSet::new()))
                 || !self.kind_matches(&node.kind)
@@ -361,11 +393,11 @@ impl Selection {
                 current = parents.get(&id).copied().flatten();
             }
         }
-        SelectedStructure {
-            nodes: ordered
+        SelectedIndexes {
+            indexes: ordered
                 .into_iter()
-                .filter(|node| selected.contains(&node.id))
-                .cloned()
+                .filter(|(_, node)| selected.contains(&node.id))
+                .map(|(index, _)| index)
                 .collect(),
             direct_count,
             omitted,

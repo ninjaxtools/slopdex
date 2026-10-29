@@ -117,18 +117,15 @@ fn lines(
 fn map(session: &mut Session, out: &mut impl Write, map_output: &mut MapOutput) -> Result<()> {
     let format = session.format();
     if let Some(options) = session.map_options.take() {
-        let (rows, selection) = session.run("Mapping repository structure", |engine| {
-            Ok((
-                engine.map_limited(&options, format != Format::Json)?,
-                engine.selection(&options)?,
-            ))
+        let (prepared, selection) = session.run("Mapping repository structure", |engine| {
+            engine.map_prepared(&options, format != Format::Json)
         })?;
         emit_map(
             session.cli,
             out,
-            &rows,
-            Some(session.engine()),
-            Some(&selection),
+            prepared,
+            session.engine(),
+            &selection,
             map_output,
         )?;
     }

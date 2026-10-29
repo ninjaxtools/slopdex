@@ -15,19 +15,14 @@ impl Engine {
         crate::map::query(self, &self.root, &options)
     }
 
-    pub(crate) fn map_limited(
+    pub(crate) fn map_prepared(
         &self,
         options: &Value,
         label_invocations: bool,
-    ) -> Result<LimitedResults<Value>> {
+    ) -> Result<(crate::map::PreparedMap, Selection)> {
         let mut options = options.clone();
         options["limit"] = limits::resolve(&self.config, &options)?.value();
-        crate::map::query_limited_with_reference_labels(
-            self,
-            &self.root,
-            &options,
-            label_invocations,
-        )
+        crate::map::prepare(self, &self.root, &options, label_invocations)
     }
 
     /// Resolve name and description selectors against the current structural snapshot.
@@ -153,6 +148,7 @@ impl Engine {
     }
 
     fn symbol_structures(&self) -> Result<BTreeMap<String, Arc<parse::FileStructure>>> {
+        self.preload_structures()?;
         self.db
             .paths()?
             .into_iter()
@@ -163,6 +159,24 @@ impl Engine {
                 Ok((path, structure))
             })
             .collect()
+    }
+
+    /// Fill the per-file structure cache with one bulk load. Whole-snapshot
+    /// consumers (semantic selection, the call graph) would otherwise issue
+    /// several statements per file. The index lock held for the engine's
+    /// lifetime keeps the files table in step with the loaded snapshot.
+    pub(super) fn preload_structures(&self) -> Result<()> {
+        if self.structures.borrow().len() >= self.files.len() {
+            return Ok(());
+        }
+        let mut all = self.db.all_structures(STRUCTURE_PARSER_VERSION)?;
+        let mut cache = self.structures.borrow_mut();
+        for path in self.files.keys() {
+            cache
+                .entry(path.clone())
+                .or_insert_with(|| all.remove(path).map(Arc::new));
+        }
+        Ok(())
     }
 
     /// One vocabulary index per loaded snapshot: selectors and symbol results in
@@ -360,7 +374,9 @@ impl Engine {
                     .db
                     .structure_current(path, &file.hash, STRUCTURE_PARSER_VERSION)? =>
             {
-                Some(Arc::new(self.db.structure(path)?))
+                // Currency is verified above; skip the checked accessor's
+                // second existence query.
+                Some(Arc::new(self.db.read_structure(path)?))
             }
             _ => None,
         };
@@ -388,7 +404,12 @@ impl Engine {
         if let Some(cached) = self.db.cache("callgraph", &key)? {
             return Ok(serde_json::from_str(&cached)?);
         }
-        let graph = crate::callgraph::CallGraph::load(&self.db)?;
+        // Build from the engine's (bulk-loaded) structures instead of
+        // re-reading every file's structure from the database.
+        let graph = crate::callgraph::CallGraph::from_structures(
+            self.symbol_structures()?,
+            crate::callgraph::CallGraph::indexed_keys(&self.db)?,
+        );
         if !self.readonly {
             self.db
                 .cache_put("callgraph", &key, &serde_json::to_string(&graph)?)?;

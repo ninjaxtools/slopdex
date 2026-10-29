@@ -17,13 +17,13 @@ pub(crate) use output::{RenderedSymbol, faq_search_context};
 use self::{
     args::{Cli, Command, Format},
     io::{print_json, with_stdout},
-    output::{print_limit_notice, print_map},
+    output::{print_limit_notice, print_map_row},
     workspace::{SourceWorkspace, map_workspaces, root_path, source_workspace},
 };
 use crate::{
     engine::Engine,
     filter,
-    limits::{self, LimitedResults, ResultLimit},
+    limits::{self, ResultLimit},
     lines, map, ui,
 };
 use anyhow::Result;
@@ -34,12 +34,11 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Default)]
 struct MapOutput {
-    rows: Vec<Value>,
     limit: Option<ResultLimit>,
     remaining: Option<usize>,
     omitted: bool,
+    json: io::JsonArrayWriter,
 }
 
 impl MapOutput {
@@ -62,13 +61,13 @@ impl MapOutput {
             .value();
     }
 
-    fn include(&mut self, results: &LimitedResults<Value>) -> bool {
+    fn include(&mut self, count: usize, omitted: bool) -> bool {
         if self.remaining == Some(0) {
-            self.omitted |= results.count > 0;
+            self.omitted |= count > 0;
             return false;
         }
-        self.remaining = self.remaining.map(|remaining| remaining - results.count);
-        self.omitted |= results.omitted;
+        self.remaining = self.remaining.map(|remaining| remaining - count);
+        self.omitted |= omitted;
         true
     }
 }
@@ -110,7 +109,12 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
             directory: None,
         }],
     };
-    let mut map_output = MapOutput::default();
+    let mut map_output = MapOutput {
+        limit: None,
+        remaining: None,
+        omitted: false,
+        json: io::JsonArrayWriter::new(),
+    };
     let mut line_files = Vec::new();
     for workspace in workspaces {
         run_workspace(cli, &workspace, &mut out, &mut map_output, &mut line_files)?;
@@ -131,7 +135,7 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
     if matches!(cli.command, Command::Map(_)) {
         let format = cli.global.format.unwrap_or(Format::Summary);
         if format == Format::Json {
-            print_json(&mut out, &map_output.rows)?;
+            map_output.json.finish(&mut out)?;
         }
         print_limit_notice(
             &mut out,
@@ -143,31 +147,38 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+/// Stream one workspace's prepared map rows to `out`, honoring the shared
+/// declaration budget. Rows are written per file and dropped, so peak
+/// memory does not grow with the size of the printed map.
 fn emit_map(
     cli: &Cli,
     out: &mut impl Write,
-    results: &LimitedResults<Value>,
-    source: Option<&dyn map::StructureSource>,
-    selection: Option<&filter::Selection>,
+    prepared: map::PreparedMap,
+    source: &dyn map::StructureSource,
+    selection: &filter::Selection,
     collected: &mut MapOutput,
 ) -> Result<()> {
-    if !collected.include(results) {
+    if !collected.include(prepared.count, prepared.omitted) {
         return Ok(());
     }
-    let format = cli.global.format.unwrap_or(Format::Summary);
     if cli.global.format == Some(Format::Json) {
-        collected.rows.extend_from_slice(&results.rows);
+        prepared.emit_each(source, &mut |_, _, row| collected.json.row(out, &row))
     } else {
-        print_map(
-            out,
-            &results.rows,
-            format,
-            cli.global.detail,
-            source,
-            selection,
-        )?;
+        let mut first = true;
+        prepared.emit_each(source, &mut |_, structure, row| {
+            print_map_row(
+                out,
+                &row,
+                !first,
+                cli.global.detail,
+                Some(source),
+                Some(structure),
+                Some(selection),
+            )?;
+            first = false;
+            Ok(())
+        })
     }
-    Ok(())
 }
 
 fn run_workspace(

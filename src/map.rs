@@ -19,7 +19,9 @@ use std::{
 /// The same selection and rendering paths serve indexed and directly parsed files.
 pub(crate) trait StructureSource {
     fn paths(&self) -> Result<Vec<String>>;
-    fn structure(&self, path: &str) -> Result<Option<FileStructure>>;
+    /// Shared structure so whole-repository scans do not deep-clone every
+    /// file's declarations on each access.
+    fn structure(&self, path: &str) -> Result<Option<std::sync::Arc<FileStructure>>>;
     fn source(&self, path: &str) -> Option<&str>;
     fn call_graph(&self) -> Result<CallGraph>;
 
@@ -45,6 +47,10 @@ pub(crate) trait StructureSource {
     fn symbol_descriptions(&self, _path: &str) -> Result<HashMap<usize, String>> {
         Ok(HashMap::new())
     }
+
+    /// Drop cached structures once a scan holds shared references to the
+    /// ones it still needs. Sources without a cache do nothing.
+    fn release_structures(&self) {}
 }
 
 #[derive(Default)]
@@ -69,7 +75,9 @@ impl Unindexed {
         let mut result = Self::default();
         let mut source_paths = engine::source_paths(root, index, config)?;
         source_paths.sort();
+        let progress = ui::counted("Parsing files", source_paths.len());
         for path in source_paths {
+            progress.inc(1);
             // Call/reference resolution needs the whole workspace; otherwise parse only
             // files that can contribute to the requested map.
             if !needs_graph && !path_matches(&selection, &paths, &path) {
@@ -96,7 +104,7 @@ impl Unindexed {
             // Retain the file proving omission so query_limited can report it,
             // but do not parse any later files unless call resolution needs them.
             let omitted = if !needs_graph && remaining.is_some() {
-                let selected = selection.select_structure_limited_in(
+                let selected = selection.select_structure_limited_indexes(
                     &path,
                     &parsed.structure,
                     Some(&source),
@@ -112,6 +120,7 @@ impl Unindexed {
                 break;
             }
         }
+        progress.finish();
         Ok(result)
     }
 }
@@ -121,11 +130,11 @@ impl StructureSource for Unindexed {
         Ok(self.files.keys().cloned().collect())
     }
 
-    fn structure(&self, path: &str) -> Result<Option<FileStructure>> {
+    fn structure(&self, path: &str) -> Result<Option<std::sync::Arc<FileStructure>>> {
         Ok(self
             .files
             .get(path)
-            .map(|(_, parsed)| parsed.structure.clone()))
+            .map(|(_, parsed)| std::sync::Arc::new(parsed.structure.clone())))
     }
 
     fn source(&self, path: &str) -> Option<&str> {
@@ -212,6 +221,132 @@ pub(crate) fn query_limited_with_reference_labels(
     options: &Value,
     label_invocations: bool,
 ) -> Result<LimitedResults<Value>> {
+    Ok(query_limited_with_selection(source, root, options, label_invocations)?.0)
+}
+
+/// Receives one prepared file's path, shared structure, and serialized row.
+type MapEmit<'a> = dyn FnMut(&str, &std::sync::Arc<FileStructure>, Value) -> Result<()> + 'a;
+
+/// One file's selected declarations as positions in its shared structure.
+/// Whole-repository maps retain these instead of cloned declarations, so
+/// peak memory tracks the structures themselves, not copies of them.
+pub(crate) struct PreparedFile {
+    pub(crate) structure: std::sync::Arc<FileStructure>,
+    nodes: Vec<usize>,
+}
+
+/// A map query with selection and call-graph expansion resolved, ready to
+/// emit rows one file at a time. Emitting per file keeps at most one file's
+/// serialized row alive instead of a `Value` tree for the whole repository.
+pub(crate) struct PreparedMap {
+    files: BTreeMap<String, PreparedFile>,
+    expansion: Option<(CallGraph, crate::callgraph::Expansion, HashSet<Key>)>,
+    refs: Refs,
+    label_invocations: bool,
+    pub(crate) omitted: bool,
+    pub(crate) limit: Option<usize>,
+    pub(crate) count: usize,
+}
+
+impl PreparedMap {
+    pub(crate) fn emit_each(
+        self,
+        source: &dyn StructureSource,
+        emit: &mut MapEmit<'_>,
+    ) -> Result<()> {
+        for (path, mut file) in self.files {
+            file.nodes
+                .sort_by_key(|&index| file.structure.nodes[index].source_order_key());
+            let mut values = Vec::new();
+            for &index in &file.nodes {
+                let node = &file.structure.nodes[index];
+                let key = Key {
+                    path: path.clone(),
+                    id: node.id,
+                };
+                let mut value = serde_json::to_value(node)?;
+                value.as_object_mut().unwrap().remove("calls");
+                value.as_object_mut().unwrap().remove("referenceSites");
+                if let Some((graph, expansion, code_keys)) = &self.expansion {
+                    if let Some(depth) = expansion.depths.get(&key) {
+                        value["callDepth"] = json!(depth);
+                    }
+                    let references = if self.label_invocations {
+                        graph.reference_labels(&key, self.refs)
+                    } else {
+                        graph.references(&key, self.refs)
+                    };
+                    if !references.is_empty() {
+                        value["references"] = json!(references);
+                    }
+                    if code_keys.contains(&key) {
+                        value["expandedCode"] = json!(true);
+                        if let Some(code) = source
+                            .source(&path)
+                            .and_then(|source| source.get(node.start_byte..node.end_byte))
+                        {
+                            value["source"] = json!(code);
+                        }
+                    }
+                }
+                values.push(value);
+            }
+            emit(&path, &file.structure, json!({"path":path,"nodes":values}))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn collect(self, source: &dyn StructureSource) -> Result<LimitedResults<Value>> {
+        let (omitted, limit) = (self.omitted, self.limit);
+        let mut rows = Vec::new();
+        self.emit_each(source, &mut |_, _, row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        Ok(LimitedResults {
+            rows,
+            omitted,
+            limit,
+        })
+    }
+}
+
+fn node_position(structure: &FileStructure, id: usize) -> Option<usize> {
+    match structure.nodes.get(id) {
+        Some(node) if node.id == id => Some(id),
+        _ => structure.nodes.iter().position(|node| node.id == id),
+    }
+}
+
+/// Positions of `node` and its ancestors within `structure`, mirroring
+/// `ancestors` for an identical structure from the same extraction.
+fn ancestor_positions(structure: &FileStructure, node: &StructureNode) -> Vec<usize> {
+    let Some(start) = node_position(structure, node.id) else {
+        return Vec::new();
+    };
+    let mut positions = vec![start];
+    let mut parent = structure.nodes[start].parent_id;
+    let mut visited = HashSet::new();
+    while let Some(id) = parent.filter(|id| visited.insert(*id)) {
+        let Some(position) = node_position(structure, id) else {
+            break;
+        };
+        positions.push(position);
+        parent = structure.nodes[position].parent_id;
+    }
+    positions.reverse();
+    positions
+}
+
+/// The resolved selection is returned with the prepared map: semantic
+/// selection can scan every structure and embed every symbol name, so
+/// callers that also render with it must not resolve it a second time.
+pub(crate) fn prepare(
+    source: &dyn StructureSource,
+    root: &Path,
+    options: &Value,
+    label_invocations: bool,
+) -> Result<(PreparedMap, Selection)> {
     let limit = limits::resolve(&Value::Null, options)?.count();
     let mut remaining = limit;
     let mut omitted = false;
@@ -220,10 +355,12 @@ pub(crate) fn query_limited_with_reference_labels(
     let paths = selected_paths(root, options)?;
     let (callers, callees) = call_depths(options);
     let refs = reference_mode(options, callers, callees)?;
-    let mut selected = BTreeMap::<String, Vec<StructureNode>>::new();
+    let mut selected = BTreeMap::<String, PreparedFile>::new();
     let mut source_paths = source.paths()?;
     source_paths.sort();
+    let progress = ui::counted("Mapping files", source_paths.len());
     for path in source_paths {
+        progress.inc(1);
         if !path_matches(&selection, &paths, &path) {
             continue;
         }
@@ -233,11 +370,18 @@ pub(crate) fn query_limited_with_reference_labels(
             } else {
                 None
             };
-            let matches = selection.select_structure_limited_in(&path, &structure, text, remaining);
+            let matches =
+                selection.select_structure_limited_indexes(&path, &structure, text, remaining);
             direct_count += matches.direct_count;
             remaining = remaining.map(|remaining| remaining - matches.direct_count);
-            if !matches.nodes.is_empty() {
-                selected.insert(path, matches.nodes);
+            if !matches.indexes.is_empty() {
+                selected.insert(
+                    path,
+                    PreparedFile {
+                        structure,
+                        nodes: matches.indexes,
+                    },
+                );
             }
             if matches.omitted {
                 omitted = true;
@@ -249,9 +393,10 @@ pub(crate) fn query_limited_with_reference_labels(
         let graph = source.call_graph()?;
         let expand_callers = options["expandCallers"].as_u64().unwrap_or(0) as usize;
         let expand_callees = options["expandCallees"].as_u64().unwrap_or(0) as usize;
-        let seeds = selected.iter().flat_map(|(path, nodes)| {
-            nodes
+        let seeds = selected.iter().flat_map(|(path, file)| {
+            file.nodes
                 .iter()
+                .map(|&index| &file.structure.nodes[index])
                 .filter(|node| {
                     matches!(
                         node.kind.as_str(),
@@ -264,15 +409,28 @@ pub(crate) fn query_limited_with_reference_labels(
                 })
         });
         let expanded = graph.expand(seeds, callers, callees);
-        let code_keys = graph.code_keys(&expanded, expand_callers, expand_callees);
+        let code_keys: HashSet<Key> = graph
+            .code_keys(&expanded, expand_callers, expand_callees)
+            .into_iter()
+            .collect();
+        let mut present: HashMap<String, HashSet<usize>> = HashMap::new();
         for key in expanded.depths.keys() {
-            if let Some(structure) = graph.files.get(&key.path)
+            if let Some(graph_structure) = graph.files.get(&key.path)
                 && let Some(node) = graph.node(key)
             {
-                let nodes = selected.entry(key.path.clone()).or_default();
-                for ancestor in ancestors(structure, node) {
-                    if !nodes.iter().any(|existing| existing.id == ancestor.id) {
-                        nodes.push(ancestor);
+                let structure = graph_structure.clone();
+                let file = selected
+                    .entry(key.path.clone())
+                    .or_insert_with(|| PreparedFile {
+                        structure,
+                        nodes: Vec::new(),
+                    });
+                let seen = present
+                    .entry(key.path.clone())
+                    .or_insert_with(|| file.nodes.iter().copied().collect());
+                for position in ancestor_positions(&file.structure, node) {
+                    if seen.insert(position) {
+                        file.nodes.push(position);
                     }
                 }
             }
@@ -281,50 +439,32 @@ pub(crate) fn query_limited_with_reference_labels(
     } else {
         None
     };
-    let mut result = Vec::new();
-    for (path, mut nodes) in selected {
-        nodes.sort_by_key(StructureNode::source_order_key);
-        let mut values = Vec::new();
-        for node in nodes {
-            let key = Key {
-                path: path.clone(),
-                id: node.id,
-            };
-            let mut value = serde_json::to_value(&node)?;
-            value.as_object_mut().unwrap().remove("calls");
-            value.as_object_mut().unwrap().remove("referenceSites");
-            if let Some((graph, expansion, code_keys)) = &expansion {
-                if let Some(depth) = expansion.depths.get(&key) {
-                    value["callDepth"] = json!(depth);
-                }
-                let references = if label_invocations {
-                    graph.reference_labels(&key, refs)
-                } else {
-                    graph.references(&key, refs)
-                };
-                if !references.is_empty() {
-                    value["references"] = json!(references);
-                }
-                if code_keys.contains(&key) {
-                    value["expandedCode"] = json!(true);
-                    if let Some(code) = source
-                        .source(&path)
-                        .and_then(|source| source.get(node.start_byte..node.end_byte))
-                    {
-                        value["source"] = json!(code);
-                    }
-                }
-            }
-            values.push(value);
-        }
-        result.push(json!({"path":path,"nodes":values}));
-    }
-    Ok(LimitedResults {
-        rows: result,
-        omitted,
-        limit,
-        count: direct_count,
-    })
+    progress.finish();
+    // Prepared files hold shared references to the structures emission
+    // needs; sources may now drop caches of everything else they loaded.
+    source.release_structures();
+    Ok((
+        PreparedMap {
+            files: selected,
+            expansion,
+            refs,
+            label_invocations,
+            omitted,
+            limit,
+            count: direct_count,
+        },
+        selection,
+    ))
+}
+
+pub(crate) fn query_limited_with_selection(
+    source: &dyn StructureSource,
+    root: &Path,
+    options: &Value,
+    label_invocations: bool,
+) -> Result<(LimitedResults<Value>, Selection)> {
+    let (prepared, selection) = prepare(source, root, options, label_invocations)?;
+    Ok((prepared.collect(source)?, selection))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1032,7 +1172,7 @@ mod tests {
             fn paths(&self) -> Result<Vec<String>> {
                 self.0.paths()
             }
-            fn structure(&self, path: &str) -> Result<Option<FileStructure>> {
+            fn structure(&self, path: &str) -> Result<Option<std::sync::Arc<FileStructure>>> {
                 self.0.structure(path)
             }
             fn source(&self, path: &str) -> Option<&str> {
@@ -1096,7 +1236,7 @@ mod tests {
                 paths.reverse();
                 Ok(paths)
             }
-            fn structure(&self, path: &str) -> Result<Option<FileStructure>> {
+            fn structure(&self, path: &str) -> Result<Option<std::sync::Arc<FileStructure>>> {
                 self.reads.borrow_mut().push(path.to_owned());
                 self.source.structure(path)
             }
@@ -1329,8 +1469,8 @@ mod tests {
             fn paths(&self) -> Result<Vec<String>> {
                 Ok(vec!["guide.md".into()])
             }
-            fn structure(&self, _path: &str) -> Result<Option<FileStructure>> {
-                Ok(Some(self.0.clone()))
+            fn structure(&self, _path: &str) -> Result<Option<std::sync::Arc<FileStructure>>> {
+                Ok(Some(std::sync::Arc::new(self.0.clone())))
             }
             fn source(&self, _path: &str) -> Option<&str> {
                 None

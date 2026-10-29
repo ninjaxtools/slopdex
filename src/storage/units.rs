@@ -192,71 +192,176 @@ pub(super) fn row_usize(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Res
     usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
+/// The JSON payload written by `write_structure` in each symbol's metadata
+/// column. Deserializing the typed form directly avoids building a
+/// `serde_json::Value` tree and cloning each field out of it per symbol.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeMetadata {
+    attributes: Vec<String>,
+    imports: Vec<crate::parse::ImportBinding>,
+    heading_level: Option<usize>,
+    #[serde(default)]
+    calls: Vec<crate::parse::CallSite>,
+    #[serde(default)]
+    references: Vec<crate::parse::ReferenceSite>,
+    #[serde(default)]
+    description_hash: Option<String>,
+    declaration_start_line: Option<usize>,
+    declaration_start_byte: Option<usize>,
+}
+
+fn structure_node(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<StructureNode> {
+    Ok(StructureNode {
+        id: row_usize(row, offset)?,
+        parent_id: row
+            .get::<_, Option<i64>>(offset + 1)?
+            .map(|_| row_usize(row, offset + 1))
+            .transpose()?,
+        language: row.get(offset + 2)?,
+        kind: row.get(offset + 3)?,
+        name: row.get(offset + 4)?,
+        qualified_name: row.get(offset + 5)?,
+        signature: row.get(offset + 6)?,
+        start_byte: row_usize(row, offset + 7)?,
+        end_byte: row_usize(row, offset + 8)?,
+        start_line: row_usize(row, offset + 9)?,
+        start_column: row_usize(row, offset + 10)?,
+        end_line: row_usize(row, offset + 11)?,
+        end_column: row_usize(row, offset + 12)?,
+        ..Default::default()
+    })
+}
+
+/// Content-addressed description prose, fetched at most once per hash within
+/// one structure load (the same prose can back many symbols and files).
+fn description_content(
+    conn: &Connection,
+    cache: &mut HashMap<String, String>,
+    key: &str,
+) -> Result<String> {
+    if let Some(content) = cache.get(key) {
+        return Ok(content.clone());
+    }
+    let content: String = conn
+        .prepare_cached("SELECT content FROM global.description_content WHERE hash=?")?
+        .query_row([key], |r| r.get(0))
+        .with_context(|| format!("Missing global description content {key}"))?;
+    cache.insert(key.to_owned(), content.clone());
+    Ok(content)
+}
+
+fn finish_node(
+    conn: &Connection,
+    descriptions: &mut HashMap<String, String>,
+    names: &mut HashMap<usize, Vec<String>>,
+    mut node: StructureNode,
+    metadata: &str,
+) -> Result<StructureNode> {
+    let metadata: NodeMetadata = serde_json::from_str(metadata)?;
+    node.attributes = metadata.attributes;
+    node.imports = metadata.imports;
+    node.heading_level = metadata.heading_level;
+    node.declaration_start_line = metadata.declaration_start_line;
+    node.declaration_start_byte = metadata.declaration_start_byte;
+    node.calls = metadata.calls;
+    node.references = metadata.references;
+    node.description = metadata
+        .description_hash
+        .as_deref()
+        .map(|key| description_content(conn, descriptions, key))
+        .transpose()?;
+    node.names = names.remove(&node.id).unwrap_or_default();
+    Ok(node)
+}
+
 pub(super) fn read_structure(conn: &Connection, path: &str) -> Result<FileStructure> {
     let mut names = HashMap::<usize, Vec<String>>::new();
-    let mut names_stmt = conn.prepare(
+    let mut names_stmt = conn.prepare_cached(
         "SELECT symbol_id,name FROM symbol_names WHERE path=? ORDER BY symbol_id,ordinal",
     )?;
     for row in names_stmt.query_map([path], |r| Ok((row_usize(r, 0)?, r.get::<_, String>(1)?)))? {
         let (id, name) = row?;
         names.entry(id).or_default().push(name);
     }
-    let mut stmt = conn.prepare("SELECT id,parent_id,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata FROM symbols WHERE path=? ORDER BY ordinal")?;
+    let mut stmt = conn.prepare_cached("SELECT id,parent_id,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata FROM symbols WHERE path=? ORDER BY ordinal")?;
     let rows = stmt.query_map([path], |r| {
-        Ok((
-            StructureNode {
-                id: row_usize(r, 0)?,
-                parent_id: r
-                    .get::<_, Option<i64>>(1)?
-                    .map(|_| row_usize(r, 1))
-                    .transpose()?,
-                language: r.get(2)?,
-                kind: r.get(3)?,
-                name: r.get(4)?,
-                qualified_name: r.get(5)?,
-                signature: r.get(6)?,
-                start_byte: row_usize(r, 7)?,
-                end_byte: row_usize(r, 8)?,
-                start_line: row_usize(r, 9)?,
-                start_column: row_usize(r, 10)?,
-                end_line: row_usize(r, 11)?,
-                end_column: row_usize(r, 12)?,
-                ..Default::default()
-            },
-            r.get::<_, String>(13)?,
-        ))
+        Ok((structure_node(r, 0)?, r.get::<_, String>(13)?))
     })?;
+    let mut descriptions = HashMap::new();
     let nodes = rows
-        .map(|r| {
-            let (mut node, metadata) = r?;
-            let metadata: Value = serde_json::from_str(&metadata)?;
-            node.attributes = serde_json::from_value(metadata["attributes"].clone())?;
-            node.imports = serde_json::from_value(metadata["imports"].clone())?;
-            node.heading_level = serde_json::from_value(metadata["headingLevel"].clone())?;
-            node.declaration_start_line =
-                serde_json::from_value(metadata["declarationStartLine"].clone())?;
-            node.declaration_start_byte =
-                serde_json::from_value(metadata["declarationStartByte"].clone())?;
-            node.calls =
-                serde_json::from_value(metadata.get("calls").cloned().unwrap_or(json!([])))?;
-            node.references =
-                serde_json::from_value(metadata.get("references").cloned().unwrap_or(json!([])))?;
-            node.description = metadata["descriptionHash"]
-                .as_str()
-                .map(|key| {
-                    conn.query_row(
-                        "SELECT content FROM global.description_content WHERE hash=?",
-                        [key],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .with_context(|| format!("Missing global description content {key}"))
-                })
-                .transpose()?;
-            node.names = names.remove(&node.id).unwrap_or_default();
-            Ok(node)
+        .map(|row| {
+            let (node, metadata) = row?;
+            finish_node(conn, &mut descriptions, &mut names, node, &metadata)
         })
         .collect::<Result<_>>()?;
     Ok(FileStructure { nodes })
+}
+
+/// Every current file's structure in a few ordered scans, for whole-snapshot
+/// consumers (call graph, semantic selection). Files whose structure is not
+/// current for `version` are omitted; files with no symbols map to an empty
+/// structure. This replaces one statement set per file with bulk reads.
+pub(super) fn read_all_structures(
+    conn: &Connection,
+    version: &str,
+) -> Result<std::collections::BTreeMap<String, FileStructure>> {
+    let mut result = std::collections::BTreeMap::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT path FROM files WHERE parser_version=? AND structure_hash=hash ORDER BY path",
+        )?;
+        for row in stmt.query_map([version], |r| r.get::<_, String>(0))? {
+            result.insert(row?, FileStructure::default());
+        }
+    }
+    let mut names = HashMap::<String, HashMap<usize, Vec<String>>>::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT path,symbol_id,name FROM symbol_names ORDER BY path,symbol_id,ordinal",
+        )?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                row_usize(r, 1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })? {
+            let (path, id, name) = row?;
+            if result.contains_key(&path) {
+                names
+                    .entry(path)
+                    .or_default()
+                    .entry(id)
+                    .or_default()
+                    .push(name);
+            }
+        }
+    }
+    let mut descriptions = HashMap::new();
+    let mut stmt = conn.prepare_cached("SELECT path,id,parent_id,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata FROM symbols ORDER BY path,ordinal")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            structure_node(r, 1)?,
+            r.get::<_, String>(14)?,
+        ))
+    })?;
+    // Rows arrive grouped by path, so one file's names can be drained in place.
+    let mut current: Option<(String, HashMap<usize, Vec<String>>)> = None;
+    for row in rows {
+        let (path, node, metadata) = row?;
+        let Some(structure) = result.get_mut(&path) else {
+            continue;
+        };
+        if current.as_ref().map(|(current, _)| current.as_str()) != Some(path.as_str()) {
+            current = Some((path.clone(), names.remove(&path).unwrap_or_default()));
+        }
+        let file_names = &mut current.as_mut().expect("current file names").1;
+        let node = finish_node(conn, &mut descriptions, file_names, node, &metadata)?;
+        structure.nodes.push(node);
+    }
+    Ok(result)
 }
 
 pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {

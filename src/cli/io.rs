@@ -69,6 +69,53 @@ pub(super) fn print_json(out: &mut impl Write, value: &impl serde::Serialize) ->
     Ok(())
 }
 
+/// Streams a pretty-printed JSON array element by element, byte-identical
+/// to `print_json` of the collected rows, without retaining them.
+pub(super) struct JsonArrayWriter {
+    started: bool,
+    first: bool,
+}
+
+impl JsonArrayWriter {
+    pub(super) fn new() -> Self {
+        Self {
+            started: false,
+            first: true,
+        }
+    }
+
+    pub(super) fn row(&mut self, out: &mut impl Write, value: &serde_json::Value) -> Result<()> {
+        if !self.started {
+            writeln!(out, "[")?;
+            self.started = true;
+        }
+        if !self.first {
+            writeln!(out, ",")?;
+        }
+        self.first = false;
+        // Pretty-printed elements nest one indent level inside the array;
+        // structural newlines are the only raw ones in the serialization.
+        let text = serde_json::to_string_pretty(value)?;
+        let mut lines = text.lines();
+        if let Some(first) = lines.next() {
+            write!(out, "  {first}")?;
+            for line in lines {
+                write!(out, "\n  {line}")?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(&mut self, out: &mut impl Write) -> Result<()> {
+        if self.started {
+            writeln!(out, "\n]")?;
+        } else {
+            writeln!(out, "[]")?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[path = "io_tests.rs"]
 mod tests;

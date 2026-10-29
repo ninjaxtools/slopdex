@@ -10,8 +10,6 @@ pub(crate) struct LimitedResults<T> {
     pub(crate) rows: Vec<T>,
     pub(crate) omitted: bool,
     pub(crate) limit: Option<usize>,
-    /// Results subject to the limit, excluding ancestor/call-graph context.
-    pub(crate) count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

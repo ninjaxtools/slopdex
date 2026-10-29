@@ -185,7 +185,6 @@ impl Engine {
             Ok(json!({"index":name,"id":row.id,"order":order,"rank":rank+1,"similarity":similarity,"kind":row.kind,"path":row.path,"name":row.name,"text":row.text,"data":row.data,"embeddings":embeddings}))
         }).collect::<Result<_>>()?;
         Ok(LimitedResults {
-            count: rows.len(),
             rows,
             omitted,
             limit,

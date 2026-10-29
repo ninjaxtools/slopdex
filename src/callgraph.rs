@@ -1,5 +1,5 @@
 //! Conservative, snapshot-based call resolution and bounded graph traversal.
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,8 @@ pub struct Expansion {
 
 #[derive(Serialize, Deserialize)]
 pub struct CallGraph {
-    pub files: BTreeMap<String, FileStructure>,
+    #[serde(with = "arc_files")]
+    pub files: BTreeMap<String, std::sync::Arc<FileStructure>>,
     #[serde(with = "edge_map")]
     edges: BTreeMap<Key, BTreeSet<Key>>,
     #[serde(with = "edge_map")]
@@ -103,6 +104,34 @@ mod edge_map {
     }
 }
 
+/// Structures are shared with the engine's cache; serialization is the same
+/// map shape as owned structures, so cached graphs stay readable.
+mod arc_files {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        files: &BTreeMap<String, std::sync::Arc<FileStructure>>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        files
+            .iter()
+            .map(|(path, structure)| (path, &**structure))
+            .collect::<BTreeMap<_, _>>()
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<BTreeMap<String, std::sync::Arc<FileStructure>>, D::Error> {
+        Ok(
+            BTreeMap::<String, FileStructure>::deserialize(deserializer)?
+                .into_iter()
+                .map(|(path, structure)| (path, std::sync::Arc::new(structure)))
+                .collect(),
+        )
+    }
+}
+
 fn callable(node: &StructureNode) -> bool {
     matches!(
         node.kind.as_str(),
@@ -117,8 +146,26 @@ fn node_by_id(structure: &FileStructure, id: usize) -> Option<&StructureNode> {
 
 impl CallGraph {
     pub fn load(db: &Database) -> Result<Self> {
+        // A stale graph would silently point at declarations from a different
+        // parser generation, particularly under --no-reindex.
+        let files = db.all_structures(STRUCTURE_PARSER_VERSION)?;
+        for path in db.paths()? {
+            ensure!(
+                files.contains_key(&path),
+                "Call graph requires current structure for {path}; run without --no-reindex"
+            );
+        }
+        let files = files
+            .into_iter()
+            .map(|(path, structure)| (path, std::sync::Arc::new(structure)))
+            .collect();
+        Ok(Self::from_structures(files, Self::indexed_keys(db)?))
+    }
+
+    /// Search-indexed callable keys: only these can be call-graph edge ends.
+    pub fn indexed_keys(db: &Database) -> Result<BTreeSet<Key>> {
         let mut indexed = BTreeSet::new();
-        let mut stmt = db.conn.prepare(
+        let mut stmt = db.conn.prepare_cached(
             "SELECT path,symbol_id FROM search_units WHERE kind='function' AND symbol_id IS NOT NULL",
         )?;
         for row in stmt.query_map([], |row| {
@@ -130,23 +177,14 @@ impl CallGraph {
                 id: usize::try_from(id)?,
             });
         }
-        let mut files = BTreeMap::new();
-        for path in db.paths()? {
-            // A stale graph would silently point at declarations from a different
-            // parser generation, particularly under --no-reindex.
-            let (hash, version): (String, Option<String>) = db.conn.query_row(
-                "SELECT hash,parser_version FROM files WHERE path=?",
-                [&path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            ensure!(
-                db.structure_current(&path, &hash, STRUCTURE_PARSER_VERSION)?
-                    && version.as_deref() == Some(STRUCTURE_PARSER_VERSION),
-                "Call graph requires current structure for {path}; run without --no-reindex"
-            );
-            files.insert(path.clone(), db.structure(&path)?);
-        }
-        Ok(Self::from_parts(files, indexed))
+        Ok(indexed)
+    }
+
+    pub(crate) fn from_structures(
+        files: BTreeMap<String, std::sync::Arc<FileStructure>>,
+        indexed: BTreeSet<Key>,
+    ) -> Self {
+        Self::from_parts(files, indexed)
     }
 
     pub(crate) fn from_parsed<'a>(
@@ -165,24 +203,38 @@ impl CallGraph {
                     });
                 }
             }
-            structures.insert(path.to_owned(), parsed.structure.clone());
+            structures.insert(
+                path.to_owned(),
+                std::sync::Arc::new(parsed.structure.clone()),
+            );
         }
         Ok(Self::from_parts(structures, indexed))
     }
 
-    fn from_parts(files: BTreeMap<String, FileStructure>, indexed: BTreeSet<Key>) -> Self {
+    fn from_parts(
+        files: BTreeMap<String, std::sync::Arc<FileStructure>>,
+        indexed: BTreeSet<Key>,
+    ) -> Self {
         let mut graph = Self {
             files,
             edges: BTreeMap::new(),
             reverse: BTreeMap::new(),
             references: BTreeMap::new(),
         };
-        for (path, structure) in &graph.files {
+        let Self {
+            files,
+            edges,
+            reverse,
+            references,
+        } = &mut graph;
+        let files: &BTreeMap<String, std::sync::Arc<FileStructure>> = files;
+        let mut resolver = Resolver::new(files, &indexed);
+        let progress = crate::ui::counted("Resolving calls and references", files.len());
+        for (path, structure) in files {
             for node in &structure.nodes {
                 for site in &node.references {
-                    if let Some(to) = resolve_reference(&graph.files, path, node, site) {
-                        graph
-                            .references
+                    if let Some(to) = resolver.resolve_reference(path, node, site) {
+                        references
                             .entry(Key {
                                 path: path.clone(),
                                 id: node.id,
@@ -201,34 +253,26 @@ impl CallGraph {
                     continue;
                 }
                 for site in &node.calls {
-                    if let Some(to) = resolve(
-                        &graph.files,
-                        &indexed,
-                        path,
-                        node,
-                        &site.name,
-                        site.receiver.as_deref(),
-                    ) {
+                    if let Some(to) =
+                        resolver.resolve(path, node, &site.name, site.receiver.as_deref())
+                    {
                         // Shell command lookup has a separate namespace from
                         // variables. Its static callable sites already supply
                         // the conservative function references we can support.
                         if node.language == "bash" {
-                            graph
-                                .references
+                            references
                                 .entry(from.clone())
                                 .or_default()
                                 .insert(to.clone());
                         }
-                        graph
-                            .edges
-                            .entry(from.clone())
-                            .or_default()
-                            .insert(to.clone());
-                        graph.reverse.entry(to).or_default().insert(from.clone());
+                        edges.entry(from.clone()).or_default().insert(to.clone());
+                        reverse.entry(to).or_default().insert(from.clone());
                     }
                 }
             }
+            progress.inc(1);
         }
+        progress.finish();
         graph
     }
 
@@ -435,137 +479,456 @@ fn local_name<'a>(language: &str, binding: &'a ImportBinding) -> Option<&'a str>
 /// namespace (`* as`) and `require` bindings qualify; paths in the other
 /// languages always name modules, packages, or types.
 fn module_binding(language: &str, binding: &ImportBinding) -> bool {
-    !matches!(language, "javascript" | "jsx" | "typescript" | "tsx")
-        || binding.wildcard
-        || binding.name.is_none()
+    module_binding_parts(language, binding.wildcard, binding.name.is_none())
 }
 
-/// General references use the parser's lexical binding, not the callable
-/// resolver's candidate search. In particular, an unknown local must never
-/// fall back to a same-named import or a globally unique declaration.
-fn resolve_reference(
-    files: &BTreeMap<String, FileStructure>,
-    path: &str,
-    owner: &StructureNode,
-    site: &ReferenceSite,
-) -> Option<Key> {
-    let structure = files.get(path)?;
-    let binding = site.binding_id.and_then(|id| node_by_id(structure, id));
-    let mut candidates = BTreeSet::new();
-    if let Some(binding) = binding {
-        if binding.kind == "import" {
-            for import in &binding.imports {
-                let root = site.receiver.as_deref().unwrap_or(&site.name);
-                if local_name(&owner.language, import) != Some(root)
-                    || import.wildcard && site.receiver.is_none()
-                {
-                    continue;
+fn module_binding_parts(language: &str, wildcard: bool, name_none: bool) -> bool {
+    !matches!(language, "javascript" | "jsx" | "typescript" | "tsx") || wildcard || name_none
+}
+
+/// Per-file candidate indexes built once per graph construction. Resolution
+/// previously rescanned a file's declarations for every call/reference site
+/// and rescanned every file for every import binding a site touched, which
+/// is quadratic in repository size.
+struct FileIndex<'a> {
+    imports: Vec<&'a StructureNode>,
+    /// Nodes by declared name, every alias, and the synthetic `default` key
+    /// for default-exported declarations. Consumers re-apply their exact
+    /// name predicate, so this is a safe superset for each of them.
+    by_name: HashMap<&'a str, Vec<&'a StructureNode>>,
+    by_qualified: HashMap<&'a str, Vec<&'a StructureNode>>,
+    children: HashMap<usize, Vec<&'a StructureNode>>,
+}
+
+impl<'a> FileIndex<'a> {
+    fn build(structure: &'a FileStructure) -> Self {
+        let mut index = Self {
+            imports: Vec::new(),
+            by_name: HashMap::new(),
+            by_qualified: HashMap::new(),
+            children: HashMap::new(),
+        };
+        for node in &structure.nodes {
+            if node.kind == "import" {
+                index.imports.push(node);
+            }
+            index
+                .by_name
+                .entry(node.name.as_str())
+                .or_default()
+                .push(node);
+            for name in &node.names {
+                index.by_name.entry(name.as_str()).or_default().push(node);
+            }
+            if node.attributes.iter().any(|attr| attr == "default") {
+                index.by_name.entry("default").or_default().push(node);
+            }
+            index
+                .by_qualified
+                .entry(node.qualified_name.as_str())
+                .or_default()
+                .push(node);
+            if let Some(parent) = node.parent_id {
+                index.children.entry(parent).or_default().push(node);
+            }
+        }
+        index
+    }
+
+    fn named(&self, name: &str) -> &[&'a StructureNode] {
+        self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn bindings(&self) -> Vec<&'a ImportBinding> {
+        self.imports.iter().flat_map(|node| &node.imports).collect()
+    }
+}
+
+/// Everything target-file selection for one import depends on. Two bindings
+/// with equal keys select identical files, so the all-files scan runs once
+/// per distinct key instead of once per call/reference site.
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct TargetKey {
+    from: String,
+    language: String,
+    source: Option<String>,
+    binding_path: String,
+    wildcard: bool,
+    binding_name_none: bool,
+    kind: TargetKind,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum TargetKind {
+    Reference { receiver: bool },
+    Call { imported_callable: bool },
+    Header,
+}
+
+impl TargetKey {
+    fn new(from: &str, language: &str, binding: &ImportBinding, kind: TargetKind) -> Self {
+        Self {
+            from: from.to_owned(),
+            language: language.to_owned(),
+            source: binding.source.clone(),
+            binding_path: binding.path.clone(),
+            wildcard: binding.wildcard,
+            binding_name_none: binding.name.is_none(),
+            kind,
+        }
+    }
+}
+
+enum Pattern {
+    Import(ImportPattern),
+    Rust(RustPattern),
+    Header(HeaderPattern),
+}
+
+impl Pattern {
+    fn matches(&self, target: &str) -> bool {
+        match self {
+            Self::Import(pattern) => pattern.matches(target),
+            Self::Rust(pattern) => pattern.matches(target),
+            Self::Header(pattern) => pattern.matches(target),
+        }
+    }
+
+    /// Indexed paths that could match; callers re-verify with `matches`, so
+    /// this only has to be a superset of the true matches.
+    fn candidates<'a>(
+        &self,
+        paths: &PathIndex<'a>,
+        files: &'a BTreeMap<String, std::sync::Arc<FileStructure>>,
+    ) -> Vec<&'a str> {
+        match self {
+            Self::Import(pattern) => pattern.candidates(paths, files),
+            Self::Rust(pattern) => pattern.candidates(paths, files),
+            Self::Header(pattern) => pattern.candidates(paths, files),
+        }
+    }
+}
+
+/// Exact, suffix, and Go-directory lookups over indexed paths, so an
+/// import's target files are found without scanning every path in the
+/// repository (the remaining superlinear term in graph construction).
+struct PathIndex<'a> {
+    /// Paths sorted by reversed chars; a suffix query is a prefix range.
+    reversed: Vec<(String, &'a str)>,
+    go_directories: HashMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> PathIndex<'a> {
+    fn build(files: &'a BTreeMap<String, std::sync::Arc<FileStructure>>) -> Self {
+        let mut reversed: Vec<(String, &'a str)> = files
+            .keys()
+            .map(|path| (path.chars().rev().collect(), path.as_str()))
+            .collect();
+        reversed.sort();
+        let mut go_directories: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+        for path in files.keys().filter(|path| path.ends_with(".go")) {
+            go_directories
+                .entry(go_directory(path))
+                .or_default()
+                .push(path.as_str());
+        }
+        Self {
+            reversed,
+            go_directories,
+        }
+    }
+
+    fn suffix<'b>(&'b self, suffix: &str) -> impl Iterator<Item = &'a str> + 'b {
+        let reversed: String = suffix.chars().rev().collect();
+        let start = self
+            .reversed
+            .partition_point(|(candidate, _)| candidate.as_str() < reversed.as_str());
+        let end = self.reversed.partition_point(|(candidate, _)| {
+            candidate.as_str() < reversed.as_str() || candidate.starts_with(&reversed)
+        });
+        self.reversed[start..end].iter().map(|(_, path)| *path)
+    }
+}
+
+/// The directory name containing a Go file, as import matching defines it.
+fn go_directory(target: &str) -> &str {
+    target
+        .rsplit_once('/')
+        .map(|(directory, _)| directory.rsplit('/').next().unwrap_or(directory))
+        .unwrap_or("")
+}
+
+/// A value imported from a module is not itself that module. Verify the full
+/// module path before accepting top-level members through a receiver.
+fn namespace_pattern(key: &TargetKey) -> Option<Pattern> {
+    match key.language.as_str() {
+        "rust" => Some(Pattern::Rust(RustPattern::new(
+            &key.from,
+            &format!("{}::__member", key.binding_path),
+            true,
+        ))),
+        "python" => Some(Pattern::Import(ImportPattern::new(
+            &key.from,
+            None,
+            &key.binding_path,
+            false,
+        ))),
+        "java" => None,
+        _ => module_binding_parts(&key.language, key.wildcard, key.binding_name_none).then(|| {
+            Pattern::Import(ImportPattern::new(
+                &key.from,
+                key.source.as_deref(),
+                &key.binding_path,
+                false,
+            ))
+        }),
+    }
+}
+
+struct Resolver<'a> {
+    files: &'a BTreeMap<String, std::sync::Arc<FileStructure>>,
+    indexed: &'a BTreeSet<Key>,
+    indexes: HashMap<&'a str, FileIndex<'a>>,
+    paths: PathIndex<'a>,
+    reference_target_cache: HashMap<TargetKey, Vec<(&'a str, bool)>>,
+    file_target_cache: HashMap<TargetKey, Vec<&'a str>>,
+}
+
+impl<'a> Resolver<'a> {
+    fn new(
+        files: &'a BTreeMap<String, std::sync::Arc<FileStructure>>,
+        indexed: &'a BTreeSet<Key>,
+    ) -> Self {
+        Self {
+            files,
+            indexed,
+            indexes: files
+                .iter()
+                .map(|(path, structure)| (path.as_str(), FileIndex::build(structure)))
+                .collect(),
+            paths: PathIndex::build(files),
+            reference_target_cache: HashMap::new(),
+            file_target_cache: HashMap::new(),
+        }
+    }
+
+    /// Files an import can reference, each with whether it is the import's
+    /// namespace (top-level members are reachable through a receiver only
+    /// for namespace files). The cached list is cloned: it is almost always
+    /// empty or a single file, and callers need `&mut self` again to resolve
+    /// further sites while iterating it.
+    fn reference_targets(&mut self, key: TargetKey) -> Vec<(&'a str, bool)> {
+        let TargetKind::Reference { receiver } = key.kind else {
+            unreachable!("reference target kind")
+        };
+        self.reference_target_cache
+            .entry(key)
+            .or_insert_with_key(|key| {
+                let namespace = receiver.then(|| namespace_pattern(key)).flatten();
+                let mut patterns = vec![Pattern::Import(ImportPattern::new(
+                    &key.from,
+                    key.source.as_deref(),
+                    &key.binding_path,
+                    !receiver && key.language != "java",
+                ))];
+                if key.language == "java" && !receiver {
+                    patterns.push(Pattern::Import(ImportPattern::new(
+                        &key.from,
+                        None,
+                        &key.binding_path,
+                        true,
+                    )));
                 }
-                for target in
-                    local_import_targets(structure, binding, import, site, &owner.language)
-                {
-                    candidates.insert(Key {
-                        path: path.to_owned(),
-                        id: target,
-                    });
+                let mut candidates = BTreeSet::new();
+                if let Some(namespace) = &namespace {
+                    candidates.extend(namespace.candidates(&self.paths, self.files));
                 }
-                for (other_path, other) in files {
-                    let namespace = site.receiver.is_some()
-                        && reference_namespace_matches(&owner.language, path, other_path, import);
-                    let matches_path = import_path_matches(
-                        path,
-                        other_path,
-                        import.source.as_deref(),
-                        &import.path,
-                        site.receiver.is_none() && owner.language != "java",
-                    ) || owner.language == "java"
-                        && site.receiver.is_none()
-                        && import_path_matches(path, other_path, None, &import.path, true);
-                    if !namespace && !matches_path {
+                for pattern in &patterns {
+                    candidates.extend(pattern.candidates(&self.paths, self.files));
+                }
+                candidates
+                    .into_iter()
+                    .filter_map(|path| {
+                        let namespace = receiver
+                            && namespace
+                                .as_ref()
+                                .is_some_and(|pattern| pattern.matches(path));
+                        let matches_path = patterns.iter().any(|pattern| pattern.matches(path));
+                        (namespace || matches_path).then_some((path, namespace))
+                    })
+                    .collect()
+            })
+            .clone()
+    }
+
+    /// Files an import can call into, or C headers an include can name; both
+    /// exclude the importing file itself.
+    fn file_targets(&mut self, key: TargetKey) -> Vec<&'a str> {
+        self.file_target_cache
+            .entry(key)
+            .or_insert_with_key(|key| {
+                let pattern = match key.kind {
+                    TargetKind::Call { imported_callable } => Pattern::Import(ImportPattern::new(
+                        &key.from,
+                        key.source.as_deref(),
+                        &key.binding_path,
+                        imported_callable,
+                    )),
+                    TargetKind::Header => {
+                        Pattern::Header(HeaderPattern::new(&key.from, &key.binding_path))
+                    }
+                    TargetKind::Reference { .. } => unreachable!("file target kind"),
+                };
+                pattern
+                    .candidates(&self.paths, self.files)
+                    .into_iter()
+                    .filter(|path| *path != key.from.as_str() && pattern.matches(path))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .clone()
+    }
+
+    /// General references use the parser's lexical binding, not the callable
+    /// resolver's candidate search. In particular, an unknown local must never
+    /// fall back to a same-named import or a globally unique declaration.
+    fn resolve_reference(
+        &mut self,
+        path: &str,
+        owner: &StructureNode,
+        site: &ReferenceSite,
+    ) -> Option<Key> {
+        let files = self.files;
+        let structure = files.get(path)?;
+        let binding = site.binding_id.and_then(|id| node_by_id(structure, id));
+        let mut candidates = BTreeSet::new();
+        if let Some(binding) = binding {
+            if binding.kind == "import" {
+                for import in &binding.imports {
+                    let root = site.receiver.as_deref().unwrap_or(&site.name);
+                    if local_name(&owner.language, import) != Some(root)
+                        || import.wildcard && site.receiver.is_none()
+                    {
                         continue;
+                    }
+                    let local = self.indexes.get(path).map(|index| {
+                        Self::local_import_targets(
+                            structure,
+                            index,
+                            binding,
+                            import,
+                            site,
+                            &owner.language,
+                        )
+                    });
+                    for target in local.into_iter().flatten() {
+                        candidates.insert(Key {
+                            path: path.to_owned(),
+                            id: target,
+                        });
                     }
                     let target_name = if site.receiver.is_some() {
                         site.name.as_str()
                     } else {
                         import.name.as_deref().unwrap_or(&site.name)
                     };
-                    for target in &other.nodes {
-                        let named = target.names.iter().any(|name| name == target_name)
-                            || target.name == target_name
-                            || target_name == "default"
-                                && target.attributes.iter().any(|attr| attr == "default");
-                        if !named || matches!(target.kind.as_str(), "import" | "impl") {
+                    let key = TargetKey::new(
+                        path,
+                        &owner.language,
+                        import,
+                        TargetKind::Reference {
+                            receiver: site.receiver.is_some(),
+                        },
+                    );
+                    for (other_path, namespace) in self.reference_targets(key) {
+                        let other = &files[other_path];
+                        let Some(index) = self.indexes.get(other_path) else {
                             continue;
-                        }
-                        let valid = if let Some(receiver) = site.receiver.as_deref() {
-                            if target.parent_id.is_none() {
-                                namespace && (owner.language != "go" || target.kind != "method")
-                            } else {
-                                let container = import.name.as_deref().unwrap_or(receiver);
-                                target
-                                    .parent_id
-                                    .and_then(|id| node_by_id(other, id))
-                                    .is_some_and(|parent| {
-                                        container_named(parent, container)
-                                            && reference_static_member(target, parent)
-                                    })
+                        };
+                        for target in index.named(target_name) {
+                            let named = target.names.iter().any(|name| name == target_name)
+                                || target.name == target_name
+                                || target_name == "default"
+                                    && target.attributes.iter().any(|attr| attr == "default");
+                            if !named || matches!(target.kind.as_str(), "import" | "impl") {
+                                continue;
                             }
-                        } else {
-                            target.parent_id.is_none()
-                                || owner.language == "java"
-                                    && target
+                            let valid = if let Some(receiver) = site.receiver.as_deref() {
+                                if target.parent_id.is_none() {
+                                    namespace && (owner.language != "go" || target.kind != "method")
+                                } else {
+                                    let container = import.name.as_deref().unwrap_or(receiver);
+                                    target
                                         .parent_id
                                         .and_then(|id| node_by_id(other, id))
                                         .is_some_and(|parent| {
-                                            import.path.rsplit('.').nth(1) == Some(&parent.name)
+                                            container_named(parent, container)
                                                 && reference_static_member(target, parent)
                                         })
-                        };
-                        if valid {
-                            candidates.insert(Key {
-                                path: other_path.clone(),
-                                id: target.id,
-                            });
+                                }
+                            } else {
+                                target.parent_id.is_none()
+                                    || owner.language == "java"
+                                        && target
+                                            .parent_id
+                                            .and_then(|id| node_by_id(other, id))
+                                            .is_some_and(|parent| {
+                                                import.path.rsplit('.').nth(1) == Some(&parent.name)
+                                                    && reference_static_member(target, parent)
+                                            })
+                            };
+                            if valid {
+                                candidates.insert(Key {
+                                    path: other_path.to_owned(),
+                                    id: target.id,
+                                });
+                            }
                         }
                     }
                 }
-            }
-        } else if site.receiver.is_none() {
-            candidates.insert(Key {
-                path: path.to_owned(),
-                id: binding.id,
-            });
-        } else {
-            for target in &structure.nodes {
-                if target.name != site.name && !target.names.contains(&site.name) {
-                    continue;
-                }
-                let parent = target.parent_id.and_then(|id| node_by_id(structure, id));
-                let valid = parent.is_some_and(|parent| {
-                    (parent.id == binding.id
-                        || parent.kind == "impl"
-                            && binding.parent_id == parent.parent_id
-                            && impl_type(&parent.name) == binding.name)
-                        && reference_static_member(target, parent)
+            } else if site.receiver.is_none() {
+                candidates.insert(Key {
+                    path: path.to_owned(),
+                    id: binding.id,
                 });
-                if valid {
-                    candidates.insert(Key {
-                        path: path.to_owned(),
-                        id: target.id,
-                    });
-                }
-            }
-        }
-    } else if owner.language == "c" && site.receiver.is_none() {
-        // Includes provide explicit cross-file evidence, unlike a globally
-        // unique name. Several headers defining the name remain ambiguous.
-        for import in structure.nodes.iter().filter(|node| node.kind == "import") {
-            for binding in &import.imports {
-                for (other_path, other) in files {
-                    if other_path == path || !header_path_matches(path, other_path, &binding.path) {
+            } else if let Some(index) = self.indexes.get(path) {
+                for target in index.named(&site.name) {
+                    if target.name != site.name && !target.names.contains(&site.name) {
                         continue;
                     }
-                    for target in &other.nodes {
+                    let parent = target.parent_id.and_then(|id| node_by_id(structure, id));
+                    let valid = parent.is_some_and(|parent| {
+                        (parent.id == binding.id
+                            || parent.kind == "impl"
+                                && binding.parent_id == parent.parent_id
+                                && impl_type(&parent.name) == binding.name)
+                            && reference_static_member(target, parent)
+                    });
+                    if valid {
+                        candidates.insert(Key {
+                            path: path.to_owned(),
+                            id: target.id,
+                        });
+                    }
+                }
+            }
+        } else if owner.language == "c" && site.receiver.is_none() {
+            // Includes provide explicit cross-file evidence, unlike a globally
+            // unique name. Several headers defining the name remain ambiguous.
+            let bindings = self
+                .indexes
+                .get(path)
+                .map(FileIndex::bindings)
+                .unwrap_or_default();
+            for binding in bindings {
+                let key = TargetKey::new(path, &owner.language, binding, TargetKind::Header);
+                for other_path in self.file_targets(key) {
+                    let other = &files[other_path];
+                    let Some(index) = self.indexes.get(other_path) else {
+                        continue;
+                    };
+                    for target in index.named(&site.name) {
                         if (target.name == site.name || target.names.contains(&site.name))
                             && (target.parent_id.is_none()
                                 || target.kind == "variant"
@@ -578,134 +941,314 @@ fn resolve_reference(
                             && !matches!(target.kind.as_str(), "import" | "impl")
                         {
                             candidates.insert(Key {
-                                path: other_path.clone(),
+                                path: other_path.to_owned(),
                                 id: target.id,
                             });
                         }
                     }
                 }
             }
-        }
-    } else if matches!(
-        site.receiver.as_deref(),
-        Some("self" | "this" | "Self" | "cls")
-    ) {
-        let scope = std::iter::successors(owner.parent_id, |id| {
-            node_by_id(structure, *id).and_then(|node| node.parent_id)
-        })
-        .filter_map(|id| node_by_id(structure, id))
-        .find(|node| {
-            matches!(
-                node.kind.as_str(),
-                "class" | "struct" | "impl" | "interface"
-            )
-        });
-        if let Some(scope) = scope {
-            for target in &structure.nodes {
-                if target.parent_id == Some(scope.id)
-                    && (target.name == site.name || target.names.contains(&site.name))
-                    && (!matches!(site.receiver.as_deref(), Some("Self" | "cls"))
-                        || reference_static_member(target, scope))
-                {
-                    candidates.insert(Key {
-                        path: path.to_owned(),
-                        id: target.id,
-                    });
-                }
-            }
-        }
-    }
-    (candidates.len() == 1)
-        .then(|| candidates.into_iter().next())
-        .flatten()
-}
-
-/// Inline modules/namespaces are still same-file declarations. Resolve an
-/// explicit item path, never a bare-name search across unrelated containers.
-fn local_import_targets(
-    structure: &FileStructure,
-    declaration: &StructureNode,
-    import: &ImportBinding,
-    site: &ReferenceSite,
-    language: &str,
-) -> Vec<usize> {
-    let mut path: Vec<String> = match language {
-        "rust" => {
-            let mut module = std::iter::successors(declaration.parent_id, |id| {
+        } else if matches!(
+            site.receiver.as_deref(),
+            Some("self" | "this" | "Self" | "cls")
+        ) {
+            let scope = std::iter::successors(owner.parent_id, |id| {
                 node_by_id(structure, *id).and_then(|node| node.parent_id)
             })
             .filter_map(|id| node_by_id(structure, id))
-            .find(|node| node.kind == "module")
-            .map(|node| {
-                node.qualified_name
-                    .split('.')
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-            let mut segments = import.path.split("::").peekable();
-            match segments.peek().copied() {
-                Some("self") => {
-                    segments.next();
+            .find(|node| {
+                matches!(
+                    node.kind.as_str(),
+                    "class" | "struct" | "impl" | "interface"
+                )
+            });
+            if let Some(scope) = scope
+                && let Some(children) = self
+                    .indexes
+                    .get(path)
+                    .and_then(|index| index.children.get(&scope.id))
+            {
+                for target in children {
+                    if target.parent_id == Some(scope.id)
+                        && (target.name == site.name || target.names.contains(&site.name))
+                        && (!matches!(site.receiver.as_deref(), Some("Self" | "cls"))
+                            || reference_static_member(target, scope))
+                    {
+                        candidates.insert(Key {
+                            path: path.to_owned(),
+                            id: target.id,
+                        });
+                    }
                 }
-                Some("super") => {
-                    while segments.peek() == Some(&"super") {
+            }
+        }
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()
+    }
+
+    /// Inline modules/namespaces are still same-file declarations. Resolve an
+    /// explicit item path, never a bare-name search across unrelated containers.
+    fn local_import_targets(
+        structure: &FileStructure,
+        index: &FileIndex<'_>,
+        declaration: &StructureNode,
+        import: &ImportBinding,
+        site: &ReferenceSite,
+        language: &str,
+    ) -> Vec<usize> {
+        let mut path: Vec<String> = match language {
+            "rust" => {
+                let mut module = std::iter::successors(declaration.parent_id, |id| {
+                    node_by_id(structure, *id).and_then(|node| node.parent_id)
+                })
+                .filter_map(|id| node_by_id(structure, id))
+                .find(|node| node.kind == "module")
+                .map(|node| {
+                    node.qualified_name
+                        .split('.')
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+                let mut segments = import.path.split("::").peekable();
+                match segments.peek().copied() {
+                    Some("self") => {
                         segments.next();
-                        if module.pop().is_none() {
-                            return Vec::new();
+                    }
+                    Some("super") => {
+                        while segments.peek() == Some(&"super") {
+                            segments.next();
+                            if module.pop().is_none() {
+                                return Vec::new();
+                            }
+                        }
+                    }
+                    _ => {
+                        module.clear();
+                        if segments.peek() == Some(&"crate") {
+                            segments.next();
                         }
                     }
                 }
-                _ => {
-                    module.clear();
-                    if segments.peek() == Some(&"crate") {
-                        segments.next();
+                module.extend(segments.map(str::to_owned));
+                module
+            }
+            "typescript" | "tsx" if import.source.is_none() && import.name.is_none() => {
+                import.path.split('.').map(str::to_owned).collect()
+            }
+            _ => return Vec::new(),
+        };
+        if site.receiver.is_some() {
+            path.push(site.name.clone());
+        }
+        let qualified = path.join(".");
+        index
+            .by_qualified
+            .get(qualified.as_str())
+            .into_iter()
+            .flatten()
+            .filter(|target| {
+                !matches!(target.kind.as_str(), "import" | "impl")
+                    && (site.receiver.is_none()
+                        || target
+                            .parent_id
+                            .and_then(|id| node_by_id(structure, id))
+                            .is_some_and(|parent| reference_static_member(target, parent)))
+            })
+            .map(|target| target.id)
+            .collect()
+    }
+
+    fn resolve(
+        &mut self,
+        path: &str,
+        owner: &StructureNode,
+        name: &str,
+        receiver: Option<&str>,
+    ) -> Option<Key> {
+        let files = self.files;
+        let structure = files.get(path)?;
+        let index = self.indexes.get(path)?;
+        let language = owner.language.as_str();
+        let ancestors: Vec<_> = std::iter::successors(owner.parent_id, |id| {
+            node_by_id(structure, *id).and_then(|n| n.parent_id)
+        })
+        .filter_map(|id| node_by_id(structure, id))
+        .collect();
+        let scope = ancestors.iter().find(|n| {
+            matches!(
+                n.kind.as_str(),
+                "class" | "struct" | "impl" | "interface" | "module"
+            )
+        });
+        let mut candidates = BTreeSet::new();
+        for node in index.named(name) {
+            if !callable(node) || node.name != name {
+                continue;
+            }
+            let valid = match receiver {
+                None => match node.parent_id {
+                    None => true,
+                    Some(parent_id) => ancestors.iter().any(|parent| {
+                        parent.id == parent_id && bare_name_reaches(language, parent)
+                    }),
+                },
+                Some("self" | "this" | "Self" | "cls") => scope.is_some_and(|s| {
+                    node.parent_id == Some(s.id)
+                        || node.qualified_name.starts_with(&format!("{}.", s.name))
+                }),
+                Some(receiver) => node
+                    .parent_id
+                    .and_then(|id| node_by_id(structure, id))
+                    .is_some_and(|container| container_named(container, receiver)),
+            };
+            if valid {
+                let key = Key {
+                    path: path.to_owned(),
+                    id: node.id,
+                };
+                if self.indexed.contains(&key) {
+                    candidates.insert(key);
+                }
+            }
+        }
+        if receiver.is_none() && candidates.is_empty() {
+            for class in index.named(name) {
+                if class.kind != "class" || class.name != name {
+                    continue;
+                }
+                for constructor in index.children.get(&class.id).into_iter().flatten() {
+                    if constructor.kind == "constructor" && constructor.name == "__init__" {
+                        let key = Key {
+                            path: path.to_owned(),
+                            id: constructor.id,
+                        };
+                        if self.indexed.contains(&key) {
+                            candidates.insert(key);
+                        }
                     }
                 }
             }
-            module.extend(segments.map(str::to_owned));
-            module
         }
-        "typescript" | "tsx" if import.source.is_none() && import.name.is_none() => {
-            import.path.split('.').map(str::to_owned).collect()
+        // Explicit imports are the only basis for a cross-file edge. Do not guess
+        // using a globally unique bare name or an unknown runtime receiver.
+        for binding in index.bindings() {
+            let referenced = receiver.unwrap_or(name);
+            if local_name(language, binding) != Some(referenced)
+                || (binding.wildcard && receiver.is_none())
+            {
+                continue;
+            }
+            let target_name = if receiver.is_some() {
+                name
+            } else {
+                binding.name.as_deref().unwrap_or(name)
+            };
+            // `config.validate()` reaches a module-level function only through
+            // a namespace binding; a value binding would need the value's type.
+            let namespace = receiver.is_some() && module_binding(language, binding);
+            let key = TargetKey::new(
+                path,
+                language,
+                binding,
+                TargetKind::Call {
+                    imported_callable: receiver.is_none(),
+                },
+            );
+            for other_path in self.file_targets(key) {
+                let other = &files[other_path];
+                let Some(other_index) = self.indexes.get(other_path) else {
+                    continue;
+                };
+                for node in other_index.named(target_name) {
+                    if !callable(node) || node.name != target_name {
+                        continue;
+                    }
+                    let valid = match (receiver, node.parent_id) {
+                        (None, parent) => parent.is_none(),
+                        // Go methods are top-level declarations too, but only
+                        // functions are reachable through a package name.
+                        (Some(_), None) => {
+                            namespace && (language != "go" || node.kind == "function")
+                        }
+                        (Some(receiver), Some(parent)) => {
+                            let container = binding.name.as_deref().unwrap_or(receiver);
+                            node_by_id(other, parent).is_some_and(|c| container_named(c, container))
+                                && static_member(node)
+                        }
+                    };
+                    if !valid {
+                        continue;
+                    }
+                    let key = Key {
+                        path: other_path.to_owned(),
+                        id: node.id,
+                    };
+                    if self.indexed.contains(&key) {
+                        candidates.insert(key);
+                    }
+                }
+            }
         }
-        _ => return Vec::new(),
-    };
-    if site.receiver.is_some() {
-        path.push(site.name.clone());
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()
     }
-    let qualified = path.join(".");
-    structure
-        .nodes
-        .iter()
-        .filter(|target| {
-            target.qualified_name == qualified
-                && !matches!(target.kind.as_str(), "import" | "impl")
-                && (site.receiver.is_none()
-                    || target
-                        .parent_id
-                        .and_then(|id| node_by_id(structure, id))
-                        .is_some_and(|parent| reference_static_member(target, parent)))
-        })
-        .map(|target| target.id)
-        .collect()
 }
 
-fn header_path_matches(from: &str, target: &str, include: &str) -> bool {
-    let base = std::path::Path::new(from)
-        .parent()
-        .unwrap_or(std::path::Path::new(""));
-    let mut parts = Vec::new();
-    for part in base.join(include).components() {
-        match part {
-            std::path::Component::ParentDir => {
-                parts.pop();
+/// A C include path resolved once, so scanning candidate files is plain
+/// string comparison instead of rebuilding the joined path per file.
+struct HeaderPattern {
+    joined: String,
+    include: String,
+    suffix: String,
+}
+
+impl HeaderPattern {
+    fn new(from: &str, include: &str) -> Self {
+        let base = std::path::Path::new(from)
+            .parent()
+            .unwrap_or(std::path::Path::new(""));
+        let mut parts = Vec::new();
+        for part in base.join(include).components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    parts.pop();
+                }
+                std::path::Component::Normal(part) => {
+                    parts.push(part.to_string_lossy().into_owned())
+                }
+                _ => {}
             }
-            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-            _ => {}
+        }
+        Self {
+            joined: parts.join("/"),
+            include: include.to_owned(),
+            suffix: format!("/{include}"),
         }
     }
-    target == parts.join("/") || target == include || target.ends_with(&format!("/{include}"))
+
+    fn matches(&self, target: &str) -> bool {
+        target == self.joined || target == self.include || target.ends_with(&self.suffix)
+    }
+
+    fn candidates<'a>(
+        &self,
+        paths: &PathIndex<'a>,
+        files: &'a BTreeMap<String, std::sync::Arc<FileStructure>>,
+    ) -> Vec<&'a str> {
+        let mut candidates: Vec<&'a str> = [&self.joined, &self.include]
+            .into_iter()
+            .filter_map(|exact| {
+                files
+                    .get_key_value(exact.as_str())
+                    .map(|(path, _)| path.as_str())
+            })
+            .collect();
+        candidates.extend(paths.suffix(&self.suffix));
+        candidates
+    }
 }
 
 fn reference_static_member(node: &StructureNode, parent: &StructureNode) -> bool {
@@ -734,244 +1277,81 @@ fn reference_static_member(node: &StructureNode, parent: &StructureNode) -> bool
                 || matches!(node.kind.as_str(), "class" | "struct" | "enum" | "type"))
 }
 
-/// A value imported from a module is not itself that module. Verify the full
-/// module path before accepting top-level members through a receiver.
-fn reference_namespace_matches(
-    language: &str,
-    from: &str,
-    target: &str,
-    binding: &ImportBinding,
-) -> bool {
-    match language {
-        "rust" => rust_import_matches(from, target, &format!("{}::__member", binding.path), true),
-        "python" => import_path_matches(from, target, None, &binding.path, false),
-        "java" => false,
-        _ => {
-            module_binding(language, binding)
-                && import_path_matches(
-                    from,
-                    target,
-                    binding.source.as_deref(),
-                    &binding.path,
-                    false,
-                )
-        }
-    }
+/// One import binding's target-file predicate with every target-independent
+/// string (joined paths, suffixes, candidate files) computed once. Resolution
+/// scans all indexed files per binding; with per-target formatting and
+/// splitting that scan dominated call-graph construction on large repos.
+struct ImportPattern {
+    /// Exact candidate files for relative JS/TS imports; when present, no
+    /// other branch applies.
+    js_exact: Option<Vec<String>>,
+    python_exact: String,
+    python_suffix: String,
+    python_init: String,
+    rust: RustPattern,
+    go_package: String,
+    java_suffix: String,
 }
 
-fn resolve(
-    files: &BTreeMap<String, FileStructure>,
-    indexed: &BTreeSet<Key>,
-    path: &str,
-    owner: &StructureNode,
-    name: &str,
-    receiver: Option<&str>,
-) -> Option<Key> {
-    let structure = files.get(path)?;
-    let language = owner.language.as_str();
-    let ancestors: Vec<_> = std::iter::successors(owner.parent_id, |id| {
-        node_by_id(structure, *id).and_then(|n| n.parent_id)
-    })
-    .filter_map(|id| node_by_id(structure, id))
-    .collect();
-    let scope = ancestors.iter().find(|n| {
-        matches!(
-            n.kind.as_str(),
-            "class" | "struct" | "impl" | "interface" | "module"
-        )
-    });
-    let mut candidates = BTreeSet::new();
-    for node in structure
-        .nodes
-        .iter()
-        .filter(|n| callable(n) && n.name == name)
-    {
-        let valid = match receiver {
-            None => match node.parent_id {
-                None => true,
-                Some(parent_id) => ancestors
-                    .iter()
-                    .any(|parent| parent.id == parent_id && bare_name_reaches(language, parent)),
-            },
-            Some("self" | "this" | "Self" | "cls") => scope.is_some_and(|s| {
-                node.parent_id == Some(s.id)
-                    || node.qualified_name.starts_with(&format!("{}.", s.name))
-            }),
-            Some(receiver) => node
-                .parent_id
-                .and_then(|id| node_by_id(structure, id))
-                .is_some_and(|container| container_named(container, receiver)),
-        };
-        if valid {
-            let key = Key {
-                path: path.to_owned(),
-                id: node.id,
-            };
-            if indexed.contains(&key) {
-                candidates.insert(key);
-            }
-        }
-    }
-    if receiver.is_none() && candidates.is_empty() {
-        for class in structure
-            .nodes
-            .iter()
-            .filter(|n| n.kind == "class" && n.name == name)
+impl ImportPattern {
+    fn new(from: &str, module: Option<&str>, binding: &str, imported_callable: bool) -> Self {
+        let module = module.unwrap_or(binding);
+        let js_exact = if module.starts_with('.')
+            && (from.ends_with(".js")
+                || from.ends_with(".mjs")
+                || from.ends_with(".cjs")
+                || from.ends_with(".jsx")
+                || from.ends_with(".ts")
+                || from.ends_with(".mts")
+                || from.ends_with(".cts")
+                || from.ends_with(".tsx"))
         {
-            for constructor in structure.nodes.iter().filter(|n| {
-                n.parent_id == Some(class.id) && n.kind == "constructor" && n.name == "__init__"
-            }) {
-                let key = Key {
-                    path: path.to_owned(),
-                    id: constructor.id,
-                };
-                if indexed.contains(&key) {
-                    candidates.insert(key);
-                }
-            }
-        }
-    }
-    // Explicit imports are the only basis for a cross-file edge. Do not guess
-    // using a globally unique bare name or an unknown runtime receiver.
-    for import in structure.nodes.iter().filter(|n| n.kind == "import") {
-        for binding in &import.imports {
-            let referenced = receiver.unwrap_or(name);
-            if local_name(language, binding) != Some(referenced)
-                || (binding.wildcard && receiver.is_none())
-            {
-                continue;
-            }
-            let target_name = if receiver.is_some() {
-                name
-            } else {
-                binding.name.as_deref().unwrap_or(name)
-            };
-            // `config.validate()` reaches a module-level function only through
-            // a namespace binding; a value binding would need the value's type.
-            let namespace = receiver.is_some() && module_binding(language, binding);
-            for (other_path, other) in files {
-                if other_path == path
-                    || !import_path_matches(
-                        path,
-                        other_path,
-                        binding.source.as_deref(),
-                        &binding.path,
-                        receiver.is_none(),
-                    )
-                {
-                    continue;
-                }
-                for node in other
-                    .nodes
-                    .iter()
-                    .filter(|n| callable(n) && n.name == target_name)
-                {
-                    let valid = match (receiver, node.parent_id) {
-                        (None, parent) => parent.is_none(),
-                        // Go methods are top-level declarations too, but only
-                        // functions are reachable through a package name.
-                        (Some(_), None) => {
-                            namespace && (language != "go" || node.kind == "function")
-                        }
-                        (Some(receiver), Some(parent)) => {
-                            let container = binding.name.as_deref().unwrap_or(receiver);
-                            node_by_id(other, parent).is_some_and(|c| container_named(c, container))
-                                && static_member(node)
-                        }
-                    };
-                    if !valid {
-                        continue;
+            let base = std::path::Path::new(from)
+                .parent()
+                .unwrap_or(std::path::Path::new(""));
+            let joined = base.join(module);
+            let mut parts = Vec::new();
+            for part in joined.components() {
+                match part {
+                    std::path::Component::ParentDir => {
+                        parts.pop();
                     }
-                    let key = Key {
-                        path: other_path.clone(),
-                        id: node.id,
-                    };
-                    if indexed.contains(&key) {
-                        candidates.insert(key);
-                    }
+                    std::path::Component::Normal(s) => parts.push(s.to_string_lossy().to_string()),
+                    _ => {}
                 }
             }
-        }
-    }
-    (candidates.len() == 1)
-        .then(|| candidates.into_iter().next())
-        .flatten()
-}
-
-fn import_path_matches(
-    from: &str,
-    target: &str,
-    module: Option<&str>,
-    binding: &str,
-    imported_callable: bool,
-) -> bool {
-    let module = module.unwrap_or(binding);
-    if module.starts_with('.')
-        && (from.ends_with(".js")
-            || from.ends_with(".mjs")
-            || from.ends_with(".cjs")
-            || from.ends_with(".jsx")
-            || from.ends_with(".ts")
-            || from.ends_with(".mts")
-            || from.ends_with(".cts")
-            || from.ends_with(".tsx"))
-    {
-        let base = std::path::Path::new(from)
-            .parent()
-            .unwrap_or(std::path::Path::new(""));
-        let joined = base.join(module);
-        let mut parts = Vec::new();
-        for part in joined.components() {
-            match part {
-                std::path::Component::ParentDir => {
-                    parts.pop();
-                }
-                std::path::Component::Normal(s) => parts.push(s.to_string_lossy().to_string()),
-                _ => {}
-            }
-        }
-        let prefix = parts.join("/");
-        return [
-            ".js",
-            ".mjs",
-            ".cjs",
-            ".jsx",
-            ".ts",
-            ".mts",
-            ".cts",
-            ".tsx",
-            "/index.js",
-            "/index.ts",
-        ]
-        .iter()
-        .any(|ext| target == format!("{prefix}{ext}"))
-            || target == prefix;
-    }
-    if target.ends_with(".py") {
-        let path = module.trim_start_matches('.').replace('.', "/");
-        return target == format!("{path}.py")
-            || target.ends_with(&format!("/{path}.py"))
-            || target == format!("{path}/__init__.py");
-    }
-    if target.ends_with(".rs") {
-        return rust_import_matches(from, target, module, imported_callable);
-    }
-    if target.ends_with(".go") {
-        // Files of package `p` live in a directory named `p`; the import path's
-        // last segment is the package directory for conventional layouts.
-        let package = module
+            let prefix = parts.join("/");
+            let mut candidates: Vec<String> = [
+                ".js",
+                ".mjs",
+                ".cjs",
+                ".jsx",
+                ".ts",
+                ".mts",
+                ".cts",
+                ".tsx",
+                "/index.js",
+                "/index.ts",
+            ]
+            .iter()
+            .map(|ext| format!("{prefix}{ext}"))
+            .collect();
+            candidates.push(prefix);
+            Some(candidates)
+        } else {
+            None
+        };
+        let python_path = module.trim_start_matches('.').replace('.', "/");
+        // Files of package `p` live in a directory named `p`; the import
+        // path's last segment is the package directory for conventional
+        // Go layouts.
+        let go_package = module
             .trim_end_matches('/')
             .rsplit('/')
             .next()
-            .unwrap_or(module);
-        let directory = target
-            .rsplit_once('/')
-            .map(|(directory, _)| directory.rsplit('/').next().unwrap_or(directory))
-            .unwrap_or("");
-        return !package.is_empty() && directory == package;
-    }
-    if target.ends_with(".java") {
-        let module = if imported_callable {
+            .unwrap_or(module)
+            .to_owned();
+        let java_module = if imported_callable {
             module
                 .rsplit_once('.')
                 .map(|(prefix, _)| prefix)
@@ -979,45 +1359,175 @@ fn import_path_matches(
         } else {
             module
         };
-        return target.ends_with(&format!("{}.java", module.replace('.', "/")));
+        Self {
+            js_exact,
+            python_exact: format!("{python_path}.py"),
+            python_suffix: format!("/{python_path}.py"),
+            python_init: format!("{python_path}/__init__.py"),
+            rust: RustPattern::new(from, module, imported_callable),
+            go_package,
+            java_suffix: format!("{}.java", java_module.replace('.', "/")),
+        }
     }
-    false
+
+    fn matches(&self, target: &str) -> bool {
+        if let Some(candidates) = &self.js_exact {
+            return candidates.iter().any(|candidate| candidate == target);
+        }
+        if target.ends_with(".py") {
+            target == self.python_exact
+                || target.ends_with(&self.python_suffix)
+                || target == self.python_init
+        } else if target.ends_with(".rs") {
+            self.rust.matches(target)
+        } else if target.ends_with(".go") {
+            !self.go_package.is_empty() && go_directory(target) == self.go_package
+        } else if target.ends_with(".java") {
+            target.ends_with(&self.java_suffix)
+        } else {
+            false
+        }
+    }
+
+    fn candidates<'a>(
+        &self,
+        paths: &PathIndex<'a>,
+        files: &'a BTreeMap<String, std::sync::Arc<FileStructure>>,
+    ) -> Vec<&'a str> {
+        if let Some(exact) = &self.js_exact {
+            return exact
+                .iter()
+                .filter_map(|candidate| {
+                    files
+                        .get_key_value(candidate.as_str())
+                        .map(|(path, _)| path.as_str())
+                })
+                .collect();
+        }
+        let mut candidates = Vec::new();
+        for exact in [&self.python_exact, &self.python_init] {
+            candidates.extend(
+                files
+                    .get_key_value(exact.as_str())
+                    .map(|(path, _)| path.as_str()),
+            );
+        }
+        candidates.extend(paths.suffix(&self.python_suffix));
+        candidates.extend(self.rust.candidates(paths, files));
+        if !self.go_package.is_empty() {
+            candidates.extend(
+                paths
+                    .go_directories
+                    .get(self.go_package.as_str())
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+        candidates.extend(paths.suffix(&self.java_suffix));
+        candidates
+    }
 }
 
 /// Rust paths name items: a callable import points at its parent module's
 /// file, a receiver import names either a module file or a type in its parent
 /// module. `super::` paths resolve relative to the importing file's module.
-fn rust_import_matches(from: &str, target: &str, module: &str, imported_callable: bool) -> bool {
-    let segments: Vec<&str> = module.split("::").collect();
-    let candidates: Vec<&[&str]> = if imported_callable {
-        vec![&segments[..segments.len().saturating_sub(1)]]
-    } else {
-        vec![&segments[..], &segments[..segments.len().saturating_sub(1)]]
-    };
-    if segments.first() == Some(&"super") {
-        let supers = segments.iter().take_while(|s| **s == "super").count();
-        let Some(base) = rust_super_directory(from, supers) else {
-            return false;
+/// A Rust item path prepared once: exact files for `super::` paths, path
+/// suffixes for crate-relative paths.
+struct RustPattern {
+    exact: Vec<String>,
+    suffixes: Vec<String>,
+    crate_root: bool,
+    never: bool,
+}
+
+impl RustPattern {
+    fn new(from: &str, module: &str, imported_callable: bool) -> Self {
+        let segments: Vec<&str> = module.split("::").collect();
+        let candidates: Vec<&[&str]> = if imported_callable {
+            vec![&segments[..segments.len().saturating_sub(1)]]
+        } else {
+            vec![&segments[..], &segments[..segments.len().saturating_sub(1)]]
         };
-        return candidates.into_iter().any(|segments| {
-            let segments = &segments[supers.min(segments.len())..];
-            rust_module_files(&base, segments)
-                .iter()
-                .any(|candidate| candidate == target)
-        });
-    }
-    candidates.into_iter().any(|segments| {
-        let segments: Vec<&str> = segments
-            .iter()
-            .copied()
-            .filter(|s| !matches!(*s, "crate" | "self"))
-            .collect();
-        if segments.is_empty() {
-            return target.ends_with("lib.rs") || target.ends_with("main.rs");
+        if segments.first() == Some(&"super") {
+            let supers = segments.iter().take_while(|s| **s == "super").count();
+            let Some(base) = rust_super_directory(from, supers) else {
+                return Self {
+                    exact: Vec::new(),
+                    suffixes: Vec::new(),
+                    crate_root: false,
+                    never: true,
+                };
+            };
+            return Self {
+                exact: candidates
+                    .into_iter()
+                    .flat_map(|segments| {
+                        rust_module_files(&base, &segments[supers.min(segments.len())..])
+                    })
+                    .collect(),
+                suffixes: Vec::new(),
+                crate_root: false,
+                never: false,
+            };
         }
-        let path = segments.join("/");
-        target.ends_with(&format!("{path}.rs")) || target.ends_with(&format!("{path}/mod.rs"))
-    })
+        let mut suffixes = Vec::new();
+        let mut crate_root = false;
+        for segments in candidates {
+            let segments: Vec<&str> = segments
+                .iter()
+                .copied()
+                .filter(|s| !matches!(*s, "crate" | "self"))
+                .collect();
+            if segments.is_empty() {
+                crate_root = true;
+            } else {
+                let path = segments.join("/");
+                suffixes.push(format!("{path}.rs"));
+                suffixes.push(format!("{path}/mod.rs"));
+            }
+        }
+        Self {
+            exact: Vec::new(),
+            suffixes,
+            crate_root,
+            never: false,
+        }
+    }
+
+    fn matches(&self, target: &str) -> bool {
+        !self.never
+            && (self.exact.iter().any(|candidate| candidate == target)
+                || self.suffixes.iter().any(|suffix| target.ends_with(suffix))
+                || self.crate_root && (target.ends_with("lib.rs") || target.ends_with("main.rs")))
+    }
+
+    fn candidates<'a>(
+        &self,
+        paths: &PathIndex<'a>,
+        files: &'a BTreeMap<String, std::sync::Arc<FileStructure>>,
+    ) -> Vec<&'a str> {
+        if self.never {
+            return Vec::new();
+        }
+        let mut candidates: Vec<&'a str> = self
+            .exact
+            .iter()
+            .filter_map(|candidate| {
+                files
+                    .get_key_value(candidate.as_str())
+                    .map(|(path, _)| path.as_str())
+            })
+            .collect();
+        for suffix in &self.suffixes {
+            candidates.extend(paths.suffix(suffix));
+        }
+        if self.crate_root {
+            candidates.extend(paths.suffix("lib.rs"));
+            candidates.extend(paths.suffix("main.rs"));
+        }
+        candidates
+    }
 }
 
 /// The directory whose files belong to the module `supers` levels above the
@@ -1773,5 +2283,236 @@ mod tests {
         // `Load` ignores the same-named method; `Validate` is ambiguous between
         // two `config` directories and is dropped.
         assert_eq!(edges(&graph), ["cmd/main.go:main -> config/config.go:Load"]);
+    }
+
+    #[test]
+    fn import_and_header_path_matching_characterization() {
+        // Characterization table for the path predicates the resolver scans
+        // with: (from, target, module, binding, imported_callable, expected).
+        // Guards the prepared-pattern fast path against semantic drift.
+        type ImportCase<'a> = (&'a str, &'a str, Option<&'a str>, &'a str, bool, bool);
+        let cases: &[ImportCase<'_>] = &[
+            // JS/TS relative imports resolve to exact candidate files.
+            ("src/a.ts", "src/b.ts", Some("./b"), "", false, true),
+            ("src/a.ts", "src/b/index.ts", Some("./b"), "", false, true),
+            ("src/a.ts", "src/b.js", Some("./b"), "", false, true),
+            ("src/a.ts", "src/c.ts", Some("./b"), "", false, false),
+            ("src/sub/a.ts", "src/b.ts", Some("../b"), "", false, true),
+            ("src/a.rs", "src/b.ts", Some("./b"), "", false, false),
+            ("src/a.ts", "src/b.ts", Some("b"), "", false, false),
+            // Python dotted modules match by path suffix or package init.
+            ("a.py", "pkg/mod.py", Some("pkg.mod"), "", false, true),
+            ("a.py", "src/pkg/mod.py", Some("pkg.mod"), "", false, true),
+            ("a.py", "pkg/__init__.py", Some("pkg"), "", false, true),
+            ("a.py", "pkg/other.py", Some("pkg.mod"), "", false, false),
+            ("a.py", "pkg/mod.py", Some(".pkg.mod"), "", false, true),
+            ("a.py", "pkg/mod.py", None, "pkg.mod", false, true),
+            // Rust item paths match module files; callables point at parents.
+            (
+                "src/main.rs",
+                "src/dep.rs",
+                Some("crate::dep::helper"),
+                "",
+                true,
+                true,
+            ),
+            (
+                "src/main.rs",
+                "src/dep.rs",
+                Some("crate::dep::helper"),
+                "",
+                false,
+                true,
+            ),
+            (
+                "src/main.rs",
+                "src/dep/mod.rs",
+                Some("crate::dep"),
+                "",
+                false,
+                true,
+            ),
+            (
+                "src/main.rs",
+                "src/other.rs",
+                Some("crate::dep::helper"),
+                "",
+                true,
+                false,
+            ),
+            ("src/main.rs", "src/lib.rs", Some("crate"), "", true, true),
+            ("src/main.rs", "src/dep.rs", Some("crate"), "", true, false),
+            (
+                "src/pkg/m.rs",
+                "src/pkg/sib.rs",
+                Some("super::sib::func"),
+                "",
+                true,
+                true,
+            ),
+            (
+                "src/pkg/m.rs",
+                "src/sib.rs",
+                Some("super::sib::func"),
+                "",
+                true,
+                false,
+            ),
+            (
+                "src/pkg/mod.rs",
+                "src/top.rs",
+                Some("super::top::f"),
+                "",
+                true,
+                true,
+            ),
+            // Go matches by package directory name.
+            (
+                "cmd/main.go",
+                "pkg/foo/bar.go",
+                Some("example.com/foo"),
+                "",
+                false,
+                true,
+            ),
+            (
+                "cmd/main.go",
+                "pkg/baz/bar.go",
+                Some("example.com/foo"),
+                "",
+                false,
+                false,
+            ),
+            ("cmd/main.go", "bar.go", Some("foo"), "", false, false),
+            // Java matches the qualified class file; callables strip a segment.
+            (
+                "A.java",
+                "src/com/x/Widget.java",
+                Some("com.x.Widget"),
+                "",
+                false,
+                true,
+            ),
+            (
+                "A.java",
+                "src/com/x/Widget.java",
+                Some("com.x.Widget.render"),
+                "",
+                true,
+                true,
+            ),
+            (
+                "A.java",
+                "src/com/x/Widget.java",
+                Some("com.x.Widget.render"),
+                "",
+                false,
+                false,
+            ),
+            // Other target kinds never match.
+            ("src/a.ts", "src/b.md", Some("./b"), "", false, false),
+        ];
+        for &(from, target, module, binding, callable, expected) in cases {
+            assert_eq!(
+                ImportPattern::new(from, module, binding, callable).matches(target),
+                expected,
+                "ImportPattern({from:?}, {module:?}, {binding:?}, {callable}).matches({target:?})"
+            );
+        }
+        let headers: &[(&str, &str, &str, bool)] = &[
+            ("src/a.c", "src/b.h", "b.h", true),
+            ("src/a.c", "include/b.h", "b.h", true),
+            ("src/a.c", "src/c.h", "b.h", false),
+            ("src/sub/a.c", "src/b.h", "../b.h", true),
+        ];
+        for &(from, target, include, expected) in headers {
+            assert_eq!(
+                HeaderPattern::new(from, include).matches(target),
+                expected,
+                "HeaderPattern({from:?}, {include:?}).matches({target:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_candidates_cover_every_matching_path() {
+        // Candidate generation via the path index must never drop a file
+        // that the pattern itself would match in an exhaustive scan.
+        let files: BTreeMap<String, std::sync::Arc<FileStructure>> = [
+            "src/a.ts",
+            "src/b.ts",
+            "src/b/index.ts",
+            "pkg/mod.py",
+            "src/pkg/mod.py",
+            "pkg/__init__.py",
+            "src/dep.rs",
+            "src/dep/mod.rs",
+            "src/lib.rs",
+            "pkg/foo/bar.go",
+            "src/com/x/Widget.java",
+            "src/b.h",
+            "include/b.h",
+        ]
+        .into_iter()
+        .map(|path| {
+            (
+                path.to_owned(),
+                std::sync::Arc::new(FileStructure::default()),
+            )
+        })
+        .collect();
+        let index = PathIndex::build(&files);
+        assert_eq!(
+            index.suffix("dep.rs").collect::<BTreeSet<_>>(),
+            BTreeSet::from(["src/dep.rs"])
+        );
+        assert_eq!(
+            index.suffix("/pkg/mod.py").collect::<BTreeSet<_>>(),
+            BTreeSet::from(["src/pkg/mod.py"])
+        );
+        assert_eq!(
+            index.suffix(".rs").collect::<BTreeSet<_>>(),
+            BTreeSet::from(["src/dep.rs", "src/dep/mod.rs", "src/lib.rs"])
+        );
+        let patterns = vec![
+            Pattern::Import(ImportPattern::new("src/a.ts", Some("./b"), "", false)),
+            Pattern::Import(ImportPattern::new("a.py", Some("pkg.mod"), "", false)),
+            Pattern::Import(ImportPattern::new("a.py", Some("pkg"), "", false)),
+            Pattern::Import(ImportPattern::new(
+                "src/main.rs",
+                Some("crate::dep::helper"),
+                "",
+                true,
+            )),
+            Pattern::Import(ImportPattern::new("src/main.rs", Some("crate"), "", true)),
+            Pattern::Import(ImportPattern::new(
+                "cmd/main.go",
+                Some("example.com/foo"),
+                "",
+                false,
+            )),
+            Pattern::Import(ImportPattern::new(
+                "A.java",
+                Some("com.x.Widget"),
+                "",
+                false,
+            )),
+            Pattern::Rust(RustPattern::new("src/pkg/m.rs", "super::sib::func", true)),
+            Pattern::Header(HeaderPattern::new("src/a.c", "b.h")),
+        ];
+        for pattern in &patterns {
+            let scanned: BTreeSet<&str> = files
+                .keys()
+                .map(String::as_str)
+                .filter(|path| pattern.matches(path))
+                .collect();
+            let via_index: BTreeSet<&str> = pattern
+                .candidates(&index, &files)
+                .into_iter()
+                .filter(|path| pattern.matches(path))
+                .collect();
+            assert_eq!(via_index, scanned);
+            assert!(!scanned.is_empty() || matches!(pattern, Pattern::Rust(_)));
+        }
     }
 }

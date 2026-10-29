@@ -2,18 +2,14 @@ use super::{
     array,
     render::{markdown_map_bodies, source_code},
 };
-use crate::{
-    cli::{
-        args::{Detail, Format},
-        io::print_json,
-    },
-    filter, map,
-    parse::StructureNode,
-};
+#[cfg(test)]
+use crate::cli::{args::Format, io::print_json};
+use crate::{cli::args::Detail, filter, map, parse::StructureNode};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{collections::HashMap, io::Write};
 
+#[cfg(test)]
 pub(in crate::cli) fn print_map(
     out: &mut impl Write,
     rows: &[Value],
@@ -26,6 +22,24 @@ pub(in crate::cli) fn print_map(
         return print_json(out, &rows);
     }
     for (index, row) in rows.iter().enumerate() {
+        print_map_row(out, row, index > 0, detail, source, None, selection)?;
+    }
+    Ok(())
+}
+
+/// Print one map file's row. `full` supplies the file's complete structure
+/// when the caller already holds it (streamed map output), avoiding a
+/// second load; otherwise it is fetched from `source`.
+pub(in crate::cli) fn print_map_row(
+    out: &mut impl Write,
+    row: &Value,
+    separator: bool,
+    detail: Detail,
+    source: Option<&dyn map::StructureSource>,
+    full: Option<&crate::parse::FileStructure>,
+    selection: Option<&filter::Selection>,
+) -> Result<()> {
+    {
         let path = row["path"].as_str().context("map result is missing path")?;
         let nodes: Vec<StructureNode> = serde_json::from_value(row["nodes"].clone())
             .with_context(|| format!("decode map nodes for {path}"))?;
@@ -54,13 +68,18 @@ pub(in crate::cli) fn print_map(
                 }
             }
         }
-        let full = source
-            .map(|source| source.structure(path))
-            .transpose()?
-            .flatten();
+        let fetched = if full.is_none() {
+            source
+                .map(|source| source.structure(path))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let full = full.or(fetched.as_deref());
         if detail == Detail::Expanded
             && let Some(source) = source.and_then(|source| source.source(path))
-            && let Some(structure) = &full
+            && let Some(structure) = full
         {
             let bodies = markdown_map_bodies(source, structure);
             for node in &nodes {
@@ -82,7 +101,7 @@ pub(in crate::cli) fn print_map(
         } else {
             None
         };
-        if index > 0 {
+        if separator {
             writeln!(out)?;
         }
         write!(
@@ -93,7 +112,7 @@ pub(in crate::cli) fn print_map(
                 Some(path),
                 detail.into(),
                 source.and_then(|source| source.source(path)),
-                full.as_ref(),
+                full,
                 map::Descriptions {
                     file: if detail == Detail::Expanded {
                         source.and_then(|source| source.file_description(path))

@@ -403,8 +403,8 @@ impl crate::map::StructureSource for Engine {
         self.db.paths()
     }
 
-    fn structure(&self, path: &str) -> Result<Option<parse::FileStructure>> {
-        let structure = self.presentation_structure(path)?;
+    fn structure(&self, path: &str) -> Result<Option<Arc<parse::FileStructure>>> {
+        let structure = self.cached_structure(path)?;
         ensure!(
             structure.is_some(),
             "Structure for {path} requires refresh; run map without --no-reindex"
@@ -426,6 +426,10 @@ impl crate::map::StructureSource for Engine {
 
     fn call_graph(&self) -> Result<crate::callgraph::CallGraph> {
         self.call_graph()
+    }
+
+    fn release_structures(&self) {
+        self.structures.borrow_mut().clear();
     }
 
     fn file_description(&self, path: &str) -> Option<&str> {

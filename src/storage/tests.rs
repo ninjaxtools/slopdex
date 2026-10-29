@@ -1429,6 +1429,49 @@ fn structure_roundtrips_full_metadata_and_links_pending_units() -> Result<()> {
 }
 
 #[test]
+fn all_structures_matches_per_file_reads_and_omits_stale_files() -> Result<()> {
+    let (_dir, mut db) = fixture()?;
+    let records = vec![
+        parsed_record(
+            "a.rs",
+            "use std::collections::HashMap as Map;\n/// Run it.\npub fn run() {}\npub fn helper() { run(); }\n",
+        )?,
+        parsed_record("empty.rs", "")?,
+        parsed_record("guide.md", "# Guide\n## Setup\n")?,
+    ];
+    db.apply_structure(&records, &[], None)?;
+    // A file published under an older parser version is not current.
+    let stale = parsed_record("stale.rs", "pub fn old() {}\n")?;
+    db.apply_structure_with_version(std::slice::from_ref(&stale), &[], None, "older-version")?;
+
+    let all = db.all_structures(STRUCTURE_PARSER_VERSION)?;
+    assert_eq!(
+        all.keys().collect::<Vec<_>>(),
+        ["a.rs", "empty.rs", "guide.md"]
+    );
+    // The bulk scan must reproduce the per-file read exactly, including
+    // names, descriptions, calls/references, and empty structures.
+    for (path, structure) in &all {
+        assert_eq!(*structure, db.structure(path)?, "{path}");
+    }
+    assert!(all["empty.rs"].nodes.is_empty());
+    assert!(
+        all["a.rs"]
+            .nodes
+            .iter()
+            .any(|node| node.description.is_some())
+    );
+    assert!(db.all_structures("next-version")?.is_empty());
+    assert_eq!(
+        db.all_structures("older-version")?
+            .keys()
+            .collect::<Vec<_>>(),
+        ["stale.rs"]
+    );
+    Ok(())
+}
+
+#[test]
 fn structure_reads_metadata_without_declaration_start_byte() -> Result<()> {
     let (_dir, mut db) = fixture()?;
     let mut record = parsed_record("code.rs", "/// API.\nfn run() {}\n")?;

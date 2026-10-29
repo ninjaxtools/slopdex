@@ -265,7 +265,6 @@ impl Engine {
             rows.truncate(count);
         }
         Ok(LimitedResults {
-            count: rows.len(),
             rows,
             omitted,
             limit: limit.count(),
@@ -290,7 +289,6 @@ impl Engine {
             rows.truncate(count);
         }
         Ok(LimitedResults {
-            count: rows.len(),
             rows,
             omitted,
             limit: limit.count(),

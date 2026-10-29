@@ -164,7 +164,7 @@ pub(crate) fn indexed(
         } else {
             None
         };
-        if let Some(lines) = count_file(&path, text, structure.as_ref(), &selection, options)? {
+        if let Some(lines) = count_file(&path, text, structure.as_deref(), &selection, options)? {
             result.push((root.join(path), lines));
         }
     }

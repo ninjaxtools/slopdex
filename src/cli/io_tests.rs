@@ -68,3 +68,27 @@ fn stdout_boundary_only_ignores_its_own_broken_pipes() {
     );
     assert!(result.is_err(), "an unrelated error must still propagate");
 }
+
+#[test]
+fn json_array_writer_matches_print_json_byte_for_byte() {
+    let row_sets: Vec<Vec<serde_json::Value>> = vec![
+        vec![],
+        vec![json!({"path": "a.rs", "nodes": []})],
+        vec![
+            json!({"path": "a.rs", "nodes": [{"id": 0, "name": "x\ny", "ranges": [1, 2]}]}),
+            json!({"path": "b.rs", "nodes": []}),
+            json!("scalar"),
+        ],
+    ];
+    for rows in row_sets {
+        let mut collected = Vec::new();
+        print_json(&mut collected, &rows).unwrap();
+        let mut streamed = Vec::new();
+        let mut writer = JsonArrayWriter::new();
+        for row in &rows {
+            writer.row(&mut streamed, row).unwrap();
+        }
+        writer.finish(&mut streamed).unwrap();
+        assert_eq!(streamed, collected);
+    }
+}

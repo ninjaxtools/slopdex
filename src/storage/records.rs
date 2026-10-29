@@ -327,25 +327,41 @@ impl Database {
     pub fn paths(&self) -> Result<Vec<String>> {
         Ok(self
             .conn
-            .prepare("SELECT path FROM files ORDER BY path")?
+            .prepare_cached("SELECT path FROM files ORDER BY path")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn structure_current(&self, path: &str, source_hash: &str, version: &str) -> Result<bool> {
-        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE path=? AND hash=? AND structure_hash=? AND parser_version=?)",
-            params![path, source_hash, source_hash, version], |r| r.get(0))?)
+        Ok(self.conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM files WHERE path=? AND hash=? AND structure_hash=? AND parser_version=?)")?
+            .query_row(params![path, source_hash, source_hash, version], |r| r.get(0))?)
+    }
+
+    /// Structures for every file current for `version`, loaded with bulk
+    /// scans instead of per-file statements. Non-current files are omitted.
+    pub fn all_structures(
+        &self,
+        version: &str,
+    ) -> Result<std::collections::BTreeMap<String, FileStructure>> {
+        read_all_structures(&self.conn, version)
+    }
+
+    /// Read one file's stored structure without a currency check. Callers
+    /// that already verified currency avoid a second existence query.
+    pub(crate) fn read_structure(&self, path: &str) -> Result<FileStructure> {
+        read_structure(&self.conn, path)
     }
 
     pub fn missing_structure_paths(&self, version: &str) -> Result<Vec<String>> {
-        Ok(self.conn.prepare("SELECT path FROM files WHERE parser_version IS NULL OR parser_version<>? OR structure_hash IS NULL OR structure_hash<>hash ORDER BY path")?
+        Ok(self.conn.prepare_cached("SELECT path FROM files WHERE parser_version IS NULL OR parser_version<>? OR structure_hash IS NULL OR structure_hash<>hash ORDER BY path")?
             .query_map([version], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Missing/unpublished structure is an error, distinct from a parsed file
     /// with zero declarations. No parsing or providers occur in this accessor.
     pub fn structure(&self, path: &str) -> Result<FileStructure> {
-        let current: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM files WHERE path=? AND parser_version IS NOT NULL AND structure_hash=hash)", [path], |r| r.get(0))?;
+        let current: bool = self.conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM files WHERE path=? AND parser_version IS NOT NULL AND structure_hash=hash)")?
+            .query_row([path], |r| r.get(0))?;
         ensure!(current, "No current structure for {path}");
         read_structure(&self.conn, path)
     }

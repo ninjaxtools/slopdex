@@ -11,7 +11,7 @@ use super::workspace::{
 use super::{MapOutput, emit_map};
 use crate::engine::Engine;
 use crate::providers::Providers;
-use crate::{filter, lines, map, ui};
+use crate::{lines, map, ui};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -318,20 +318,13 @@ impl<'a> Session<'a> {
             let source = ui::spin("Parsing structure", || {
                 map::Unindexed::parse(&root, &index, &config, &options)
             })?;
-            let results = map::query_limited_with_reference_labels(
+            let (prepared, selection) = map::prepare(
                 &source,
                 &root,
                 &options,
                 cli.global.format != Some(Format::Json),
             )?;
-            emit_map(
-                cli,
-                &mut out,
-                &results,
-                Some(&source),
-                Some(&filter::Selection::compile(&options)?),
-                map_output,
-            )?;
+            emit_map(cli, &mut out, prepared, &source, &selection, map_output)?;
             return Ok(None);
         }
         let mode = CommandMode::for_command(&cli.command);
