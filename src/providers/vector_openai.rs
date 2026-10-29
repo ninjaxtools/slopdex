@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::models::Vector;
 
 use super::vector::{Configuration, model};
-use super::{Context, OPENAI, Protocol, api_key, auth_headers, truncate_bytes};
+use super::{Context, OPENAI, truncate_bytes};
 
 pub(super) struct OpenAiVector {
     context: Arc<Context>,
@@ -48,8 +48,6 @@ impl Vector for OpenAiVector {
             return Ok(Vec::new());
         }
         self.config.check_batch(inputs.len())?;
-        let key = api_key(&self.context.config, "embeddingApiKey", "openai")?;
-        let headers = auth_headers(&key, Protocol::Responses)?;
         // A byte is a conservative token upper bound for OpenAI's byte-level BPE.
         let values: Vec<&str> = inputs.iter().map(|s| truncate_bytes(s, 8191)).collect();
         let mut body = json!({"model": self.config.model, "input": values,
@@ -57,15 +55,7 @@ impl Vector for OpenAiVector {
         if self.config.model == "text-embedding-ada-002" {
             body.as_object_mut().unwrap().remove("dimensions");
         }
-        let response = self.context.http.request_with_notice(
-            &self.config.url,
-            Some(&body),
-            &headers,
-            || {
-                self.context
-                    .report_call("vectors", "openai", &self.config.model)
-            },
-        )?;
-        self.config.parse(&response, inputs.len())
+        self.config
+            .request_embeddings(&self.context, "openai", &body, inputs.len())
     }
 }

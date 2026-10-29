@@ -16,6 +16,7 @@ mod structure;
 mod syntax;
 
 pub(crate) use references::{EditSite, edit_sites};
+pub(crate) use syntax::grammar;
 
 pub use structure::{CallSite, FileStructure, ImportBinding, ReferenceSite, StructureNode};
 

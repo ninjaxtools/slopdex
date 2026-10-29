@@ -4,10 +4,10 @@
 //! not entire physical lines. The caller can therefore retain mixed lines and
 //! ordinary blank lines while removing blank lines inside a multiline span.
 
-use super::syntax::{children, text, unwrap_value};
-use anyhow::{Context, Result};
+use super::syntax::{children, parse_code, text, unwrap_value};
+use anyhow::Result;
 use std::ops::Range;
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::Node;
 
 /// Conventional test paths in the supported source languages. Both separator
 /// spellings work independently of the host platform; this never accesses disk.
@@ -154,24 +154,7 @@ fn collect_ranges(
         exclusions.comments = merge(descriptions.comments);
         return Ok(exclusions);
     }
-    let grammar: Language = match language {
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        "c" => tree_sitter_c::LANGUAGE.into(),
-        "bash" => tree_sitter_bash::LANGUAGE.into(),
-        _ => tree_sitter_javascript::LANGUAGE.into(),
-    };
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .with_context(|| format!("Cannot initialize {language} parser for {path}"))?;
-    let mut tree = parser
-        .parse(source, None)
-        .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
+    let (mut parser, mut tree) = parse_code(language, path, source)?;
     if language == "bash" {
         tree = super::shell::recover(&mut parser, tree, source);
     }

@@ -1,6 +1,6 @@
 //! Tree-sitter structure for configuration and markup, with bounded text search units.
 
-use super::syntax::text;
+use super::syntax::{grammar, parse_with, text};
 use super::{Diagnostic, FileStructure, ParsedFile, StructureNode};
 use anyhow::{Context, Result};
 use std::{
@@ -9,7 +9,7 @@ use std::{
     ops::Range,
     sync::OnceLock,
 };
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::Node;
 
 #[path = "document.rs"]
 pub(super) mod document;
@@ -26,23 +26,9 @@ pub(super) fn parse(
     source: &str,
     descriptions: &mut super::descriptions::SourceDescriptions,
 ) -> Result<ParsedFile> {
-    let grammar: Language = match language {
-        "json" => tree_sitter_json::LANGUAGE.into(),
-        "terraform" => tree_sitter_hcl::LANGUAGE.into(),
-        "yaml" => tree_sitter_yaml::LANGUAGE.into(),
-        "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
-        "xml" => tree_sitter_xml::LANGUAGE_XML.into(),
-        "html" => tree_sitter_html::LANGUAGE.into(),
-        "css" => tree_sitter_css::LANGUAGE.into(),
-        _ => unreachable!("only data languages are dispatched here"),
-    };
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .with_context(|| format!("Cannot initialize {language} parser for {path}"))?;
-    let mut tree = parser
-        .parse(source, None)
-        .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
+    // Dispatch only sends config/markup languages here; all have grammars.
+    let grammar = grammar(language).expect("only data languages are dispatched here");
+    let (mut parser, mut tree) = parse_with(&grammar, language, path, source)?;
     let input = if language == "css" && tree.root_node().has_error() {
         css_compatibility(source, tree.root_node())
     } else {

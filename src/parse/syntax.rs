@@ -1,6 +1,56 @@
 //! Shared AST access: comments are layout, not expressions or bindings.
 
-use tree_sitter::Node;
+use anyhow::{Context, Result};
+use tree_sitter::{Language, Node, Parser, Tree};
+
+/// The tree-sitter grammar for every name [`super::language_for_path`] returns.
+pub(crate) fn grammar(language: &str) -> Option<Language> {
+    Some(match language {
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "javascript" | "jsx" => tree_sitter_javascript::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "go" => tree_sitter_go::LANGUAGE.into(),
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "c" => tree_sitter_c::LANGUAGE.into(),
+        "bash" => tree_sitter_bash::LANGUAGE.into(),
+        "markdown" => tree_sitter_md_025::LANGUAGE.into(),
+        "json" => tree_sitter_json::LANGUAGE.into(),
+        "terraform" => tree_sitter_hcl::LANGUAGE.into(),
+        "yaml" => tree_sitter_yaml::LANGUAGE.into(),
+        "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
+        "xml" => tree_sitter_xml::LANGUAGE_XML.into(),
+        "html" => tree_sitter_html::LANGUAGE.into(),
+        "css" => tree_sitter_css::LANGUAGE.into(),
+        _ => return None,
+    })
+}
+
+/// Parse `source` with `grammar`, returning the parser for recovery reparses.
+/// Parser initialization/failure is an error; syntax errors stay in the tree.
+pub(super) fn parse_with(
+    grammar: &Language,
+    language: &str,
+    path: &str,
+    source: &str,
+) -> Result<(Parser, Tree)> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(grammar)
+        .with_context(|| format!("Cannot initialize {language} parser for {path}"))?;
+    let tree = parser
+        .parse(source, None)
+        .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
+    Ok((parser, tree))
+}
+
+/// Parse a code file; unknown names fall back to the JavaScript grammar, as
+/// every JS-family language shares it.
+pub(super) fn parse_code(language: &str, path: &str, source: &str) -> Result<(Parser, Tree)> {
+    let grammar = grammar(language).unwrap_or_else(|| tree_sitter_javascript::LANGUAGE.into());
+    parse_with(&grammar, language, path, source)
+}
 
 pub(super) fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
     // Recovered trees keep byte offsets identical to the original source.

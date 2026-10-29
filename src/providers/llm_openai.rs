@@ -1,25 +1,10 @@
-use anyhow::Result;
-use serde_json::Value;
-use std::sync::Arc;
-
-use super::llm::{Adapter, Configured};
-use super::{Context, OPENAI, Protocol};
-use crate::models::{Llm, Message};
+use super::llm::Adapter;
+use super::{OPENAI, Protocol};
 
 pub(super) const DEFAULT_BASE: &str = OPENAI;
 pub(super) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
-pub(super) struct OpenAi {
-    configured: Configured,
-}
-
-impl OpenAi {
-    pub(super) fn new(context: Arc<Context>) -> Result<Self> {
-        Ok(Self {
-            configured: Configured::new::<Self>(context)?,
-        })
-    }
-}
+pub(super) struct OpenAi;
 
 impl Adapter for OpenAi {
     const PROVIDER: &'static str = "openai";
@@ -28,20 +13,5 @@ impl Adapter for OpenAi {
 
     fn protocol(_model: &str) -> Protocol {
         Protocol::Responses
-    }
-}
-
-impl Llm for OpenAi {
-    fn profile(&self) -> Value {
-        self.configured.profile::<Self>()
-    }
-
-    fn describe_conversation(
-        &self,
-        system: &str,
-        messages: &[Message],
-        session: &str,
-    ) -> Result<String> {
-        self.configured.describe::<Self>(system, messages, session)
     }
 }

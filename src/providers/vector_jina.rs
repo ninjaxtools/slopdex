@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::models::Vector;
 
 use super::vector::{Configuration, model};
-use super::{Context, JINA, Protocol, api_key, auth_headers, string};
+use super::{Context, JINA, string};
 
 pub(super) struct JinaVector {
     context: Arc<Context>,
@@ -77,22 +77,12 @@ impl Vector for JinaVector {
             return Ok(Vec::new());
         }
         self.config.check_batch(inputs.len())?;
-        let key = api_key(&self.context.config, "embeddingApiKey", "jina")?;
-        let headers = auth_headers(&key, Protocol::Responses)?;
         let mut body = json!({"model": self.config.model, "input": inputs,
             "dimensions": self.config.dimensions, "embedding_type": "float", "truncate": true});
         if let Some((query_task, passage_task)) = &self.tasks {
             body["task"] = json!(if query { query_task } else { passage_task });
         }
-        let response = self.context.http.request_with_notice(
-            &self.config.url,
-            Some(&body),
-            &headers,
-            || {
-                self.context
-                    .report_call("vectors", "jina", &self.config.model)
-            },
-        )?;
-        self.config.parse(&response, inputs.len())
+        self.config
+            .request_embeddings(&self.context, "jina", &body, inputs.len())
     }
 }

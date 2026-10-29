@@ -15,13 +15,9 @@ pub(super) type Edits = BTreeMap<String, Vec<Edit>>;
 
 pub(super) fn tree(path: &str, source: &str) -> Result<Tree> {
     let language = match crate::parse::language_for_path(path) {
-        Some("typescript") => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Some("tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        Some("javascript" | "jsx") => tree_sitter_javascript::LANGUAGE.into(),
-        Some("rust") => tree_sitter_rust::LANGUAGE.into(),
-        Some("go") => tree_sitter_go::LANGUAGE.into(),
-        Some("java") => tree_sitter_java::LANGUAGE.into(),
-        Some("c") => tree_sitter_c::LANGUAGE.into(),
+        Some(
+            name @ ("typescript" | "tsx" | "javascript" | "jsx" | "rust" | "go" | "java" | "c"),
+        ) => crate::parse::grammar(name).expect("supported languages have grammars"),
         _ => bail!("Unsupported refactoring language: {path}"),
     };
     let mut parser = Parser::new();

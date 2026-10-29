@@ -1,26 +1,13 @@
 use anyhow::{Result, anyhow};
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde_json::Value;
-use std::sync::Arc;
 
-use super::llm::{Adapter, Configured};
-use super::{Context, Protocol, ZEN, auth_headers};
-use crate::models::{Llm, Message};
+use super::llm::Adapter;
+use super::{Protocol, ZEN, auth_headers};
 
 pub(super) const DEFAULT_BASE: &str = ZEN;
 pub(super) const DEFAULT_MODEL: &str = "muse-spark-1.3-contributor";
 
-pub(super) struct OpenCode {
-    configured: Configured,
-}
-
-impl OpenCode {
-    pub(super) fn new(context: Arc<Context>) -> Result<Self> {
-        Ok(Self {
-            configured: Configured::new::<Self>(context)?,
-        })
-    }
-}
+pub(super) struct OpenCode;
 
 impl Adapter for OpenCode {
     const PROVIDER: &'static str = "opencode";
@@ -33,21 +20,6 @@ impl Adapter for OpenCode {
 
     fn headers(key: &str, protocol: Protocol, session: &str) -> Result<HeaderMap> {
         session_headers(key, protocol, session)
-    }
-}
-
-impl Llm for OpenCode {
-    fn profile(&self) -> Value {
-        self.configured.profile::<Self>()
-    }
-
-    fn describe_conversation(
-        &self,
-        system: &str,
-        messages: &[Message],
-        session: &str,
-    ) -> Result<String> {
-        self.configured.describe::<Self>(system, messages, session)
     }
 }
 

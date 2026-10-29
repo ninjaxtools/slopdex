@@ -7,8 +7,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
+use super::syntax::{Edit, Edits, children, edited, text, tree, walk};
 use crate::parse::{self, EditSite, FileStructure, StructureNode};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,55 +52,8 @@ struct Module {
     exports: Vec<(String, String)>,
 }
 
-#[derive(Clone)]
-struct Edit {
-    range: Range<usize>,
-    text: String,
-}
-type Edits = BTreeMap<String, Vec<Edit>>;
-
 pub(super) struct Workspace {
     files: BTreeMap<String, Module>,
-}
-
-fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter(|node| !node.is_extra())
-        .collect()
-}
-
-fn walk(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut result = Vec::new();
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        result.push(node);
-        stack.extend(children(node).into_iter().rev());
-    }
-    result
-}
-
-fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
-    &source[node.byte_range()]
-}
-
-fn tree(path: &str, source: &str) -> Result<Tree> {
-    let language = match parse::language_for_path(path) {
-        Some("typescript") => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Some("tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        Some("javascript" | "jsx") => tree_sitter_javascript::LANGUAGE.into(),
-        _ => bail!("Unsupported refactoring language: {path}"),
-    };
-    let mut parser = Parser::new();
-    parser.set_language(&language)?;
-    let tree = parser
-        .parse(source, None)
-        .context("Tree-sitter returned no tree")?;
-    ensure!(
-        !tree.root_node().has_error(),
-        "Cannot safely refactor invalid syntax in {path}"
-    );
-    Ok(tree)
 }
 
 fn has_token(node: Node<'_>, kind: &str) -> bool {
@@ -1454,26 +1408,4 @@ fn relative_module(from: &str, to: &str, style: Option<&str>) -> String {
         result.insert_str(0, "./");
     }
     result
-}
-
-fn edited(source: &str, mut edits: Vec<Edit>) -> Result<String> {
-    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
-    edits.dedup_by(|a, b| a.range == b.range && a.text == b.text);
-    let mut result = String::new();
-    let mut end = 0;
-    for edit in edits {
-        ensure!(
-            edit.range.start >= end,
-            "Conflicting refactoring edits; no files were changed"
-        );
-        result.push_str(
-            source
-                .get(end..edit.range.start)
-                .context("Invalid edit boundary")?,
-        );
-        result.push_str(&edit.text);
-        end = edit.range.end;
-    }
-    result.push_str(source.get(end..).context("Invalid edit boundary")?);
-    Ok(result)
 }

@@ -3,6 +3,7 @@
 use anyhow::{Result, anyhow, bail};
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,9 +25,9 @@ pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Llm>> {
         .or(inferred_provider)
         .unwrap_or("openai")
     {
-        "openai" => Ok(Box::new(OpenAi::new(context)?)),
-        "opencode" => Ok(Box::new(OpenCode::new(context)?)),
-        "opencode-go" => Ok(Box::new(OpenCodeGo::new(context)?)),
+        "openai" => Ok(Box::new(Provider::<OpenAi>::new(context)?)),
+        "opencode" => Ok(Box::new(Provider::<OpenCode>::new(context)?)),
+        "opencode-go" => Ok(Box::new(Provider::<OpenCodeGo>::new(context)?)),
         _ => bail!("Unsupported description provider"),
     }
 }
@@ -41,6 +42,36 @@ pub(super) trait Adapter {
 
     fn headers(key: &str, protocol: Protocol, _session: &str) -> Result<HeaderMap> {
         auth_headers(key, protocol)
+    }
+}
+
+/// One [`Llm`] implementation for every adapter; providers only declare policy.
+pub(super) struct Provider<A: Adapter> {
+    configured: Configured,
+    adapter: PhantomData<fn() -> A>,
+}
+
+impl<A: Adapter> Provider<A> {
+    pub(super) fn new(context: Arc<Context>) -> Result<Self> {
+        Ok(Self {
+            configured: Configured::new::<A>(context)?,
+            adapter: PhantomData,
+        })
+    }
+}
+
+impl<A: Adapter> Llm for Provider<A> {
+    fn profile(&self) -> Value {
+        self.configured.profile::<A>()
+    }
+
+    fn describe_conversation(
+        &self,
+        system: &str,
+        messages: &[Message],
+        session: &str,
+    ) -> Result<String> {
+        self.configured.describe::<A>(system, messages, session)
     }
 }
 

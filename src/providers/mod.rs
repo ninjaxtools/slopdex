@@ -50,8 +50,6 @@ mod llm_opencode_go;
 mod ollama;
 mod protocol;
 mod rerank;
-mod rerank_cohere;
-mod rerank_jina;
 mod rerank_openai;
 mod vector;
 mod vector_jina;

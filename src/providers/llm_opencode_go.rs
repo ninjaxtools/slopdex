@@ -1,27 +1,14 @@
 use anyhow::Result;
 use reqwest::header::HeaderMap;
-use serde_json::Value;
-use std::sync::Arc;
 
-use super::llm::{Adapter, Configured};
+use super::llm::Adapter;
 use super::llm_opencode::{family_protocol, session_headers};
-use super::{Context, GO, Protocol};
-use crate::models::{Llm, Message};
+use super::{GO, Protocol};
 
 pub(super) const DEFAULT_BASE: &str = GO;
 pub(super) const DEFAULT_MODEL: &str = "muse-spark-1.3-contributor";
 
-pub(super) struct OpenCodeGo {
-    configured: Configured,
-}
-
-impl OpenCodeGo {
-    pub(super) fn new(context: Arc<Context>) -> Result<Self> {
-        Ok(Self {
-            configured: Configured::new::<Self>(context)?,
-        })
-    }
-}
+pub(super) struct OpenCodeGo;
 
 impl Adapter for OpenCodeGo {
     const PROVIDER: &'static str = "opencode-go";
@@ -38,20 +25,5 @@ impl Adapter for OpenCodeGo {
 
     fn headers(key: &str, protocol: Protocol, session: &str) -> Result<HeaderMap> {
         session_headers(key, protocol, session)
-    }
-}
-
-impl Llm for OpenCodeGo {
-    fn profile(&self) -> Value {
-        self.configured.profile::<Self>()
-    }
-
-    fn describe_conversation(
-        &self,
-        system: &str,
-        messages: &[Message],
-        session: &str,
-    ) -> Result<String> {
-        self.configured.describe::<Self>(system, messages, session)
     }
 }

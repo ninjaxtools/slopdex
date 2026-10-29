@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use crate::models::Vector;
 
-use super::{Context, endpoint, index, normalize, positive, string, unqualify};
+use super::{
+    Context, Protocol, api_key, auth_headers, endpoint, index, normalize, positive, string,
+    unqualify,
+};
 
 pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Vector>> {
     match string(&context.config, &["provider", "embeddingProvider"])?.unwrap_or("openai") {
@@ -83,6 +86,24 @@ impl Configuration {
 
     pub(super) fn check_batch(&self, count: usize) -> Result<()> {
         check_batch(count, self.batch_size)
+    }
+
+    /// Send one hosted embedding request; each provider builds its own body.
+    pub(super) fn request_embeddings(
+        &self,
+        context: &Context,
+        provider: &str,
+        body: &Value,
+        count: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let key = api_key(&context.config, "embeddingApiKey", provider)?;
+        let headers = auth_headers(&key, Protocol::Responses)?;
+        let response = context
+            .http
+            .request_with_notice(&self.url, Some(body), &headers, || {
+                context.report_call("vectors", provider, &self.model);
+            })?;
+        self.parse(&response, count)
     }
 
     pub(super) fn parse(&self, response: &Value, count: usize) -> Result<Vec<Vec<f32>>> {

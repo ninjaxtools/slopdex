@@ -1,11 +1,11 @@
 //! Tree-sitter callable extraction and recoverable syntax diagnostics.
 
-use super::syntax::{Descent, children, text, unwrap_value as unwrap};
+use super::syntax::{Descent, children, parse_code, text, unwrap_value as unwrap};
 use super::{CallSite, Callable, Diagnostic, ParsedFile};
 use crate::hash;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use tree_sitter::{Language, Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn parse(
     language: &'static str,
@@ -13,24 +13,7 @@ pub(super) fn parse(
     source: &str,
     descriptions: &mut super::descriptions::SourceDescriptions,
 ) -> Result<ParsedFile> {
-    let grammar: Language = match language {
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        "c" => tree_sitter_c::LANGUAGE.into(),
-        "bash" => tree_sitter_bash::LANGUAGE.into(),
-        _ => tree_sitter_javascript::LANGUAGE.into(),
-    };
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .with_context(|| format!("Cannot initialize {language} parser for {path}"))?;
-    let mut tree = parser
-        .parse(source, None)
-        .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
+    let (mut parser, mut tree) = parse_code(language, path, source)?;
     if language == "bash" {
         tree = super::shell::recover(&mut parser, tree, source);
     }

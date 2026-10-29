@@ -272,6 +272,16 @@ impl Engine {
         Self::open_internal(root, index, config, false, true)
     }
 
+    /// Fail if a prepared file's bytes changed since they were hashed.
+    fn verify_source_unchanged(&self, file: &File) -> Result<()> {
+        ensure!(
+            hash(fs::read(self.root.join(&file.path))?) == file.hash,
+            "Source changed during indexing: {}; rerun",
+            file.path
+        );
+        Ok(())
+    }
+
     fn open_internal(
         root: &Path,
         index: &Path,
@@ -510,11 +520,7 @@ impl Engine {
             "Git HEAD changed during indexing; rerun"
         );
         for (file, _) in &changed {
-            ensure!(
-                hash(fs::read(self.root.join(&file.path))?) == file.hash,
-                "Source changed during indexing: {}; rerun",
-                file.path
-            );
+            self.verify_source_unchanged(file)?;
         }
         self.write_index(|engine| engine.db.apply(&changed, &[], checkpoint.as_deref()))?;
         self.load()?;
@@ -788,16 +794,8 @@ impl Engine {
         );
         let verifying = ui::counted("Verifying indexed files", changed.len());
         for (file, _) in &changed {
-            if !file
-                .errors
-                .iter()
-                .any(|error| error["code"] == "read-error")
-            {
-                ensure!(
-                    hash(fs::read(self.root.join(&file.path))?) == file.hash,
-                    "Source changed during indexing: {}; rerun",
-                    file.path
-                );
+            if !has_read_error(file) {
+                self.verify_source_unchanged(file)?;
             }
             verifying.inc(1);
         }
@@ -2967,11 +2965,7 @@ impl Engine {
             "Git HEAD changed during indexing; rerun"
         );
         for (file, _) in &changed {
-            ensure!(
-                hash(fs::read(self.root.join(&file.path))?) == file.hash,
-                "Source changed during indexing: {}; rerun",
-                file.path
-            );
+            self.verify_source_unchanged(file)?;
         }
         self.write_index(|engine| {
             engine.db.apply(&changed, &[], checkpoint.as_deref())?;
