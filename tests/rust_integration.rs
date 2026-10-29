@@ -4286,42 +4286,58 @@ fn current_map_reads_share_the_lock_and_stale_maps_wait_for_writers() -> Result<
     writer.refresh_structure()?;
     drop(writer);
 
+    // The in-process engines resolve the ambient global Git ignore (an input
+    // to the saved discovery policy) from this process's environment. The CLI
+    // child must resolve the same one or it correctly treats the snapshot as
+    // stale for a different environment and waits for a writer. Its slopdex
+    // config and cache stay pinned to the fixture; only the Git-global inputs
+    // are inherited.
+    let config_file = repo.home.join("config.json");
+    fs::write(&config_file, "{}\n")?;
+    let child_map = || -> Result<Output> {
+        let mut command = repo.child(env!("CARGO_BIN_EXE_slopdex"));
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+        ] {
+            match std::env::var_os(key) {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        let output = command
+            .arg("--root")
+            .arg(&repo.root)
+            .arg("--index")
+            .arg(&repo.index)
+            .arg("--config")
+            .arg(&config_file)
+            .args(["map", "source.rs"])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(output)
+    };
+
     let mut reader =
         Engine::open_map_readonly(&repo.root, &repo.index, isolated(&repo.index, json!({})))?;
     let generation = reader.status()?["generation"].clone();
     assert_eq!(reader.refresh_structure()?["filesUpdated"], 0);
-    let output = repo
-        .child(env!("CARGO_BIN_EXE_slopdex"))
-        .arg("--root")
-        .arg(&repo.root)
-        .arg("--index")
-        .arg(&repo.index)
-        .args(["map", "source.rs"])
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = child_map()?;
     assert!(String::from_utf8(output.stdout)?.contains("pub fn first()"));
     assert_eq!(reader.status()?["generation"], generation);
 
     repo.write("source.rs", "pub fn second() {}\n")?;
     assert!(reader.refresh_structure().is_err());
     drop(reader);
-    let output = repo
-        .child(env!("CARGO_BIN_EXE_slopdex"))
-        .arg("--root")
-        .arg(&repo.root)
-        .arg("--index")
-        .arg(&repo.index)
-        .args(["map", "source.rs"])
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = child_map()?;
     assert!(String::from_utf8(output.stdout)?.contains("pub fn second()"));
     Ok(())
 }
