@@ -1,6 +1,6 @@
 This repository employs the use of LLMs for [automatic programming](https://antirez.com/news/159).
 
-This README is in my own words.
+This README is mostly in my own words.
 
 # slopdex
 
