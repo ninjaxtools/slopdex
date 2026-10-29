@@ -236,7 +236,7 @@ fn file_hits_group_with_callable_and_symbol_hits_and_preserve_json_with_calls() 
         assert!(output.contains("  // api.rs:check()\n"), "{output}");
         assert!(!output.contains("pub const TIMEOUT"), "{output}");
     }
-    let (context, files) = super::faq_search_context(
+    let (context, files, symbols) = super::faq_search_context(
         &engine,
         &rows,
         (0, 0, 0, 0),
@@ -246,6 +246,18 @@ fn file_hits_group_with_callable_and_symbol_hits_and_preserve_json_with_calls() 
     assert!(context.contains("*** api.rs  // score=0.98"));
     assert!(context.contains("// Handles requests.\n// Checks permissions."));
     assert!(files.contains("api.rs"));
+    assert!(
+        symbols.iter().any(|symbol| symbol.path == "api.rs"
+            && symbol.qualified_name == "run"
+            && symbol.start_line == 2),
+        "{symbols:?}"
+    );
+    assert!(
+        !symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == "check"),
+        "only rendered declarations are citable: {symbols:?}"
+    );
     Ok(())
 }
 

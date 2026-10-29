@@ -547,7 +547,7 @@ format, or `path:line:qualifiedName` for single-line symbols, for example
 All JSON reference locations remain unchanged: callable names never gain `()`,
 even when the corresponding text annotation marks an invocation.
 `--refs` controls these annotations on map nodes, callable search results,
-cross-search source and match objects, and FAQ's returned functions,
+cross-search source and match objects, and in FAQ's LLM context,
 independently of traversal. Graph expansion uses `callDepth` on map nodes and
 `relatedCallables` on callable search results; caller/callee depth fields retain
 their graph meaning. With both depths zero and no explicit `--refs`, outgoing
@@ -1074,30 +1074,44 @@ indexed code for callers and callees up to two edges away
 by default, even below `--expand-code-threshold`. Use `--expand-callers N` and
 `--expand-callees N` (or `--expand-callables N`) to override either depth;
 explicit `0` disables that direction's automatic code expansion. These defaults
-apply to the LLM context, not FAQ's JSON result or text references.
-`--refs` controls outgoing annotations in both the context and returned excerpts
-independently of traversal. Its implicit default follows the resolved depths for
-each output, including the context's code-expansion depths.
+apply only to the LLM context; the rendered search output itself is neither
+returned nor cached with the answer.
+`--refs` controls outgoing annotations in that context independently of
+traversal. Its implicit default follows the context's resolved depths,
+including its code-expansion depths.
 The entire prompt is limited to 128 KiB; expanded search output is marked if
 truncated on a UTF-8 boundary. Complete files are not appended to the prompt.
-The instruction asks for an explanation of existing code/docs with paths and
-symbols, not an implementation proposal.
+The instruction asks for an explanation of existing code/docs, not an
+implementation proposal, as a single JSON object holding a free-text
+`description` and a `references` list of the files and symbols from the
+supplied context that the model considers relevant (a path, plus a symbol name
+for symbol references).
 
 Context uses the indexed snapshot. Provider retries/failover still apply.
+Cited references are validated against the rendered context: a file citation
+must name a rendered file, and a symbol citation must name a rendered
+declaration (including expanded callers/callees and reference-comment targets)
+in that file, matched by qualified or unqualified name. Citations that do not
+match are silently dropped, as are any line numbers the model supplies.
+Responses that are not the requested JSON object are treated as a plain
+description with no references. Reranker order informs the prompt.
 JSON output contains `query` (the current question), `question` (the original
-cached question), `description`, `files`, `functions`, `searchResults` (the original
-references), `omitted`, and `limit`; full source and embedding input
-are stripped from returned function metadata. Reranker order informs the prompt,
-but `rerankScore` is not copied to the returned `functions` array.
+cached question), `description`, `references`, `omitted`, and `limit`. Each
+kept reference is `{"path": ...}` for a whole file or
+`{"path": ..., "symbol": <canonical qualified name>, "startLine": ..., "endLine": ...}`
+with the line range taken from the rendered context, in cited order without
+duplicates.
 Text output labels the generated prose `Explanation` and follows it with
-`References` in the shared excerpt syntax. The prose is model-generated; its
+`References`, one location per line (`path`, or `path:start-end:symbol` in the
+shared symbol-location format). The prose is model-generated; its
 format and wording are not deterministic.
 
 Each workspace maintains a separate `faq` vector index backed by SQLite entries.
-An entry stores the original question, the complete answer/reference result, the
-content hashes of context files, and two vector references: the question embedding
-(query mode) and the plain-text LLM answer embedding (document mode). Map output,
-scores, and reference excerpts are not included in the answer embedding.
+An entry stores the original question, the answer and its kept references, the
+content hashes of exactly the referenced files, and two vector references: the
+question embedding (query mode) and the plain-text LLM answer embedding
+(document mode). The search context, its scores, and its excerpts are not
+stored in the entry or included in the answer embedding.
 
 Before searching code, FAQ compares the incoming question to both embeddings and
 selects the best entry whose cosine similarity is **strictly greater than
@@ -1110,18 +1124,19 @@ FAQ hits reuse the original references without searching, reranking, or calling
 the LLM again; a new question may still require a query embedding. Entries persist
 across restarts and unrelated snapshot changes. Embedding/LLM profiles and search
 filters/context options isolate answers; changing only the FAQ cutoff does not.
-Every context file (including caller/callee expansion and reference-only targets)
-must still match both the indexed and on-disk content hash. Changes, deletions,
-and renames invalidate cached answers, but their entries remain as canonical-question
-anchors. A matching paraphrase refreshes the same entry using its **original
+Every referenced file must still match both the indexed and on-disk content
+hash; changes to context files the answer did not cite do not invalidate it.
+Changes, deletions, and renames of referenced files invalidate cached answers,
+but their entries remain as canonical-question anchors. A matching paraphrase refreshes the same entry using its **original
 question**, not a newly worded prompt. `query` reports the incoming question;
 `question` reports the canonical one used for search and the LLM request. Entries
 are updated in place, without accumulating duplicates for paraphrases.
 Live files are read for this
 validation even with `--no-reindex`; that flag still uses the saved snapshot on a
-miss, but a stale snapshot cannot publish a reusable FAQ entry. Empty-file-context
-answers are not added to the FAQ index; an existing stale question anchor is
-retained until it can be refreshed with valid file dependencies. The FAQ table is created on demand in
+miss, but a stale snapshot cannot publish a reusable FAQ entry. Answers whose
+references match no context file are not added to the FAQ index; an existing
+stale question anchor is retained until it can be refreshed with valid
+referenced-file dependencies. The FAQ table is created on demand in
 existing schema-4 indexes; no rebuild is needed. A live-state reset clears FAQ entries.
 Like other query caches, FAQ membership and derived-pointer writes are best-effort
 when another reader holds the workspace lock; refreshed answers still return,
@@ -1131,8 +1146,10 @@ FAQ freshness and LLM request reuse are separate cache layers. After rebuilding
 the search context, an exact-request lookup uses the configured LLM profile,
 endpoint/fallback settings, system instruction, and complete final prompt. File
 hashes, snapshot generations, index paths, and incoming paraphrases are **not**
-part of that key. An edit outside the supplied context may therefore invalidate
-the FAQ entry without requiring another LLM call. A changed prompt or model
+part of that key. An edit to a referenced file that leaves the rendered context
+unchanged may therefore invalidate the FAQ entry without requiring another LLM
+call; the raw cached response is simply re-parsed and its references
+re-validated against the rebuilt context. A changed prompt or model
 requires a different response. Successful LLM results are saved even when the
 snapshot is stale or a later FAQ/vector publication fails.
 
@@ -1188,7 +1205,7 @@ scored entry is included, even with negative similarity.
 
 `-e` / `--regexp` (alias `--regex`) matches entry paths, names, and text, with repeated
 expressions combined by OR and `-i` / `--ignore-case` for case-insensitive matching.
-For FAQ, text means the original question plus plain answer, not attached map output.
+For FAQ, text means the original question plus plain answer, not the search context or reference list.
 Regex filters are applied before semantic ranking; combining `-q` and `-e` uses AND.
 
 Default text is compact: one truncated preview per entry, with rank, ID, location,
@@ -1315,8 +1332,9 @@ changes, or earlier answers can change the key; reuse requires an identical
 effective request, not merely matching callable source. Source
 descriptions are extracted locally and never sent to a generator for replacement.
 FAQ explanation keys cover the final system/prompt request and LLM configuration,
-not file dependencies. The semantic FAQ entry separately tracks file freshness
-and preserves the original question when a paraphrase triggers regeneration.
+not file dependencies. The semantic FAQ entry separately tracks the freshness of
+its referenced files and preserves the original question when a paraphrase
+triggers regeneration.
 Map without `-q` never contacts S3. An uncached
 semantic query with `--no-reindex` may consult S3 before its provider call.
 When S3 is enabled later, the next successful semantic refresh uploads existing

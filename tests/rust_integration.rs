@@ -250,6 +250,46 @@ fn description_prompt(body: &Value) -> &str {
         .unwrap()
 }
 
+/// Simulate an LLM citing its FAQ context: one reference per rendered file
+/// section, naming the section's first callable when the prompt shows one.
+fn faq_citations(prompt: &str) -> Vec<Value> {
+    let mut references = Vec::new();
+    let mut current: Option<(String, Option<String>)> = None;
+    let mut finish = |current: &mut Option<(String, Option<String>)>| {
+        if let Some((path, symbol)) = current.take()
+            && !references.iter().any(|r: &Value| r["path"] == path)
+        {
+            references.push(match symbol {
+                Some(symbol) => json!({"path": path, "symbol": symbol}),
+                None => json!({"path": path}),
+            });
+        }
+    };
+    for line in prompt.lines() {
+        if let Some(header) = line.strip_prefix("*** ") {
+            finish(&mut current);
+            current = Some((header.split("  ").next().unwrap().trim().to_owned(), None));
+            continue;
+        }
+        if let Some((_, symbol @ None)) = &mut current {
+            for keyword in ["fn ", "def ", "function "] {
+                if let Some(index) = line.find(keyword) {
+                    let name: String = line[index + keyword.len()..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                        .collect();
+                    if !name.is_empty() {
+                        *symbol = Some(name);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    finish(&mut current);
+    references
+}
+
 fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
     // Windows accepted sockets inherit the listener's nonblocking mode.
     // Request parsing needs blocking I/O, bounded by the timeouts below.
@@ -323,17 +363,27 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
         }
         "/v1/responses" => {
             let prompt = description_prompt(&body);
-            let prefix = if prompt.starts_with("Describe the purpose") {
-                "file-summary"
-            } else if prompt.starts_with("Describe what") {
-                "callable-summary"
+            if prompt.starts_with("Task: ") {
+                let description = format!(
+                    "answer grounded in indexed context: {}",
+                    slopdex::hash(body["input"].to_string())
+                );
+                let answer =
+                    json!({"description": description, "references": faq_citations(prompt)});
+                (200, json!({"output_text": answer.to_string()}))
             } else {
-                "answer grounded in indexed context"
-            };
-            (
-                200,
-                json!({"output_text": format!("{prefix}: {}", slopdex::hash(body["input"].to_string()))}),
-            )
+                let prefix = if prompt.starts_with("Describe the purpose") {
+                    "file-summary"
+                } else if prompt.starts_with("Describe what") {
+                    "callable-summary"
+                } else {
+                    "answer grounded in indexed context"
+                };
+                (
+                    200,
+                    json!({"output_text": format!("{prefix}: {}", slopdex::hash(body["input"].to_string()))}),
+                )
+            }
         }
         "/v1/rerank" => {
             let documents = body["documents"]
@@ -3353,12 +3403,16 @@ fn describe_uses_indexed_search_context_without_whole_files() -> Result<()> {
             .starts_with("answer grounded")
     );
     assert_eq!(answer["query"], "east");
-    assert_eq!(answer["files"].as_array().unwrap().len(), 1);
-    assert_eq!(answer["files"][0]["path"], "a.rs");
-    assert!(answer["files"][0].get("content").is_none());
-    assert_eq!(answer["functions"][0]["qualifiedName"], "alpha");
-    assert!(answer["functions"][0].get("source").is_none());
-    assert!(answer["functions"][0].get("embeddingInput").is_none());
+    assert_eq!(answer["references"].as_array().unwrap().len(), 1);
+    assert_eq!(answer["references"][0]["path"], "a.rs");
+    assert_eq!(answer["references"][0]["symbol"], "alpha");
+    assert_eq!(answer["references"][0]["startLine"], 2);
+    assert!(
+        answer.get("searchResults").is_none()
+            && answer.get("functions").is_none()
+            && answer.get("files").is_none(),
+        "search context must not be returned: {answer}"
+    );
     let requests = mock.requests("/responses");
     let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
         .as_str()
@@ -6295,14 +6349,14 @@ fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result
     repo.write(".slopdex/config.json", &mock.config().to_string())?;
     write_reference_traversal_fixture(&repo)?;
     repo.cli_json(&["update"])?;
-    let cases: [(&str, &str, &str, &[&str]); 5] = [
-        ("^middle$", "all", "0", &["b.py:6-7:helper"]),
-        ("^helper$", "cross-file", "0", &["c.py:3-4:leaf"]),
-        ("^middle$", "none", "1", &[]),
-        ("^middle$", "cross-file", "1", &[]),
-        ("^middle$", "all", "1", &["b.py:6-7:helper"]),
+    let cases: [(&str, &str, &str, &str); 5] = [
+        ("^middle$", "all", "0", "middle"),
+        ("^helper$", "cross-file", "0", "helper"),
+        ("^middle$", "none", "1", "middle"),
+        ("^middle$", "cross-file", "1", "middle"),
+        ("^middle$", "all", "1", "middle"),
     ];
-    for (pattern, mode, depth, references) in cases {
+    for (pattern, mode, depth, cited_symbol) in cases {
         let before = mock.requests("/responses").len();
         let result = repo.cli_json(&[
             "--no-reindex",
@@ -6325,32 +6379,23 @@ fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result
             "--refs",
             mode,
         ])?;
-        assert_eq!(result["functions"].as_array().unwrap().len(), 1);
-        let function = &result["functions"][0];
-        assert_eq!(function["references"], json!(references), "{mode}, {depth}");
         assert!(
-            function.get("callees").is_none(),
-            "legacy field: {function}"
+            result.get("functions").is_none() && result.get("searchResults").is_none(),
+            "faq returns only the answer and its references: {result}"
         );
-        let related = function["relatedCallables"].as_array().unwrap();
-        if depth == "0" {
-            assert!(
-                related.is_empty(),
-                "refs-only describe expanded targets: {result}"
-            );
-        } else {
-            assert_eq!(related.len(), 1);
-            assert_eq!(related[0]["node"]["name"], "helper");
-            assert_eq!(related[0]["callDepth"]["callee"], 1);
-            assert_eq!(
-                related[0]["references"],
-                if mode == "none" {
-                    json!([])
-                } else {
-                    json!(["c.py:3-4:leaf"])
-                }
-            );
-        }
+        let references = result["references"].as_array().unwrap();
+        let cited = references
+            .iter()
+            .find(|r| r["path"] == "b.py")
+            .unwrap_or_else(|| panic!("{mode}, {depth}: {result}"));
+        assert_eq!(cited["symbol"], cited_symbol, "{mode}, {depth}");
+        assert!(cited["startLine"].is_number(), "{result}");
+        assert!(
+            !references
+                .iter()
+                .any(|r| r["path"] == "c.py" || r["path"] == "d.py"),
+            "reference-only targets are not cited sections: {result}"
+        );
         let requests = mock.requests("/responses");
         assert_eq!(
             requests.len(),
@@ -6815,7 +6860,10 @@ fn describe_prompt_defaults_to_two_expanded_call_levels_with_explicit_overrides(
         "1",
     ];
     let result = repo.cli_json(&base)?;
-    assert!(result["functions"][0].get("relatedCallables").is_none());
+    assert!(
+        result.get("functions").is_none() && result.get("searchResults").is_none(),
+        "context expansion must not leak structured traversal into the result: {result}"
+    );
     let requests = mock.requests("/responses");
     let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
         .as_str()
@@ -7047,11 +7095,14 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
         "1",
     ])?;
     assert!(
-        describe["functions"]
-            .as_array()
-            .is_some_and(|fs| fs.iter().any(|f| f["relatedCallables"]
-                .as_array()
-                .is_some_and(|related| related.iter().any(|r| r["node"]["name"] == "outer"))))
+        describe["references"].as_array().is_some_and(|refs| {
+            refs.iter()
+                .any(|r| r["path"] == "a.py" && r["symbol"] == "outer")
+                && refs
+                    .iter()
+                    .any(|r| r["path"] == "b.py" && r["symbol"] == "middle")
+        }),
+        "the caller reached through the faq context must be citable: {describe}"
     );
     let cross = repo.cli(&[
         "cross-search",

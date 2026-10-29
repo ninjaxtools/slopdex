@@ -14,7 +14,7 @@ use super::{MapOutput, emit_map, warn_errors};
 use crate::engine::Engine;
 use crate::{limits, lines, ui};
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -165,7 +165,6 @@ fn faq(session: &mut Session, args: &FaqArgs, out: &mut impl Write) -> Result<()
     let cli = session.cli;
     let format = session.format();
     let mut options = args.query.filters.options();
-    let calls = args.query.calls.resolve(cli.global.detail);
     let context = args.query.calls.resolve_faq_context();
     options["callers"] = json!(context.callers);
     options["callees"] = json!(context.callees);
@@ -177,22 +176,9 @@ fn faq(session: &mut Session, args: &FaqArgs, out: &mut impl Write) -> Result<()
         options["faqThreshold"] = json!(threshold);
     }
     let engine = session.engine();
-    let mut result = ui::spin("Answering FAQ", || engine.faq(&args.query.query, &options))?;
-    // A semantic hit returns the original references, never a fresh search.
-    let references: Vec<Value> = serde_json::from_value(result["searchResults"].clone())?;
+    let result = ui::spin("Answering FAQ", || engine.faq(&args.query.query, &options))?;
+    // A semantic hit returns the original answer and references, never a fresh search.
     if format == Format::Json {
-        if calls.enabled() {
-            let presentation =
-                Presentation::with_calls(engine, calls, cli.global.expand_code_threshold)?;
-            if let Some(functions) = result["functions"].as_array_mut() {
-                for function in functions {
-                    let related = presentation.related_json(function);
-                    let outgoing = presentation.outgoing_json(function);
-                    function["relatedCallables"] = json!(related);
-                    function["references"] = json!(outgoing);
-                }
-            }
-        }
         print_json(out, &result)?;
     } else {
         writeln!(
@@ -200,16 +186,25 @@ fn faq(session: &mut Session, args: &FaqArgs, out: &mut impl Write) -> Result<()
             "Explanation\n{}",
             result["description"].as_str().unwrap_or("")
         )?;
+        let references = result["references"].as_array().cloned().unwrap_or_default();
         if !references.is_empty() {
             writeln!(out, "\nReferences")?;
-            print_search(
-                out,
-                &references,
-                format,
-                cli.global.detail,
-                false,
-                &mut Presentation::with_calls(engine, calls, cli.global.expand_code_threshold)?,
-            )?;
+            for reference in &references {
+                let path = reference["path"].as_str().unwrap_or("");
+                match reference["symbol"].as_str() {
+                    Some(symbol) => writeln!(
+                        out,
+                        "{}",
+                        crate::map::symbol_location(
+                            path,
+                            reference["startLine"].as_u64().unwrap_or(1) as usize,
+                            reference["endLine"].as_u64().unwrap_or(1) as usize,
+                            symbol,
+                        )
+                    )?,
+                    None => writeln!(out, "{path}")?,
+                }
+            }
         }
     }
     print_limit_notice(

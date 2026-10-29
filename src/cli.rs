@@ -12,7 +12,7 @@ mod workspace;
 use session::CommandMode;
 use session::Session;
 
-pub(crate) use output::faq_search_context;
+pub(crate) use output::{RenderedSymbol, faq_search_context};
 
 use self::{
     args::{Cli, Command, Format},

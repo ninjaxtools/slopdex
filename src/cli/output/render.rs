@@ -82,6 +82,56 @@ pub(super) fn score_details(row: &Value) -> String {
     }
 }
 
+/// One declaration actually rendered into map/search text, with the line
+/// range shown for it. FAQ validates LLM-cited symbols against these.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RenderedSymbol {
+    pub path: String,
+    pub qualified_name: String,
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+impl RenderedSymbol {
+    fn node(path: &str, node: &StructureNode) -> Self {
+        Self {
+            path: path.to_owned(),
+            qualified_name: node.qualified_name.clone(),
+            name: node.name.clone(),
+            start_line: node.start_line,
+            end_line: node.end_line,
+        }
+    }
+
+    /// Parse a `path:start-end:qualifiedName` reference location, as produced
+    /// by the call graph; invocation labels carry a trailing `()`.
+    fn location(location: &str) -> Option<Self> {
+        let (path, start, end, name) = location.match_indices(':').find_map(|(index, _)| {
+            let (range, name) = location[index + 1..].split_once(':')?;
+            let (start, end) = range.split_once('-').unwrap_or((range, range));
+            Some((
+                &location[..index],
+                start.parse::<usize>().ok()?,
+                end.parse::<usize>().ok()?,
+                name,
+            ))
+        })?;
+        let qualified_name = name.strip_suffix("()").unwrap_or(name);
+        Some(Self {
+            path: path.to_owned(),
+            name: qualified_name
+                .rsplit(['.', ':'])
+                .next()
+                .unwrap_or(qualified_name)
+                .to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            start_line: start,
+            end_line: end,
+        })
+    }
+}
+
 pub(in crate::cli) struct Presentation<'a> {
     engine: Option<&'a Engine>,
     structures: HashMap<String, Option<FileStructure>>,
@@ -91,6 +141,8 @@ pub(in crate::cli) struct Presentation<'a> {
     expanded: Option<Expansion>,
     force_code: BTreeSet<Key>,
     pub(super) dependencies: RefCell<BTreeSet<String>>,
+    pub(super) record_symbols: bool,
+    pub(super) rendered_symbols: RefCell<BTreeSet<RenderedSymbol>>,
 }
 
 impl<'a> Presentation<'a> {
@@ -104,6 +156,8 @@ impl<'a> Presentation<'a> {
             expanded: None,
             force_code: BTreeSet::new(),
             dependencies: RefCell::new(BTreeSet::new()),
+            record_symbols: false,
+            rendered_symbols: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -123,6 +177,12 @@ impl<'a> Presentation<'a> {
 
     pub(super) fn calls_enabled(&self) -> bool {
         self.calls.enabled()
+    }
+
+    fn record_symbol(&self, symbol: RenderedSymbol) {
+        if self.record_symbols {
+            self.rendered_symbols.borrow_mut().insert(symbol);
+        }
     }
 
     pub(super) fn key(&self, function: &Value) -> Option<Key> {
@@ -164,6 +224,12 @@ impl<'a> Presentation<'a> {
             .borrow_mut()
             .extend(graph.reference_paths(&key, self.calls.refs));
         let references = graph.reference_labels(&key, self.calls.refs);
+        for symbol in references
+            .iter()
+            .filter_map(|o| RenderedSymbol::location(o))
+        {
+            self.record_symbol(symbol);
+        }
         map::render_references(path, references.iter().map(String::as_str), depth)
     }
 
@@ -235,6 +301,8 @@ impl<'a> Presentation<'a> {
             expanded: None,
             force_code: BTreeSet::new(),
             dependencies: RefCell::new(BTreeSet::new()),
+            record_symbols: false,
+            rendered_symbols: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -696,6 +764,9 @@ fn print_ranked_file(
     }
     let mut nodes: Vec<_> = selected.into_values().collect();
     nodes.sort_by_key(StructureNode::source_order_key);
+    for node in &nodes {
+        presentation.record_symbol(RenderedSymbol::node(path, node));
+    }
     if let Some(graph) = &presentation.graph {
         for node in &nodes {
             let key = Key {
@@ -707,6 +778,11 @@ fn print_ranked_file(
                 .dependencies
                 .borrow_mut()
                 .extend(graph.reference_paths(&key, presentation.calls.refs));
+            // Reference targets are named in the rendered comments even when
+            // their own declarations are not rendered as hunks.
+            for symbol in outgoing.iter().filter_map(|o| RenderedSymbol::location(o)) {
+                presentation.record_symbol(symbol);
+            }
             if !outgoing.is_empty() {
                 references.insert(node.id, outgoing);
             }
@@ -776,6 +852,37 @@ fn print_ranked_file(
         )?;
     }
     for (fallback_index, hit) in unmatched.iter().enumerate() {
+        // Hits without indexed structure are rendered from their search unit
+        // metadata (or, for Markdown, their heading path) instead of a node.
+        let start = hit.item["startLine"].as_u64().unwrap_or(1) as usize;
+        let qualified = hit.item["qualifiedName"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| {
+                let headings: Vec<_> = array(&hit.item["headingPath"])
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect();
+                (!headings.is_empty()).then(|| headings.join("."))
+            });
+        if let Some(qualified_name) = qualified {
+            let name = text(hit.item, "name");
+            presentation.record_symbol(RenderedSymbol {
+                path: path.to_owned(),
+                name: if name.is_empty() {
+                    qualified_name
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&qualified_name)
+                        .to_owned()
+                } else {
+                    name.to_owned()
+                },
+                qualified_name,
+                start_line: start,
+                end_line: hit.item["endLine"].as_u64().unwrap_or(start as u64) as usize,
+            });
+        }
         if !nodes.is_empty() || file_hit.is_some() || fallback_index > 0 {
             writeln!(out)?;
         }

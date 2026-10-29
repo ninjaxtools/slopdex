@@ -253,11 +253,11 @@ The `faq` command sends the given question together with a `map` to the configur
 $ slopdex faq "How are RPC endpoints registered?"
 ```
 
-First a `map` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation which generates an explanation which will be emitted along with the `compact` map output.
+First a `map` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation, which generates an explanation along with a list of the file and file/symbol references from the map that it considers relevant. Only the explanation and those references (with line numbers taken from the map) are emitted and cached; references that do not appear in the map are silently dropped, and the map output itself is discarded.
 
 The result is indexed under the embeddings of the original question as well as the LLM response. Any subsequent questions will be use the index to try and get a match above the configured threshold (0.9 by default, configured with `--faq-threshold`), and reuse the response.
 
-Changes in the files involved invalidate the FAQ answer and repeat the LLM request.
+Changes in the referenced files invalidate the FAQ answer and repeat the LLM request.
 
 ## Inspect and export indexes
 

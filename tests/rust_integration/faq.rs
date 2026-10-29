@@ -48,7 +48,7 @@ fn faq_matches_question_or_plain_answer_without_repeating_search_and_survives_re
     let reranks = mock.requests("/rerank").len();
     let by_question = engine.faq("VECTOR_NORTH paraphrased question", &options)?;
     assert_eq!(by_question["description"], original["description"]);
-    assert_eq!(by_question["searchResults"], original["searchResults"]);
+    assert_eq!(by_question["references"], original["references"]);
     // This query is orthogonal to the stored question, but identical to its answer vector.
     let by_answer = engine.faq("eastward answer paraphrase", &options)?;
     assert_eq!(by_answer["question"], original["question"]);
@@ -155,7 +155,7 @@ fn faq_invalidates_changed_deleted_and_renamed_files_but_not_unrelated_edits() -
     );
     engine.refresh()?;
     assert!(
-        engine.faq("east", &options)?["files"]
+        engine.faq("east", &options)?["references"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -164,7 +164,7 @@ fn faq_invalidates_changed_deleted_and_renamed_files_but_not_unrelated_edits() -
 }
 
 #[test]
-fn faq_tracks_expanded_callers_callees_and_reference_only_files() -> Result<()> {
+fn faq_tracks_cited_expanded_files_but_not_uncited_reference_only_files() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     repo.write("entry.ts", "import { helper, LIMIT } from './defs';\nexport function entry() { /* VECTOR_EAST */ return helper() + LIMIT; }\n")?;
@@ -174,15 +174,19 @@ fn faq_tracks_expanded_callers_callees_and_reference_only_files() -> Result<()> 
     )?;
     let mut engine = repo.open(&mock.config())?;
     engine.refresh()?;
-    for (callers, callees, refs) in [(2, 2, "none"), (0, 0, "cross-file")] {
+    // Expanded callees render defs.ts as its own section, which the mock LLM
+    // cites; reference-only mentions are present in the context but uncited.
+    for (callers, callees, refs, cited) in [(2, 2, "none", true), (0, 0, "cross-file", false)] {
         let options = json!({"glob":"entry.ts", "minSimilarity":-1,"callers":callers,"callees":callees,"expandCallers":0,"expandCallees":0,"refs":refs});
         let answer = engine.faq("east", &options)?;
-        assert!(
-            answer["files"]
+        assert_eq!(
+            answer["references"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|file| file["path"] == "defs.ts")
+                .any(|file| file["path"] == "defs.ts"),
+            cited,
+            "{answer}"
         );
         let calls = mock.requests("/responses").len();
         repo.write("defs.ts", &format!("export const LIMIT = {};\nexport function helper() {{ /* VECTOR_NORTH */ return LIMIT; }}\n", calls + 10))?;
@@ -191,15 +195,23 @@ fn faq_tracks_expanded_callers_callees_and_reference_only_files() -> Result<()> 
         assert_eq!(
             mock.requests("/responses").len(),
             calls,
-            "the changed reference target did not change the actual prompt"
+            "the changed target did not change the actual prompt"
         );
         let rows = engine.index_entries("faq", &json!({}))?;
         let expected = slopdex::hash(fs::read(repo.root.join("defs.ts"))?);
-        assert!(
-            rows.iter()
-                .any(|row| row["data"]["valid"] == true
-                    && row["data"]["files"]["defs.ts"] == expected)
-        );
+        if cited {
+            assert!(
+                rows.iter().any(|row| row["data"]["valid"] == true
+                    && row["data"]["files"]["defs.ts"] == expected),
+                "the cited file's new hash must be tracked: {rows:?}"
+            );
+        } else {
+            assert!(
+                rows.iter().any(|row| row["data"]["valid"] == true
+                    && row["data"]["files"].get("defs.ts").is_none()),
+                "the uncited file must not be tracked: {rows:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -240,8 +252,24 @@ fn faq_cli_replaces_describe_and_threshold_override_reuses_saved_references() ->
     ])?;
     assert_eq!(second["question"], "east");
     assert_eq!(second["description"], first["description"]);
-    assert_eq!(second["searchResults"], first["searchResults"]);
+    assert_eq!(second["references"], first["references"]);
     assert_eq!(mock.requests("/responses").len(), 1);
+    let text = repo.cli_format(&["faq", "east", "--threshold", "-1"], "text")?;
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let text = String::from_utf8(text.stdout)?;
+    assert!(text.starts_with("Explanation\nanswer grounded"), "{text}");
+    assert!(
+        text.contains("\nReferences\ncode.rs:1-4:selected\n"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("*** code.rs") && !text.contains("@@"),
+        "text output must not include map excerpts: {text}"
+    );
     assert!(!repo.cli(&["describe", "east"])?.status.success());
     for value in ["NaN", "2", "-2", "0.8-0.9"] {
         assert!(
@@ -281,7 +309,8 @@ fn faq_selects_best_entry_and_isolates_filters_and_embedding_profiles() -> Resul
     assert_eq!(mock.requests("/responses").len(), calls);
     options["glob"] = json!("one.rs");
     let filtered = engine.faq("VECTOR_NORTH question", &options)?;
-    assert_eq!(filtered["files"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["references"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["references"][0]["path"], "one.rs");
     assert_eq!(mock.requests("/responses").len(), calls + 1);
     drop(engine);
     let mut changed = config.clone();
@@ -349,7 +378,7 @@ fn faq_readers_defer_writes_without_allowing_stale_semantic_hits() -> Result<()>
     let answer = engine.faq("east new question", &all())?;
     assert_eq!(answer["question"], "east original question");
     assert_eq!(answer["query"], "east new question");
-    assert_eq!(answer["functions"][0]["qualifiedName"], "changed");
+    assert_eq!(answer["references"][0]["symbol"], "changed");
     assert_eq!(
         db.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?,
         before
@@ -563,5 +592,83 @@ fn faq_request_cache_keeps_paid_answers_even_when_the_snapshot_cannot_publish_a_
     assert_eq!(engine.faq("east", &all())?, answer);
     assert_eq!(entries(&repo)?, 1);
     assert_eq!(mock.requests("/responses").len(), calls);
+    Ok(())
+}
+
+#[test]
+fn faq_returns_only_llm_text_and_selected_references_and_invalidates_only_referenced_files()
+-> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("entry.ts", "import { helper, LIMIT } from './defs';\nexport function entry() { /* VECTOR_EAST */ return helper() + LIMIT; }\n")?;
+    repo.write(
+        "defs.ts",
+        "export const LIMIT = 1;\nexport function helper() { /* VECTOR_NORTH */ return LIMIT; }\n",
+    )?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    // defs.ts reaches the LLM context only as cross-file reference comments;
+    // the mock LLM cites the rendered entry.ts symbol, not defs.ts.
+    let options = json!({"glob":"entry.ts", "minSimilarity":-1,"callers":0,"callees":0,"expandCallers":0,"expandCallees":0,"refs":"cross-file"});
+    let answer = engine.faq("east", &options)?;
+    let node = engine
+        .presentation_structure("entry.ts")?
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|node| node.qualified_name == "entry")
+        .unwrap();
+    assert_eq!(
+        answer["references"],
+        json!([{"path":"entry.ts","symbol":"entry","startLine":node.start_line,"endLine":node.end_line}])
+    );
+    for discarded in ["searchResults", "functions", "files"] {
+        assert!(
+            answer.get(discarded).is_none(),
+            "map output must not be returned: {answer}"
+        );
+    }
+    let (result, files): (String, String) =
+        repo.db()?
+            .query_row("SELECT result,files FROM faq_entries", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+    let stored: Value = serde_json::from_str(&result)?;
+    assert_eq!(stored["references"], answer["references"]);
+    assert!(stored.get("searchResults").is_none(), "{stored}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&files)?
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["entry.ts"],
+        "only referenced files are tracked for invalidation"
+    );
+    // Changing a context file the LLM did not cite keeps the answer valid.
+    let calls = mock.requests("/responses").len();
+    repo.write(
+        "defs.ts",
+        "export const LIMIT = 2;\nexport function helper() { /* VECTOR_NORTH */ return LIMIT; }\n",
+    )?;
+    engine.refresh()?;
+    assert_eq!(
+        engine.index_entries("faq", &json!({}))?[0]["data"]["valid"],
+        true
+    );
+    assert_eq!(engine.faq("east", &options)?, answer);
+    assert_eq!(mock.requests("/responses").len(), calls);
+    // Changing the referenced file invalidates the cached answer.
+    repo.write("entry.ts", "import { helper, LIMIT } from './defs';\nexport function entry() { /* VECTOR_EAST */ return helper() + LIMIT + 1; }\n")?;
+    engine.refresh()?;
+    assert_eq!(
+        engine.index_entries("faq", &json!({}))?[0]["data"]["valid"],
+        false
+    );
+    engine.faq("east", &options)?;
+    assert_eq!(
+        engine.index_entries("faq", &json!({}))?[0]["data"]["valid"],
+        true
+    );
     Ok(())
 }

@@ -92,14 +92,21 @@ pub(in crate::cli) fn print_search(
     )
 }
 
-/// FAQ uses expanded search presentation; dependencies include traversal and reference targets.
+pub(crate) use super::render::RenderedSymbol;
+
+/// FAQ uses expanded search presentation; dependencies include traversal and
+/// reference targets, and rendered symbols are what the LLM may later cite.
 pub(crate) fn faq_search_context(
     engine: &Engine,
     rows: &[Value],
     depths: (usize, usize, usize, usize),
     refs: Refs,
     expand_code_threshold: f64,
-) -> Result<(String, std::collections::BTreeSet<String>)> {
+) -> Result<(
+    String,
+    std::collections::BTreeSet<String>,
+    Vec<RenderedSymbol>,
+)> {
     let (callers, callees, expand_callers, expand_callees) = depths;
     let mut out = Vec::new();
     let mut presentation = Presentation::with_calls(
@@ -113,6 +120,7 @@ pub(crate) fn faq_search_context(
         },
         expand_code_threshold,
     )?;
+    presentation.record_symbols = true;
     print_search(
         &mut out,
         rows,
@@ -121,9 +129,18 @@ pub(crate) fn faq_search_context(
         false,
         &mut presentation,
     )?;
+    let mut symbols: Vec<_> = presentation
+        .rendered_symbols
+        .into_inner()
+        .into_iter()
+        .collect();
+    symbols.sort_by(|a, b| {
+        (&a.path, a.start_line, &a.qualified_name).cmp(&(&b.path, b.start_line, &b.qualified_name))
+    });
     Ok((
         String::from_utf8(out)?,
         presentation.dependencies.into_inner(),
+        symbols,
     ))
 }
 

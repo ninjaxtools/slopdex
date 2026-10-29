@@ -87,7 +87,7 @@ provider caches accelerate work but do not define the live repository snapshot.
    and ranks indexed callables by code similarity; available callable/file
    description similarities are supplementary scores and do not affect ranking
    or thresholds.
-   `faq` reuses answers through a separate question/answer vector index, checking context-file hashes before reuse; on a miss it sends search context to an LLM. `map.rs`
+   `faq` reuses answers through a separate question/answer vector index, checking referenced-file hashes before reuse; on a miss it sends search context to an LLM and keeps only the explanations' cited files/symbols that appear in that context. `map.rs`
    renders declaration excerpts, and `callgraph.rs` expands conservatively
    resolved caller/callee context from saved structure.
    Callable graph depths control declaration/code expansion; independent `--refs`
