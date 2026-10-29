@@ -143,6 +143,11 @@ pub(in crate::cli) struct Presentation<'a> {
     pub(super) dependencies: RefCell<BTreeSet<String>>,
     pub(super) record_symbols: bool,
     pub(super) rendered_symbols: RefCell<BTreeSet<RenderedSymbol>>,
+    /// FAQ context renders every declaration in candidate files, not only hits.
+    pub(super) full_file_maps: bool,
+    /// FAQ context drops whole trailing file sections beyond this many bytes.
+    pub(super) byte_budget: Option<usize>,
+    pub(super) sections_omitted: bool,
 }
 
 impl<'a> Presentation<'a> {
@@ -158,6 +163,9 @@ impl<'a> Presentation<'a> {
             dependencies: RefCell::new(BTreeSet::new()),
             record_symbols: false,
             rendered_symbols: RefCell::new(BTreeSet::new()),
+            full_file_maps: false,
+            byte_budget: None,
+            sections_omitted: false,
         }
     }
 
@@ -303,6 +311,9 @@ impl<'a> Presentation<'a> {
             dependencies: RefCell::new(BTreeSet::new()),
             record_symbols: false,
             rendered_symbols: RefCell::new(BTreeSet::new()),
+            full_file_maps: false,
+            byte_budget: None,
+            sections_omitted: false,
         }
     }
 
@@ -633,17 +644,108 @@ pub(super) fn print_ranked_files(
             .total_cmp(&maximum(&a.1))
             .then_with(|| a.0.cmp(&b.0))
     });
-    for (index, ((is_target, path), hits)) in files.into_iter().enumerate() {
-        if index > 0 {
-            writeln!(out)?;
+    let budget = source.byte_budget;
+    let mut written = 0usize;
+    let mut written_sections = 0usize;
+    let mut omitted = false;
+    for ((is_target, path), hits) in files {
+        if budget.is_none() {
+            if written_sections > 0 {
+                writeln!(out)?;
+            }
+            if is_target && target.is_some() {
+                print_ranked_file(out, &path, &hits, detail, target.as_deref_mut().unwrap())?;
+            } else {
+                print_ranked_file(out, &path, &hits, detail, source)?;
+            }
+            written_sections += 1;
+            continue;
         }
-        if is_target && target.is_some() {
-            print_ranked_file(out, &path, &hits, detail, target.as_deref_mut().unwrap())?;
+        let separator = usize::from(written_sections > 0);
+        let allowance = budget
+            .unwrap()
+            .saturating_sub(written)
+            .saturating_sub(separator);
+        let (section, section_omitted) = if is_target && target.is_some() {
+            budgeted_section(
+                target.as_deref_mut().unwrap(),
+                &path,
+                &hits,
+                detail,
+                allowance,
+                written_sections == 0,
+            )?
         } else {
-            print_ranked_file(out, &path, &hits, detail, source)?;
+            budgeted_section(
+                source,
+                &path,
+                &hits,
+                detail,
+                allowance,
+                written_sections == 0,
+            )?
+        };
+        omitted |= section_omitted;
+        let Some(section) = section.filter(|section| !section.is_empty()) else {
+            continue;
+        };
+        if written_sections > 0 {
+            writeln!(out)?;
+            written += 1;
         }
+        out.write_all(&section)?;
+        written += section.len();
+        written_sections += 1;
     }
+    source.sections_omitted = omitted;
     Ok(())
+}
+
+/// Render one file section within `allowance` bytes, retrying hits-only when
+/// the full map does not fit and rolling back tracked state for skipped files.
+fn budgeted_section(
+    active: &mut Presentation<'_>,
+    path: &str,
+    hits: &[RankedHit<'_>],
+    detail: Detail,
+    allowance: usize,
+    first: bool,
+) -> Result<(Option<Vec<u8>>, bool)> {
+    let dependencies = active.dependencies.borrow().clone();
+    let symbols = active.rendered_symbols.borrow().clone();
+    let mut section = Vec::new();
+    print_ranked_file(&mut section, path, hits, detail, active)?;
+    if section.is_empty() {
+        return Ok((Some(section), false));
+    }
+    let mut omitted = false;
+    if section.len() > allowance && active.full_file_maps {
+        omitted = true;
+        *active.dependencies.borrow_mut() = dependencies.clone();
+        *active.rendered_symbols.borrow_mut() = symbols.clone();
+        let full = active.full_file_maps;
+        active.full_file_maps = false;
+        section.clear();
+        let rendered = print_ranked_file(&mut section, path, hits, detail, active);
+        active.full_file_maps = full;
+        rendered?;
+    }
+    if section.len() > allowance {
+        omitted = true;
+        if !first {
+            *active.dependencies.borrow_mut() = dependencies;
+            *active.rendered_symbols.borrow_mut() = symbols;
+            return Ok((None, omitted));
+        }
+        let mut end = allowance.min(section.len());
+        if let Ok(text) = std::str::from_utf8(&section) {
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+        }
+        section.truncate(end);
+    }
+    Ok((Some(section), omitted))
 }
 
 fn print_ranked_file(
@@ -655,6 +757,11 @@ fn print_ranked_file(
 ) -> Result<()> {
     let structure = presentation.structure(path)?.cloned();
     let mut selected = HashMap::<usize, StructureNode>::new();
+    if presentation.full_file_maps
+        && let Some(structure) = &structure
+    {
+        selected.extend(structure.nodes.iter().map(|node| (node.id, node.clone())));
+    }
     let mut annotations: HashMap<usize, String> = HashMap::new();
     let mut references = HashMap::new();
     let mut extras = HashMap::new();

@@ -1067,20 +1067,29 @@ with `0`.
 
 ### Frequently asked questions
 
-`faq` replaces `describe`. On a cache miss it sends the query and expanded text search output (file headers,
-declaration skeletons, scores, available source or generated descriptions, and
-Markdown content) to the configured description provider. The prompt includes
-indexed code for callers and callees up to two edges away
-by default, even below `--expand-code-threshold`. Use `--expand-callers N` and
-`--expand-callees N` (or `--expand-callables N`) to override either depth;
-explicit `0` disables that direction's automatic code expansion. These defaults
-apply only to the LLM context; the rendered search output itself is neither
-returned nor cached with the answer.
+`faq` replaces `describe`. On a cache miss it first uses semantic search to
+select seed files, symbols, and Markdown sections for the question. It then
+sends the configured description provider a merged context for those candidate
+files: each candidate file's full declaration map (all declarations and
+headings, including private ones), scores on the direct hits, available file
+descriptions, and Markdown seed content. Direct seed declarations include
+their indexed source code when their similarity exceeds
+`--expand-code-threshold`; callers and callees include code up to two edges
+away by default, even below that threshold, while other declarations in the
+file maps remain signatures only.
+Use `--expand-callers N` and `--expand-callees N` (or `--expand-callables N`)
+to override either related-code depth; explicit `0` disables that direction's
+related-code expansion. These defaults apply only to
+the LLM context; the rendered context itself is neither returned nor cached
+with the answer.
 `--refs` controls outgoing annotations in that context independently of
 traversal. Its implicit default follows the context's resolved depths,
 including its code-expansion depths.
-The entire prompt is limited to 128 KiB; expanded search output is marked if
-truncated on a UTF-8 boundary. Complete files are not appended to the prompt.
+The entire prompt is limited to 128 KiB. Candidate files are rendered in
+relevance order; a file whose full map does not fit the remaining budget is
+retried as hits-only excerpts, and whole trailing file sections beyond the
+budget are omitted and marked. Complete file source is not appended apart
+from the selected code bodies and Markdown excerpts above.
 The instruction asks for an explanation of existing code/docs, not an
 implementation proposal, as a single JSON object holding a free-text
 `description` and a `references` list of the files and symbols from the
@@ -1090,7 +1099,8 @@ for symbol references).
 Context uses the indexed snapshot. Provider retries/failover still apply.
 Cited references are validated against the rendered context: a file citation
 must name a rendered file, and a symbol citation must name a rendered
-declaration (including expanded callers/callees and reference-comment targets)
+declaration (including other declarations in a candidate file's full map,
+expanded callers/callees, and reference-comment targets)
 in that file, matched by qualified or unqualified name. Citations that do not
 match are silently dropped, as are any line numbers the model supplies.
 Responses that are not the requested JSON object are treated as a plain

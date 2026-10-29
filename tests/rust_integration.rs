@@ -251,15 +251,15 @@ fn description_prompt(body: &Value) -> &str {
 }
 
 /// Simulate an LLM citing its FAQ context: one reference per rendered file
-/// section, naming the section's first callable when the prompt shows one.
+/// section, naming its scored direct hit when shown, else its first callable.
 fn faq_citations(prompt: &str) -> Vec<Value> {
     let mut references = Vec::new();
-    let mut current: Option<(String, Option<String>)> = None;
-    let mut finish = |current: &mut Option<(String, Option<String>)>| {
-        if let Some((path, symbol)) = current.take()
+    let mut current: Option<(String, Option<String>, Option<String>)> = None;
+    let mut finish = |current: &mut Option<(String, Option<String>, Option<String>)>| {
+        if let Some((path, scored, first)) = current.take()
             && !references.iter().any(|r: &Value| r["path"] == path)
         {
-            references.push(match symbol {
+            references.push(match scored.or(first) {
                 Some(symbol) => json!({"path": path, "symbol": symbol}),
                 None => json!({"path": path}),
             });
@@ -268,10 +268,16 @@ fn faq_citations(prompt: &str) -> Vec<Value> {
     for line in prompt.lines() {
         if let Some(header) = line.strip_prefix("*** ") {
             finish(&mut current);
-            current = Some((header.split("  ").next().unwrap().trim().to_owned(), None));
+            current = Some((
+                header.split("  ").next().unwrap().trim().to_owned(),
+                None,
+                None,
+            ));
             continue;
         }
-        if let Some((_, symbol @ None)) = &mut current {
+        if let Some((_, scored, first)) = &mut current
+            && (scored.is_none() || first.is_none())
+        {
             for keyword in ["fn ", "def ", "function "] {
                 if let Some(index) = line.find(keyword) {
                     let name: String = line[index + keyword.len()..]
@@ -279,7 +285,12 @@ fn faq_citations(prompt: &str) -> Vec<Value> {
                         .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
                         .collect();
                     if !name.is_empty() {
-                        *symbol = Some(name);
+                        if first.is_none() {
+                            *first = Some(name.clone());
+                        }
+                        if scored.is_none() && line.contains("score=") {
+                            *scored = Some(name);
+                        }
                         break;
                     }
                 }
@@ -3418,9 +3429,16 @@ fn describe_uses_indexed_search_context_without_whole_files() -> Result<()> {
         .as_str()
         .unwrap();
     assert!(prompt.starts_with("Task: east\n\n*** a.rs\n"), "{prompt}");
-    assert!(prompt.contains("@@ 2-"), "{prompt}");
+    assert!(prompt.contains("@@ 1-"), "{prompt}");
     assert!(prompt.contains("fn alpha"), "{prompt}");
-    assert!(!prompt.contains("FILE_CONTEXT_SENTINEL"), "{prompt}");
+    assert!(
+        prompt.contains("const FILE_CONTEXT_SENTINEL"),
+        "the candidate file's declaration map is included: {prompt}"
+    );
+    assert!(
+        !prompt.contains("fn other"),
+        "non-candidate files are not mapped: {prompt}"
+    );
     assert!(!prompt.contains("Full source code for best matching files"));
     assert!(!prompt.contains("not_indexed_yet"));
     assert!(!prompt.starts_with('{'));
@@ -6356,6 +6374,7 @@ fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result
         ("^middle$", "cross-file", "1", "middle"),
         ("^middle$", "all", "1", "middle"),
     ];
+    let mut first_prompt = String::new();
     for (pattern, mode, depth, cited_symbol) in cases {
         let before = mock.requests("/responses").len();
         let result = repo.cli_json(&[
@@ -6397,12 +6416,21 @@ fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result
             "reference-only targets are not cited sections: {result}"
         );
         let requests = mock.requests("/responses");
-        assert_eq!(
-            requests.len(),
-            before + 1,
-            "describe must generate this distinct context"
+        // With full file maps and zero code-expansion depths, all/1 renders
+        // exactly the all/0 prompt, so its paid LLM response is reused.
+        assert!(
+            requests.len() == before || requests.len() == before + 1,
+            "{mode}, {depth}: {requests:?}"
         );
-        let prompt = description_prompt(&requests.last().unwrap().body);
+        let prompt = if requests.len() == before {
+            first_prompt.clone()
+        } else {
+            description_prompt(&requests.last().unwrap().body).to_owned()
+        };
+        if first_prompt.is_empty() {
+            first_prompt = prompt.clone();
+        }
+        let prompt = &prompt;
         assert_eq!(
             prompt.contains("  # b.py:helper()\n"),
             mode == "all",
@@ -6410,13 +6438,16 @@ fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result
         );
         assert_eq!(
             prompt.contains("  # c.py:leaf()\n"),
-            mode != "none" && (depth == "1" || pattern == "^helper$"),
+            mode != "none",
             "{mode}, {depth}: {prompt}"
         );
-        assert_eq!(
+        assert!(
             prompt.contains("def helper():"),
-            depth == "1" || pattern == "^helper$",
-            "{prompt}"
+            "the full b.py map includes sibling declarations: {prompt}"
+        );
+        assert!(
+            !prompt.contains("@ code:\ndef helper():"),
+            "code-expansion depths are 0 and the expand threshold is 1: {prompt}"
         );
         assert!(
             !prompt.contains("def leaf():"),

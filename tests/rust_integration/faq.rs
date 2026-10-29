@@ -672,3 +672,33 @@ fn faq_returns_only_llm_text_and_selected_references_and_invalidates_only_refere
     );
     Ok(())
 }
+
+#[test]
+fn faq_context_includes_full_file_maps_and_seed_code() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(
+        "code.rs",
+        &(function("selected", "VECTOR_EAST") + &function("sibling", "VECTOR_WEST")),
+    )?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let options = json!({"glob":"code.rs","minSimilarity":0.9,"code":true});
+    engine.faq("east", &options)?;
+    let requests = mock.requests("/responses");
+    let prompt = description_prompt(&requests.last().unwrap().body);
+    assert!(prompt.contains("*** code.rs\n"), "{prompt}");
+    assert!(
+        prompt.contains("fn sibling"),
+        "the seed file's full declaration map must reach the LLM: {prompt}"
+    );
+    assert!(
+        prompt.contains("@ code:\nfn selected"),
+        "direct seed code must reach the LLM: {prompt}"
+    );
+    assert!(
+        !prompt.contains("@ code:\nfn sibling"),
+        "non-seed declarations stay as map signatures: {prompt}"
+    );
+    Ok(())
+}

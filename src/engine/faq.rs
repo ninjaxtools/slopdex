@@ -47,7 +47,7 @@ impl Engine {
         context["limit"] = limits::resolve(&self.config, options)?.value();
         let contract = hash(
             json!([
-                "faq-v2",
+                "faq-v3",
                 SYSTEM,
                 STRUCTURE_PARSER_VERSION,
                 self.providers.vector().profile(),
@@ -204,12 +204,16 @@ impl Engine {
         );
         // The rendered search text is LLM context only: it is neither returned
         // nor cached with the answer. Its files/symbols bound what may be cited.
-        let (search, dependencies, symbols) = crate::cli::faq_search_context(
+        // Reserve room for the truncation marker; whole trailing file sections
+        // beyond the remaining budget are omitted during rendering instead.
+        let search_budget = FAQ_PROMPT_BYTES - prompt.len() - marker.len();
+        let (search, dependencies, symbols, omitted) = crate::cli::faq_search_context(
             self,
             &matches,
             (callers, callees, expand_callers, expand_callees),
             refs,
             options["expandCodeThreshold"].as_f64().unwrap_or(0.9),
+            search_budget,
         )?;
         let context_files: BTreeMap<_, _> = dependencies
             .into_iter()
@@ -218,15 +222,8 @@ impl Engine {
                 Ok((path, file.hash.clone()))
             })
             .collect::<Result<_>>()?;
-        let search_budget = FAQ_PROMPT_BYTES - prompt.len();
-        if search.len() <= search_budget {
-            prompt.push_str(&search);
-        } else {
-            let mut end = search_budget.saturating_sub(marker.len());
-            while !search.is_char_boundary(end) {
-                end -= 1;
-            }
-            prompt.push_str(&search[..end]);
+        prompt.push_str(&search);
+        if omitted {
             prompt.push_str(marker);
         }
         ui::progress("Generating explanation from search results");

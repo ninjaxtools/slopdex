@@ -247,13 +247,13 @@ $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 
 ## Frequently asked questions
 
-The `faq` command sends the given question together with a `map` to the configured LLM and caches the response in a vector index.
+The `faq` command sends the given question together with relevant code and file maps to the configured LLM and caches the response in a vector index.
 
 ```console
 $ slopdex faq "How are RPC endpoints registered?"
 ```
 
-First a `map` is performed with `--detail expanded`, `--expand-callers 2`, and `--expand-callees 2`, which will include code and comments/descriptions. The result is given to an LLM for interpretation, which generates an explanation along with a list of the file and file/symbol references from the map that it considers relevant. Only the explanation and those references (with line numbers taken from the map) are emitted and cached; references that do not appear in the map are silently dropped, and the map output itself is discarded.
+First a semantic search selects the relevant files and symbols for the question. For each candidate file, the LLM is then given its full declaration map in expanded detail, with source code for the directly relevant symbols and for callers/callees up to two edges away. The LLM generates an explanation along with a list of the file and file/symbol references from that context that it considers relevant. Only the explanation and those references (with line numbers taken from the map) are emitted and cached; references that do not appear in the context are silently dropped, and the context itself is discarded.
 
 The result is indexed under the embeddings of the original question as well as the LLM response. Any subsequent questions will be use the index to try and get a match above the configured threshold (0.9 by default, configured with `--faq-threshold`), and reuse the response.
 
