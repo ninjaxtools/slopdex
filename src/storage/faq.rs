@@ -1,4 +1,5 @@
 //! Workspace-local FAQ membership; provider vectors remain in the artifact store.
+use super::publish::validate_embedding_reference;
 use super::*;
 use std::collections::BTreeMap;
 

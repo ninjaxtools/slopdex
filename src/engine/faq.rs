@@ -179,3 +179,152 @@ impl Engine {
         Ok(prepared.into_index())
     }
 }
+
+const FAQ_PROMPT_BYTES: usize = 128 * 1024;
+
+impl Engine {
+    fn answer_faq(
+        &self,
+        query: &str,
+        options: &Value,
+        previous_files: Option<&BTreeMap<String, String>>,
+    ) -> Result<(Value, BTreeMap<String, String>)> {
+        let expand_callers = options["expandCallers"].as_u64().unwrap_or(2) as usize;
+        let expand_callees = options["expandCallees"].as_u64().unwrap_or(2) as usize;
+        let callers = (options["callers"].as_u64().unwrap_or(0) as usize).max(expand_callers);
+        let callees = (options["callees"].as_u64().unwrap_or(0) as usize).max(expand_callees);
+        let refs = crate::map::reference_mode(options, callers, callees)?;
+        let results = self.search_limited(query, "search", options)?;
+        let mut matches = results.rows;
+        let mut files = BTreeMap::<String, Value>::new();
+        for item in &matches {
+            let data = match item["type"].as_str() {
+                Some("markdown" | "document") => &item["chunk"],
+                Some("symbol") => &item["symbol"],
+                Some("file") => &item["file"],
+                _ => &item["function"],
+            };
+            if let Some(path) = data["path"].as_str() {
+                let file = &self.files[path];
+                let similarity = score(item, "similarity");
+                let entry = files.entry(path.into()).or_insert_with(
+                    || json!({"path":path,"description":file.description,"similarity":similarity}),
+                );
+                if similarity > score(entry, "similarity") {
+                    entry["similarity"] = json!(similarity);
+                }
+            }
+        }
+        let mut prompt = format!("Task: {query}\n\n");
+        let marker = "\n[Search results truncated to fit the prompt size limit]\n";
+        ensure!(
+            prompt.len() + marker.len() <= FAQ_PROMPT_BYTES,
+            "FAQ question exceeds the prompt size limit"
+        );
+        let (search, dependencies) = crate::cli::faq_search_context(
+            self,
+            &matches,
+            (callers, callees, expand_callers, expand_callees),
+            refs,
+            options["expandCodeThreshold"].as_f64().unwrap_or(0.9),
+        )?;
+        let dependencies: BTreeMap<_, _> = dependencies
+            .into_iter()
+            .map(|path| {
+                let file = self.files.get(&path).context("Missing FAQ context file")?;
+                files
+                    .entry(path.clone())
+                    .or_insert_with(|| json!({"path":path,"description":file.description}));
+                Ok((path, file.hash.clone()))
+            })
+            .collect::<Result<_>>()?;
+        let search_budget = FAQ_PROMPT_BYTES - prompt.len();
+        if search.len() <= search_budget {
+            prompt.push_str(&search);
+        } else {
+            let mut end = search_budget.saturating_sub(marker.len());
+            while !search.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.push_str(&search[..end]);
+            prompt.push_str(marker);
+        }
+        ui::progress("Generating explanation from search results");
+        let system = faq::SYSTEM;
+        let request = json!([
+            "explanation-request-v1",
+            self.providers.llm().profile(),
+            self.config["descriptionBaseUrl"],
+            self.config["descriptionFallbackModel"],
+            self.config["fallbackModel"],
+            system,
+            prompt
+        ]);
+        // Request identity is independent of FAQ file hashes, index generations,
+        // and the incoming paraphrase. Successful paid results live in global.cache.
+        let key = hash(request.to_string());
+        self.artifacts
+            .hydrate_text(&self.db, "explanation", std::slice::from_ref(&key))?;
+        let _lock = registry::artifact_lock(&self.db, "explanation", &key)?;
+        let description = if let Some(cached) = self.db.cache("explanation", &key)? {
+            cached
+        } else {
+            // Promote old exact-request results when their old identity can
+            // still be reconstructed. Never reuse one whose prompt differs.
+            let mut legacy = request.clone();
+            legacy[0] = json!("explanation-v2");
+            let mut keys = vec![hash(legacy.to_string())];
+            legacy[0] = json!("explanation-v3");
+            for files in std::iter::once(&dependencies).chain(previous_files) {
+                let mut legacy = legacy.clone();
+                legacy.as_array_mut().unwrap().push(json!(files));
+                let key = hash(legacy.to_string());
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            self.artifacts
+                .hydrate_text(&self.db, "explanation", &keys)?;
+            let mut cached = None;
+            for key in keys {
+                cached = self.db.cache("explanation", &key)?;
+                if cached.is_some() {
+                    break;
+                }
+            }
+            let description = match cached {
+                Some(cached) => cached,
+                None => self.providers.llm().describe(system, &prompt)?,
+            };
+            self.db.cache_put("explanation", &key, &description)?;
+            self.artifacts
+                .put_text(&self.db, "explanation", &key, &description);
+            description
+        };
+        let files: Vec<_> = files.into_values().collect();
+        let functions: Vec<_> = matches
+            .iter()
+            .filter(|r| r["type"] == "function")
+            .map(|r| {
+                let mut f = r["function"].clone();
+                f.as_object_mut().unwrap().remove("source");
+                f.as_object_mut().unwrap().remove("embeddingInput");
+                f["similarity"] = r["similarity"].clone();
+                f
+            })
+            .collect();
+        for row in &mut matches {
+            for key in ["function", "symbol", "file", "chunk"] {
+                if let Some(data) = row.get_mut(key).and_then(Value::as_object_mut) {
+                    data.remove("source");
+                    data.remove("embeddingInput");
+                }
+            }
+        }
+        Ok((
+            json!({"query":query,"question":query,"description":description,"files":files,"functions":functions,
+            "searchResults":matches,"omitted":results.omitted,"limit":results.limit}),
+            dependencies,
+        ))
+    }
+}

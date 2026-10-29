@@ -1,4 +1,6 @@
 use super::{test_support::parse, *};
+use serde_json::json;
+use std::path::Path;
 
 #[test]
 fn external_source_saved_config_paths_use_its_directory() -> Result<()> {
