@@ -231,9 +231,7 @@ impl Engine {
         let request = json!([
             "explanation-request-v1",
             self.providers.llm().profile(),
-            self.config["descriptionBaseUrl"],
-            self.config["descriptionFallbackModel"],
-            self.config["fallbackModel"],
+            hash(self.config["descriptionCommand"].to_string()),
             system,
             prompt
         ]);

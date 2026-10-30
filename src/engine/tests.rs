@@ -789,11 +789,13 @@ fn provider() -> Result<(String, std::sync::Arc<std::sync::Mutex<Vec<usize>>>)> 
                         .map(|index| json!({"index":index,"embedding":vector}))
                         .collect();
                     json!({"data":data})
-                } else if body["text"]["format"]["name"] == "function_ranking" {
-                    let count =
-                        body["text"]["format"]["schema"]["properties"]["ranking"]["minItems"]
-                            .as_u64()
-                            .unwrap_or(0) as usize;
+                } else if body["instructions"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("Rank candidate documents"))
+                {
+                    let prompt: Value =
+                        serde_json::from_str(body["messages"][0]["content"].as_str().unwrap())?;
+                    let count = prompt["resultCount"].as_u64().unwrap() as usize;
                     seen.lock().unwrap().push(count);
                     let ranking: Vec<_> = (0..count)
                         .map(|index| json!({"index":index,"score":1.0 - index as f64 / 1000.0}))
@@ -802,7 +804,15 @@ fn provider() -> Result<(String, std::sync::Arc<std::sync::Mutex<Vec<usize>>>)> 
                 } else {
                     json!({"output_text":"Generated summary."})
                 };
-                let bytes = serde_json::to_vec(&response)?;
+                let bytes = if path.ends_with("/harness") {
+                    response["output_text"]
+                        .as_str()
+                        .unwrap()
+                        .as_bytes()
+                        .to_vec()
+                } else {
+                    serde_json::to_vec(&response)?
+                };
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -817,14 +827,17 @@ fn provider() -> Result<(String, std::sync::Arc<std::sync::Mutex<Vec<usize>>>)> 
     Ok((base, reranked))
 }
 
+use crate::test_agent as agent;
+
 fn provider_config(temp: &tempfile::TempDir, base: &str) -> Value {
     json!({
         "embeddingProvider":"openai", "embeddingModel":"unit-embedding",
         "embeddingDimensions":2, "symbolDimensions":2,
-        "descriptionProvider":"openai", "descriptionModel":"unit-description",
-        "rerankerProvider":"openai", "rerankerModel":"unit-reranker",
-        "embeddingBaseUrl":base, "descriptionBaseUrl":base, "rerankerBaseUrl":base,
-        "embeddingApiKey":"unit", "descriptionApiKey":"unit", "rerankerApiKey":"unit",
+        "descriptionCommand":agent::http(base, "unit"), "descriptionModel":"unit-description",
+        "rerankerProvider":"command", "rerankerModel":"unit-reranker",
+        "rerankerCommand":agent::http(base, "unit"),
+        "embeddingBaseUrl":base,
+        "embeddingApiKey":"unit",
         "providerMaxRetries":0, "retryDelayMs":0, "providerTimeoutMs":5000,
         "artifactCachePath":temp.path().join("global.sqlite")
     })

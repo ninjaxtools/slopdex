@@ -71,7 +71,8 @@ provider caches accelerate work but do not define the live repository snapshot.
    `--no-reindex`.
 3. Semantic refresh uses `models.rs` traits and `providers/` adapters to generate
    missing embeddings, including available source or generated descriptions.
-   Description text is optional; indexing it is always enabled. Source descriptions
+   Text generation delegates to configured agent CLI commands, while embeddings
+   and native reranking remain API-based. Description text is optional; indexing it is always enabled. Source descriptions
    take precedence. Only explicit `generate descriptions` invokes indexed generation,
    excluding source-described files/callables and Markdown files. Completed work is
    cached before live publication: workspace SQLite first, then a reusable

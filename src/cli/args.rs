@@ -47,16 +47,16 @@ pub(super) struct Global {
     /// Download a missing Ollama model during update --setup or config embeddings; saves ollamaAutoPull
     #[arg(long, global = true)]
     pub(super) pull: bool,
-    /// Description provider (default: openai, or the saved profile)
-    #[arg(long, global = true, value_parser = ["openai", "opencode", "opencode-go"])]
-    pub(super) description_provider: Option<String>,
-    /// Description model, optionally provider-qualified (default: provider default, or the saved profile)
+    /// Agent CLI command as a JSON argument array (overrides descriptionCommand)
+    #[arg(long, global = true)]
+    pub(super) description_command: Option<String>,
+    /// Optional model passed with --model to opencode, pi, claude, or codex
     #[arg(long, global = true, value_parser = nonempty)]
     pub(super) description_model: Option<String>,
-    /// Optional same-provider fallback description model
-    #[arg(long, global = true, value_parser = nonempty)]
-    pub(super) description_fallback_model: Option<String>,
-    /// OpenAI reranker candidate count (1..=100; default: 10)
+    /// Allow executing agent CLI commands supplied by repository-local settings
+    #[arg(long, global = true)]
+    pub(super) trust_repo_commands: bool,
+    /// Generative reranker candidate count (1..=100; default: 10)
     #[arg(long, global = true, value_parser = candidates)]
     pub(super) reranker_candidates: Option<usize>,
     /// Text by default; index list exports CSV/JSON, lines accepts files, cross-search JSON is JSONL
@@ -932,12 +932,7 @@ impl Cli {
         &'a self,
         positional: Option<&'a str>,
     ) -> Result<Option<&'a str>> {
-        let option = self.global.description_provider.as_deref();
-        ensure!(
-            positional.is_none() || option.is_none() || positional == option,
-            "models provider and --description-provider must match"
-        );
-        let provider = positional.or(option);
+        let provider = positional;
         ensure!(
             provider.is_none() || matches!(provider, Some("opencode" | "opencode-go")),
             "models provider must be opencode or opencode-go"

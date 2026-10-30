@@ -7,8 +7,7 @@ use std::sync::Arc;
 use crate::models::Vector;
 
 use super::{
-    Context, Protocol, api_key, auth_headers, endpoint, index, normalize, positive, string,
-    unqualify,
+    Context, api_key, auth_headers, endpoint, index, normalize, positive, string, unqualify,
 };
 
 pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Vector>> {
@@ -97,7 +96,7 @@ impl Configuration {
         count: usize,
     ) -> Result<Vec<Vec<f32>>> {
         let key = api_key(&context.config, "embeddingApiKey", provider)?;
-        let headers = auth_headers(&key, Protocol::Responses)?;
+        let headers = auth_headers(&key)?;
         let response = context
             .http
             .request_with_notice(&self.url, Some(body), &headers, || {

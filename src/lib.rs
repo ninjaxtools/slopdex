@@ -24,3 +24,6 @@ pub fn hash(input: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(input.as_ref()))
 }
+#[cfg(test)]
+#[path = "../tests/support/agent.rs"]
+pub(crate) mod test_agent;

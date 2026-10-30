@@ -23,17 +23,15 @@ const ADVANCED_KEYS: &[&str] = &[
     "embeddingProvider",
     "embeddingModel",
     "embeddingDimensions",
-    "fallbackModel",
     "embeddingBaseUrl",
-    "descriptionBaseUrl",
     "rerankerBaseUrl",
     "embeddingApiKey",
-    "descriptionApiKey",
     "rerankerApiKey",
     "openaiApiKey",
     "jinaApiKey",
     "cohereApiKey",
-    "opencodeApiKey",
+    "rerankerCommand",
+    "agentTimeoutMs",
     "artifactCachePath",
     "artifactS3",
     "symbolDimensions",
@@ -159,6 +157,10 @@ fn mark_repository_config_from(config: &mut Value, global: &Global, user: &Path)
     object.insert(CONFIG_ORIGIN_KEY.into(), json!(CONFIG_ORIGIN_REPOSITORY));
     object.remove("trustedEndpointHosts");
     object.remove(TRUST_REPOSITORY_ENDPOINTS_KEY);
+    object.remove(crate::providers::TRUST_COMMANDS_KEY);
+    if global.trust_repo_commands {
+        object.insert(crate::providers::TRUST_COMMANDS_KEY.into(), json!(true));
+    }
     if global.trust_repo_endpoints {
         object.insert(TRUST_REPOSITORY_ENDPOINTS_KEY.into(), json!(true));
     }
@@ -203,7 +205,6 @@ fn normalize_config_aliases(config: &mut Value) {
         ("embeddingProvider", "provider"),
         ("embeddingModel", "model"),
         ("embeddingDimensions", "dimensions"),
-        ("fallbackModel", "descriptionFallbackModel"),
     ] {
         if let Some(value) = object.remove(alias).filter(|value| !value.is_null())
             && object.get(canonical).is_none_or(Value::is_null)
@@ -216,18 +217,14 @@ fn normalize_config_aliases(config: &mut Value) {
 pub(super) fn effective_config(global: &Global, path: &Path) -> Result<Value> {
     let mut config = read_config(path)?;
     apply_embedding_overrides(&mut config, global);
-    for (key, value) in [
-        ("descriptionProvider", &global.description_provider),
-        ("descriptionModel", &global.description_model),
-        (
-            "descriptionFallbackModel",
-            &global.description_fallback_model,
-        ),
-    ] {
-        if let Some(value) = value {
-            config[key] = json!(value);
-        }
+    if let Some(value) = &global.description_model {
+        config["descriptionModel"] = json!(value);
     }
+    if let Some(command) = &global.description_command {
+        config["descriptionCommand"] = serde_json::from_str(command)
+            .context("--description-command must be a JSON argument array")?;
+    }
+    config[crate::providers::TRUST_COMMANDS_KEY] = json!(global.trust_repo_commands);
     if let Some(value) = global.reranker_candidates {
         config["rerankerCandidates"] = json!(value);
     }
@@ -338,26 +335,17 @@ fn validate_config(config: &Value) -> Result<()> {
         config.get("descriptionsEnabled").is_none(),
         "descriptionsEnabled has been removed; remove it from config and run `slopdex generate descriptions` to generate descriptions explicitly"
     );
-    for (key, allowed) in [
-        ("provider", &["openai", "jina", "ollama"][..]),
-        (
-            "descriptionProvider",
-            &["openai", "opencode", "opencode-go"][..],
-        ),
-    ] {
-        if let Some(value) = config.get(key) {
-            ensure!(
-                value.as_str().is_some_and(|value| allowed.contains(&value)),
-                "unsupported {key}: {value}"
-            );
-        }
+    if let Some(value) = config.get("provider") {
+        ensure!(
+            matches!(value.as_str(), Some("openai" | "jina" | "ollama")),
+            "unsupported provider: {value}"
+        );
     }
     for key in [
         "model",
         "indexPath",
         "artifactCachePath",
         "descriptionModel",
-        "descriptionFallbackModel",
         "ollamaKeepAlive",
         "ollamaModelDigest",
         "jinaTask",
@@ -372,12 +360,25 @@ fn validate_config(config: &Value) -> Result<()> {
     if let Some(hosts) = config.get("trustedEndpointHosts") {
         validate_trusted_hosts(hosts)?;
     }
+    for key in ["descriptionCommand", "rerankerCommand"] {
+        if let Some(value) = config.get(key) {
+            ensure!(
+                value.as_array().is_some_and(|args| !args.is_empty()
+                    && args
+                        .iter()
+                        .all(|arg| arg.as_str().is_some_and(|s| !s.contains('\0')))
+                    && args[0].as_str().is_some_and(|s| !s.trim().is_empty())),
+                "{key} must be a non-empty argument array with a non-empty executable and no NUL bytes"
+            );
+        }
+    }
     for key in [
         "dimensions",
         "maxFileSize",
         "embeddingBatchSize",
         "parallelism",
         "embeddingParallelism",
+        "agentTimeoutMs",
         "ollamaNativeDimensions",
         "ollamaContextLength",
         "ollamaPullTimeoutMs",
@@ -417,7 +418,7 @@ fn validate_config(config: &Value) -> Result<()> {
         ensure!(
             matches!(
                 config["rerankerProvider"].as_str(),
-                Some("cohere" | "jina" | "openai")
+                Some("cohere" | "jina" | "command")
             ),
             "unsupported rerankerProvider"
         );
@@ -427,7 +428,7 @@ fn validate_config(config: &Value) -> Result<()> {
                 "rerankerModel must be a non-empty string"
             );
         }
-        if config["rerankerProvider"] == "openai"
+        if config["rerankerProvider"] == "command"
             && let Some(count) = config.get("rerankerCandidates")
         {
             ensure!(
@@ -794,9 +795,8 @@ pub(super) fn run_config(
     write_config(path, &config)?;
     if interactive {
         let summary = [
-            "descriptionProvider",
+            "descriptionCommand",
             "descriptionModel",
-            "descriptionFallbackModel",
             "rerankingEnabled",
             "rerankerProvider",
             "rerankerModel",

@@ -891,7 +891,7 @@ fn readme_commands_parse() {
         vec![
             "config",
             "set",
-            "descriptionFallbackModel",
+            "descriptionModel",
             "muse-spark-1.3-contributor",
         ],
         vec!["config"],
@@ -1202,7 +1202,6 @@ fn validates_combinations_before_opening_an_index() {
         vec!["search", "query", "--output", "clusters"],
         vec!["map", "--output", "clusters"],
         vec!["cross-search", "--cohesion", "--output", "clusters"],
-        vec!["help", "models", "--description-provider", "openai"],
     ] {
         let cli = Cli::try_parse_from(std::iter::once("slopdex").chain(args)).unwrap();
         assert!(cli.validate().is_err());
@@ -1249,6 +1248,8 @@ fn argument_errors_cover_global_constraints_and_conflicting_model_selections() {
         vec!["generate", "descriptions", "--callables"],
         vec!["descriptions", "enable"],
         vec!["models"],
+        vec!["help", "models", "--description-provider", "openai"],
+        vec!["status", "--description-fallback-model", "old-model"],
         vec!["search-code", "query", "--regexp", "(?=lookahead)"],
         vec!["search-code", "query", "--regexp", r"(a)\1"],
     ] {
@@ -1256,35 +1257,14 @@ fn argument_errors_cover_global_constraints_and_conflicting_model_selections() {
             .unwrap_err();
         assert_eq!(error.exit_code(), 2, "{args:?}");
     }
-    for (args, message) in [
-        (
-            vec![
-                "help",
-                "models",
-                "opencode",
-                "--description-provider",
-                "opencode-go",
-            ],
-            "must match",
-        ),
-        (
-            vec!["help", "models", "--description-provider", "openai"],
-            "opencode or opencode-go",
-        ),
-    ] {
-        let cli =
-            Cli::try_parse_from(std::iter::once("slopdex").chain(args.iter().copied())).unwrap();
-        assert!(
-            cli.validate().unwrap_err().to_string().contains(message),
-            "{args:?}"
-        );
-    }
+    parse(&["help", "models", "opencode"]);
     parse(&[
-        "help",
-        "models",
-        "opencode",
-        "--description-provider",
-        "opencode",
+        "status",
+        "--description-command",
+        "[\"opencode\",\"run\"]",
+        "--description-model",
+        "opencode-go/deepseek-v4.1-flash",
+        "--trust-repo-commands",
     ]);
     parse(&["config", "set", "descriptionModel", "same"]);
     parse(&[

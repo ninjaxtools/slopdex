@@ -1,15 +1,15 @@
 //! Blocking hosted and local providers. Construction is offline; credentials are resolved on use.
 //!
 //! Implementations of the provider-independent traits in [`crate::models`] live
-//! in `<capability>_<provider>.rs` modules (for example, `llm_opencode_go.rs`).
+//! in `<capability>_<provider>.rs` modules (for example, `vector_ollama.rs`).
 //! The `llm`, `vector`, and `rerank` factories select implementations; indexing
 //! and search consume their traits through [`Providers`]. HTTP transport and
 //! wire protocols are shared separately from provider policy.
 //!
 //! The canonical `provider`, `model`, and `dimensions` embedding keys take precedence
 //! over the `embeddingProvider`, `embeddingModel`, and `embeddingDimensions` aliases.
-//! Endpoint overrides are `embeddingBaseUrl`, `descriptionBaseUrl`, and
-//! `rerankerBaseUrl`; a base URL includes its API version, e.g. `http://localhost/v1`.
+//! API endpoint overrides are `embeddingBaseUrl` and `rerankerBaseUrl`;
+//! text generation instead uses a configured agent CLI command.
 //! Embedding/reranking overrides may also include `/embeddings` or `/rerank`.
 //! Optional operation-specific `*ApiKey` keys override provider-specific `*ApiKey`
 //! keys and the usual environment variables. Never print this struct or its config.
@@ -20,8 +20,8 @@
 //! the user config's `trustedEndpointHosts` or `--trust-repo-endpoints` is passed.
 //! `providerTimeoutMs` defaults to 60,000 (capped at 300,000), `providerMaxRetries`
 //! defaults to 2 (maximum 5), and `retryDelayMs` defaults to 250. Backoff and numeric
-//! Retry-After delays are capped at five seconds. Description failover/empty-output
-//! recovery allows six total attempts, without nested HTTP retries.
+//! Retry-After delays are capped at five seconds. Agent harnesses own their
+//! authentication, retries, model discovery, and fallback policy.
 //!
 //! `models(None)` lists both public OpenCode catalogues. Entries have exactly the
 //! shape `{ "provider": "opencode-go", "model": "model-id" }`; join with `/` for
@@ -33,24 +33,19 @@ use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::Read;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use http::{Failure, Http};
-use protocol::{Protocol, auth_headers, description_request, description_text};
+use http::Http;
+use protocol::auth_headers;
 
 mod http;
 mod llm;
-mod llm_openai;
-mod llm_opencode;
-mod llm_opencode_go;
 mod ollama;
 mod protocol;
 mod rerank;
-mod rerank_openai;
+mod rerank_command;
 mod vector;
 mod vector_jina;
 mod vector_ollama;
@@ -70,7 +65,7 @@ const JINA: &str = "https://api.jina.ai/v1";
 const COHERE: &str = "https://api.cohere.com/v2";
 const ZEN: &str = "https://opencode.ai/zen/v1";
 const GO: &str = "https://opencode.ai/zen/go/v1";
-const DESCRIPTION_ATTEMPTS: usize = 6;
+pub use llm::TRUST_COMMANDS_KEY;
 
 /// Reserved effective-configuration keys set by the CLI loader; never saved.
 /// `configOrigin: "repository"` marks settings loaded from `<root>/.slopdex/config.json`.
@@ -289,8 +284,8 @@ pub fn models(provider: Option<&str>) -> Result<Value> {
     let mut result = Vec::new();
     for provider in providers {
         let base = match *provider {
-            "opencode" => llm_opencode::DEFAULT_BASE,
-            "opencode-go" => llm_opencode_go::DEFAULT_BASE,
+            "opencode" => ZEN,
+            "opencode-go" => GO,
             _ => unreachable!("catalogue providers validated above"),
         };
         result.extend(fetch_models(&http, provider, base)?);
@@ -360,33 +355,10 @@ fn unqualify<'a>(model: &'a str, provider: &str) -> Result<&'a str> {
     Ok(model)
 }
 
-fn auth_path() -> Option<PathBuf> {
-    let data = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| PathBuf::from(s.trim()))
-        .or_else(|| dirs::home_dir().map(|p| p.join(".local/share")))?;
-    Some(data.join("opencode/auth.json"))
-}
-
-fn stored_key(path: &std::path::Path, provider: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let auth: Value = serde_json::from_reader(file.take(1024 * 1024)).ok()?;
-    auth.get(provider)?
-        .get("key")?
-        .as_str()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_owned())
-}
-
 fn api_key(config: &Value, operation_key: &str, provider: &str) -> Result<String> {
-    resolve_api_key(
-        config,
-        operation_key,
-        provider,
-        |name| std::env::var(name).ok(),
-        |provider| auth_path().and_then(|p| stored_key(&p, provider)),
-    )
+    resolve_api_key(config, operation_key, provider, |name| {
+        std::env::var(name).ok()
+    })
 }
 
 /// Credential lookup with injectable process state, so policy is testable
@@ -396,13 +368,11 @@ fn resolve_api_key(
     operation_key: &str,
     provider: &str,
     environment: impl Fn(&str) -> Option<String>,
-    stored: impl Fn(&str) -> Option<String>,
 ) -> Result<String> {
     let (setting, env) = match provider {
         "openai" => ("openaiApiKey", "OPENAI_API_KEY"),
         "jina" => ("jinaApiKey", "JINA_API_KEY"),
         "cohere" => ("cohereApiKey", "COHERE_API_KEY"),
-        "opencode" | "opencode-go" => ("opencodeApiKey", "OPENCODE_API_KEY"),
         _ => bail!("Unsupported credential provider"),
     };
     // Keys written into the selected config file travel with its endpoints.
@@ -413,13 +383,6 @@ fn resolve_api_key(
         guard_foreign_credential(config, operation_key, provider, env)?;
         return Ok(key.trim().into());
     }
-    if provider.starts_with("opencode") {
-        if let Some(key) = stored(provider) {
-            guard_foreign_credential(config, operation_key, provider, "stored opencode/auth.json")?;
-            return Ok(key);
-        }
-        bail!("OPENCODE_API_KEY or stored opencode/auth.json credentials are required");
-    }
     bail!("{env} is required")
 }
 
@@ -429,14 +392,6 @@ fn operation_endpoint(operation_key: &str, provider: &str) -> Result<(&'static s
         "embeddingApiKey" => (
             "embeddingBaseUrl",
             if provider == "jina" { JINA } else { OPENAI },
-        ),
-        "descriptionApiKey" => (
-            "descriptionBaseUrl",
-            match provider {
-                "opencode" => ZEN,
-                "opencode-go" => GO,
-                _ => OPENAI,
-            },
         ),
         "rerankerApiKey" => (
             "rerankerBaseUrl",
@@ -453,7 +408,6 @@ fn operation_endpoint(operation_key: &str, provider: &str) -> Result<(&'static s
 fn operation_name(operation_key: &str) -> &'static str {
     match operation_key {
         "embeddingApiKey" => "embedding",
-        "descriptionApiKey" => "description",
         _ => "reranking",
     }
 }

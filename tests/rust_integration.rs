@@ -21,6 +21,9 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "support/agent.rs"]
+mod agent;
+
 #[path = "rust_integration/lines.rs"]
 mod lines;
 
@@ -173,11 +176,11 @@ impl Mock {
         json!({
             "embeddingProvider": "openai", "embeddingModel": "integration-embedding",
             "embeddingDimensions": 4, "embeddingBatchSize": 8,
-            "descriptionProvider": "openai", "descriptionModel": "integration-description",
+            "descriptionCommand": agent::http(&self.base, TEST_KEY), "descriptionModel": "integration-description",
             "rerankerProvider": "cohere", "rerankerModel": "integration-reranker",
-            "embeddingBaseUrl": self.base, "descriptionBaseUrl": self.base,
+            "embeddingBaseUrl": self.base,
             "rerankerBaseUrl": self.base,
-            "embeddingApiKey": TEST_KEY, "descriptionApiKey": TEST_KEY,
+            "embeddingApiKey": TEST_KEY,
             "rerankerApiKey": TEST_KEY,
             "artifactCachePath": self.cache.path().join("artifacts.sqlite"),
             "providerMaxRetries": 0, "retryDelayMs": 0,
@@ -312,7 +315,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
     reader.read_line(&mut line)?;
     let mut parts = line.split_whitespace();
     ensure!(parts.next() == Some("POST"), "expected a local POST");
-    let path = parts.next().context("missing request path")?.to_owned();
+    let mut path = parts.next().context("missing request path")?.to_owned();
+    let harness = path == "/v1/harness";
     let mut length = None;
     let mut authorized = false;
     loop {
@@ -339,7 +343,11 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
     ensure!(length <= 2_000_000, "unexpectedly large fixture request");
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;
-    let body: Value = serde_json::from_slice(&bytes)?;
+    let mut body: Value = serde_json::from_slice(&bytes)?;
+    if harness {
+        path = "/v1/responses".into();
+        body = agent::request(&body, "integration-description");
+    }
     let mut state = state.lock().unwrap();
     state.requests.push(Request {
         path: path.clone(),
@@ -434,9 +442,19 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
     if let Some(concurrent) = concurrent
         && concurrent.work.matches(&request)
     {
-        return concurrent.respond(&mut stream, request, response);
+        return concurrent.respond(&mut stream, request, response, harness);
     }
-    write_response(&mut stream, status, &response)
+    if harness {
+        let text = agent::response(&response);
+        write!(
+            stream,
+            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+            text.len()
+        )?;
+        Ok(())
+    } else {
+        write_response(&mut stream, status, &response)
+    }
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, response: &Value) -> Result<()> {
@@ -523,7 +541,13 @@ impl ConcurrentRequests {
         })
     }
 
-    fn respond(&self, stream: &mut TcpStream, request: Request, response: Value) -> Result<()> {
+    fn respond(
+        &self,
+        stream: &mut TcpStream,
+        request: Request,
+        response: Value,
+        harness: bool,
+    ) -> Result<()> {
         let mut progress = self.progress.lock().unwrap();
         let ordinal = progress.arrived;
         progress.arrived += 1;
@@ -576,7 +600,20 @@ impl ConcurrentRequests {
             (200, response)
         };
         let mut progress = self.progress.lock().unwrap();
-        write_response(stream, status, &response)?;
+        if harness {
+            let text = if status == 200 {
+                agent::response(&response)
+            } else {
+                "fixture failure".into()
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            )?;
+        } else {
+            write_response(stream, status, &response)?;
+        }
         progress.active -= 1;
         progress.completed.push((request, status));
         self.changed.notify_all();
@@ -732,6 +769,7 @@ impl Repo {
             .arg("--index")
             .arg(&self.index)
             .args(["--output", format])
+            .arg("--trust-repo-commands")
             .args(args)
             .output()?;
         assert!(
@@ -1493,7 +1531,10 @@ fn assert_concurrent_paid_work_survives_failure(work: ConcurrentWork) -> Result<
         ConcurrentWork::Callables => engine.generate_descriptions(),
     }
     .expect_err("one request in the first window must fail");
-    assert!(format!("{error:#}").contains("HTTP 503"));
+    assert!(format!("{error:#}").contains(match work {
+        ConcurrentWork::Embeddings => "HTTP 503",
+        ConcurrentWork::Callables => "Agent command failed",
+    }));
     mock.requests(""); // Surface any timeout/protocol failure in the scheduling harness.
     assert_eq!(engine.status()?["functionCount"], 10);
     assert_eq!(engine.status()?["fileCount"], file_count);
@@ -2617,7 +2658,7 @@ fn force_rebuild_for_moved_root_reuses_code_markdown_and_description_artifacts()
 }
 
 #[test]
-fn description_settings_are_restored_from_the_index_when_omitted_from_config() -> Result<()> {
+fn description_commands_are_never_restored_from_the_index() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
     repo.write("code.rs", &function("example", "VECTOR_EAST"))?;
@@ -2626,20 +2667,68 @@ fn description_settings_are_restored_from_the_index_when_omitted_from_config() -
     engine.refresh()?;
     engine.generate_descriptions()?;
     let expected = engine.search("east", "search-descriptions", &all())?;
-    let status = engine.status()?;
     drop(engine);
-    for key in ["descriptionProvider", "descriptionModel"] {
+    for key in ["descriptionCommand", "descriptionModel"] {
         config.as_object_mut().unwrap().remove(key);
     }
     let calls = mock.count();
     let mut engine = repo.open(&config)?;
-    assert_eq!(engine.status()?, status);
+    assert_eq!(engine.status()?["descriptionProfile"]["configured"], false);
     assert_eq!(engine.refresh()?["filesUpdated"], 0);
     assert_eq!(
         engine.search("east", "search-descriptions", &all())?,
         expected
     );
     assert_eq!(mock.count(), calls);
+    assert!(
+        engine
+            .generate_descriptions()
+            .unwrap_err()
+            .to_string()
+            .contains("descriptionCommand")
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_repository_agent_commands_cannot_grant_themselves_trust() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("code.rs", &function("example", "VECTOR_EAST"))?;
+    let mut config = mock.config();
+    config["trustRepositoryCommands"] = json!(true);
+    let path = repo.root.join(".slopdex/config.json");
+    repo.write(".slopdex/config.json", &config.to_string())?;
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    drop(engine);
+    let result = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .args(["--no-reindex", "generate", "descriptions"])
+        .output()?;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--trust-repo-commands"));
+    assert!(mock.requests("/responses").is_empty());
+    let result = repo
+        .child(env!("CARGO_BIN_EXE_slopdex"))
+        .arg("--root")
+        .arg(&repo.root)
+        .arg("--index")
+        .arg(&repo.index)
+        .arg("--config")
+        .arg(&path)
+        .args(["--no-reindex", "generate", "descriptions"])
+        .output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(mock.requests("/responses").len(), 2);
     Ok(())
 }
 
@@ -4592,7 +4681,10 @@ fn regression_description_model_change_invalidates_generated_descriptions_only_o
         6,
         "a changed generation profile invalidates file and callable descriptions"
     );
-    assert_eq!(requests[3].body["model"], config["descriptionModel"]);
+    assert_eq!(
+        engine.status()?["descriptionProfile"]["model"],
+        config["descriptionModel"]
+    );
     let prompt = description_prompt(&requests[4].body);
     assert!(prompt.starts_with("Describe what"));
     assert!(prompt.contains("Symbol: edited\n"));
@@ -11240,7 +11332,6 @@ fn description_keys_include_path_context_profiles_settings_and_effective_transcr
     second.write("src/another.rs", &source)?;
     let mut different_model = config.clone();
     different_model["descriptionModel"] = json!("alternate-description-model");
-    different_model["descriptionFallbackModel"] = json!("fallback-model");
     let mut engine = second.open(&different_model)?;
     engine.refresh()?;
     assert_eq!(
@@ -11270,7 +11361,10 @@ fn description_keys_include_path_context_profiles_settings_and_effective_transcr
     assert!(profile_keys.is_disjoint(&rows.iter().map(|(key, _)| key.clone()).collect()));
     drop(engine);
 
-    different_model["descriptionFallbackModel"] = json!("replacement-fallback-model");
+    different_model["descriptionCommand"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("another-wrapper-option"));
     let mut engine = second.open(&different_model)?;
     engine.refresh()?;
     assert_eq!(mock.requests("/responses").len(), calls + 2);

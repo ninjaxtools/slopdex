@@ -487,17 +487,23 @@ impl Engine {
                 })
                 .collect();
             let reranking = ui::counted("Reranking candidates", documents.len());
-            let ranking_key = hash(
-                json!([
-                    "rerank-v1",
-                    self.config["rerankerProvider"],
-                    self.config["rerankerModel"],
-                    self.config["rerankerBaseUrl"],
-                    query,
-                    documents
-                ])
-                .to_string(),
-            );
+            let mut ranking_identity = json!([
+                "rerank-v1",
+                self.config["rerankerProvider"],
+                self.config["rerankerModel"],
+                self.config["rerankerBaseUrl"],
+                query,
+                documents
+            ]);
+            // Preserve native API cache identities; only command rerankers
+            // depend on a subprocess invocation.
+            if self.config["rerankerProvider"] == "command" {
+                ranking_identity
+                    .as_array_mut()
+                    .unwrap()
+                    .push(self.config["rerankerCommand"].clone());
+            }
+            let ranking_key = hash(ranking_identity.to_string());
             self.artifacts
                 .hydrate_text(&self.db, "rerank", std::slice::from_ref(&ranking_key))?;
             let _lock = registry::artifact_lock(&self.db, "rerank", &ranking_key)?;

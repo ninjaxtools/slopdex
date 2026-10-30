@@ -21,8 +21,7 @@ fn test_config(temp: &TempDir) -> Value {
         "embeddingProvider":"openai", "embeddingModel":"search-fixture",
         "embeddingDimensions":2, "symbolDimensions":2,
         "embeddingBaseUrl":"http://127.0.0.1:1/v1", "embeddingApiKey":"fixture",
-        "descriptionProvider":"openai", "descriptionModel":"source-only-no-llm",
-        "descriptionBaseUrl":"http://127.0.0.1:1/v1", "descriptionApiKey":"fixture",
+        "descriptionCommand":["fixture-harness-must-not-run"], "descriptionModel":"source-only-no-llm",
         "providerMaxRetries":0, "artifactCachePath":temp.path().join("artifacts.sqlite")
     })
 }
@@ -363,10 +362,9 @@ fn multiple_queries_choose_and_sort_best_rerank_scores_without_provider_calls() 
         .collect::<Result<Vec<_>>>()?;
     drop(baseline);
     fixture.config["rerankingEnabled"] = json!(true);
-    fixture.config["rerankerProvider"] = json!("openai");
+    fixture.config["rerankerProvider"] = json!("command");
     fixture.config["rerankerModel"] = json!("rerank-fixture");
-    fixture.config["rerankerBaseUrl"] = json!("http://127.0.0.1:1/v1");
-    fixture.config["rerankerApiKey"] = json!("fixture");
+    fixture.config["rerankerCommand"] = json!(["fixture-harness-must-not-run"]);
     let db =
         Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
     for (query, rows) in queries.iter().zip(&documents) {
@@ -378,7 +376,8 @@ fn multiple_queries_choose_and_sort_best_rerank_scores_without_provider_calls() 
                 fixture.config["rerankerModel"],
                 fixture.config["rerankerBaseUrl"],
                 query,
-                documents
+                documents,
+                fixture.config["rerankerCommand"]
             ])
             .to_string(),
         );

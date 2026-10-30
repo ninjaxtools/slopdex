@@ -31,7 +31,7 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/parse/shell.rs` | Bash heredoc/function recovery; expansion boundaries are matched by parsing exponentially growing windows so bodies with thousands of expansions stay linear. |
 | `src/callgraph.rs` | Snapshot callable graph and outgoing symbol-reference resolution: language-aware bare-name scoping, `impl`/static receiver matching, namespace-only `.` receivers through imports, Rust `super::` and Go package import paths. |
 | `src/parse/descriptions.rs` | Shared source-comment attachment, Python function/class docstrings, and file/symbol description extraction. |
-| `src/models.rs`, `src/providers/` | Provider-independent LLM/vector/reranking traits, hosted implementations and local Ollama embeddings, credentials and endpoint overrides, protocol routing, response validation and bounded retries. |
+| `src/models.rs`, `src/providers/` | Capability traits, agent CLI text generation, hosted/local embeddings and native reranking, API credential/endpoint policy and bounded HTTP retries. |
 | `src/storage.rs` | Worktree SQLite bindings, attached global artifacts, streamed snapshot digests, transactional live-state reconciliation, schema validation. |
 | `src/cache.rs` | Authoritative global SQLite store and validated, best-effort S3 provider artifacts. |
 | `src/git.rs`, `src/registry.rs` | Git candidate discovery/checkpoints, repository relatedness evidence, and self-retiring per-artifact single-flight locks. |
@@ -544,8 +544,8 @@ sequential callable turns; different files can proceed in parallel. Each success
 HTTP result is cached immediately. External model-call notices go to stderr
 once per kind/provider/model per process using thread-safe deduplication;
 `verbose: true` / `--verbose` reports every outgoing attempt, including retries.
-Kinds are `vectors`, `descriptions`, and `reranking`; notices name the actual
-model (including fallback), without credentials, URLs, or input. Construction
+Notices name the configured model (or harness default), without command arguments,
+credentials, URLs, or input. Construction
 and cache hits produce no model-call notices. Operation-specific base URLs/API
 keys override provider defaults as described in the
 [reference](reference.md#root-configuration-and-provider-overrides). Public
@@ -555,8 +555,7 @@ OpenAI embedding input is UTF-8-boundary-truncated at 8191 bytes; batches are
 capped at 32. Jina uses `code.query`/`code.passage`, server truncation, and a cap of
 64. Responses must contain one unique indexed, finite, nonzero vector of the
 configured dimensions per input; vectors are normalized before persistence.
-Descriptions use separate file/callable requests, with model-family protocol
-routing for OpenCode. Task explanations include saved search context and optionally
+Descriptions use separate file/callable harness invocations. Task explanations include saved search context and optionally
 related callable code from indexed snapshots, within the prompt byte limit.
 
 Ordinary HTTP calls retry retryable transport/read failures and statuses
@@ -567,22 +566,24 @@ set 0–5 retries and a request timeout capped at 300 seconds; backoff honors nu
 are bounded to 32 MiB. Invalid JSON/validated payload failures are not ordinary
 transport retries.
 
-Description failover/empty-output recovery has a separate six-attempt total cap,
-without nesting the HTTP retry loop. A successful fallback remains active in that
-provider instance; a later eligible failure can switch back. Permanent model
-failures are skipped within the current call, and shared-authentication 401 or
-redirect failures stop failover. Output truncation (`length`/`max_tokens`/
-`MAX_TOKENS`/Responses `incomplete`) and Gemini prompt blocks are permanent for
-that model: the same body is never resent, the fallback model gets one attempt,
-and without one the call fails immediately. Without fallback/empty output, ordinary
-configured retry limits apply. Cache hits bypass provider calls, and a failed
-refresh can be rerun to reuse its already committed artifacts.
+`providers/llm.rs` launches explicit argument arrays without a shell. Each process
+receives the full system/transcript JSON on stdin and returns plain answer text
+on stdout. Recognized opencode/pi/claude/codex executable names receive an optional
+`--model` flag; unknown commands get no guessed flags. The harness owns credentials,
+model protocols, retries and fallback policy. Missing commands fail only on use.
+Private temporary files avoid pipe deadlocks; subprocess timeouts kill and reap
+the child, and output is bounded to 32 MiB. Errors never echo subprocess output or
+argv. Description profiles include a digest of the complete command and optional model;
+generative reranking uses the same adapter and validates complete JSON rankings.
+Executable commands are never restored from indexes, and repository commands need
+`--trust-repo-commands` or an explicit trusted `--config`. Cache hits bypass model
+calls; failed publication can reuse completed artifacts.
 
 Hosted endpoint policy lives in `providers/mod.rs`: `check_hosted_endpoint` runs at
-construction for embeddings, descriptions, and (lazily) reranking, enforcing TLS
+construction for embeddings and (lazily) native reranking, enforcing TLS
 for non-loopback custom hosts and emitting the deduplicated custom-host warning;
 `guard_foreign_credential` runs inside credential resolution and refuses
-environment/stored keys for repository-configured remote hosts unless trusted.
+environment keys for repository-configured remote hosts unless trusted.
 The CLI loader marks repository-selected settings with the reserved
 `configOrigin` key (`cli/config.rs::mark_repository_config`), discarding any
 `trustedEndpointHosts` from that file and adopting the user config's list.

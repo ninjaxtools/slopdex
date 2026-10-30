@@ -8,8 +8,7 @@ use std::sync::Arc;
 use crate::models::Rerank;
 
 use super::{
-    COHERE, Context, JINA, Protocol, api_key, auth_headers, endpoint, parse_ranking, string,
-    unqualify,
+    COHERE, Context, JINA, api_key, auth_headers, endpoint, parse_ranking, string, unqualify,
 };
 
 pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Rerank>> {
@@ -28,7 +27,12 @@ pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Rerank>> {
             "jina-reranker-v3.5",
             JINA,
         )?)),
-        "openai" => Ok(Box::new(super::rerank_openai::OpenAiRerank::new(context)?)),
+        "command" => Ok(Box::new(super::rerank_command::CommandRerank::new(
+            context,
+        )?)),
+        "openai" => bail!(
+            "OpenAI generative reranking has been removed; set rerankerProvider to command and configure rerankerCommand"
+        ),
         _ => bail!("Unsupported reranker provider"),
     }
 }
@@ -107,7 +111,7 @@ impl Configuration {
         count: usize,
     ) -> Result<Vec<(usize, f64)>> {
         let key = api_key(&context.config, "rerankerApiKey", provider)?;
-        let headers = auth_headers(&key, Protocol::Responses)?;
+        let headers = auth_headers(&key)?;
         let url = endpoint(&self.base, "rerank")?;
         let response = context
             .http

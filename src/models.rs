@@ -26,9 +26,9 @@ impl Message {
     }
 }
 
-/// A text-generating model, including its configured fallback policy.
+/// Text generation delegated to a configured agent harness.
 pub trait Llm: Send + Sync {
-    /// Stable cache identity of the configured primary model.
+    /// Stable cache identity of the configured command and optional model.
     fn profile(&self) -> Value;
     fn describe(&self, system: &str, prompt: &str) -> Result<String> {
         self.describe_conversation(system, &[Message::user(prompt.into())], "")

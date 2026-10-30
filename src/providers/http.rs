@@ -26,8 +26,6 @@ fn client(timeout: Duration) -> Result<Client> {
 pub(super) struct Failure {
     pub(super) message: String,
     pub(super) retryable: bool,
-    pub(super) can_failover: bool,
-    pub(super) empty_output: bool,
     /// The request never produced a server response (connect, send, or timeout).
     pub(super) transport: bool,
     pub(super) retry_after: Option<Duration>,
@@ -38,22 +36,9 @@ impl Failure {
         Self {
             message: message.into(),
             retryable,
-            can_failover: true,
-            empty_output: false,
             transport: false,
             retry_after: None,
         }
-    }
-    pub(super) fn empty(message: &str) -> Self {
-        Self {
-            empty_output: true,
-            ..Self::new(message, true)
-        }
-    }
-    /// Repeating the identical request cannot help (truncated or blocked output);
-    /// another configured model may still succeed.
-    pub(super) fn permanent(message: &str) -> Self {
-        Self::new(message, false)
     }
 }
 
@@ -232,9 +217,6 @@ impl Http {
                 .map(|n| Duration::from_secs(n.min(5)));
             return Err(Failure {
                 retry_after,
-                // A different model cannot repair invalid shared credentials or
-                // a redirect rejected by our HTTP policy. A 403 can be model-scoped.
-                can_failover: code != 401 && !status.is_redirection(),
                 ..Failure::new(format!("HTTP {code}"), retryable)
             });
         }

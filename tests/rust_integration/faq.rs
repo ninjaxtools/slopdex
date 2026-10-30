@@ -529,7 +529,7 @@ fn faq_promotes_legacy_file_keyed_answers_using_the_matching_entries_original_qu
     let request = mock.requests("/responses").pop().unwrap();
     let profile = slopdex::providers::Providers::new(&config)?.llm().profile();
     let legacy_key = slopdex::hash(json!([
-        "explanation-v3",profile,config["descriptionBaseUrl"],config["descriptionFallbackModel"],config["fallbackModel"],
+        "explanation-v3",profile,slopdex::hash(config["descriptionCommand"].to_string()),
         request.body["instructions"],description_prompt(&request.body),{"code.rs":slopdex::hash(&source)}
     ]).to_string());
     let db = repo.db()?;

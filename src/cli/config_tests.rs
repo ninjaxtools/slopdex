@@ -393,8 +393,7 @@ fn canonical_config_wins_conflicting_aliases() {
     fs::write(
         &path,
         json!({"provider": "openai", "model": "new-model", "dimensions": 8,
-        "embeddingProvider": "jina", "embeddingModel": "old-model", "embeddingDimensions": 1024,
-        "descriptionFallbackModel": "new-backup", "fallbackModel": "old-backup"})
+        "embeddingProvider": "jina", "embeddingModel": "old-model", "embeddingDimensions": 1024})
         .to_string(),
     )
     .unwrap();
@@ -402,8 +401,6 @@ fn canonical_config_wins_conflicting_aliases() {
     assert_eq!(config["provider"], "openai");
     assert_eq!(config["model"], "new-model");
     assert_eq!(config["dimensions"], 8);
-    assert_eq!(config["descriptionFallbackModel"], "new-backup");
-    assert!(config.get("fallbackModel").is_none());
 }
 
 #[test]
@@ -415,8 +412,8 @@ fn config_set_keeps_json_stdout_machine_readable() {
         vec![
             "config",
             "set",
-            "descriptionProvider",
-            "openai",
+            "descriptionCommand",
+            "[\"opencode\",\"run\"]",
             "--output",
             "json",
         ],
@@ -425,7 +422,7 @@ fn config_set_keeps_json_stdout_machine_readable() {
             "config",
             "set",
             "rerankerProvider",
-            "openai",
+            "command",
             "--output",
             "json",
         ],
@@ -544,17 +541,10 @@ fn invalid_config_settings_cannot_partially_persist_a_config_action() {
         panic!()
     };
     let mut cases = Vec::new();
-    for key in ["provider", "descriptionProvider"] {
-        for value in [Value::Null, json!(false), json!("unsupported")] {
-            cases.push((key, value));
-        }
+    for value in [Value::Null, json!(false), json!("unsupported")] {
+        cases.push(("provider", value));
     }
-    for key in [
-        "model",
-        "indexPath",
-        "descriptionModel",
-        "descriptionFallbackModel",
-    ] {
+    for key in ["model", "indexPath", "descriptionModel"] {
         for value in [Value::Null, json!(42), json!(" \t\n")] {
             cases.push((key, value));
         }
@@ -587,7 +577,7 @@ fn invalid_config_settings_cannot_partially_persist_a_config_action() {
         ("rerankerCandidates", json!("10")),
     ]);
     for (key, value) in cases {
-        let mut config = json!({"rerankingEnabled": true, "rerankerProvider": "openai",
+        let mut config = json!({"rerankingEnabled": true, "rerankerProvider": "command",
             "custom": {"keep": [1, 2]}});
         config[key] = value;
         let original = serde_json::to_vec(&config).unwrap();
@@ -640,7 +630,7 @@ fn unrelated_config_edits_durably_normalize_aliases_without_saving_global_overri
         &path,
         json!({"provider": null, "embeddingProvider": "jina",
         "model": "canonical", "embeddingModel": "obsolete", "dimensions": null,
-        "embeddingDimensions": 16, "descriptionFallbackModel": "backup", "fallbackModel": null,
+        "embeddingDimensions": 16, "descriptionModel": "primary",
         "custom": {"nested": [null, "λ"]}})
         .to_string(),
     )
@@ -663,7 +653,7 @@ fn unrelated_config_edits_durably_normalize_aliases_without_saving_global_overri
     );
     assert_eq!(result, json!({"configPath": path, "parallelism": 4}));
     let expected = json!({"provider": "jina", "model": "canonical", "dimensions": 16,
-        "descriptionFallbackModel": "backup", "parallelism": 4,
+        "descriptionModel": "primary", "parallelism": 4,
         "custom": {"nested": [null, "λ"]}});
     // Inspect raw JSON: read_config would hide aliases accidentally left on disk.
     let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -685,7 +675,7 @@ fn config_set_preserves_other_settings_and_accepts_json_values() {
     let path = temp.path().join("config.json");
     write_config(
         &path,
-        &json!({"rerankingEnabled": true, "rerankerProvider": "openai",
+        &json!({"rerankingEnabled": true, "rerankerProvider": "command",
         "rerankerModel": "custom-model", "rerankerCandidates": 37, "custom": "keep"}),
     )
     .unwrap();

@@ -15,8 +15,6 @@ struct ScriptedSelection {
 struct ScriptedPrompts {
     input: io::Cursor<Vec<u8>>,
     output: Vec<u8>,
-    catalog: Value,
-    fetches: Vec<String>,
     selections: Vec<ScriptedSelection>,
     installed: Vec<String>,
     installed_fetches: usize,
@@ -27,8 +25,6 @@ impl ScriptedPrompts {
         Self {
             input: io::Cursor::new(answers.as_bytes().to_vec()),
             output: Vec::new(),
-            catalog: Value::Null,
-            fetches: Vec::new(),
             selections: Vec::new(),
             installed: Vec::new(),
             installed_fetches: 0,
@@ -99,12 +95,6 @@ impl Prompts for ScriptedPrompts {
         Ok(value)
     }
 
-    fn catalog(&mut self, provider: &str) -> Result<Value> {
-        self.fetches.push(provider.to_owned());
-        ensure!(!self.catalog.is_null(), "no scripted catalog supplied");
-        Ok(self.catalog.clone())
-    }
-
     fn installed(&mut self, _config: &Value) -> Result<Vec<String>> {
         self.installed_fetches += 1;
         Ok(self.installed.clone())
@@ -128,7 +118,7 @@ fn full_ollama_configuration_uses_local_batching_without_throttling_descriptions
     let mut config = json!({});
     configure_interactively(
         &mut config,
-        &mut ScriptedPrompts::new("openai\n\nno\nno\nollama\n\n\n\n\n\n\n\n\n\n\n"),
+        &mut ScriptedPrompts::new("\n\nno\nollama\n\n\n\n\n\n\n\n\n\n\n"),
     )
     .unwrap();
     assert_eq!(config["embeddingBatchSize"], 8);
@@ -139,16 +129,15 @@ fn full_ollama_configuration_uses_local_batching_without_throttling_descriptions
 #[test]
 fn wizard_configures_description_models_without_enablement_and_preserves_extensions() {
     let mut config = json!({"custom": "keep"});
-    let mut prompts = ScriptedPrompts::new(&format!("openai\n\nno\nno\n{}", "\n".repeat(11)));
+    let mut prompts = ScriptedPrompts::new(&format!("\n\nno\n{}", "\n".repeat(11)));
     configure_interactively(&mut config, &mut prompts).unwrap();
-    assert_eq!(config["descriptionProvider"], "openai");
-    assert_eq!(config["descriptionModel"], "gpt-5.6-luna");
+    assert_eq!(config["descriptionCommand"], json!(["opencode", "run"]));
+    assert!(config.get("descriptionModel").is_none());
     assert_eq!(config["model"], "text-embedding-3-large");
     assert_eq!(config["dimensions"], 3072);
     assert_eq!(config["custom"], "keep");
-    assert!(prompts.fetches.is_empty());
     let output = String::from_utf8(prompts.output).unwrap();
-    assert!(output.contains("Description provider"));
+    assert!(output.contains("Description agent command"));
     assert!(output.contains("Description model"));
     assert!(!output.contains("Generate file and function descriptions"));
 }
@@ -157,13 +146,13 @@ fn wizard_configures_description_models_without_enablement_and_preserves_extensi
 fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
     for (answers, provider, model, dimensions) in [
         (
-            "openai\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n",
+            "\n\nno\n\n\n\n\n\n\n\n\n\n\n",
             "jina",
             "jina-embeddings-v3",
             16,
         ),
         (
-            "openai\n\nno\nno\nopenai\ntext-embedding-3-small\n8\n\n\n\n\n\n\n\n",
+            "\n\nno\nopenai\ntext-embedding-3-small\n8\n\n\n\n\n\n\n\n",
             "openai",
             "text-embedding-3-small",
             8,
@@ -191,79 +180,18 @@ fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
 }
 
 #[test]
-fn wizard_removes_fallback_alias_when_fallback_is_disabled() {
-    let mut config = json!({"descriptionProvider": "openai", "descriptionModel": "primary",
-        "fallbackModel": "backup"});
-    let mut prompts = ScriptedPrompts::new("\n\nno\nno\n\n\n\n\n\n\n\n\n\n\n\n");
-    configure_interactively(&mut config, &mut prompts).unwrap();
-    assert!(config.get("fallbackModel").is_none());
-    assert!(config.get("descriptionFallbackModel").is_none());
+fn wizard_command_configuration_is_offline_and_preserves_model_ids() {
+    let mut config = json!({"descriptionModel":"opencode-go/deepseek-v4.1-flash"});
+    let mut prompts = ScriptedPrompts::new("[\"pi\",\"--print\",\"--no-tools\"]\n\n");
+    configure_interactively_filtered(&mut config, &mut prompts, Some("description")).unwrap();
     assert_eq!(
-        Providers::new(&config).unwrap().description_profile()["model"],
-        "primary"
-    );
-}
-
-#[test]
-fn wizard_published_models_are_searchable_scoped_and_defaulted() {
-    let catalog = json!([
-        {"provider": "opencode-go", "model": "first"},
-        {"provider": "opencode-go", "model": "saved"},
-        {"provider": "opencode", "model": "other-provider"}
-    ]);
-    let mut prompts = ScriptedPrompts::new("\n\n\n");
-    assert_eq!(
-        prompts
-            .published(&catalog, "opencode-go", "Model", "saved", None)
-            .unwrap(),
-        "saved"
+        config["descriptionCommand"],
+        json!(["pi", "--print", "--no-tools"])
     );
     assert_eq!(
-        prompts
-            .published(&catalog, "opencode-go", "Fallback", "saved", Some("saved"))
-            .unwrap(),
-        "first"
+        config["descriptionModel"],
+        "opencode-go/deepseek-v4.1-flash"
     );
-    assert_eq!(
-        prompts
-            .published(&catalog, "opencode-go", "Model", "retired", None)
-            .unwrap(),
-        "first"
-    );
-    assert!(
-        prompts
-            .selections
-            .iter()
-            .all(|selection| selection.searchable)
-    );
-    assert_eq!(prompts.selections[0].default, "saved");
-    assert_eq!(prompts.selections[0].choices, ["first", "saved"]);
-    assert_eq!(prompts.selections[1].choices, ["first"]);
-    assert!(
-        prompts
-            .published(&catalog, "missing", "Model", "", None)
-            .is_err()
-    );
-    assert!(
-        prompts
-            .published(&catalog, "opencode", "Fallback", "", Some("other-provider"))
-            .is_err()
-    );
-}
-
-#[test]
-fn wizard_fetches_one_catalog_and_reuses_it_for_fallback() {
-    let mut config = json!({"descriptionProvider": "opencode-go", "descriptionModel": "primary",
-        "descriptionFallbackModel": "backup"});
-    let mut prompts = ScriptedPrompts::new(&"\n".repeat(16));
-    prompts.catalog = json!([
-        {"provider": "opencode-go", "model": "primary"},
-        {"provider": "opencode-go", "model": "backup"}
-    ]);
-    configure_interactively(&mut config, &mut prompts).unwrap();
-    assert_eq!(prompts.fetches, ["opencode-go"]);
-    assert_eq!(config["descriptionModel"], "primary");
-    assert_eq!(config["descriptionFallbackModel"], "backup");
 }
 
 #[test]
@@ -271,12 +199,11 @@ fn wizard_cancellation_at_every_prompt_discards_all_changes() {
     let original = json!({"embeddingProvider": "jina", "embeddingModel": "custom",
         "embeddingDimensions": 16, "custom": "keep"});
     let answers = [
-        "openai",
+        "[\"opencode\",\"run\"]",
         "primary",
         "yes",
-        "backup",
-        "yes",
-        "openai",
+        "command",
+        "[\"codex\",\"exec\"]",
         "reranker",
         "100",
         "openai",
@@ -311,12 +238,14 @@ fn wizard_cancellation_at_every_prompt_discards_all_changes() {
     assert_eq!(config["rerankerCandidates"], 100);
     assert_eq!(config["verbose"], true);
     assert_eq!(config["defaultLimit"], "none");
-    assert!(prompts.fetches.is_empty());
 }
 
 #[test]
 fn wizard_catalog_and_validation_errors_discard_changes() {
-    for answers in ["opencode-go\n", "openai\n\nno\nno\n\n\n\n\n[\n\n\n\n\n\n"] {
+    for answers in [
+        "not-json\n",
+        "[\"opencode\",\"run\"]\n\nno\n\n\n\n\n[\n\n\n\n\n\n",
+    ] {
         let original = json!({"embeddingProvider": "jina", "custom": "keep"});
         let mut config = original.clone();
         assert!(configure_interactively(&mut config, &mut ScriptedPrompts::new(answers)).is_err());
@@ -326,12 +255,11 @@ fn wizard_catalog_and_validation_errors_discard_changes() {
 
 #[test]
 fn filtered_config_prompts_only_matching_keys() {
-    let mut config =
-        json!({"descriptionProvider": "openai", "descriptionModel": "old", "parallelism": 3});
+    let mut config = json!({"descriptionCommand": ["opencode","run"], "descriptionModel": "old", "parallelism": 3});
     let mut prompts = ScriptedPrompts::new("new\n");
     configure_interactively_filtered(&mut config, &mut prompts, Some("descriptionModel")).unwrap();
     assert_eq!(config["descriptionModel"], "new");
-    assert_eq!(config["descriptionProvider"], "openai");
+    assert_eq!(config["descriptionCommand"], json!(["opencode", "run"]));
     assert_eq!(config["parallelism"], 3);
     let mut prompts = ScriptedPrompts::new("7\n");
     configure_interactively_filtered(&mut config, &mut prompts, Some("parallel")).unwrap();
@@ -384,7 +312,7 @@ fn focused_embeddings_offer_presets_installed_and_custom_without_description_cat
         ),
     ] {
         let mut config = json!({"provider": "openai", "model": "old", "dimensions": 8,
-            "embeddingBaseUrl": "https://old.invalid/v1", "descriptionProvider": "opencode-go",
+            "embeddingBaseUrl": "https://old.invalid/v1", "descriptionCommand": ["opencode","run"],
             "descriptionModel": "keep", "custom": true});
         let mut prompts = ScriptedPrompts::new(&format!("ollama\n{answer}\nyes\n"));
         prompts.installed = vec!["installed-embed".into(), "qwen3-embedding:4b".into()];
@@ -396,7 +324,6 @@ fn focused_embeddings_offer_presets_installed_and_custom_without_description_cat
         assert_eq!(config["descriptionModel"], "keep");
         assert_eq!(config["custom"], true);
         assert!(config.get("embeddingBaseUrl").is_none());
-        assert!(prompts.fetches.is_empty());
         let selection = &prompts.selections[1];
         assert_eq!(
             selection.choices,
@@ -448,7 +375,7 @@ fn full_wizard_supports_ollama_and_provider_prefix_resets_stale_fields() {
     let mut config = json!({"provider": "jina", "model": "old", "dimensions": 16,
         "embeddingBaseUrl": "https://old.invalid/v1"});
     let mut prompts = ScriptedPrompts::new(&format!(
-        "openai\n\nno\nno\nollama\nqwen3-embedding:4b\nyes\n{}",
+        "\n\nno\nollama\nqwen3-embedding:4b\nyes\n{}",
         "\n".repeat(8)
     ));
     configure_interactively(&mut config, &mut prompts).unwrap();

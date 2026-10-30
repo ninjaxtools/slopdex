@@ -210,16 +210,8 @@ impl Engine {
         if !readonly {
             registry::register(&db, &root)?;
         }
-        // Persisted description settings also apply when an index is moved to a
-        // caller without a config file. Explicit settings still take precedence.
-        if config.get("descriptionProvider").is_none()
-            && config.get("descriptionModel").is_none()
-            && let Some(profile) = db.meta("description_profile")?
-        {
-            let profile: Value = serde_json::from_str(&profile)?;
-            config["descriptionProvider"] = profile["provider"].clone();
-            config["descriptionModel"] = profile["model"].clone();
-        }
+        // Never restore executable commands from an index or shared artifact.
+        // Generation requires an explicitly configured, trusted command.
         let map_config = json!({});
         if !structural_only {
             crate::providers::resolve_embeddings(

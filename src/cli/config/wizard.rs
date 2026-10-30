@@ -6,7 +6,6 @@ use super::{
 };
 use crate::cli::args::positive;
 use crate::limits::{self, ResultLimit};
-use crate::providers::Providers;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -22,7 +21,7 @@ fn array(value: &Value) -> &[Value] {
 fn reranker_default(provider: &str) -> &'static str {
     match provider {
         "jina" => "jina-reranker-v3.5",
-        "openai" => "gpt-5.6-luna",
+        "command" => "",
         _ => "rerank-v4.0-pro",
     }
 }
@@ -67,7 +66,6 @@ trait Prompts {
     fn yes(&mut self, label: &str, default: bool) -> Result<bool>;
     fn number(&mut self, label: &str, default: u64, max: Option<usize>) -> Result<usize>;
     fn required(&mut self, label: &str, default: &str) -> Result<String>;
-    fn catalog(&mut self, provider: &str) -> Result<Value>;
     fn installed(&mut self, config: &Value) -> Result<Vec<String>>;
     fn select(
         &mut self,
@@ -79,32 +77,6 @@ trait Prompts {
 
     fn choice(&mut self, label: &str, default: &str, choices: &[&str]) -> Result<String> {
         self.select(label, default, choices, false)
-    }
-
-    fn published(
-        &mut self,
-        catalog: &Value,
-        provider: &str,
-        label: &str,
-        current: &str,
-        excluded: Option<&str>,
-    ) -> Result<String> {
-        let models: Vec<&str> = array(catalog)
-            .iter()
-            .filter(|row| text(row, "provider") == provider)
-            .map(|row| text(row, "model"))
-            .filter(|model| !model.is_empty() && Some(*model) != excluded)
-            .collect();
-        ensure!(
-            !models.is_empty(),
-            "{provider} returned no selectable models"
-        );
-        let default = if models.contains(&current) {
-            current
-        } else {
-            models[0]
-        };
-        self.select(label, default, &models, true)
     }
 }
 
@@ -187,12 +159,6 @@ impl Prompts for CliclackPrompts {
         Ok(value.trim().to_owned())
     }
 
-    fn catalog(&mut self, provider: &str) -> Result<Value> {
-        crate::ui::spin("Fetching published models", || {
-            Providers::models(Some(provider))
-        })
-    }
-
     fn installed(&mut self, config: &Value) -> Result<Vec<String>> {
         match crate::providers::installed_embedding_models(config) {
             Ok(models) => Ok(models),
@@ -207,9 +173,8 @@ impl Prompts for CliclackPrompts {
 }
 
 pub(super) const CONFIG_KEYS: &[&str] = &[
-    "descriptionProvider",
+    "descriptionCommand",
     "descriptionModel",
-    "descriptionFallbackModel",
     "rerankingEnabled",
     "rerankerProvider",
     "rerankerModel",
@@ -341,93 +306,24 @@ fn configure_interactively_filtered(
     let mut config = saved.clone();
     normalize_config_aliases(&mut config);
     let existing = config.clone();
-    if prefix.is_none()
-        || prefix.is_some_and(|p| {
-            [
-                "descriptionProvider",
-                "descriptionModel",
-                "descriptionFallbackModel",
-            ]
-            .iter()
-            .any(|key| key.starts_with(p))
-        })
-    {
-        let provider = if selected(prefix, "descriptionProvider") {
-            prompts.choice(
-                "Description provider",
-                existing["descriptionProvider"]
-                    .as_str()
-                    .unwrap_or("opencode-go"),
-                &["opencode-go", "opencode", "openai"],
-            )?
+    if selected(prefix, "descriptionCommand") {
+        let default = existing
+            .get("descriptionCommand")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "[\"opencode\",\"run\"]".into());
+        config["descriptionCommand"] = serde_json::from_str(
+            &prompts.required("Description agent command (JSON argument array)", &default)?,
+        )?;
+    }
+    if selected(prefix, "descriptionModel") {
+        let model = prompts.ask(
+            "Description model (blank uses harness default)",
+            text(&existing, "descriptionModel"),
+        )?;
+        if model.is_empty() {
+            config.as_object_mut().unwrap().remove("descriptionModel");
         } else {
-            existing["descriptionProvider"]
-                .as_str()
-                .unwrap_or("opencode-go")
-                .to_owned()
-        };
-        let same = existing["descriptionProvider"] == provider;
-        let current = if same {
-            text(&existing, "descriptionModel")
-        } else {
-            ""
-        };
-        let catalog = if provider == "openai"
-            || !selected(prefix, "descriptionModel")
-                && !selected(prefix, "descriptionFallbackModel")
-        {
-            None
-        } else {
-            Some(prompts.catalog(&provider)?)
-        };
-        let model = if !selected(prefix, "descriptionModel") {
-            current.to_owned()
-        } else if let Some(catalog) = &catalog {
-            prompts.published(catalog, &provider, "Description model", current, None)?
-        } else {
-            prompts.required(
-                "Description model",
-                if current.is_empty() {
-                    "gpt-5.6-luna"
-                } else {
-                    current
-                },
-            )?
-        };
-        if selected(prefix, "descriptionProvider") {
-            config["descriptionProvider"] = json!(provider);
-        }
-        if selected(prefix, "descriptionModel") {
             config["descriptionModel"] = json!(model);
-        }
-        if selected(prefix, "descriptionFallbackModel")
-            && prompts.yes(
-                "Configure a fallback description model?",
-                existing.get("descriptionFallbackModel").is_some(),
-            )?
-        {
-            let current = if same {
-                text(&existing, "descriptionFallbackModel")
-            } else {
-                ""
-            };
-            let fallback = if let Some(catalog) = &catalog {
-                prompts.published(
-                    catalog,
-                    &provider,
-                    "Fallback description model",
-                    current,
-                    Some(&model),
-                )?
-            } else {
-                prompts.required("Fallback description model", current)?
-            };
-            config["descriptionFallbackModel"] = json!(fallback);
-        } else if selected(prefix, "descriptionFallbackModel") {
-            config
-                .as_object_mut()
-                .unwrap()
-                .remove("descriptionFallbackModel");
         }
     }
     let reranking = if selected(prefix, "rerankingEnabled") {
@@ -452,7 +348,7 @@ fn configure_interactively_filtered(
             prompts.choice(
                 "Reranker provider",
                 existing["rerankerProvider"].as_str().unwrap_or("cohere"),
-                &["cohere", "jina", "openai"],
+                &["cohere", "jina", "command"],
             )?
         } else {
             existing["rerankerProvider"]
@@ -468,13 +364,27 @@ fn configure_interactively_filtered(
         } else {
             reranker_default(&provider)
         };
+        if provider == "command" {
+            let command = existing
+                .get("rerankerCommand")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "[\"opencode\",\"run\"]".into());
+            config["rerankerCommand"] = serde_json::from_str(
+                &prompts.required("Reranking agent command (JSON argument array)", &command)?,
+            )?;
+        }
         if selected(prefix, "rerankerModel") {
-            config["rerankerModel"] = json!(prompts.required("Reranker model", default)?);
+            let model = prompts.ask("Reranker model (blank uses harness default)", default)?;
+            if model.is_empty() {
+                config.as_object_mut().unwrap().remove("rerankerModel");
+            } else {
+                config["rerankerModel"] = json!(model);
+            }
         }
         if selected(prefix, "rerankerProvider") {
             config["rerankerProvider"] = json!(provider);
         }
-        if provider == "openai" || (prefix.is_some() && selected(prefix, "rerankerCandidates")) {
+        if provider == "command" || (prefix.is_some() && selected(prefix, "rerankerCandidates")) {
             let default = if same {
                 existing["rerankerCandidates"].as_u64().unwrap_or(10)
             } else {

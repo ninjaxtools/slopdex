@@ -639,17 +639,12 @@ fn apply_description(
 
 fn description_settings(config: &Value) -> Value {
     json!({
-        "descriptionProvider": config["descriptionProvider"],
+        "commandHash": hash(config["descriptionCommand"].to_string()),
         "descriptionModel": config["descriptionModel"],
-        "descriptionFallbackModel": config["descriptionFallbackModel"],
-        "fallbackModel": config["fallbackModel"],
-        "descriptionBaseUrl": config["descriptionBaseUrl"],
-        "providerTimeoutMs": config["providerTimeoutMs"],
-        "providerMaxRetries": config["providerMaxRetries"],
-        "retryDelayMs": config["retryDelayMs"],
+        "agentTimeoutMs": config["agentTimeoutMs"],
     })
 }
-/// Keep SQLite writes on the caller thread. Persist each successful HTTP result
+/// Keep SQLite writes on the caller thread. Persist each successful model result
 /// as it arrives, even if another in-flight request fails. Never launch more
 /// requests after a failed window, and join every worker before returning.
 fn run_jobs<T: Sync, R: Send>(

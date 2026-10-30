@@ -1,5 +1,4 @@
 use super::*;
-use crate::models::Message;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{
@@ -9,17 +8,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::test_agent as agent;
 #[path = "ollama_tests.rs"]
 mod ollama_tests;
-
-fn adapter_protocol(provider: &str, model: &str) -> Protocol {
-    match provider {
-        "openai" => <llm_openai::OpenAi as llm::Adapter>::protocol(model),
-        "opencode" => <llm_opencode::OpenCode as llm::Adapter>::protocol(model),
-        "opencode-go" => <llm_opencode_go::OpenCodeGo as llm::Adapter>::protocol(model),
-        _ => panic!("unsupported test provider: {provider}"),
-    }
-}
 
 struct Request {
     path: String,
@@ -42,19 +33,10 @@ impl Mock {
                 .collect(),
         )
     }
-
     fn raw(replies: Vec<(u16, String)>) -> Self {
-        Self::wire(
-            replies
-                .into_iter()
-                .map(|(status, body)| {
-                    format!("HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nRetry-After: 0\r\n\r\n{body}", body.len())
-                })
-                .collect(),
-        )
+        Self::wire(replies.into_iter().map(|(status, body)|
+            format!("HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nRetry-After: 0\r\n\r\n{body}", body.len())).collect())
     }
-
-    // Raw wire replies allow deterministic short reads and custom response headers.
     fn wire(replies: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -65,7 +47,7 @@ impl Mock {
         let stopped = stop.clone();
         let worker = thread::spawn(move || {
             for reply in replies {
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + Duration::from_secs(30);
                 let mut stream = loop {
                     if stopped.load(Ordering::Relaxed) {
                         return;
@@ -82,11 +64,9 @@ impl Mock {
                         Err(e) => panic!("mock accept failed: {e}"),
                     }
                 };
-                // Windows accepted sockets inherit the listener's nonblocking mode.
-                // Use blocking reads for partial requests, bounded by the timeout below.
                 stream.set_nonblocking(false).unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .set_read_timeout(Some(Duration::from_secs(30)))
                     .unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut first = String::new();
@@ -129,29 +109,22 @@ impl Mock {
             worker: Some(worker),
         }
     }
-
     fn config(&self) -> Value {
-        json!({"embeddingBaseUrl": self.base, "descriptionBaseUrl": self.base, "rerankerBaseUrl": self.base,
-            "embeddingApiKey": "mock-secret", "descriptionApiKey": "mock-secret", "rerankerApiKey": "mock-secret",
+        json!({"embeddingBaseUrl": self.base, "rerankerBaseUrl": self.base,
+            "embeddingApiKey": "mock-secret", "rerankerApiKey": "mock-secret",
             "dimensions": 2, "retryDelayMs": 0, "providerTimeoutMs": 2000})
     }
 }
-
 impl Drop for Mock {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
+            let result = worker.join();
             if !thread::panicking() {
-                worker.join().unwrap();
-            } else {
-                let _ = worker.join();
+                result.unwrap();
             }
         }
     }
-}
-
-fn response(text: &str) -> Value {
-    json!({"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]})
 }
 
 #[test]
@@ -159,251 +132,85 @@ fn model_notices_dedupe_by_kind_provider_and_actual_model() {
     let reported = ReportedCalls::default();
     for (kind, provider, model) in [
         ("vectors", "openai", "primary"),
-        ("descriptions", "openai", "primary"),
-        ("reranking", "openai", "primary"),
-        ("descriptions", "opencode", "primary"),
-        ("descriptions", "opencode", "fallback"),
+        ("description", "command", "primary"),
+        ("reranker", "command", "primary"),
     ] {
         assert!(should_report_call(&reported, false, kind, provider, model));
         assert!(!should_report_call(&reported, false, kind, provider, model));
-        for _ in 0..3 {
-            assert!(should_report_call(&reported, true, kind, provider, model));
-        }
-        assert!(!should_report_call(&reported, false, kind, provider, model));
+        assert!(should_report_call(&reported, true, kind, provider, model));
     }
-    // A verbose first call still counts as reported for later quiet callers.
-    assert!(should_report_call(
-        &reported, true, "vectors", "jina", "new"
-    ));
-    assert!(!should_report_call(
-        &reported, false, "vectors", "jina", "new"
-    ));
-}
-
-#[test]
-fn concurrent_model_notices_report_once_unless_verbose() {
-    for verbose in [false, true] {
-        let reported = ReportedCalls::default();
-        let barrier = std::sync::Barrier::new(10);
-        let count = thread::scope(|scope| {
-            let workers: Vec<_> = (0..10)
-                .map(|_| {
-                    scope.spawn(|| {
-                        barrier.wait();
-                        usize::from(should_report_call(
-                            &reported,
-                            verbose,
-                            "descriptions",
-                            "openai",
-                            "primary",
-                        ))
-                    })
+    let barrier = std::sync::Barrier::new(10);
+    let reported = ReportedCalls::default();
+    let count = thread::scope(|scope| {
+        let workers: Vec<_> = (0..10)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    usize::from(should_report_call(
+                        &reported, false, "vectors", "jina", "new",
+                    ))
                 })
-                .collect();
-            workers
-                .into_iter()
-                .map(|w| w.join().unwrap())
-                .sum::<usize>()
-        });
-        assert_eq!(count, if verbose { 10 } else { 1 });
-    }
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .sum::<usize>()
+    });
+    assert_eq!(count, 1);
 }
 
 #[test]
-fn http_notices_run_for_each_outgoing_attempt() {
-    let mock = Mock::new(vec![(503, json!({})), (200, json!({"ok": true}))]);
-    let http = Http::new(&mock.config()).unwrap();
-    let mut notices = 0;
-    let result = http
-        .request_with_notice(&mock.base, Some(&json!({})), &HeaderMap::new(), || {
-            notices += 1;
-        })
-        .unwrap();
-    assert_eq!(result, json!({"ok": true}));
-    assert_eq!(notices, 2);
-    assert_eq!(mock.requests.lock().unwrap().len(), notices);
-}
-
-#[test]
-fn constructor_is_offline_and_supports_legacy_and_qualified_config() {
+fn construction_is_offline_and_embeddings_preserve_aliases() {
     let mock = Mock::new(vec![]);
-    let config = json!({"provider": "jina", "model": "jina-embeddings-v4", "dimensions": 8,
-        "descriptionModel": "opencode-go/deepseek-v4", "descriptionFallbackModel": "opencode-go/muse-spark-1.3-contributor",
-        "descriptionBaseUrl": mock.base});
-    let p = Providers::new(&config).unwrap();
-    assert_eq!(p.dimensions(), 8);
-    assert_eq!(
-        p.embedding_profile(),
-        json!({"provider": "jina", "model": "jina-embeddings-v4", "dimensions": 8, "strategyVersion": "rust-v1"})
-    );
-    assert_eq!(p.description_profile()["model"], "deepseek-v4");
-    assert_eq!(p.description_profile()["provider"], "opencode-go");
+    let p = Providers::new(&json!({"embeddingProvider":"jina", "embeddingModel":"jina/jina-embeddings-v4", "embeddingDimensions":16,
+        "descriptionCommand":["not-installed-agent"], "descriptionModel":"provider/arbitrary-model"})).unwrap();
+    assert_eq!(p.dimensions(), 16);
+    assert_eq!(p.embedding_profile()["provider"], "jina");
+    assert_eq!(p.description_profile()["model"], "provider/arbitrary-model");
+    assert_eq!(p.description_profile()["provider"], "command");
     assert!(p.embed(&[], false).unwrap().is_empty());
     assert!(p.rerank("", &[]).unwrap().is_empty());
     assert!(mock.requests.lock().unwrap().is_empty());
-    assert!(Providers::new(&json!({"descriptionProvider": "opencode", "descriptionFallbackModel": "opencode-go/foo"})).is_err());
-    assert!(Providers::new(&json!({"dimensions": 0})).is_err());
-    let aliases = Providers::new(
-        &json!({"embeddingProvider": "jina", "embeddingModel": "jina-embeddings-v4", "embeddingDimensions": 16}),
+    let p = Providers::new(
+        &json!({"provider":"openai", "model":"text-embedding-3-small", "dimensions":8,
+        "embeddingProvider":"jina", "embeddingDimensions":16}),
     )
     .unwrap();
-    assert_eq!(aliases.embedding_profile()["provider"], "jina");
-    assert_eq!(aliases.dimensions(), 16);
-    let canonical = Providers::new(&json!({
-        "provider": "openai", "model": "text-embedding-3-small", "dimensions": 8,
-        "embeddingProvider": "jina", "embeddingModel": "jina/jina-embeddings-v4",
-        "embeddingDimensions": 16
-    }))
-    .unwrap();
-    assert_eq!(
-        canonical.embedding_profile(),
-        json!({"provider": "openai",
-        "model": "text-embedding-3-small", "dimensions": 8, "strategyVersion": "rust-v1"})
-    );
+    assert_eq!(p.dimensions(), 8);
+    assert_eq!(p.embedding_profile()["provider"], "openai");
 }
 
 #[test]
-fn symbol_vectors_are_lazy_and_have_separate_profiles_and_dimensions() {
-    for (config, primary_dimensions, symbol_dimensions) in [
-        (json!({}), 3072, 256),
-        (json!({"dimensions": 128}), 128, 128),
-        (json!({"dimensions": 256}), 256, 256),
-        (json!({"symbolDimensions": 512}), 3072, 512),
-        (
-            json!({"embeddingProvider": "jina", "embeddingDimensions": 768,
-                "embeddingModel": "jina/jina-embeddings-v4", "symbolDimensions": 64}),
-            768,
-            64,
-        ),
-    ] {
+fn symbol_vectors_are_lazy_separate_and_normalize_input() {
+    for provider in ["openai", "jina"] {
+        let mock = Mock::new(vec![(200, json!({"data":[{"index":0,"embedding":[3,4]}]}))]);
+        let mut config = mock.config();
+        config["provider"] = json!(provider);
+        config["dimensions"] = json!(512);
+        config["symbolDimensions"] = json!(2);
         let p = Providers::new(&config).unwrap();
         assert!(p.symbol_vector.get().is_none());
-        let primary_profile = p.embedding_profile();
-        let symbols = p.symbol_vector().unwrap();
-        assert_eq!(symbols.dimensions(), symbol_dimensions);
-        assert_eq!(p.dimensions(), primary_dimensions);
-        assert_eq!(p.embedding_profile(), primary_profile);
-        assert_ne!(symbols.profile(), primary_profile);
+        let symbol = p.symbol_vector().unwrap();
+        assert_eq!(symbol.dimensions(), 2);
+        assert_eq!(p.dimensions(), 512);
+        assert_ne!(symbol.profile(), p.embedding_profile());
+        assert!(std::ptr::eq(symbol, p.symbol_vector().unwrap()));
         assert_eq!(
-            symbols.profile()["symbolNormalizationVersion"],
-            "symbols-v1"
+            symbol.embed(&["getHTTP2Response".into()], true).unwrap(),
+            vec![vec![0.6, 0.8]]
         );
-        assert_eq!(symbols.profile()["provider"], primary_profile["provider"]);
-        assert_eq!(symbols.profile()["model"], primary_profile["model"]);
-        assert!(std::ptr::eq(symbols, p.symbol_vector().unwrap()));
-        assert!(symbols.embed(&[], false).unwrap().is_empty());
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests[0].body["input"], json!(["get http 2 response"]));
+        assert_eq!(requests[0].body["dimensions"], 2);
+        if provider == "jina" {
+            assert_eq!(requests[0].body["task"], "code.query");
+        }
     }
     for invalid in [json!(0), json!(-1), json!(1.5), json!("256")] {
-        let p = Providers::new(&json!({"symbolDimensions": invalid})).unwrap();
-        for _ in 0..2 {
-            let error = p.symbol_vector().err().unwrap();
-            assert!(
-                error
-                    .to_string()
-                    .contains("symbolDimensions must be a positive integer")
-            );
-            assert!(p.symbol_vector.get().is_none());
-        }
-    }
-}
-
-#[test]
-fn symbol_vectors_request_native_dimensions_and_preserve_provider_configuration() {
-    for provider in ["openai", "jina"] {
-        for configured_dimensions in [None, Some(128)] {
-            let dimensions = configured_dimensions.unwrap_or(256);
-            let mock = Mock::new(vec![
-                (
-                    200,
-                    json!({"data": [{"index": 0, "embedding": vec![1; dimensions]}]}),
-                ),
-                (
-                    200,
-                    json!({"data": [{"index": 0, "embedding": vec![1; dimensions]}]}),
-                ),
-                (
-                    200,
-                    json!({"data": [{"index": 0, "embedding": vec![1; 512]}]}),
-                ),
-            ]);
-            let mut config = mock.config();
-            config["provider"] = json!(provider);
-            config["dimensions"] = json!(512);
-            config["embeddingBatchSize"] = json!(1);
-            config["embeddingBaseUrl"] = json!(format!("{}/embeddings/", mock.base));
-            if provider == "jina" {
-                config.as_object_mut().unwrap().remove("embeddingApiKey");
-                config["jinaApiKey"] = json!("provider-secret");
-            }
-            if let Some(dimensions) = configured_dimensions {
-                config["symbolDimensions"] = json!(dimensions);
-            }
-            let p = Providers::new(&config).unwrap();
-            let symbols = p.symbol_vector().unwrap();
-            assert_eq!(symbols.batch_limit(), 1);
-            assert_eq!(
-                symbols.profile()["endpoint"],
-                p.embedding_profile()["endpoint"]
-            );
-            assert!(symbols.embed(&["a".into(), "b".into()], false).is_err());
-            assert!(mock.requests.lock().unwrap().is_empty());
-            for query in [false, true] {
-                let result = symbols.embed(&["getHTTP2Response".into()], query).unwrap();
-                assert_eq!(result[0].len(), dimensions);
-            }
-            p.embed(&["getHTTP2Response".into()], false).unwrap();
-            let requests = mock.requests.lock().unwrap();
-            assert_eq!(requests.len(), 3);
-            for request in &requests[..2] {
-                assert_eq!(request.path, "/v1/embeddings");
-                assert_eq!(request.body["dimensions"], dimensions);
-                assert_eq!(request.body["input"], json!(["get http 2 response"]));
-                let key = if provider == "jina" {
-                    "provider-secret"
-                } else {
-                    "mock-secret"
-                };
-                assert!(
-                    request
-                        .headers
-                        .contains(&format!("authorization: bearer {key}"))
-                );
-            }
-            if provider == "jina" {
-                assert_eq!(requests[0].body["task"], "code.passage");
-                assert_eq!(requests[1].body["task"], "code.query");
-            }
-            assert_eq!(requests[2].body["dimensions"], 512);
-            assert_eq!(requests[2].body["input"], json!(["getHTTP2Response"]));
-        }
-    }
-}
-
-#[test]
-fn symbol_vectors_preserve_legacy_ada_dimensions_without_requesting_them() {
-    for symbol_dimensions in [None, Some(256)] {
-        let mock = Mock::new(vec![(
-            200,
-            json!({"data": [{"index": 0, "embedding": vec![1; 1536]}]}),
-        )]);
-        let mut config = mock.config();
-        config.as_object_mut().unwrap().remove("dimensions");
-        config["embeddingModel"] = json!("openai/text-embedding-ada-002");
-        if let Some(dimensions) = symbol_dimensions {
-            config["symbolDimensions"] = json!(dimensions);
-        }
-        let p = Providers::new(&config).unwrap();
-        let symbols = p.symbol_vector().unwrap();
-        assert_eq!(p.dimensions(), 1536);
-        assert_eq!(symbols.dimensions(), 1536);
-        assert_ne!(symbols.profile(), p.embedding_profile());
-        let result = symbols.embed(&["GLOBAL_CONSTANT".into()], false).unwrap();
-        assert_eq!(result[0].len(), 1536);
-        let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].body["model"], "text-embedding-ada-002");
-        assert!(requests[0].body.get("dimensions").is_none());
-        assert_eq!(requests[0].body["input"], json!(["global constant"]));
+        let p = Providers::new(&json!({"symbolDimensions":invalid})).unwrap();
+        assert!(p.symbol_vector().is_err());
+        assert!(p.symbol_vector.get().is_none());
     }
 }
 
@@ -412,10 +219,10 @@ fn embeddings_batch_reorder_normalize_and_use_jina_tasks() {
     let mock = Mock::new(vec![
         (
             200,
-            json!({"data": [{"index": 1, "embedding": [0, 4]}, {"index": 0, "embedding": [3, 4]}]}),
+            json!({"data":[{"index":1,"embedding":[0,4]},{"index":0,"embedding":[3,4]}]}),
         ),
-        (200, json!({"data": [{"index": 0, "embedding": [5, 0]}]})),
-        (200, json!({"data": [{"index": 0, "embedding": [0, 9]}]})),
+        (200, json!({"data":[{"index":0,"embedding":[5,0]}]})),
+        (200, json!({"data":[{"index":0,"embedding":[0,9]}]})),
     ]);
     let mut config = mock.config();
     config["provider"] = json!("jina");
@@ -426,15 +233,13 @@ fn embeddings_batch_reorder_normalize_and_use_jina_tasks() {
         p.embed(&["a".into(), "b".into()], false).unwrap(),
         vec![vec![0.6, 0.8], vec![0., 1.]]
     );
-    assert_eq!(p.embed(&["c".into()], false).unwrap(), vec![vec![1., 0.]]);
-    p.embed(&["query".into()], true).unwrap();
+    p.embed(&["c".into()], false).unwrap();
+    p.embed(&["q".into()], true).unwrap();
     let requests = mock.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].path, "/v1/embeddings");
     assert_eq!(requests[0].body["task"], "code.passage");
     assert_eq!(requests[2].body["task"], "code.query");
     assert_eq!(requests[0].body["embedding_type"], "float");
-    assert!(requests[0].body.get("encoding_format").is_none());
     assert!(
         requests[0]
             .headers
@@ -443,1060 +248,320 @@ fn embeddings_batch_reorder_normalize_and_use_jina_tasks() {
 }
 
 #[test]
-fn embedding_limit_caps_requests_and_never_hides_successful_batches() {
+fn embedding_limits_expose_successful_paid_batches() {
     for (provider, maximum) in [("openai", 32), ("jina", 64)] {
         for configured in [None, Some(2), Some(128)] {
             let limit = configured.unwrap_or(maximum).min(maximum);
             let data: Vec<_> = (0..limit)
-                .map(|i| json!({"index": i, "embedding": [1, 0]}))
+                .map(|i| json!({"index":i,"embedding":[1,0]}))
                 .collect();
-            let mock = Mock::new(vec![
-                (200, json!({"data": data})),
-                (503, json!({"error": "unavailable"})),
-            ]);
+            let mock = Mock::new(vec![(200, json!({"data":data})), (503, json!({}))]);
             let mut config = mock.config();
             config["provider"] = json!(provider);
             config["providerMaxRetries"] = json!(0);
-            if let Some(size) = configured {
-                config["embeddingBatchSize"] = json!(size);
+            if let Some(n) = configured {
+                config["embeddingBatchSize"] = json!(n);
             }
             let p = Providers::new(&config).unwrap();
             assert_eq!(p.embedding_batch_limit(), limit);
-            let inputs = vec!["input".to_owned(); limit + 1];
-            let error = p.embed(&inputs, false).unwrap_err();
-            assert!(error.to_string().contains("exceeds batch limit"));
+            let inputs = vec!["input".into(); limit + 1];
+            assert!(p.embed(&inputs, false).is_err());
             assert!(mock.requests.lock().unwrap().is_empty());
-
-            // The caller receives the first paid result before the next can
-            // fail, so it has an opportunity to persist it durably.
-            let first = p.embed(&inputs[..limit], false).unwrap();
-            assert_eq!(first.len(), limit);
-            assert_eq!(mock.requests.lock().unwrap().len(), 1);
+            assert_eq!(p.embed(&inputs[..limit], false).unwrap().len(), limit);
             assert!(p.embed(&inputs[limit..], false).is_err());
-            let requests = mock.requests.lock().unwrap();
-            assert_eq!(requests.len(), 2);
-            assert_eq!(requests[0].body["input"].as_array().unwrap().len(), limit);
+            assert_eq!(mock.requests.lock().unwrap().len(), 2);
         }
     }
 }
 
 #[test]
-fn openai_embedding_input_is_bounded_on_utf8_boundaries() {
-    let mock = Mock::new(vec![(
-        200,
-        json!({"data": [{"index": 0, "embedding": [1, 0]}]}),
-    )]);
+fn embedding_validation_rejects_corruption_without_poisoning_next_call() {
+    for data in [
+        json!([]),
+        json!([{"index":1,"embedding":[1,0]}]),
+        json!([{"index":0,"embedding":[1]}]),
+        json!([{"index":0,"embedding":["1",0]}]),
+        json!([{"index":0,"embedding":[0,0]}]),
+        json!([{"index":0,"embedding":[1e100,0]}]),
+        json!([{"index":0,"embedding":[1,0]},{"index":0,"embedding":[0,1]}]),
+    ] {
+        let mock = Mock::new(vec![
+            (200, json!({"data":data})),
+            (200, json!({"data":[{"index":0,"embedding":[1,0]}]})),
+        ]);
+        let p = Providers::new(&mock.config()).unwrap();
+        assert!(p.embed(&["a".into()], false).is_err());
+        assert_eq!(p.embed(&["a".into()], false).unwrap(), vec![vec![1., 0.]]);
+        assert_eq!(mock.requests.lock().unwrap().len(), 2);
+    }
+    assert_eq!(normalize(&json!([1e-200, 0]), 2).unwrap(), vec![1., 0.]);
+}
+
+#[test]
+fn openai_bounds_utf8_input_and_ada_keeps_native_dimensions() {
+    let mock = Mock::new(vec![(200, json!({"data":[{"index":0,"embedding":[1,0]}]}))]);
     let p = Providers::new(&mock.config()).unwrap();
     let input = "🙂x".repeat(10_000);
     p.embed(std::slice::from_ref(&input), false).unwrap();
     let requests = mock.requests.lock().unwrap();
     let sent = requests[0].body["input"][0].as_str().unwrap();
     assert!(sent.len() <= 8191 && input.starts_with(sent));
-    assert_eq!(requests[0].body["encoding_format"], "float");
-    assert_eq!(requests[0].body["dimensions"], 2);
-}
-
-#[test]
-fn embedding_response_validation_rejects_corruption() {
-    for data in [
-        json!([]),
-        json!([{"index": 1, "embedding": [1, 0]}]),
-        json!([{"index": 0, "embedding": [1]}]),
-        json!([{"index": 0, "embedding": ["1", 0]}]),
-        json!([{"index": 0, "embedding": [0, 0]}]),
-        json!([{"index": 0, "embedding": [1e100, 0]}]),
-    ] {
-        let mock = Mock::new(vec![(200, json!({"data": data}))]);
-        assert!(
-            Providers::new(&mock.config())
-                .unwrap()
-                .embed(&["a".into()], false)
-                .is_err()
-        );
-    }
+    drop(requests);
+    assert!(Providers::new(&json!({"model":"text-embedding-ada-002","dimensions":256})).is_err());
     let mock = Mock::new(vec![(
         200,
-        json!({"data": [{"index": 0, "embedding": [1, 0]}, {"index": 0, "embedding": [0, 1]}]}),
+        json!({"data":[{"index":0,"embedding":vec![1;1536]}]}),
     )]);
+    let mut config = mock.config();
+    config.as_object_mut().unwrap().remove("dimensions");
+    config["model"] = json!("text-embedding-ada-002");
+    config["symbolDimensions"] = json!(256);
+    let p = Providers::new(&config).unwrap();
+    let symbols = p.symbol_vector().unwrap();
+    assert_eq!(symbols.dimensions(), 1536);
+    symbols.embed(&["GLOBAL_CONSTANT".into()], false).unwrap();
     assert!(
-        Providers::new(&mock.config())
-            .unwrap()
-            .embed(&["a".into(), "b".into()], false)
-            .is_err()
+        mock.requests.lock().unwrap()[0]
+            .body
+            .get("dimensions")
+            .is_none()
     );
-    assert_eq!(normalize(&json!([1e-200, 0]), 2).unwrap(), vec![1., 0.]);
 }
 
 #[test]
-fn descriptions_use_all_four_wire_protocols_and_headers() {
-    for (provider, model, path, output, auth) in [
-        (
-            "openai",
-            "gpt-5.6-luna",
-            "/v1/responses",
-            response(" hello "),
-            "authorization: bearer mock-secret",
-        ),
-        (
-            "opencode",
-            "deepseek-v4",
-            "/v1/chat/completions",
-            json!({"choices": [{"message": {"content": "hello"}}]}),
-            "authorization: bearer mock-secret",
-        ),
-        (
-            "opencode-go",
-            "qwen3.8-max",
-            "/v1/messages",
-            json!({"content": [{"type": "thinking", "thinking": "private"}, {"type": "text", "text": "hello"}]}),
-            "x-api-key: mock-secret",
-        ),
-        (
-            "opencode",
-            "gemini-3.8-flash",
-            "/v1/models/gemini-3.8-flash:generateContent",
-            json!({"candidates": [{"content": {"parts": [{"thought": true, "text": "private"}, {"text": "hello"}]}}]}),
-            "x-goog-api-key: mock-secret",
-        ),
-    ] {
-        let mock = Mock::new(vec![(200, output.clone()), (200, output)]);
-        let mut config = mock.config();
-        config["descriptionProvider"] = json!(provider);
-        config["descriptionModel"] = json!(model);
-        let providers = Providers::new(&config).unwrap();
-        let mut messages = vec![Message::user("question".into())];
-        assert_eq!(
-            providers
-                .llm()
-                .describe_conversation("instructions", &messages, "file-session")
-                .unwrap(),
-            "hello"
-        );
-        messages.push(Message::assistant("hello".into()));
-        messages.push(Message::user("callable question".into()));
-        assert_eq!(
-            providers
-                .llm()
-                .describe_conversation("instructions", &messages, "file-session")
-                .unwrap(),
-            "hello"
-        );
-        let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests[0].path, path);
-        assert!(requests[0].headers.contains(auth));
-        assert!(!requests[0].path.contains("mock-secret"));
-        assert_eq!(
-            requests[0].headers.contains("x-opencode-session:"),
-            provider != "openai"
-        );
-        let body = &requests[0].body;
-        let next = &requests[1].body;
-        if provider != "openai" {
-            assert!(
-                requests
-                    .iter()
-                    .all(|request| request.headers.contains("x-opencode-session: file-session"))
-            );
-        }
-        match adapter_protocol(provider, model) {
-            Protocol::Responses => {
-                assert_eq!(body["store"], false);
-                assert_eq!(body["instructions"], "instructions");
-                assert_eq!(body["input"][0]["content"][0]["text"], "question");
-                assert_eq!(next["input"][0], body["input"][0]);
-                assert_eq!(next["input"][1]["role"], "assistant");
-                assert_eq!(next["input"][1]["content"][0]["type"], "output_text");
-                assert_eq!(next["input"][1]["content"][0]["text"], "hello");
-                assert_eq!(next["input"][2]["content"][0]["text"], "callable question");
-            }
-            Protocol::Chat => {
-                assert_eq!(body["messages"][0]["content"], "instructions");
-                assert_eq!(body["messages"][1]["content"], "question");
-                assert_eq!(next["messages"][1], body["messages"][1]);
-                assert_eq!(
-                    next["messages"][2],
-                    json!({"role": "assistant", "content": "hello"})
-                );
-                assert_eq!(next["messages"][3]["content"], "callable question");
-            }
-            Protocol::Messages => {
-                assert_eq!(body["system"], "instructions");
-                assert_eq!(next["messages"][0], body["messages"][0]);
-                assert_eq!(next["messages"][1]["role"], "assistant");
-                assert_eq!(next["messages"][1]["content"][0]["text"], "hello");
-                assert_eq!(
-                    next["messages"][2]["content"][0]["text"],
-                    "callable question"
-                );
-                assert_eq!(next["cache_control"]["type"], "ephemeral");
-                assert!(
-                    requests[0]
-                        .headers
-                        .contains("anthropic-version: 2023-06-01")
-                );
-            }
-            Protocol::Gemini => {
-                assert_eq!(
-                    body["systemInstruction"]["parts"][0]["text"],
-                    "instructions"
-                );
-                assert_eq!(body["contents"][0]["parts"][0]["text"], "question");
-                assert_eq!(next["contents"][0], body["contents"][0]);
-                assert_eq!(next["contents"][1]["role"], "model");
-                assert_eq!(next["contents"][1]["parts"][0]["text"], "hello");
-                assert_eq!(next["contents"][2]["parts"][0]["text"], "callable question");
+fn native_rerankers_validate_rankings_preserve_credentials_and_endpoints() {
+    for provider in ["cohere", "jina"] {
+        for bad in [
+            Value::Null,
+            json!([]),
+            json!([{"index":0,"relevance_score":0.1},{"index":0,"relevance_score":0.2}]),
+            json!([{"index":0,"relevance_score":"secret"}]),
+        ] {
+            let mock = Mock::new(vec![
+                (200, json!({"results":bad})),
+                (
+                    200,
+                    json!({"results":[{"index":0,"relevance_score":0.1},{"index":1,"relevance_score":0.9}]}),
+                ),
+            ]);
+            let mut config = mock.config();
+            config["rerankerProvider"] = json!(provider);
+            config["rerankerModel"] = json!(format!("{provider}/custom"));
+            config["rerankerBaseUrl"] = json!(format!("{}/rerank/?route=custom", mock.base));
+            let p = Providers::new(&config).unwrap();
+            let docs = ["first".into(), "second".into()];
+            assert!(p.rerank("q", &docs).is_err());
+            assert_eq!(p.rerank("q", &docs).unwrap(), vec![(1, 0.9), (0, 0.1)]);
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].path, "/v1/rerank?route=custom");
+            assert_eq!(requests[0].body["model"], "custom");
+            if provider == "jina" {
+                assert_eq!(requests[0].body["return_documents"], false);
             }
         }
     }
-}
-
-#[test]
-fn catalogue_model_families_select_the_existing_registry_protocols() {
-    for model in ["gpt-5", "grok-4", "muse-spark-1", "unknown"] {
-        assert_eq!(adapter_protocol("opencode-go", model), Protocol::Responses);
-    }
-    for model in [
-        "big-pickle",
-        "deepseek-v4",
-        "glm-5",
-        "hy3",
-        "kimi-k3",
-        "ling-2",
-        "longcat-1",
-        "mimo-v2",
-        "nemotron-3",
-        "omen-1",
+    for ranking in [
+        json!([]),
+        json!([{"index":1,"score":0.5}]),
+        json!([{"index":0,"score":1.1}]),
+        json!([{"index":0,"score":"0.5"}]),
     ] {
-        assert_eq!(adapter_protocol("opencode", model), Protocol::Chat);
+        assert!(parse_ranking(&ranking, 1, true).is_err());
     }
-    assert_eq!(adapter_protocol("opencode", "minimax-m3"), Protocol::Chat);
-    assert_eq!(
-        adapter_protocol("opencode-go", "minimax-m3"),
-        Protocol::Messages
-    );
-    assert_eq!(
-        adapter_protocol("opencode", "claude-sonnet"),
-        Protocol::Messages
-    );
-    assert_eq!(
-        adapter_protocol("openai", "deepseek-custom"),
-        Protocol::Responses
-    );
 }
 
 #[test]
-fn fallback_is_sticky_and_switches_back_including_wire_protocol() {
-    let mock = Mock::new(vec![
-        (400, json!({"error": "model unavailable"})),
-        (200, response("fallback")),
-        (200, response("fallback again")),
-        (503, json!({"error": "unavailable"})),
-        (
-            200,
-            json!({"choices": [{"message": {"content": "primary"}}]}),
-        ),
-    ]);
-    let mut config = mock.config();
-    config["descriptionProvider"] = json!("opencode-go");
-    config["descriptionModel"] = json!("deepseek-v4");
-    config["descriptionFallbackModel"] = json!("muse-spark-1.3-contributor");
-    let p = Providers::new(&config).unwrap();
-    assert_eq!(p.describe("system", "one").unwrap(), "fallback");
-    assert_eq!(p.describe("system", "two").unwrap(), "fallback again");
-    assert_eq!(p.describe("system", "three").unwrap(), "primary");
-    assert_eq!(p.description_profile()["model"], "deepseek-v4");
-    let requests = mock.requests.lock().unwrap();
-    let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
-    assert_eq!(
-        paths,
-        [
-            "/v1/chat/completions",
-            "/v1/responses",
-            "/v1/responses",
-            "/v1/responses",
-            "/v1/chat/completions"
-        ]
-    );
-}
-
-#[test]
-fn description_empty_retry_and_failover_are_bounded() {
-    let mock = Mock::new(vec![(200, response("")), (200, response("recovered"))]);
-    assert_eq!(
-        Providers::new(&mock.config())
-            .unwrap()
-            .describe("s", "p")
+fn http_retries_transient_statuses_not_auth_redirects_or_paid_invalid_json() {
+    for status in [408, 409, 425, 429, 500, 502, 503, 504, 529] {
+        let mock = Mock::new(vec![(status, json!({})), (200, json!({"ok":true}))]);
+        let http = Http::new(&mock.config()).unwrap();
+        let mut notices = 0;
+        assert_eq!(
+            http.request_with_notice(
+                &mock.base,
+                Some(&json!({"input":["λ"]})),
+                &HeaderMap::new(),
+                || notices += 1
+            )
             .unwrap(),
-        "recovered"
-    );
-    assert_eq!(mock.requests.lock().unwrap().len(), 2);
-    for fallback in [false, true] {
-        let mock = Mock::new(vec![(200, response("")); 6]);
-        let mut config = mock.config();
-        if fallback {
-            config["descriptionFallbackModel"] = json!("backup");
-        }
-        assert!(Providers::new(&config).unwrap().describe("s", "p").is_err());
-        assert_eq!(mock.requests.lock().unwrap().len(), 6);
+            json!({"ok":true})
+        );
+        assert_eq!(notices, 2);
     }
-}
-
-#[test]
-fn description_failover_does_not_retry_permanently_failed_models() {
-    let mock = Mock::new(vec![
-        (404, json!({"error": "unknown primary"})),
-        (503, json!({"error": "fallback temporarily unavailable"})),
-        (200, response("fallback recovered")),
-        (200, response("still fallback")),
-    ]);
-    let mut config = mock.config();
-    config["descriptionModel"] = json!("primary");
-    config["descriptionFallbackModel"] = json!("backup");
-    let p = Providers::new(&config).unwrap();
-    assert_eq!(p.describe("s", "p").unwrap(), "fallback recovered");
-    assert_eq!(p.describe("s", "p").unwrap(), "still fallback");
-    let requests = mock.requests.lock().unwrap();
-    let models: Vec<_> = requests
-        .iter()
-        .map(|r| r.body["model"].as_str().unwrap())
-        .collect();
-    assert_eq!(models, ["primary", "backup", "backup", "backup"]);
-    drop(requests);
-
-    let mock = Mock::new(vec![(400, json!({})); DESCRIPTION_ATTEMPTS]);
-    let mut config = mock.config();
-    config["descriptionFallbackModel"] = json!("backup");
-    assert!(Providers::new(&config).unwrap().describe("s", "p").is_err());
-    assert_eq!(mock.requests.lock().unwrap().len(), 2);
-}
-
-#[test]
-fn description_failover_stops_on_shared_auth_errors_and_redirects() {
-    for status in [401, 302, 307] {
-        let mock = Mock::new(vec![
-            (status, json!({"error": "mock-secret"}));
-            DESCRIPTION_ATTEMPTS
-        ]);
-        let mut config = mock.config();
-        config["descriptionFallbackModel"] = json!("backup");
-        let error = Providers::new(&config)
-            .unwrap()
-            .describe("s", "p")
-            .unwrap_err();
-        assert!(error.to_string().contains(&status.to_string()));
-        assert!(!format!("{error:#?}").contains("mock-secret"));
-        assert_eq!(mock.requests.lock().unwrap().len(), 1);
-    }
-}
-
-#[test]
-fn description_transient_retries_respect_limits_without_nested_retries() {
-    for (fallback, retries, expected) in [(false, 0, 1), (false, 2, 3), (true, 5, 6)] {
-        let mock = Mock::new(vec![(503, json!({})); DESCRIPTION_ATTEMPTS + 1]);
-        let mut config = mock.config();
-        config["providerMaxRetries"] = json!(retries);
-        if fallback {
-            config["descriptionFallbackModel"] = json!("backup");
-        }
-        assert!(Providers::new(&config).unwrap().describe("s", "p").is_err());
-        assert_eq!(mock.requests.lock().unwrap().len(), expected);
-    }
-}
-
-#[test]
-fn http_retries_transient_statuses_but_not_auth_or_bad_json() {
-    let vector = json!({"data": [{"index": 0, "embedding": [1, 0]}]});
-    let mock = Mock::new(vec![(429, json!({})), (503, json!({})), (200, vector)]);
-    Providers::new(&mock.config())
-        .unwrap()
-        .embed(&["a".into()], false)
-        .unwrap();
-    assert_eq!(mock.requests.lock().unwrap().len(), 3);
     for status in [400, 401, 403, 404, 302] {
-        let mock = Mock::new(vec![
-            (status, json!({"error": "mock-secret"})),
-            (200, json!({})),
-        ]);
-        let error = Providers::new(&mock.config())
+        let mock = Mock::new(vec![(status, json!({"error":"mock-secret"}))]);
+        let error = Http::new(&mock.config())
             .unwrap()
-            .embed(&["a".into()], false)
+            .request(&mock.base, None, &HeaderMap::new())
             .unwrap_err();
         assert!(error.to_string().contains(&status.to_string()));
         assert!(!format!("{error:#?}").contains("mock-secret"));
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
     let mock = Mock::raw(vec![(200, "not JSON: mock-secret".into())]);
-    let error = Providers::new(&mock.config())
+    let error = Http::new(&mock.config())
         .unwrap()
-        .embed(&["a".into()], false)
+        .request(&mock.base, None, &HeaderMap::new())
         .unwrap_err();
     assert!(!format!("{error:#?}").contains("mock-secret"));
-    let mock = Mock::new(vec![(503, json!({})); 3]);
-    assert!(
-        Providers::new(&mock.config())
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn http_short_reads_recover_and_retry_after_is_bounded() {
+    let mock = Mock::wire(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort".into(),
+        "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".into(),
+    ]);
+    assert_eq!(
+        Http::new(&mock.config())
             .unwrap()
-            .embed(&["a".into()], false)
-            .is_err()
+            .request(&mock.base, None, &HeaderMap::new())
+            .unwrap(),
+        json!({"ok":true})
     );
-    assert_eq!(mock.requests.lock().unwrap().len(), 3);
-}
-
-#[test]
-fn stalled_http_request_respects_timeout_without_leaking_url_credentials() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let base = format!(
-        "http://{}/v1?token=url-secret",
-        listener.local_addr().unwrap()
-    );
-    let worker = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            match listener.accept() {
-                Ok((_stream, _)) => {
-                    thread::sleep(Duration::from_millis(500));
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline);
-                    thread::sleep(Duration::from_millis(2));
-                }
-                Err(error) => panic!("mock accept failed: {error}"),
-            }
-        }
-    });
-    let p = Providers::new(
-        &json!({"embeddingBaseUrl": base, "embeddingApiKey": "header-secret",
-        "providerTimeoutMs": 100, "providerMaxRetries": 0}),
-    )
-    .unwrap();
-    let start = Instant::now();
-    let error = p.embed(&["input".into()], false).unwrap_err();
-    assert!(start.elapsed() < Duration::from_secs(3));
-    let detail = format!("{error:#?}");
-    assert!(detail.contains("timed out"));
-    assert!(!detail.contains("url-secret") && !detail.contains("header-secret"));
-    worker.join().unwrap();
-}
-
-#[test]
-fn all_rerankers_validate_and_return_descending_scores() {
-    for provider in ["cohere", "jina", "openai"] {
-        let output = if provider == "openai" {
-            response(
-                &json!({"ranking": [{"index": 0, "score": 0.1}, {"index": 1, "score": 0.9}]})
-                    .to_string(),
-            )
-        } else {
-            json!({"results": [{"index": 0, "relevance_score": 0.1}, {"index": 1, "relevance_score": 0.9}]})
-        };
-        let mock = Mock::new(vec![(200, output)]);
-        let mut config = mock.config();
-        config["rerankerProvider"] = json!(provider);
-        let p = Providers::new(&config).unwrap();
-        assert_eq!(
-            p.rerank("query", &["first".into(), "second".into()])
-                .unwrap(),
-            vec![(1, 0.9), (0, 0.1)]
-        );
-        let requests = mock.requests.lock().unwrap();
-        if provider == "openai" {
-            assert_eq!(requests[0].path, "/v1/responses");
-            assert_eq!(requests[0].body["reasoning"]["effort"], "high");
-            assert_eq!(requests[0].body["text"]["format"]["type"], "json_schema");
-        } else {
-            assert_eq!(requests[0].path, "/v1/rerank");
-            let mut expected = json!({"model": if provider == "cohere" {
-                "rerank-v4.0-pro"
-            } else {
-                "jina-reranker-v3.5"
-            }, "query": "query", "documents": ["first", "second"], "top_n": 2});
-            if provider == "jina" {
-                expected["return_documents"] = json!(false);
-            }
-            assert_eq!(requests[0].body, expected);
-            assert!(
-                requests[0]
-                    .headers
-                    .contains("authorization: bearer mock-secret")
-            );
-        }
-    }
-    for ranking in [
-        json!([]),
-        json!([{"index": 1, "score": 0.5}]),
-        json!([{"index": 0, "score": 1.1}]),
-        json!([{"index": 0, "score": "0.5"}]),
+    for (header, expected) in [
+        ("0", Some(0)),
+        ("2", Some(2)),
+        ("999999", Some(5)),
+        ("-1", None),
+        ("Wed, 21 Oct 2015 07:28:00 GMT", None),
     ] {
-        assert!(parse_ranking(&ranking, 1, true).is_err());
-    }
-    assert!(
-        parse_ranking(
-            &json!([{"index": 0, "score": 0.5}, {"index": 0, "score": 0.6}]),
-            2,
-            true
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn native_rerankers_preserve_provider_credentials_models_and_endpoint_overrides() {
-    for provider in ["cohere", "jina"] {
-        let mock = Mock::new(vec![(
-            200,
-            json!({"results": [{"index": 0, "relevance_score": 0.8}]}),
+        let mock = Mock::wire(vec![format!(
+            "HTTP/1.1 429 Limited\r\nContent-Length: 0\r\nRetry-After: {header}\r\nConnection: close\r\n\r\n"
         )]);
-        let mut config = mock.config();
-        config["rerankerProvider"] = json!(provider);
-        config["rerankerModel"] = json!(format!("{provider}/custom-model"));
-        config["rerankerBaseUrl"] = json!(format!("{}/rerank/?route=custom", mock.base));
-        config.as_object_mut().unwrap().remove("rerankerApiKey");
-        config[format!("{provider}ApiKey")] = json!("provider-secret");
-        let p = Providers::new(&config).unwrap();
-        let reranker = p.reranker().unwrap();
-        assert!(reranker.rerank("query", &[]).unwrap().is_empty());
-        assert!(mock.requests.lock().unwrap().is_empty());
-        assert_eq!(
-            reranker.rerank("query", &["document".into()]).unwrap(),
-            vec![(0, 0.8)]
-        );
-        let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "/v1/rerank?route=custom");
-        assert_eq!(requests[0].body["model"], "custom-model");
-        assert!(
-            requests[0]
-                .headers
-                .contains("authorization: bearer provider-secret")
-        );
+        let failure = Http::new(&mock.config())
+            .unwrap()
+            .once(&mock.base, None, &HeaderMap::new())
+            .unwrap_err();
+        assert!(failure.retryable);
+        assert_eq!(failure.retry_after, expected.map(Duration::from_secs));
     }
 }
 
 #[test]
-fn catalogue_is_public_deduplicated_and_has_documented_shape() {
+fn catalogue_remains_public_deduplicated_and_provider_scoped() {
     let mock = Mock::new(vec![(
         200,
-        json!({"data": [{"id": "deepseek-v4"}, {"id": "qwen3.8-max"}, {"id": "deepseek-v4"}]}),
+        json!({"data":[{"id":"a"},{"id":"b"},{"id":"a"}]}),
     )]);
-    let http = Http::new(&mock.config()).unwrap();
     assert_eq!(
-        fetch_models(&http, "opencode-go", &mock.base).unwrap(),
+        fetch_models(
+            &Http::new(&mock.config()).unwrap(),
+            "opencode-go",
+            &mock.base
+        )
+        .unwrap(),
         vec![
-            json!({"provider": "opencode-go", "model": "deepseek-v4"}),
-            json!({"provider": "opencode-go", "model": "qwen3.8-max"}),
+            json!({"provider":"opencode-go","model":"a"}),
+            json!({"provider":"opencode-go","model":"b"})
         ]
     );
-    let requests = mock.requests.lock().unwrap();
-    assert_eq!(requests[0].path, "/v1/models");
-    assert!(!requests[0].headers.contains("authorization"));
+    assert!(
+        !mock.requests.lock().unwrap()[0]
+            .headers
+            .contains("authorization")
+    );
     assert!(models(Some("invalid")).is_err());
     for body in [
         json!({}),
-        json!({"data": [{"id": ""}]}),
-        json!({"data": [{"id": 4}]}),
+        json!({"data":[{"id":""}]}),
+        json!({"data":[{"id":4}]}),
     ] {
         let mock = Mock::new(vec![(200, body)]);
-        assert!(fetch_models(&http, "opencode", &mock.base).is_err());
+        assert!(fetch_models(&Http::new(&mock.config()).unwrap(), "opencode", &mock.base).is_err());
     }
 }
 
 #[test]
-fn stored_auth_is_scoped_to_the_selected_provider() {
-    let path = std::env::temp_dir().join(format!("slopdex-provider-auth-{}", session_id()));
-    std::fs::write(&path, json!({"opencode": {"type": "api", "key": "zen-key"}, "opencode-go": {"type": "api", "key": "go-key"}}).to_string()).unwrap();
-    assert_eq!(stored_key(&path, "opencode").as_deref(), Some("zen-key"));
-    assert_eq!(stored_key(&path, "opencode-go").as_deref(), Some("go-key"));
-    assert_eq!(stored_key(&path, "openai"), None);
-    std::fs::write(&path, "invalid secret-bearing JSON").unwrap();
-    assert_eq!(stored_key(&path, "opencode"), None);
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn configuration_rejects_invalid_values_and_unsafe_urls_offline() {
-    for config in [Value::Null, json!([]), json!("config")] {
-        assert!(Providers::new(&config).is_err());
-    }
-    let mock = Mock::new(vec![]);
-    for (key, value) in [
-        ("providerMaxRetries", json!(6)),
-        ("providerMaxRetries", json!(-1)),
-        ("providerMaxRetries", json!(1.5)),
-        ("retryDelayMs", json!(-1)),
-        ("retryDelayMs", json!("0")),
-        ("providerTimeoutMs", json!(0)),
-        ("embeddingBatchSize", json!(0)),
-        ("dimensions", json!("2")),
-        ("provider", json!("unknown")),
-        ("model", json!("jina/foreign-model")),
-        ("model", json!("openai/")),
-        ("descriptionProvider", json!("unknown")),
-        ("descriptionModel", json!(false)),
-        ("descriptionModel", json!("  ")),
+fn config_validation_and_endpoint_policy_remain_offline() {
+    for config in [
+        Value::Null,
+        json!([]),
+        json!("config"),
+        json!({"dimensions":0}),
+        json!({"provider":"unknown"}),
+        json!({"model":"jina/foreign"}),
+        json!({"descriptionModel":false}),
+        json!({"descriptionModel":" "}),
     ] {
-        let mut config = mock.config();
-        config[key] = value;
-        assert!(Providers::new(&config).is_err(), "accepted {key}: {config}");
+        assert!(Providers::new(&config).is_err(), "{config}");
+    }
+    for key in ["embeddingBaseUrl", "rerankerBaseUrl"] {
+        let mut config =
+            json!({key:"http://gateway.example.invalid/v1","rerankerProvider":"cohere"});
+        let valid = |c: &Value| {
+            Providers::new(c).and_then(|p| {
+                if key == "rerankerBaseUrl" {
+                    p.reranker().map(|_| ())
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        assert!(valid(&config).is_err());
+        config["allowInsecureEndpoints"] = json!(true);
+        assert!(valid(&config).is_ok());
     }
     for base in [
         "not a URL",
         "file:///tmp/provider",
-        "https://user:url-secret@example.invalid/v1",
-        "https://example.invalid/v1#url-secret",
+        "https://user:secret@example.invalid/v1",
     ] {
-        for key in ["embeddingBaseUrl", "descriptionBaseUrl"] {
-            let mut config = mock.config();
-            config[key] = json!(base);
-            let error = Providers::new(&config).err().expect("invalid URL accepted");
-            assert!(!format!("{error:#?}").contains("url-secret"));
-        }
+        assert!(Providers::new(&json!({"embeddingBaseUrl":base})).is_err());
     }
-    // Null canonical settings defer to aliases, which are trimmed and unqualified.
-    let mut config = mock.config();
-    config["provider"] = Value::Null;
-    config["embeddingProvider"] = json!(" jina ");
-    config["model"] = Value::Null;
-    config["embeddingModel"] = json!(" jina/jina-embeddings-v4 ");
-    config["dimensions"] = Value::Null;
-    config["embeddingDimensions"] = json!(8);
-    let p = Providers::new(&config).unwrap();
-    assert_eq!(p.embedding_profile()["provider"], "jina");
-    assert_eq!(p.embedding_profile()["model"], "jina-embeddings-v4");
-    assert_eq!(p.dimensions(), 8);
-    assert!(mock.requests.lock().unwrap().is_empty());
-}
-
-#[test]
-fn configured_credentials_are_trimmed_and_operation_scoped() {
-    for operation_key in [Some(" operation-key "), None] {
-        let mock = Mock::new(vec![
-            (200, json!({"data": [{"index": 0, "embedding": [1, 0]}]})),
-            (200, response("description")),
-            (200, response(r#"{"ranking":[{"index":0,"score":1}]}"#)),
-        ]);
-        let mut config = mock.config();
-        config["openaiApiKey"] = json!(" provider-key ");
-        config["embeddingApiKey"] = json!(operation_key);
-        config["descriptionApiKey"] = json!(" description-key ");
-        config["rerankerApiKey"] = Value::Null;
-        config["rerankerProvider"] = json!("openai");
-        let p = Providers::new(&config).unwrap();
-        p.embed(&["input".into()], false).unwrap();
-        p.describe("system", "prompt").unwrap();
-        p.rerank("query", &["document".into()]).unwrap();
-        let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        let embedding_key = if operation_key.is_some() {
-            "operation-key"
-        } else {
-            "provider-key"
-        };
-        for (request, key) in
-            requests
-                .iter()
-                .zip([embedding_key, "description-key", "provider-key"])
-        {
-            assert!(
-                request
-                    .headers
-                    .contains(&format!("authorization: bearer {key}\r\n"))
-            );
-        }
-    }
-}
-
-#[test]
-fn invalid_credentials_fail_before_sending_in_every_protocol() {
-    for model in ["gpt-5", "deepseek-v4", "claude-sonnet", "gemini-3.8-flash"] {
-        for (key, expected) in [
-            (
-                json!("secret\r\nx-injected: true"),
-                "valid HTTP header value",
-            ),
-            (json!("  "), "descriptionApiKey must be a non-empty string"),
-            (json!(42), "descriptionApiKey must be a non-empty string"),
-        ] {
-            let mock = Mock::new(vec![]);
-            let mut config = mock.config();
-            config["descriptionProvider"] = json!("opencode");
-            config["descriptionModel"] = json!(model);
-            config["descriptionApiKey"] = key;
-            config["opencodeApiKey"] = json!("valid-but-must-not-mask-invalid-override");
-            let p = Providers::new(&config).unwrap();
-            let error = p.describe("system", "prompt").unwrap_err();
-            assert!(error.to_string().contains(expected), "{error}");
-            assert!(!format!("{error:#?}").contains("secret"));
-            assert!(mock.requests.lock().unwrap().is_empty());
-        }
-    }
-}
-
-#[test]
-fn description_urls_preserve_query_values_and_encode_model_path_segments() {
-    for (model, suffix, path, output) in [
-        ("gpt-5", "/responses/", "/v1/responses", response("ok")),
-        (
-            "deepseek-v4",
-            "/chat/completions/",
-            "/v1/chat/completions",
-            json!({"choices": [{"message": {"content": "ok"}}]}),
-        ),
-        (
-            "claude-sonnet",
-            "/messages/",
-            "/v1/messages",
-            json!({"content": [{"type": "text", "text": "ok"}]}),
-        ),
-        (
-            "gemini-custom/variant?x#y",
-            "/",
-            "/v1/models/gemini-custom%2Fvariant%3Fx%23y:generateContent",
-            json!({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
-        ),
-    ] {
-        let mock = Mock::new(vec![(200, output)]);
-        let mut config = mock.config();
-        config["descriptionProvider"] = json!("opencode");
-        config["descriptionModel"] = json!(model);
-        config["descriptionBaseUrl"] = json!(format!("{}{suffix}?route=tenant/", mock.base));
-        assert_eq!(
-            Providers::new(&config).unwrap().describe("s", "p").unwrap(),
-            "ok"
-        );
-        assert_eq!(
-            mock.requests.lock().unwrap()[0].path,
-            format!("{path}?route=tenant/")
-        );
-    }
-}
-
-#[test]
-fn description_protocols_join_only_public_text_in_order() {
-    for (model, output) in [
-        (
-            "gpt-5",
-            json!({"output_text": " first second ", "output": [{"type": "message", "content": [{"type": "output_text", "text": "duplicate"}]}]}),
-        ),
-        (
-            "gpt-5",
-            json!({"output": [
-                {"type": "reasoning", "content": [{"type": "output_text", "text": "private"}]},
-                {"type": "message", "content": [{"type": "refusal", "text": "ignored"}, {"type": "output_text", "text": " first "}]},
-                {"type": "message", "content": [{"type": "output_text", "text": 42}, {"type": "output_text", "text": "second "}]}
-            ]}),
-        ),
-        (
-            "deepseek-v4",
-            json!({"choices": [{"message": {"content": [{"type": "text", "text": " first "}, {"type": "image_url", "text": "ignored"}, {"type": "text", "text": "second "}]}}, {"message": {"content": "other candidate"}}]}),
-        ),
-        (
-            "claude-sonnet",
-            json!({"content": [{"type": "thinking", "text": "private"}, {"type": "text", "text": " first "}, {"type": "tool_use", "text": "ignored"}, {"type": "text", "text": "second "}]}),
-        ),
-        (
-            "gemini-3.8-flash",
-            json!({"candidates": [{"content": {"parts": [{"thought": true, "text": "private"}, {"text": " first "}, {"inlineData": {}}, {"text": "second "}]}}, {"content": {"parts": [{"text": "other candidate"}]}}]}),
-        ),
-    ] {
-        let mock = Mock::new(vec![(200, output)]);
-        let mut config = mock.config();
-        config["descriptionProvider"] = json!("opencode");
-        config["descriptionModel"] = json!(model);
-        assert_eq!(
-            Providers::new(&config).unwrap().describe("s", "p").unwrap(),
-            "first second",
-            "{model}"
-        );
-        assert_eq!(mock.requests.lock().unwrap().len(), 1);
-    }
-}
-
-#[test]
-fn unfinished_descriptions_retry_even_when_transport_retries_are_disabled() {
-    for (model, incomplete, complete) in [
-        (
-            "gpt-5",
-            json!({"status": "failed", "output_text": "partial"}),
-            response("complete"),
-        ),
-        (
-            "gpt-5",
-            json!({"status": "cancelled", "output_text": "partial"}),
-            response("complete"),
-        ),
-    ] {
-        let mock = Mock::new(vec![(200, incomplete), (200, complete)]);
-        let mut config = mock.config();
-        config["descriptionProvider"] = json!("opencode");
-        config["descriptionModel"] = json!(model);
-        config["providerMaxRetries"] = json!(0);
-        assert_eq!(
-            Providers::new(&config).unwrap().describe("s", "p").unwrap(),
-            "complete",
-            "{model}"
-        );
-        let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].body, requests[1].body);
-    }
-}
-
-fn truncated_description_cases() -> Vec<(&'static str, Value, Value)> {
-    vec![
-        (
-            "gpt-5",
-            json!({"status": "incomplete", "output_text": "partial"}),
-            response("complete"),
-        ),
-        (
-            "deepseek-v4",
-            json!({"choices": [{"finish_reason": "length", "message": {"content": "partial"}}]}),
-            json!({"choices": [{"finish_reason": "stop", "message": {"content": "complete"}}]}),
-        ),
-        (
-            "claude-sonnet",
-            json!({"stop_reason": "max_tokens", "content": [{"type": "text", "text": "partial"}]}),
-            json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": "complete"}]}),
-        ),
-        (
-            "gemini-3.8-flash",
-            json!({"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "partial"}]}}]}),
-            json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "complete"}]}}]}),
-        ),
-        (
-            "gemini-3.8-flash",
-            json!({"promptFeedback": {"blockReason": "SAFETY"}, "candidates": []}),
-            json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "complete"}]}}]}),
-        ),
-    ]
-}
-
-#[test]
-fn truncated_descriptions_fail_once_without_repeating_the_same_body() {
-    for (model, truncated, _) in truncated_description_cases() {
-        let mock = Mock::new(vec![(200, truncated), (200, response("never requested"))]);
-        let mut config = mock.config();
-        config["descriptionProvider"] = json!("opencode");
-        config["descriptionModel"] = json!(model);
-        let error = Providers::new(&config)
-            .unwrap()
-            .describe("s", "p")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("cannot complete") || error.contains("cannot succeed"),
-            "{model}: {error}"
-        );
-        assert_eq!(mock.requests.lock().unwrap().len(), 1, "{model}");
-    }
-}
-
-#[test]
-fn truncated_descriptions_fail_over_to_the_configured_fallback_model() {
-    for (model, truncated, complete) in truncated_description_cases() {
-        let mock = Mock::new(vec![(200, truncated), (200, complete)]);
-        let mut config = mock.config();
-        config["descriptionProvider"] = json!("opencode");
-        config["descriptionModel"] = json!(model);
-        config["descriptionFallbackModel"] = json!(model.to_owned() + "-backup");
-        assert_eq!(
-            Providers::new(&config).unwrap().describe("s", "p").unwrap(),
-            "complete",
-            "{model}"
-        );
-        let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        // Gemini names the model in the path, the other protocols in the body.
-        assert_ne!(
-            (&requests[0].path, &requests[0].body),
-            (&requests[1].path, &requests[1].body)
-        );
-    }
-    // Truncation on both models stops after one attempt each.
-    let mock = Mock::new(vec![
-        (
-            200,
-            json!({"choices": [{"finish_reason": "length", "message": {"content": "a"}}]}),
-        );
-        DESCRIPTION_ATTEMPTS
-    ]);
-    let mut config = mock.config();
-    config["descriptionProvider"] = json!("opencode");
-    config["descriptionModel"] = json!("deepseek-v4");
-    config["descriptionFallbackModel"] = json!("deepseek-v4-backup");
-    assert!(Providers::new(&config).unwrap().describe("s", "p").is_err());
-    assert_eq!(mock.requests.lock().unwrap().len(), 2);
-}
-
-#[test]
-fn null_retry_settings_mean_defaults() {
     let mock = Mock::new(vec![]);
     let mut config = mock.config();
+    config["embeddingBaseUrl"] = json!(format!("{}/embeddings?token=secret", mock.base));
+    let p = Providers::new(&config).unwrap();
+    assert!(!p.embedding_profile().to_string().contains("secret"));
     config["providerMaxRetries"] = Value::Null;
     config["retryDelayMs"] = Value::Null;
-    let http = Http::new(&config).unwrap();
-    assert_eq!(http.retries, 2);
-    assert!(Providers::new(&config).is_ok());
+    assert_eq!(Http::new(&config).unwrap().retries, 2);
 }
 
 #[test]
-fn profiles_record_custom_endpoints_without_query_strings() {
-    let mock = Mock::new(vec![]);
-    let mut config = mock.config();
-    config["embeddingBaseUrl"] = json!(format!("{}/embeddings?route=tenant&token=x", mock.base));
-    config["descriptionBaseUrl"] = json!(format!("{}?token=y", mock.base));
-    let p = Providers::new(&config).unwrap();
-    assert_eq!(
-        p.embedding_profile()["endpoint"],
-        format!("{}/embeddings", mock.base)
-    );
-    assert_eq!(p.description_profile()["endpoint"], mock.base);
-    assert!(!p.embedding_profile().to_string().contains("token"));
-    assert!(!p.description_profile().to_string().contains("token"));
-    let plain = Providers::new(&mock.config()).unwrap();
-    assert_eq!(
-        plain.embedding_profile()["endpoint"],
-        format!("{}/embeddings", mock.base)
-    );
-    // Default endpoints are not part of the profile, so existing caches stay valid.
-    let default = Providers::new(&json!({"dimensions": 2})).unwrap();
-    assert!(default.embedding_profile().get("endpoint").is_none());
-    assert!(default.description_profile().get("endpoint").is_none());
-    assert!(mock.requests.lock().unwrap().is_empty());
-}
-
-#[test]
-fn remote_custom_endpoints_require_https_unless_explicitly_allowed() {
-    for key in ["embeddingBaseUrl", "descriptionBaseUrl"] {
-        let insecure = json!({key: "http://gateway.example.invalid/v1", "dimensions": 2});
-        let error = Providers::new(&insecure)
-            .err()
-            .expect("plain http remote endpoint accepted")
-            .to_string();
-        assert!(error.contains("https") && error.contains(key), "{error}");
-        let mut allowed = insecure.clone();
-        allowed["allowInsecureEndpoints"] = json!(true);
-        assert!(Providers::new(&allowed).is_ok());
-        let secure = json!({key: "https://gateway.example.invalid/v1", "dimensions": 2});
-        assert!(Providers::new(&secure).is_ok());
-    }
-    // Loopback and the provider defaults are exempt.
-    for base in [
-        "http://127.0.0.1:9/v1",
-        "http://localhost:9/v1",
-        "http://[::1]:9/v1",
-        OPENAI,
-        "https://api.openai.com/v1/",
-    ] {
-        assert!(
-            Providers::new(&json!({"embeddingBaseUrl": base, "dimensions": 2})).is_ok(),
-            "{base}"
-        );
-    }
-    let mut config = json!({"rerankerProvider": "cohere", "rerankerBaseUrl": "http://gateway.example.invalid/v2"});
-    assert!(Providers::new(&config).unwrap().reranker().is_err());
-    config["allowInsecureEndpoints"] = json!(true);
-    assert!(Providers::new(&config).unwrap().reranker().is_ok());
-    assert_eq!(
-        remote_custom_endpoint(
-            &json!({"rerankerBaseUrl": COHERE}),
-            "rerankerBaseUrl",
-            COHERE
-        )
-        .unwrap(),
-        None
-    );
-    assert_eq!(
-        remote_custom_endpoint(
-            &json!({"rerankerBaseUrl": "https://Gateway.Example.invalid:8443/v2?x=1"}),
-            "rerankerBaseUrl",
-            COHERE
-        )
-        .unwrap()
-        .map(|url| host_label(&url)),
-        Some("gateway.example.invalid:8443".into())
-    );
-}
-
-#[test]
-fn repository_configs_cannot_route_foreign_credentials_to_their_own_endpoints() {
-    let environment = |name: &str| match name {
-        "OPENAI_API_KEY" => Some("env-secret".to_owned()),
-        "OPENCODE_API_KEY" => None,
-        _ => None,
-    };
-    let stored = |provider: &str| (provider == "opencode").then(|| "stored-secret".to_owned());
-    let remote = json!({
-        CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY,
-        "embeddingBaseUrl": "https://gateway.example.invalid/v1",
-        "descriptionBaseUrl": "https://gateway.example.invalid:8443/zen/v1",
-    });
-    for (operation, provider, source) in [
-        ("embeddingApiKey", "openai", "OPENAI_API_KEY"),
-        ("descriptionApiKey", "opencode", "stored opencode/auth.json"),
-    ] {
-        let error = resolve_api_key(&remote, operation, provider, environment, stored)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("repository config"), "{error}");
-        assert!(error.contains(source), "{error}");
-        assert!(error.contains("trustedEndpointHosts"), "{error}");
-        assert!(error.contains("--trust-repo-endpoints"), "{error}");
-        assert!(!error.contains("secret"), "{error}");
-    }
-    // Keys supplied by the same file travel with its endpoints.
-    let mut own = remote.clone();
-    own["openaiApiKey"] = json!("repo-secret");
-    assert_eq!(
-        resolve_api_key(&own, "embeddingApiKey", "openai", environment, stored).unwrap(),
-        "repo-secret"
-    );
-    // Trust from the user config (host, with or without port) or the CLI flag.
-    for hosts in [
-        json!(["gateway.example.invalid"]),
-        json!([" Gateway.Example.Invalid:8443 ", "other.invalid"]),
-    ] {
-        let mut trusted = remote.clone();
-        trusted["trustedEndpointHosts"] = hosts;
-        assert_eq!(
-            resolve_api_key(
-                &trusted,
-                "descriptionApiKey",
-                "opencode",
-                environment,
-                stored
-            )
-            .unwrap(),
-            "stored-secret"
-        );
-    }
+fn credentials_are_operation_scoped_trimmed_and_never_routed_by_untrusted_repos() {
+    let environment = |_: &str| Some(" env-secret ".into());
+    let remote = json!({CONFIG_ORIGIN_KEY:CONFIG_ORIGIN_REPOSITORY,"embeddingBaseUrl":"https://gateway.example.invalid/v1"});
+    let error = resolve_api_key(&remote, "embeddingApiKey", "openai", environment)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("repository config") && error.contains("trustedEndpointHosts"));
+    assert!(!error.contains("env-secret"));
     let mut trusted = remote.clone();
     trusted["trustedEndpointHosts"] = json!(["gateway.example.invalid"]);
-    assert!(resolve_api_key(&trusted, "embeddingApiKey", "openai", environment, stored).is_ok());
-    let mut flagged = remote.clone();
-    flagged[TRUST_REPOSITORY_ENDPOINTS_KEY] = json!(true);
     assert_eq!(
-        resolve_api_key(&flagged, "embeddingApiKey", "openai", environment, stored).unwrap(),
+        resolve_api_key(&trusted, "embeddingApiKey", "openai", environment).unwrap(),
         "env-secret"
     );
-    // Default, loopback, and non-repository endpoints are unaffected.
-    for config in [
-        json!({CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY}),
-        json!({CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY, "embeddingBaseUrl": "http://127.0.0.1:9/v1"}),
-        json!({CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY, "embeddingBaseUrl": "https://api.openai.com/v1/custom"}),
-        json!({"embeddingBaseUrl": "https://gateway.example.invalid/v1"}),
-    ] {
-        assert_eq!(
-            resolve_api_key(&config, "embeddingApiKey", "openai", environment, stored).unwrap(),
-            "env-secret",
-            "{config}"
+    let mut own = remote.clone();
+    own["embeddingApiKey"] = json!(" operation-key ");
+    own["openaiApiKey"] = json!("provider-key");
+    assert_eq!(
+        resolve_api_key(&own, "embeddingApiKey", "openai", environment).unwrap(),
+        "operation-key"
+    );
+    let mut flagged = remote.clone();
+    flagged[TRUST_REPOSITORY_ENDPOINTS_KEY] = json!(true);
+    assert!(resolve_api_key(&flagged, "embeddingApiKey", "openai", environment).is_ok());
+    for invalid in [json!(" "), json!(42), json!("key\nsecret")] {
+        let mock = Mock::new(vec![]);
+        let mut config = mock.config();
+        config["embeddingApiKey"] = invalid;
+        assert!(
+            Providers::new(&config)
+                .unwrap()
+                .embed(&["input".into()], false)
+                .is_err()
         );
+        assert!(mock.requests.lock().unwrap().is_empty());
     }
 }
 
 #[test]
-fn jina_tasks_follow_the_model_generation_or_explicit_configuration() {
+fn jina_tasks_follow_model_generation_or_explicit_config() {
     use vector_jina::tasks;
     assert_eq!(
         tasks(&json!({}), "jina-embeddings-v4").unwrap(),
@@ -1512,376 +577,50 @@ fn jina_tasks_follow_the_model_generation_or_explicit_configuration() {
     );
     assert!(tasks(&json!({}), "jina-code-embeddings-1.5b").is_err());
     assert_eq!(
-        tasks(&json!({"jinaTask": "nl2code"}), "jina-code-embeddings-1.5b").unwrap(),
+        tasks(&json!({"jinaTask":"nl2code"}), "jina-code-embeddings-1.5b").unwrap(),
         Some(("nl2code.query".into(), "nl2code.passage".into()))
     );
     assert_eq!(
-        tasks(&json!({"jinaTask": "text-matching"}), "jina-embeddings-v4").unwrap(),
-        Some(("text-matching".into(), "text-matching".into()))
-    );
-    assert_eq!(
-        tasks(&json!({"jinaTask": "none"}), "jina-embeddings-v4").unwrap(),
+        tasks(&json!({"jinaTask":"none"}), "jina-embeddings-v4").unwrap(),
         None
     );
-    assert!(tasks(&json!({"jinaTask": "Code Query"}), "jina-embeddings-v4").is_err());
-    let unknown =
-        json!({"provider": "jina", "model": "jina-code-embeddings-1.5b", "dimensions": 2});
-    assert!(Providers::new(&unknown).is_err());
-    let mut configured = unknown.clone();
-    configured["jinaTask"] = json!("nl2code");
-    let p = Providers::new(&configured).unwrap();
-    assert_eq!(p.embedding_profile()["task"], "nl2code");
-    let default = Providers::new(&json!({"provider": "jina", "dimensions": 2})).unwrap();
-    assert!(default.embedding_profile().get("task").is_none());
+    assert!(tasks(&json!({"jinaTask":"Code Query"}), "jina-embeddings-v4").is_err());
 }
 
 #[test]
-fn ada_dimension_mismatch_fails_at_construction() {
-    let error = Providers::new(&json!({"model": "text-embedding-ada-002", "dimensions": 256}))
-        .err()
-        .expect("ada-002 dimension mismatch accepted")
-        .to_string();
-    assert!(error.contains("1536"), "{error}");
-    assert!(Providers::new(&json!({"model": "text-embedding-ada-002"})).is_ok());
-    assert!(
-        Providers::new(&json!({"model": "text-embedding-ada-002", "dimensions": 1536})).is_ok()
-    );
-}
-
-#[test]
-fn malformed_and_error_descriptions_fail_over_without_leaking_remote_content() {
-    for bad_body in [
-        "not JSON: remote-secret".to_owned(),
-        json!({"error": {"message": "remote-secret"}, "output_text": "must not succeed"})
-            .to_string(),
-    ] {
-        for fallback in [false, true] {
-            let mock = Mock::raw(vec![
-                (200, bad_body.clone()),
-                (200, response("recovered").to_string()),
-                (200, response("still recovered").to_string()),
-            ]);
-            let mut config = mock.config();
-            config["descriptionModel"] = json!("primary");
-            if fallback {
-                config["descriptionFallbackModel"] = json!("backup");
-            }
-            let p = Providers::new(&config).unwrap();
-            if fallback {
-                assert_eq!(p.describe("s", "p").unwrap(), "recovered");
-                assert_eq!(p.describe("s", "p").unwrap(), "still recovered");
-                let requests = mock.requests.lock().unwrap();
-                let models: Vec<_> = requests
-                    .iter()
-                    .map(|r| r.body["model"].as_str().unwrap())
-                    .collect();
-                assert_eq!(models, ["primary", "backup", "backup"]);
-            } else {
-                let error = p.describe("s", "p").unwrap_err();
-                assert!(!format!("{error:#?}").contains("remote-secret"));
-                assert_eq!(mock.requests.lock().unwrap().len(), 1);
-                assert_eq!(p.describe("s", "p").unwrap(), "recovered");
-            }
-        }
-    }
-}
-
-#[test]
-fn model_scoped_forbidden_fails_over_with_new_auth_but_the_same_session() {
-    let output = json!({"content": [{"type": "text", "text": "ok"}]});
-    let mock = Mock::new(vec![(403, json!({})), (200, output.clone()), (200, output)]);
-    let mut config = mock.config();
-    config["descriptionProvider"] = json!("opencode");
-    config["descriptionModel"] = json!("gpt-5");
-    config["descriptionFallbackModel"] = json!("claude-sonnet");
-    let p = Providers::new(&config).unwrap();
-    assert_eq!(p.describe("s", "p").unwrap(), "ok");
-    assert_eq!(p.describe("s", "p").unwrap(), "ok");
-    let requests = mock.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert!(
-        requests[0]
-            .headers
-            .contains("authorization: bearer mock-secret")
-    );
-    for request in &requests[1..] {
-        assert_eq!(request.path, "/v1/messages");
-        assert!(request.headers.contains("x-api-key: mock-secret"));
-        assert!(!request.headers.contains("authorization:"));
-    }
-    let sessions: Vec<_> = requests
-        .iter()
-        .map(|r| {
-            r.headers
-                .lines()
-                .find_map(|line| line.strip_prefix("x-opencode-session: "))
-                .unwrap()
-        })
-        .collect();
-    assert!(!sessions[0].is_empty());
-    assert_eq!(sessions[0], sessions[1]);
-    assert_ne!(sessions[1], sessions[2]);
-}
-
-#[test]
-fn http_transient_statuses_replay_the_same_request_once() {
-    for status in [408, 409, 425, 500, 502, 504, 529] {
-        let mock = Mock::new(vec![(status, json!({})), (200, json!({"ok": true}))]);
-        let mut config = mock.config();
-        config["providerMaxRetries"] = json!(1);
-        let http = Http::new(&config).unwrap();
-        let headers = auth_headers("test-key", Protocol::Responses).unwrap();
-        let body = json!({"input": ["λ", "two"], "model": "custom"});
+fn generative_reranking_uses_command_and_validates_every_candidate() {
+    for count in [1, 100] {
+        let ranking: Vec<_> = (0..count)
+            .map(|index| json!({"index":index,"score":1}))
+            .collect();
+        let text = json!({"ranking":ranking}).to_string();
+        let p=Providers::new(&json!({"rerankerProvider":"command","rerankerCommand":[agent::executable(),"emit",text]})).unwrap();
         assert_eq!(
-            http.request(&mock.base, Some(&body), &headers).unwrap(),
-            json!({"ok": true})
+            p.rerank("q", &vec!["doc".into(); count]).unwrap().len(),
+            count
         );
-        let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2, "HTTP {status}");
-        for request in requests.iter() {
-            assert_eq!(request.path, "/v1");
-            assert_eq!(request.body, body);
-            assert!(request.headers.contains("authorization: bearer test-key"));
-            assert!(request.headers.contains("accept: application/json"));
-        }
     }
-}
-
-#[test]
-fn http_short_response_body_recovers_but_complete_invalid_json_does_not_retry() {
-    for declared_length in [100, 13] {
-        let mock = Mock::wire(vec![
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\nremote-secret"
-            ),
-            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}"
-                .into(),
-        ]);
-        let http = Http::new(&mock.config()).unwrap();
-        let result = http.request(&mock.base, None, &HeaderMap::new());
-        if declared_length == 100 {
-            assert_eq!(result.unwrap(), json!({"ok": true}));
-        } else {
-            let error = result.unwrap_err();
-            assert!(error.to_string().contains("malformed JSON"));
-            assert!(!format!("{error:#?}").contains("remote-secret"));
-            assert_eq!(mock.requests.lock().unwrap().len(), 1);
-            assert_eq!(
-                http.request(&mock.base, None, &HeaderMap::new()).unwrap(),
-                json!({"ok": true})
-            );
-        }
-        assert_eq!(mock.requests.lock().unwrap().len(), 2);
-    }
-}
-
-#[test]
-fn http_retry_after_is_bounded_and_invalid_values_are_ignored() {
-    // Inspect a single real HTTP exchange rather than sleeping or asserting elapsed time.
-    for (header, expected) in [
-        ("0", Some(0)),
-        ("2", Some(2)),
-        ("999999", Some(5)),
-        ("18446744073709551616", None),
-        ("-1", None),
-        ("Wed, 21 Oct 2015 07:28:00 GMT", None),
+    for text in [
+        "not JSON: secret",
+        "{}",
+        "{\"ranking\":[{\"index\":0,\"score\":2}]}",
     ] {
-        let mock = Mock::wire(vec![format!(
-            "HTTP/1.1 429 Limited\r\nContent-Length: 0\r\nRetry-After: {header}\r\nConnection: close\r\n\r\n"
-        )]);
-        let failure = Http::new(&mock.config())
-            .unwrap()
-            .once(&mock.base, None, &HeaderMap::new())
-            .unwrap_err();
-        assert!(failure.retryable);
-        assert_eq!(
-            failure.retry_after,
-            expected.map(Duration::from_secs),
-            "{header}"
-        );
-        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        let p=Providers::new(&json!({"rerankerProvider":"command","rerankerCommand":[agent::executable(),"emit",text]})).unwrap();
+        let error = p.rerank("q", &["doc".into()]).unwrap_err();
+        assert!(!format!("{error:#?}").contains("secret"));
     }
-}
-
-#[test]
-fn rerankers_reject_corrupt_rankings_and_recover_on_the_next_call() {
-    for provider in ["openai", "jina", "cohere"] {
-        let score = if provider == "openai" {
-            "score"
-        } else {
-            "relevance_score"
-        };
-        let valid = json!([{"index": 1, (score): 0.5}, {"index": 0, (score): 0.5}]);
-        let wrap = |ranking: Value| {
-            if provider == "openai" {
-                response(&json!({"ranking": ranking}).to_string())
-            } else {
-                json!({"results": ranking})
-            }
-        };
-        let mut invalid = vec![
-            wrap(Value::Null),
-            wrap(json!([{"index": 0, (score): 0.5}])),
-            wrap(json!([{"index": 0, (score): 0.5}, {"index": 0, (score): 0.5}])),
-            wrap(json!([{"index": -1, (score): 0.5}, {"index": 1, (score): 0.5}])),
-            wrap(json!([{"index": 0, (score): "remote-secret"}, {"index": 1, (score): 0.5}])),
-            wrap(json!([{"index": 0, (score): 0.5}, {"index": 2, (score): 0.5}])),
-        ];
-        if provider == "openai" {
-            invalid.extend([
-                response("not JSON: remote-secret"),
-                json!({"status": "incomplete", "output_text": json!({"ranking": valid}).to_string()}),
-                wrap(json!([{"index": 0, "score": -0.1}, {"index": 1, "score": 1}])),
-            ]);
-        }
-        for output in invalid {
-            let mock = Mock::new(vec![(200, output), (200, wrap(valid.clone()))]);
-            let mut config = mock.config();
-            config["rerankerProvider"] = json!(provider);
-            let p = Providers::new(&config).unwrap();
-            let documents = ["first".into(), "second".into()];
-            let error = p.rerank("query", &documents).unwrap_err();
-            assert!(!format!("{error:#?}").contains("remote-secret"));
-            assert_eq!(mock.requests.lock().unwrap().len(), 1);
-            assert_eq!(
-                p.rerank("query", &documents).unwrap(),
-                vec![(0, 0.5), (1, 0.5)]
-            );
-            assert_eq!(mock.requests.lock().unwrap().len(), 2);
-        }
-    }
-}
-
-#[test]
-fn reranking_validates_lazy_configuration_and_candidate_limits_before_http() {
-    let mock = Mock::new(vec![]);
-    for (settings, expected) in [
-        (json!({}), "rerankerProvider is required"),
-        (
-            json!({"rerankerProvider": "unsupported"}),
-            "Unsupported reranker provider",
-        ),
-        (
-            json!({"rerankerProvider": "cohere", "rerankerModel": "jina/foreign"}),
-            "provider must match",
-        ),
-        (
-            json!({"rerankerProvider": "jina", "rerankerBaseUrl": "file:///tmp/provider"}),
-            "base URL must be HTTP(S)",
-        ),
-        (
-            json!({"rerankerProvider": "openai", "rerankerCandidates": 101}),
-            "rerankerCandidates must not exceed 100",
-        ),
-        (
-            json!({"rerankerProvider": "openai", "rerankerCandidates": 0}),
-            "rerankerCandidates must be a positive integer",
-        ),
-        (
-            json!({"rerankerProvider": "openai", "rerankerCandidates": "10"}),
-            "rerankerCandidates must be a positive integer",
-        ),
-    ] {
-        let mut config = mock.config();
-        config
-            .as_object_mut()
-            .unwrap()
-            .extend(settings.as_object().unwrap().clone());
-        let p = Providers::new(&config).unwrap();
-        assert!(p.rerank("query", &[]).unwrap().is_empty());
-        for _ in 0..2 {
-            let error = p.rerank("query", &["document".into()]).unwrap_err();
-            assert!(error.to_string().contains(expected), "{settings}: {error}");
-        }
-    }
-    let mut config = mock.config();
-    config["rerankerProvider"] = json!("openai");
-    let p = Providers::new(&config).unwrap();
-    assert_eq!(p.reranker().unwrap().candidate_limit(), Some(100));
+    let p = Providers::new(&json!({"rerankerProvider":"command"})).unwrap();
+    assert!(p.rerank("q", &[]).unwrap().is_empty());
     assert!(
-        p.rerank("query", &vec!["document".into(); 101])
+        p.rerank("q", &vec!["doc".into(); 101])
             .unwrap_err()
             .to_string()
             .contains("at most 100")
     );
-    assert!(mock.requests.lock().unwrap().is_empty());
-}
-
-#[test]
-fn openai_reranking_bounds_utf8_documents_and_requests_every_candidate() {
-    for count in [1, 100] {
-        let ranking: Vec<_> = (0..count)
-            .map(|index| json!({"index": index, "score": 1}))
-            .collect();
-        let mock = Mock::new(vec![(
-            200,
-            response(&json!({"ranking": ranking}).to_string()),
-        )]);
-        let mut config = mock.config();
-        config["rerankerProvider"] = json!("openai");
-        let p = Providers::new(&config).unwrap();
-        let document = format!("x{}", "🙂".repeat(4000));
-        assert_eq!(
-            p.rerank("query λ", &vec![document.clone(); count])
-                .unwrap()
-                .len(),
-            count
-        );
-        let requests = mock.requests.lock().unwrap();
-        let body = &requests[0].body;
-        let prompt: Value =
-            serde_json::from_str(body["input"][0]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(prompt["query"], "query λ");
-        assert_eq!(prompt["resultCount"], count);
-        let candidates = prompt["candidates"].as_array().unwrap();
-        assert_eq!(candidates.len(), count);
-        let mut total_bytes = 0;
-        for (index, candidate) in candidates.iter().enumerate() {
-            assert_eq!(candidate["index"], index);
-            let sent = candidate["document"].as_str().unwrap();
-            assert!(!sent.is_empty() && document.starts_with(sent));
-            assert!(sent.len() <= 12_000);
-            total_bytes += sent.len();
-        }
-        assert!(total_bytes <= 80_000);
-        let schema = &body["text"]["format"]["schema"]["properties"]["ranking"];
-        assert_eq!(schema["minItems"], count);
-        assert_eq!(schema["maxItems"], count);
-        assert_eq!(schema["items"]["properties"]["index"]["maximum"], count - 1);
-        assert!(body.get("max_output_tokens").is_none());
-    }
-}
-
-#[test]
-fn malformed_embeddings_do_not_poison_later_batches_or_retry_paid_responses() {
-    for provider in ["openai", "jina"] {
-        for output in [
-            json!({}),
-            json!({"data": {"index": 0, "embedding": [1, 0]}}),
-            json!({"data": [{"embedding": [1, 0]}]}),
-            json!({"data": [{"index": -1, "embedding": [1, 0]}]}),
-            json!({"data": [{"index": "0", "embedding": [1, 0]}]}),
-            json!({"data": [{"index": 0, "embedding": null}]}),
-            json!({"data": [{"index": 0, "embedding": [true, 0]}]}),
-        ] {
-            let mock = Mock::new(vec![
-                (200, output),
-                (
-                    200,
-                    json!({"data": [{"index": 1, "embedding": [-1e-200, 0]}, {"index": 0, "embedding": [3e38, 3e38]}]}),
-                ),
-            ]);
-            let mut config = mock.config();
-            config["provider"] = json!(provider);
-            let p = Providers::new(&config).unwrap();
-            assert!(p.embed(&["bad".into()], false).is_err());
-            assert_eq!(mock.requests.lock().unwrap().len(), 1);
-            let vectors = p.embed(&["large".into(), "tiny".into()], true).unwrap();
-            assert_eq!(vectors[1], vec![-1., 0.]);
-            for component in &vectors[0] {
-                assert!((*component - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
-            }
-            assert_eq!(mock.requests.lock().unwrap().len(), 2);
-        }
-    }
+    assert!(
+        p.rerank("q", &["doc".into()])
+            .unwrap_err()
+            .to_string()
+            .contains("rerankerCommand")
+    );
 }

@@ -166,9 +166,8 @@ Configuration examples:
 slopdex config
 slopdex config description
 slopdex help models opencode-go
-slopdex config set descriptionProvider opencode-go
-slopdex config set descriptionModel gpt-5.6-luna
-slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
+slopdex config set descriptionCommand '["opencode","run"]'
+slopdex config set descriptionModel opencode-go/deepseek-v4.1-flash
 slopdex config set rerankerProvider cohere
 slopdex config set rerankingEnabled true
 slopdex config set parallelism 10
@@ -818,7 +817,7 @@ slopdex search 'validate session' --code --symbols
 slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
 slopdex search-code 'validate session' --callers 1 --callees 1 --refs none
 slopdex search-symbols 'read settings' --callers 0 --callees 0 --refs cross-file
-slopdex config set descriptionProvider opencode-go
+slopdex config set descriptionCommand '["opencode","run"]'
 slopdex generate descriptions
 slopdex search-descriptions "keep the repository index synchronized"
 slopdex faq "How are RPC endpoints registered?"
@@ -1021,9 +1020,9 @@ with per-match scores and optional filesystem distance.
 Reranking applies to query commands, including the search inside `faq`, not
 cross-search. Embedding thresholds are applied first. Cohere/Jina receive up to
 five times the effective result limit, or all retrieved threshold-passing candidates
-without a limit. OpenAI receives up to
+without a limit. Generative command reranking receives up to
 `min(100, max(limit or 100, rerankerCandidates))`; the configured candidate count
-defaults to `10`. With `--limit none` the OpenAI retrieval cap is still **100**.
+defaults to `10`. With `--limit none` the generative retrieval cap is still **100**.
 When a finite limit is at least that candidate cap and more candidates passed
 the thresholds than were reranked, the output is reported as limited even
 though fewer rows than the limit are shown.
@@ -1154,7 +1153,7 @@ but a stale entry can never directly serve its old answer while its update is de
 
 FAQ freshness and LLM request reuse are separate cache layers. After rebuilding
 the search context, an exact-request lookup uses the configured LLM profile,
-endpoint/fallback settings, system instruction, and complete final prompt. File
+command/model settings, system instruction, and complete final prompt. File
 hashes, snapshot generations, index paths, and incoming paraphrases are **not**
 part of that key. An edit to a referenced file that leaves the rendered context
 unchanged may therefore invalidate the FAQ entry without requiring another LLM
@@ -1541,8 +1540,8 @@ never generate indexed descriptions automatically. There is no enable/disable co
 
 Matching generated artifacts are reused by the full effective request, including
 the configured description profile, settings, system instruction, and ordered
-conversation messages. Generation settings include provider/model, fallback model,
-endpoint, timeout, retry count, and retry delay. Run `generate descriptions` after
+conversation messages. Generation settings include the command, optional model,
+and agent timeout. Run `generate descriptions` after
 such changes to regenerate applicable missing/stale generated prose. Source
 descriptions are retained and never replaced by generation.
 
@@ -1729,8 +1728,8 @@ not the root or config's directory.
 Command-line provider/model/dimension settings override JSON. Target repositories
 select their config using their own root and the same user-config fallback
 (or explicit `--target-config`), then receive the same global overrides.
-When neither description provider nor model is specified, the index's saved
-description profile supplies both. Description generation is always explicit;
+Executable commands are never restored from an index or shared artifact.
+Description generation is always explicit;
 the removed description enablement setting is rejected. All configuration
 updates, including `config set` and exclusion edits, write the selected file.
 Embedding-only interactive setup may explicitly select repository settings instead;
@@ -1748,12 +1747,12 @@ Example `config.json` (user or repository settings):
   "provider": "jina",
   "model": "jina-embeddings-v4",
   "dimensions": 1024,
-  "descriptionProvider": "opencode-go",
-  "descriptionModel": "gpt-5.6-luna",
-  "descriptionFallbackModel": "muse-spark-1.3-contributor",
+  "descriptionCommand": ["opencode", "run"],
+  "descriptionModel": "opencode-go/deepseek-v4.1-flash",
   "rerankingEnabled": true,
-  "rerankerProvider": "openai",
-  "rerankerModel": "gpt-5.6-luna",
+  "rerankerProvider": "command",
+  "rerankerCommand": ["opencode", "run"],
+  "rerankerModel": "opencode-go/deepseek-v4.1-flash",
   "rerankerCandidates": 10,
   "defaultLimit": 4096,
   "exclude": ["**/fixtures/**"]
@@ -1764,16 +1763,16 @@ Example `config.json` (user or repository settings):
 | --- | --- |
 | `provider`, `model`, `dimensions` | `openai` / `text-embedding-3-large` / `3072`; `jina` defaults to `jina-embeddings-v4` / `1024`; `ollama` defaults to `qwen3-embedding:0.6b` / `1024`. OpenAI small/ada models default to `1536`. CLI: `--provider`, `--model`, `--dimensions`. |
 | `symbolDimensions` | Optional native dimension for name-only symbol embeddings; default `min(256, dimensions)`. OpenAI ada and Ollama models without a known dimension-reduction contract use full dimensions. Separate from content embeddings. |
-| `descriptionProvider`, `descriptionModel` | OpenAI / `gpt-5.6-luna`; OpenCode Zen (`opencode`) and Go (`opencode-go`) default to `muse-spark-1.3-contributor`. Corresponding `--description-*` options override them. |
-| `descriptionFallbackModel` | Optional same-provider fallback; CLI `--description-fallback-model`. Successful fallback stays active within that provider instance until it fails. |
-| `rerankingEnabled`, `rerankerProvider`, `rerankerModel` | Disabled by default; models default to Cohere `rerank-v4.0-pro`, Jina `jina-reranker-v3.5`, OpenAI `gpt-5.6-luna`. |
-| `rerankerCandidates` | OpenAI candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
+| `descriptionCommand`, `descriptionModel` | Nonempty CLI argument array and optional model for descriptions and FAQs. No default command/model. CLI: `--description-command '<JSON array>'`, `--description-model`. See [agent commands](#agent-commands). |
+| `rerankingEnabled`, `rerankerProvider`, `rerankerModel`, `rerankerCommand` | Disabled by default. `cohere` defaults to `rerank-v4.0-pro`, `jina` to `jina-reranker-v3.5`; `command` uses an explicit agent command and optional model. |
+| `rerankerCandidates` | Generative (`command`) candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
+| `agentTimeoutMs` | Positive subprocess timeout for text generation, default `300000` (five minutes). No automatic subprocess retries. |
 | `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, FAQ, map direct matches, and cross-search output. `--limit` overrides it. |
 | `faqThreshold` | FAQ cache cosine cutoff in `[-1,1]`, default `0.9`; the best question or answer score must be strictly greater. `--faq-threshold` overrides it. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
 | `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`, Ollama `8` (maximum `64`); larger configured values are capped. The full config wizard defaults to `8` for Ollama and `32` otherwise; embedding-only setup leaves batching defaults to the provider. |
-| `embeddingBaseUrl`, `descriptionBaseUrl`, `rerankerBaseUrl` | Operation-specific HTTP(S) endpoint overrides; JSON only. Hosted APIs include the API version, e.g. `http://localhost:8080/v1`. Ollama uses the API base, default `http://localhost:11434/api`, not a bare server URL. For hosted providers, a host other than the provider default and loopback must use `https` and is named once per process on stderr; see [repository settings and remote endpoints](#repository-settings-and-remote-endpoints). |
+| `embeddingBaseUrl`, `rerankerBaseUrl` | Embedding/native-reranking HTTP(S) endpoint overrides; JSON only. Hosted APIs include the API version, e.g. `http://localhost:8080/v1`. Ollama uses the API base, default `http://localhost:11434/api`. Non-loopback, non-default hosted endpoints require `https` unless explicitly allowed. |
 | `allowInsecureEndpoints` | Boolean, default `false`. Permits plain `http` hosted endpoints on non-loopback hosts (for example an internal gateway). The custom-host warning still applies. |
 | `trustedEndpointHosts` | Array of host names (optionally `host:port`), read from the **user** config only. Lets a repository `.slopdex/config.json` route environment/stored API keys to those remote endpoints; `--trust-repo-endpoints` allows every host for one invocation. |
 | `jinaTask` | Jina `task` family: `code` (default for `jina-embeddings-v4`), `retrieval` (default for v3), `none` (default for v2, omits the field), `text-matching`, or another family such as `nl2code`; families expand to `<family>.query`/`<family>.passage`. Models of an unknown generation require it. A configured value becomes part of the embedding profile. |
@@ -1788,16 +1787,15 @@ Example `config.json` (user or repository settings):
 | `providerMaxRetries` | Integer `0..5`, default `2`, for ordinary retryable HTTP failures. |
 | `retryDelayMs` | Nonnegative exponential-backoff base, default `250`; delays and numeric `Retry-After` are capped at 5 seconds. |
 | `parallelism` | Defaults to `10`; bounds concurrent embedding batches and file conversations (also `config set parallelism`). Each file's description precedes its sequential callable turns; different files can proceed in parallel. Successful artifacts are persisted immediately. |
-| `verbose` | External model-call notices go to stderr once per kind/provider/model per process by default; `true` (also `--verbose`) reports every outgoing attempt, including retries. Kinds are `vectors`, `descriptions`, and `reranking`; notices identify the actual model, including fallback, without credentials, URLs, or input. Construction and cache hits produce no model-call notices. |
+| `verbose` | Model-call notices go to stderr once per kind/provider/configured-model per process by default; `true` (also `--verbose`) reports each call. Harness-default models are labeled as such; slopdex does not inspect the harness's resolved model. Construction and cache hits produce no model-call notices. |
 
-Aliases `embeddingProvider`, `embeddingModel`, `embeddingDimensions`, and
-`fallbackModel` normalize to their canonical properties; canonical values win.
+Aliases `embeddingProvider`, `embeddingModel`, and `embeddingDimensions`
+normalize to their canonical properties; canonical values win.
 Hosted embedding profiles include `strategyVersion: "rust-v1"`; Ollama uses
 `"ollama-v1"` and includes its pinned digest, endpoint, native/output dimensions,
 context length, and family-specific input strategy. Description profiles
-identify the configured primary with `strategyVersion: "file-conversation-v3"`,
-even while fallback serves requests, and include configured endpoint/fallback
-information. Generation reuse includes settings, system instruction, and the
+identify a digest of the configured command (including its arguments) and optional model
+with `strategyVersion: "harness-transcript-v1"`. Generation reuse includes settings, system instruction, and the
 complete ordered effective conversation.
 Credentials are not profile inputs. A configured endpoint enters profiles (and
 therefore `status` output and shared-index identity) without its query string,
@@ -1815,31 +1813,67 @@ Non-loopback Ollama endpoints produce a warning: local-model selection does not
 make a custom server on another machine local to this process.
 
 Embedding URLs may already end in `/embeddings`; Cohere/Jina reranking URLs may
-end in `/rerank`. Description and OpenAI reranking bases receive the required
-protocol path. OpenAI descriptions use Responses; OpenCode protocol routing is
-model-dependent (Responses, Chat Completions, Messages, or Gemini). Overrides
-must serve the selected protocol. Live `help models`/interactive config catalog selection uses
-the public OpenCode endpoints, independently of these overrides.
+end in `/rerank`. `help models` still queries the public OpenCode catalog without
+credentials; model calling and authentication belong entirely to the configured harness.
 
 Credentials are resolved only when needed, in this order:
 
-1. Operation key: `embeddingApiKey`, `descriptionApiKey`, or `rerankerApiKey`.
-2. Provider key: `openaiApiKey`, `jinaApiKey`, `cohereApiKey`, or `opencodeApiKey`.
-3. Environment: `OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, or
-   `OPENCODE_API_KEY`.
-4. For OpenCode, the matching `opencode`/`opencode-go` entry's `key` in
-   `$XDG_DATA_HOME/opencode/auth.json`, or `~/.local/share/opencode/auth.json`.
+1. Operation key: `embeddingApiKey` or native `rerankerApiKey`.
+2. Provider key: `openaiApiKey`, `jinaApiKey`, or `cohereApiKey`.
+3. Environment: `OPENAI_API_KEY`, `JINA_API_KEY`, or `COHERE_API_KEY`.
 
-Prefer environment/stored credentials to committing keys in root config.
-Description failover and empty-output recovery allow at most six total attempts,
-without nested HTTP retries; invalid shared credentials (401) and redirects stop
-failover. A description truncated at the model's output limit (`finish_reason:
-length`, `stop_reason: max_tokens`, Gemini `MAX_TOKENS`, or Responses `status:
-incomplete`) or a Gemini `promptFeedback.blockReason` is never retried with the
-same request: the configured fallback model is tried once, otherwise the request
-fails immediately with a message naming the cause. Genuinely empty outputs keep
-the bounded retry. See [implementation](implementation.md) for retry details and
-developer checks.
+Prefer environment credentials to committing keys in root config. Agent commands
+inherit the process environment and use their own credential stores. Slopdex no
+longer reads OpenCode `auth.json`, sends generative HTTP requests, or implements
+model-protocol routing or fallback models.
+
+### Agent commands
+
+Configure a non-interactive invocation as an argument array, not a shell string:
+
+```json
+{
+  "descriptionCommand": ["opencode", "run"],
+  "descriptionModel": "opencode-go/deepseek-v4.1-flash"
+}
+```
+
+Other examples are `["pi","--print","--no-tools","--no-session"]`,
+`["claude","--print","--output-format","text","--tools",""]`, and
+`["codex","exec","--sandbox","read-only","--color","never"]`.
+Slopdex appends `--model <configured-model>` for executables named `opencode`,
+`pi`, `claude`, or `codex` (including absolute paths and `.exe` executables), before
+an explicit `--` separator. Omit the model to use the harness default. For other
+executables, the model setting is ignored; put supported options directly in the
+array or use a wrapper. Slopdex does not guess flags for unknown harnesses.
+
+Every call supplies one UTF-8 JSON object on stdin with `instructions` (string),
+`task` (execution guidance), and `messages` (ordered `{role,content}` objects).
+The harness should answer the final user message using the preceding
+transcript as context. Each invocation is independent: do not configure resume or
+continue flags. Cache hits may omit earlier invocations entirely. Only stdout's
+trimmed text is used; choose a text/final-answer output mode, or wrap a harness
+that emits JSON events. Exit must be successful and the answer nonempty UTF-8,
+at most 32 MiB. Generative reranking must return `{"ranking":[{"index":0,"score":0.9}]}`
+with every candidate exactly once and scores in `[0,1]`.
+
+The child runs in the current working directory with the inherited environment.
+No shell expansion or permission bypass is added. Configure tool restrictions in
+your command; harness configuration, hooks, tools, permissions, and filesystem
+access remain the harness's responsibility. Do not put API keys in command
+arguments: use the harness's credential store or environment instead. Command
+identity is hashed before entering cache profiles and status output, but configuration
+commands still display the configured arguments. Failures report
+only a safe error, not command arguments, prompts, stdout, or stderr. Run the
+command directly to inspect harness diagnostics. Timeout kills and reaps the CLI
+process, but cannot cancel work a harness handed off to a separate background server.
+
+Repository-local commands require `--trust-repo-commands`, or selecting that
+trusted file explicitly with `--config`. There is no persisted repository setting
+that can grant itself trust. Commands are never loaded from an index. The old
+`descriptionProvider`, description API endpoint/key settings, and description
+fallback settings/flags are no longer used. Replace `rerankerProvider: "openai"`
+with `"command"` and set `rerankerCommand` to migrate generative reranking.
 
 ### Repository settings and remote endpoints
 
@@ -1857,8 +1891,7 @@ provider policy:
 - When the selected settings are the repository file (not `--config`, not the user
   config) and it supplies such an endpoint, slopdex refuses to combine that
   endpoint with credentials the file did not supply itself: environment variables
-  (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`, `OPENCODE_API_KEY`) and the
-  stored OpenCode `auth.json`. The error names the host and the credential
+   (`OPENAI_API_KEY`, `JINA_API_KEY`, `COHERE_API_KEY`). The error names the host and the credential
   source. To allow it, either add the host to `trustedEndpointHosts` in your user
   config (`slopdex --config "$XDG_CONFIG_HOME/slopdex/config.json" config set
   trustedEndpointHosts '["gateway.example.com"]'`; `host:port` entries match an

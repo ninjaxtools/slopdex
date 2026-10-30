@@ -277,27 +277,31 @@ I use OpenCode Go usually with DeepSeek or Muse Spark, which are fairly good low
 sign up for OpenCode Go through [this link](https://opencode.ai/go?ref=RAR3Z744DZ), we both receive
 $5 in credit.
 
-```console
-$ export OPENAI_API_KEY="your-api-key"
-# Or
-# export OPENCODE_API_KEY="your-api-key" # for OpenCode Zen/Go descriptions
-# Or
-# opencode auth login                    # use stored credentials instead of env variables
+Text generation runs through your configured agent CLI, using its own login and settings.
+Embeddings still use their configured API or Ollama provider.
 
+```console
+$ slopdex config set descriptionCommand '["opencode","run"]'
+$ slopdex config set descriptionModel opencode-go/deepseek-v4.1-flash
 $ slopdex generate descriptions
 $ slopdex search-descriptions "keep the repository index synchronized"
 ```
 
-You can list and configure one of OpenCode's models like this (or use the interactive config):
+Other command examples (choose one):
 
 ```console
-$ slopdex help models opencode-go
-$ slopdex config set descriptionProvider opencode-go
-$ slopdex config set descriptionModel gpt-5.6-luna
-$ slopdex config set descriptionFallbackModel muse-spark-1.3-contributor
+$ slopdex config set descriptionCommand '["pi","--print","--no-tools","--no-session"]'
+$ slopdex config set descriptionCommand '["claude","--print","--output-format","text","--tools",""]'
+$ slopdex config set descriptionCommand '["codex","exec","--sandbox","read-only","--color","never"]'
 ```
 
-The fallback model is used if the main model reports an error, and if the fallback model reports an error the main model is tried again.
+`descriptionModel` is optional; it becomes `--model <value>` for recognized
+`opencode`, `pi`, `claude`, and `codex` executables. Custom commands receive no
+extra model arguments. Commands receive the full task/transcript as JSON on stdin
+and must return only the answer text on stdout. No shell is used. The harness owns
+credentials, retries, and fallback models. Repository-local commands require
+`--trust-repo-commands` (or an explicit trusted `--config`). See the
+[agent command contract](docs/reference.md#agent-commands).
 
 ## Other formats
 
