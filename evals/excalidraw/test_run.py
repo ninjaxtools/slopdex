@@ -390,6 +390,36 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(copied, {"opencode-go": {"type": "api", "key": "eval-secret"}})
         self.assertNotIn("OPENCODE_GO_EVALS_KEY", env)
 
+    def test_faq_agent_shim_returns_answer_text_and_journals_nested_usage(self):
+        sandbox = self.root / "faq-sandbox"
+        sandbox.mkdir()
+        fake = self.root / "fake-opencode"
+        fake.write_text(f"""#!{sys.executable}
+import json, sys
+assert sys.argv[1:] == ['run', '--model', 'provider/model', '--format', 'json'], sys.argv
+assert json.loads(sys.stdin.read())['messages']
+events = [
+    {{'type': 'text', 'part': {{'messageID': 'm1', 'text': 'nested answer'}}}},
+    {{'type': 'step_finish', 'part': {{'cost': 0.25, 'tokens': {{'input': 10, 'output': 2, 'reasoning': 1, 'total': 13,
+                                                            'cache': {{'read': 4, 'write': 0}}}}}}}},
+]
+print('\\n'.join(json.dumps(event) for event in events))
+""")
+        fake.chmod(0o755)
+        shim, log = runner.install_faq_agent(sandbox, str(fake))
+        self.assertEqual(shim.name, "opencode")  # Slopdex appends --model for opencode-named executables.
+        self.assertEqual(runner.faq_usage(log), {"calls": 0, "seconds": 0, "steps": 0, "tokens": {}, "cost_usd": 0})
+        for _ in range(2):
+            result = subprocess.run([str(shim), "run", "--model", "provider/model"], input=json.dumps({"messages": [{"role": "user", "content": "q"}]}),
+                                    text=True, capture_output=True)
+            self.assertEqual((result.returncode, result.stdout), (0, "nested answer"), result.stderr)
+        usage = runner.faq_usage(log)
+        self.assertEqual((usage["calls"], usage["steps"], usage["cost_usd"]), (2, 2, 0.5))
+        self.assertEqual(usage["tokens"], {"input": 20, "output": 4, "reasoning": 2, "total": 26, "cache_read": 8, "cache_write": 0})
+        with log.open("a") as stream:
+            stream.write(json.dumps({"tokens": {}, "cost_usd": None, "seconds": 1, "steps": 0}) + "\n")
+        self.assertIsNone(runner.faq_usage(log)["cost_usd"])  # Unknown nested cost is never treated as zero.
+
     def test_paired_schedule_is_reproducible_and_counterbalanced(self):
         tasks = [dict(self.task, id=f"task-{index}") for index in range(10)]
         schedule = runner.make_trials(self.config, tasks, ["off", "map"], 2, 7)
@@ -582,6 +612,7 @@ class EvaluationTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    @patch.object(runner, "ARM_REQUIRED", {"map": ("map",)})  # Exercise the optional requirement path.
     @patch.object(runner, "TRIAL_SYMBOL_ONLY", True)  # Fixture builds symbol-only sidecars.
     def test_offline_paired_trials_and_report(self):
         """Exercise CLI spawning, both wrappers, scoring, artifacts and pairing."""

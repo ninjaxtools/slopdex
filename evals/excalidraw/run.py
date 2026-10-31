@@ -47,6 +47,8 @@ ARM_INSTRUCTIONS = {
 }
 DEFAULT_ARMS = ["off", "map"]
 ARM_NAVIGATION = {"map": ("map",)}
+# No slopdex command is mandatory: trials record which commands the agent chose to use.
+ARM_REQUIRED = {}
 ARM_OPTIONAL = {"map": ("faq", "refactor")}
 # Trials copy the full semantic index (code/docs/descriptions/symbols ANN), which faq needs.
 TRIAL_SYMBOL_ONLY = False
@@ -134,6 +136,8 @@ def load_inputs(config_path: Path):
             raise ValueError(f"Task {task['id']} must have distinct path/symbol targets")
         if task.get("difficulty") == "advanced" and (len(targets) < 5 or len({path for path, _ in targets}) < 3):
             raise ValueError(f"Advanced task {task['id']} needs at least five targets across three files")
+        if task.get("difficulty") == "expert" and (len(targets) < 7 or len({path for path, _ in targets}) < 4):
+            raise ValueError(f"Expert task {task['id']} needs at least seven targets across four files")
         for target in task["targets"]:
             path = Path(target["path"])
             if path.is_absolute() or ".." in path.parts:
@@ -676,7 +680,53 @@ def verify_native_ann_reuse(binary: str, workspace: Path, config_path: Path, ind
     return result
 
 
-def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None, index_dir: Path | None, commit: str, *, map_private=None, agent_model=None):
+def install_faq_agent(sandbox: Path, opencode: str) -> tuple[Path, Path]:
+    """An `opencode`-named shim for slopdex's agentCommand that records nested faq usage.
+
+    Slopdex appends `--model` for executables named opencode; the shim adds JSON events,
+    returns the final answer text, and journals tokens/cost so trials can count them.
+    """
+    directory = sandbox / "faq-agent"
+    directory.mkdir()
+    log = sandbox / "faq-usage.jsonl"
+    script = f"""#!{sys.executable}
+import collections, json, subprocess, sys, tempfile, time
+from pathlib import Path
+{inspect.getsource(parse_events)}
+argv = sys.argv[1:]
+position = argv.index('--') if '--' in argv else len(argv)
+argv = argv[:position] + ['--format', 'json'] + argv[position:]
+started = time.time()
+with tempfile.TemporaryDirectory() as temporary:
+    events_path = Path(temporary) / 'events.jsonl'
+    with events_path.open('w') as stream:
+        code = subprocess.run([{opencode!r}, *argv], stdin=sys.stdin, stdout=stream).returncode
+    events = parse_events(events_path)
+with open({str(log)!r}, 'a') as stream:
+    stream.write(json.dumps({{'exit_code': code, 'seconds': time.time() - started, 'tokens': events['tokens'],
+                             'cost_usd': events['cost_usd'], 'steps': events['steps'], 'errors': len(events['errors'])}}) + '\\n')
+sys.stdout.write(events['answer_text'])
+sys.exit(code or (0 if events['answer_text'].strip() else 1))
+"""
+    shim = directory / "opencode"
+    shim.write_text(script)
+    shim.chmod(0o755)
+    return shim, log
+
+
+def faq_usage(log: Path):
+    """Sum nested faq model calls; any call without cost telemetry makes the cost unknown."""
+    calls = [json.loads(line) for line in log.read_text().splitlines() if line.strip()] if log.exists() else []
+    tokens = collections.Counter()
+    for call in calls:
+        tokens.update({name: value for name, value in (call.get("tokens") or {}).items() if isinstance(value, (int, float))})
+    costs = [call.get("cost_usd") for call in calls]
+    return {"calls": len(calls), "seconds": sum(call.get("seconds", 0) for call in calls),
+            "steps": sum(call.get("steps", 0) for call in calls), "tokens": dict(tokens),
+            "cost_usd": None if any(cost is None for cost in costs) else sum(costs)}
+
+
+def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None, index_dir: Path | None, commit: str, *, map_private=None, agent_model=None, agent_command=None):
     bin_dir = sandbox / "bin"
     bin_dir.mkdir()
     log = sandbox / "slopdex-calls.jsonl"
@@ -688,7 +738,7 @@ def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None
         config_path = sandbox / "slopdex.json"
         settings = index_config(index_dir / "config.json", destination)
         # faq answers with the trial's own model through the sandboxed OpenCode.
-        settings["agentCommand"] = ["opencode", "run"]
+        settings["agentCommand"] = agent_command or ["opencode", "run"]
         if agent_model:
             settings["agentModel"] = agent_model
         write_json(config_path, settings)
@@ -893,7 +943,7 @@ def slopdex_protocol_violations(arm: str, calls, *, map_private=None):
     for call in calls:
         if not slopdex_call_allowed(arm, call["argv"], map_private=map_private):
             violations.append({"reason": "command_not_allowed", "command": slopdex_command(call["argv"]), "argv": call["argv"]})
-    for required in ARM_NAVIGATION.get(arm, ()):
+    for required in ARM_REQUIRED.get(arm, ()):
         if not any(slopdex_command(call["argv"]) == required and call.get("exit_code") == 0
                    and slopdex_call_allowed(arm, call["argv"], map_private=map_private) for call in calls):
             violations.append({"reason": "required_command_not_used_successfully", "command": required})
@@ -966,8 +1016,9 @@ def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, i
         write_json(directory / "opencode.json", cli_config)
         env = isolated_environment(sandbox, cli_config)
         env["PWD"] = str(workspace)
+        faq_shim, faq_log = install_faq_agent(sandbox, opencode)
         bin_dir, calls = install_wrapper(sandbox, workspace, trial["arm"], slopdex, index_dir, commit, map_private=map_private,
-                                         agent_model=trial["model"])
+                                         agent_model=trial["model"], agent_command=[str(faq_shim), "run"])
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
         native_ann = None
         if trial["arm"] == "map":
@@ -978,6 +1029,17 @@ def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, i
         write_json(directory / "command.json", argv)
         code, expired, elapsed = logged_process(argv, workspace, env, directory, config["timeout_seconds"])
         events = parse_events(directory / "stdout.jsonl")
+        # Nested faq model calls are part of the arm's spend: fold them into the totals.
+        faq = faq_usage(faq_log)
+        if faq_log.exists():
+            shutil.copyfile(faq_log, directory / "faq-usage.jsonl")
+        events["agent_tokens"], events["agent_cost_usd"] = dict(events["tokens"]), events["cost_usd"]
+        if faq["calls"]:
+            events["tokens"] = {name: events["tokens"].get(name, 0) + faq["tokens"].get(name, 0)
+                                for name in {*events["tokens"], *faq["tokens"]}}
+            events["cost_usd"] = (None if events["cost_usd"] is None or faq["cost_usd"] is None
+                                  else events["cost_usd"] + faq["cost_usd"])
+        events["faq_usage"] = faq
         (directory / "answer.txt").write_text(events.pop("answer_text"))
         grade = score_answer((directory / "answer.txt").read_text(), task, gold)
         changes = command(["git", "diff", "--name-only", "HEAD"], cwd=workspace)

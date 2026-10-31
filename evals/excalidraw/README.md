@@ -5,7 +5,7 @@ the exact agent instruction from the root [README.md](../../README.md) by defaul
 Optional visibility switches compare map with and without private symbols. There
 are no search, combined-tool, or experimental-prompt evaluations.
 
-The corpus contains **20 tasks and 80 reference declarations** in the
+The corpus contains **20 tasks and 140 reference declarations** in the
 [Excalidraw](https://github.com/excalidraw/excalidraw) TypeScript monorepo
 (~140k non-test lines). The default matrix is two models at medium thinking, one
 repetition, and two arms: 80 results, but **only missing or changed trials run**.
@@ -151,7 +151,7 @@ Reports compare **map − baseline**, grouped by model and thinking setting:
 - Execution wall time (agent run only) and `step_finish` count.
 - Input, output, reasoning, cache-read, cache-write, and total tokens.
 - OpenCode-reported USD cost, with missing cost telemetry kept as unknown.
-- Citation F1, all-target passes, answer/protocol status, and map invocations.
+- Citation F1, all-target passes, answer/protocol status, and slopdex command counts.
 - Per-task differences and aggregate absolute/percentage changes.
 
 Total tokens use OpenCode's reported total when available; otherwise they sum
@@ -170,9 +170,11 @@ time and provider caching can vary between runs.
 `repo/` is a Git submodule pinned to Excalidraw commit
 `a758e93d6a03e9f995973703cb886850a398a6d3`. Source-dependent commands initialize
 the recorded gitlink, never a moving branch, and verify it against `tasks.json`.
-Every executed trial gets an independent clone. There are ten intermediate tasks
-(three findings each) and ten advanced tasks (five findings across at least three
-files). Agents see the role-based prompt, not reference symbols or paths.
+Every executed trial gets an independent clone. There are ten advanced tasks
+(six findings across at least three files) and ten expert tasks (eight findings
+across at least four files, usually spanning packages). Roles describe behaviour
+along 3-6 call-deep execution paths without identifier vocabulary, and at least
+half of each task's targets are helpers reached only by following calls. Agents see the role-based prompt, not reference symbols or paths.
 
 Default models in `config.json`:
 
@@ -181,14 +183,16 @@ Default models in `config.json`:
 - Explicit `{"reasoningEffort": "medium"}`, 600-second timeout, 40 steps.
 
 Trials run sequentially in a seeded task/model order, alternating arm order when
-both are fresh. Both arms allow glob, grep, and reads. Map uses the root README
-snippet verbatim unless visibility is explicitly overridden, and must
-successfully invoke `slopdex map` with the selected visibility. `slopdex faq` and
-`slopdex refactor` are also allowed (refactoring edits files and is therefore a
-workspace violation in these read-only tasks); other slopdex commands and
-root/index/config/agent overrides are blocked. Baseline denies all
-slopdex calls. Missing required map use or disallowed commands is a protocol
-violation. These are cooperative controls, not a security sandbox.
+both are fresh. Both arms allow glob, grep, and reads, and receive the same base
+instructions. The harness adds no slopdex guidance of its own: map adds only the
+root README snippet (verbatim unless visibility is explicitly overridden).
+No slopdex command is mandatory; each trial records which commands the agent
+chose (`slopdex_commands`). Map allows `map`, `faq`, and `refactor` (refactoring
+edits files and is therefore a workspace violation in these read-only tasks);
+other slopdex commands, map calls with the wrong `--map-private` visibility, and
+root/index/config/agent overrides are protocol violations. Baseline blocks all
+slopdex calls through OpenCode permissions. These are cooperative controls, not
+a security sandbox.
 
 Global configs, instructions, plugins, and previous sessions are isolated.
 Editing, delegation, network tools, interactive questions, and LSP are disabled.
@@ -204,10 +208,14 @@ content search and `map -q`. Each trial gets its own workspace/store backup and
 copied ANN bases, and an offline search preflight (provider credentials removed)
 checks that the copies are reused without rebuilding.
 
-`faq` runs with `agentCommand: ["opencode", "run"]` and the trial's own model,
-inside the trial's isolated OpenCode environment. Its answers are cached only in
-the trial's index copy. **Nested faq model spend is not included in the reported
-tokens or USD**; its wall time is included in the agent's run time.
+`faq` answers with the trial's own model through an `opencode`-named shim in the
+trial sandbox, which runs the same OpenCode with JSON events and journals each
+nested call to `faq-usage.jsonl`. **Nested faq tokens and USD are added to the
+trial's totals** (agent-only figures stay in `agent_tokens`/`agent_cost_usd`,
+the breakdown in `faq_usage`); a nested call without cost telemetry makes the
+trial's USD unknown rather than zero. Its wall time is part of the agent's run
+time; nested steps are not added to the agent's step count. Answers are cached
+only in the trial's index copy.
 Preparation, copying, and preflight are excluded from agent timing and USD;
 ordinary map loading and query embedding latency remain timed.
 

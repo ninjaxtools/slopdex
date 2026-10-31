@@ -47,8 +47,9 @@ class ExclusiveArmTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertTrue(runner.slopdex_call_allowed("map", argv, map_private=True))
                 self.assertFalse(runner.slopdex_call_allowed("off", argv))
-                self.assertEqual(runner.slopdex_protocol_violations("map", [{"argv": argv, "exit_code": 0}]),
-                                 [{"reason": "required_command_not_used_successfully", "command": "map"}])
+                # No command is mandatory by default; faq/refactor alone are valid trials.
+                self.assertEqual(runner.ARM_REQUIRED, {})
+                self.assertEqual(runner.slopdex_protocol_violations("map", [{"argv": argv, "exit_code": 0}]), [])
 
     def test_instructions_read_current_readme_verbatim(self):
         snippet = '- custom symbol guidance: `slopdex map -q "exact concept" src`\n- preserve this second line'
@@ -177,6 +178,7 @@ class ExclusiveArmTests(unittest.TestCase):
             for argv in (["search", "--private"], ["map", "--private", "--index", "other.sqlite"]):
                 self.assertFalse(runner.slopdex_call_allowed("map", argv, map_private=private))
 
+    @patch.object(runner, "ARM_REQUIRED", {"map": ("map",)})  # Optional requirement machinery.
     def test_map_visibility_protocol_requires_success_under_matching_policy(self):
         missing = {"reason": "required_command_not_used_successfully", "command": "map"}
         for private in (True, False):
@@ -217,6 +219,7 @@ class ExclusiveArmTests(unittest.TestCase):
                 with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, "requires the map arm"):
                     runner.main(["--results", str(results), "run", "--arms", "off", "--dry-run", flag])
 
+    @patch.object(runner, "ARM_REQUIRED", {"map": ("map",)})  # Optional requirement machinery.
     def test_missing_required_command_for_unused_failed_partial_or_help_only(self):
         examples = ([], [{"argv": ["map", "target"], "exit_code": 9}],
                     [{"argv": ["map", "target"], "event": "start"}],
