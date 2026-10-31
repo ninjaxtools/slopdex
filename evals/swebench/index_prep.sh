@@ -29,7 +29,7 @@ fi
 
 # --- slopdex config (mirrors the Harbor plugin) ---
 if [[ "$INDEX_MODE" == "descriptions" ]]; then
-  CONFIG=$(printf '{"descriptionProvider": "%s", "descriptionModel": "%s", "descriptionsEnabled": true}' "${DESCRIPTION_PROVIDER:-opencode-go}" "${DESCRIPTION_MODEL:-deepseek-v4.1-flash}")
+  CONFIG=$(printf '{"descriptionProvider": "%s", "agentModel": "%s", "descriptionsEnabled": true}' "${DESCRIPTION_PROVIDER:-opencode-go}" "${DESCRIPTION_MODEL:-deepseek-v4.1-flash}")
 else
   CONFIG='{"descriptionsEnabled": false}'
 fi

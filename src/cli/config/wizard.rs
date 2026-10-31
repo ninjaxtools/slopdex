@@ -173,8 +173,8 @@ impl Prompts for CliclackPrompts {
 }
 
 pub(super) const CONFIG_KEYS: &[&str] = &[
-    "descriptionCommand",
-    "descriptionModel",
+    "agentCommand",
+    "agentModel",
     "rerankingEnabled",
     "rerankerProvider",
     "rerankerModel",
@@ -306,24 +306,24 @@ fn configure_interactively_filtered(
     let mut config = saved.clone();
     normalize_config_aliases(&mut config);
     let existing = config.clone();
-    if selected(prefix, "descriptionCommand") {
+    if selected(prefix, "agentCommand") {
         let default = existing
-            .get("descriptionCommand")
+            .get("agentCommand")
             .map(Value::to_string)
             .unwrap_or_else(|| "[\"opencode\",\"run\"]".into());
-        config["descriptionCommand"] = serde_json::from_str(
-            &prompts.required("Description agent command (JSON argument array)", &default)?,
+        config["agentCommand"] = serde_json::from_str(
+            &prompts.required("Agent command (JSON argument array)", &default)?,
         )?;
     }
-    if selected(prefix, "descriptionModel") {
+    if selected(prefix, "agentModel") {
         let model = prompts.ask(
-            "Description model (blank uses harness default)",
-            text(&existing, "descriptionModel"),
+            "Agent model (blank uses harness default)",
+            text(&existing, "agentModel"),
         )?;
         if model.is_empty() {
-            config.as_object_mut().unwrap().remove("descriptionModel");
+            config.as_object_mut().unwrap().remove("agentModel");
         } else {
-            config["descriptionModel"] = json!(model);
+            config["agentModel"] = json!(model);
         }
     }
     let reranking = if selected(prefix, "rerankingEnabled") {

@@ -131,14 +131,14 @@ fn wizard_configures_description_models_without_enablement_and_preserves_extensi
     let mut config = json!({"custom": "keep"});
     let mut prompts = ScriptedPrompts::new(&format!("\n\nno\n{}", "\n".repeat(11)));
     configure_interactively(&mut config, &mut prompts).unwrap();
-    assert_eq!(config["descriptionCommand"], json!(["opencode", "run"]));
-    assert!(config.get("descriptionModel").is_none());
+    assert_eq!(config["agentCommand"], json!(["opencode", "run"]));
+    assert!(config.get("agentModel").is_none());
     assert_eq!(config["model"], "text-embedding-3-large");
     assert_eq!(config["dimensions"], 3072);
     assert_eq!(config["custom"], "keep");
     let output = String::from_utf8(prompts.output).unwrap();
-    assert!(output.contains("Description agent command"));
-    assert!(output.contains("Description model"));
+    assert!(output.contains("Agent command"));
+    assert!(output.contains("Agent model"));
     assert!(!output.contains("Generate file and function descriptions"));
 }
 
@@ -181,17 +181,14 @@ fn wizard_migrates_embedding_aliases_and_saves_selected_values() {
 
 #[test]
 fn wizard_command_configuration_is_offline_and_preserves_model_ids() {
-    let mut config = json!({"descriptionModel":"opencode-go/deepseek-v4.1-flash"});
+    let mut config = json!({"agentModel":"opencode-go/deepseek-v4.1-flash"});
     let mut prompts = ScriptedPrompts::new("[\"pi\",\"--print\",\"--no-tools\"]\n\n");
-    configure_interactively_filtered(&mut config, &mut prompts, Some("description")).unwrap();
+    configure_interactively_filtered(&mut config, &mut prompts, Some("agent")).unwrap();
     assert_eq!(
-        config["descriptionCommand"],
+        config["agentCommand"],
         json!(["pi", "--print", "--no-tools"])
     );
-    assert_eq!(
-        config["descriptionModel"],
-        "opencode-go/deepseek-v4.1-flash"
-    );
+    assert_eq!(config["agentModel"], "opencode-go/deepseek-v4.1-flash");
 }
 
 #[test]
@@ -255,11 +252,12 @@ fn wizard_catalog_and_validation_errors_discard_changes() {
 
 #[test]
 fn filtered_config_prompts_only_matching_keys() {
-    let mut config = json!({"descriptionCommand": ["opencode","run"], "descriptionModel": "old", "parallelism": 3});
+    let mut config =
+        json!({"agentCommand": ["opencode","run"], "agentModel": "old", "parallelism": 3});
     let mut prompts = ScriptedPrompts::new("new\n");
-    configure_interactively_filtered(&mut config, &mut prompts, Some("descriptionModel")).unwrap();
-    assert_eq!(config["descriptionModel"], "new");
-    assert_eq!(config["descriptionCommand"], json!(["opencode", "run"]));
+    configure_interactively_filtered(&mut config, &mut prompts, Some("agentModel")).unwrap();
+    assert_eq!(config["agentModel"], "new");
+    assert_eq!(config["agentCommand"], json!(["opencode", "run"]));
     assert_eq!(config["parallelism"], 3);
     let mut prompts = ScriptedPrompts::new("7\n");
     configure_interactively_filtered(&mut config, &mut prompts, Some("parallel")).unwrap();
@@ -312,8 +310,8 @@ fn focused_embeddings_offer_presets_installed_and_custom_without_description_cat
         ),
     ] {
         let mut config = json!({"provider": "openai", "model": "old", "dimensions": 8,
-            "embeddingBaseUrl": "https://old.invalid/v1", "descriptionCommand": ["opencode","run"],
-            "descriptionModel": "keep", "custom": true});
+            "embeddingBaseUrl": "https://old.invalid/v1", "agentCommand": ["opencode","run"],
+            "agentModel": "keep", "custom": true});
         let mut prompts = ScriptedPrompts::new(&format!("ollama\n{answer}\nyes\n"));
         prompts.installed = vec!["installed-embed".into(), "qwen3-embedding:4b".into()];
         super::configure_embeddings_with(&mut config, &mut prompts).unwrap();
@@ -321,7 +319,7 @@ fn focused_embeddings_offer_presets_installed_and_custom_without_description_cat
         assert_eq!(config["model"], model);
         assert_eq!(config["dimensions"].as_u64(), dimensions);
         assert_eq!(config["ollamaAutoPull"], true);
-        assert_eq!(config["descriptionModel"], "keep");
+        assert_eq!(config["agentModel"], "keep");
         assert_eq!(config["custom"], true);
         assert!(config.get("embeddingBaseUrl").is_none());
         let selection = &prompts.selections[1];
@@ -346,7 +344,7 @@ fn focused_embeddings_offer_presets_installed_and_custom_without_description_cat
 #[test]
 fn focused_embedding_cancellation_at_every_prompt_is_staged() {
     let original = json!({"embeddingProvider": "jina", "embeddingModel": "saved",
-        "embeddingDimensions": 16, "descriptionModel": "keep"});
+        "embeddingDimensions": 16, "agentModel": "keep"});
     let answers = ["ollama", "Custom model", "my-embedding:tag", "yes"];
     for end in 0..answers.len() {
         let mut config = original.clone();

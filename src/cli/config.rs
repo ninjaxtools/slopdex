@@ -217,12 +217,12 @@ fn normalize_config_aliases(config: &mut Value) {
 pub(super) fn effective_config(global: &Global, path: &Path) -> Result<Value> {
     let mut config = read_config(path)?;
     apply_embedding_overrides(&mut config, global);
-    if let Some(value) = &global.description_model {
-        config["descriptionModel"] = json!(value);
+    if let Some(value) = &global.agent_model {
+        config["agentModel"] = json!(value);
     }
-    if let Some(command) = &global.description_command {
-        config["descriptionCommand"] = serde_json::from_str(command)
-            .context("--description-command must be a JSON argument array")?;
+    if let Some(command) = &global.agent_command {
+        config["agentCommand"] = serde_json::from_str(command)
+            .context("--agent-command must be a JSON argument array")?;
     }
     config[crate::providers::TRUST_COMMANDS_KEY] = json!(global.trust_repo_commands);
     if let Some(value) = global.reranker_candidates {
@@ -345,7 +345,7 @@ fn validate_config(config: &Value) -> Result<()> {
         "model",
         "indexPath",
         "artifactCachePath",
-        "descriptionModel",
+        "agentModel",
         "ollamaKeepAlive",
         "ollamaModelDigest",
         "jinaTask",
@@ -360,7 +360,7 @@ fn validate_config(config: &Value) -> Result<()> {
     if let Some(hosts) = config.get("trustedEndpointHosts") {
         validate_trusted_hosts(hosts)?;
     }
-    for key in ["descriptionCommand", "rerankerCommand"] {
+    for key in ["agentCommand", "rerankerCommand"] {
         if let Some(value) = config.get(key) {
             ensure!(
                 value.as_array().is_some_and(|args| !args.is_empty()
@@ -795,8 +795,8 @@ pub(super) fn run_config(
     write_config(path, &config)?;
     if interactive {
         let summary = [
-            "descriptionCommand",
-            "descriptionModel",
+            "agentCommand",
+            "agentModel",
             "rerankingEnabled",
             "rerankerProvider",
             "rerankerModel",

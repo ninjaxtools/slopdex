@@ -13,7 +13,7 @@ fn embedding_setup_saves_only_embedding_flags_and_resolved_identity() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("selected/config.json");
     let original = json!({"provider": "openai", "model": "old", "dimensions": 8,
-        "embeddingBaseUrl": "https://old.invalid/v1", "descriptionModel": "keep",
+        "embeddingBaseUrl": "https://old.invalid/v1", "agentModel": "keep",
         "artifactCachePath": temp.path().join("artifacts.sqlite"), "custom": {"keep": true}});
     write_config(&path, &original).unwrap();
     for command in [vec!["update", "--setup"], vec!["config", "embeddings"]] {
@@ -27,7 +27,7 @@ fn embedding_setup_saves_only_embedding_flags_and_resolved_identity() {
                 "--pull",
                 "--no-reindex",
                 "--verbose",
-                "--description-model",
+                "--agent-model",
                 "transient",
             ],
         ]
@@ -54,7 +54,7 @@ fn embedding_setup_saves_only_embedding_flags_and_resolved_identity() {
         .unwrap();
         let saved = read_config(&path).unwrap();
         assert_eq!(saved["ollamaModelDigest"], "sha256:resolved");
-        assert_eq!(saved["descriptionModel"], "keep");
+        assert_eq!(saved["agentModel"], "keep");
         assert_eq!(saved["custom"], original["custom"]);
         assert_eq!(saved["artifactCachePath"], original["artifactCachePath"]);
         for key in ["verbose", "noReindex", "forceReindex", "ignoreErrors"] {
@@ -404,6 +404,52 @@ fn canonical_config_wins_conflicting_aliases() {
 }
 
 #[test]
+fn agent_flags_override_saved_settings_without_persisting_or_changing_embeddings() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let saved = json!({
+        "provider": "jina", "model": "jina-embeddings-v3", "dimensions": 16,
+        "agentCommand": ["opencode", "run"], "agentModel": "saved-model",
+        "rerankerCommand": ["wrapper", "rank"], "rerankerModel": "rank-model"
+    });
+    write_config(&path, &saved).unwrap();
+    let command = json!(["claude", "--print"]);
+    let cli = parse(&[
+        "status",
+        "--agent-command",
+        &command.to_string(),
+        "--agent-model",
+        "provider/override#variant",
+    ]);
+    let config = effective_config(&cli.global, &path).unwrap();
+    assert_eq!(config["agentCommand"], command);
+    assert_eq!(config["agentModel"], "provider/override#variant");
+    for key in [
+        "provider",
+        "model",
+        "dimensions",
+        "rerankerCommand",
+        "rerankerModel",
+    ] {
+        assert_eq!(config[key], saved[key]);
+    }
+    let profile = Providers::new(&config).unwrap().description_profile();
+    assert_eq!(profile["configured"], true);
+    assert_eq!(profile["model"], "provider/override#variant");
+    assert_eq!(profile["commandHash"], crate::hash(command.to_string()));
+    assert_eq!(read_config(&path).unwrap(), saved);
+
+    for (command, message) in [
+        ("not-json", "--agent-command must be a JSON argument array"),
+        ("[]", "agentCommand must be a non-empty argument array"),
+    ] {
+        let cli = parse(&["status", "--agent-command", command]);
+        let error = effective_config(&cli.global, &path).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+}
+
+#[test]
 fn config_set_keeps_json_stdout_machine_readable() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.json");
@@ -412,7 +458,7 @@ fn config_set_keeps_json_stdout_machine_readable() {
         vec![
             "config",
             "set",
-            "descriptionCommand",
+            "agentCommand",
             "[\"opencode\",\"run\"]",
             "--output",
             "json",
@@ -544,7 +590,7 @@ fn invalid_config_settings_cannot_partially_persist_a_config_action() {
     for value in [Value::Null, json!(false), json!("unsupported")] {
         cases.push(("provider", value));
     }
-    for key in ["model", "indexPath", "descriptionModel"] {
+    for key in ["model", "indexPath", "agentModel"] {
         for value in [Value::Null, json!(42), json!(" \t\n")] {
             cases.push((key, value));
         }
@@ -630,7 +676,7 @@ fn unrelated_config_edits_durably_normalize_aliases_without_saving_global_overri
         &path,
         json!({"provider": null, "embeddingProvider": "jina",
         "model": "canonical", "embeddingModel": "obsolete", "dimensions": null,
-        "embeddingDimensions": 16, "descriptionModel": "primary",
+        "embeddingDimensions": 16, "agentModel": "primary",
         "custom": {"nested": [null, "λ"]}})
         .to_string(),
     )
@@ -653,7 +699,7 @@ fn unrelated_config_edits_durably_normalize_aliases_without_saving_global_overri
     );
     assert_eq!(result, json!({"configPath": path, "parallelism": 4}));
     let expected = json!({"provider": "jina", "model": "canonical", "dimensions": 16,
-        "descriptionModel": "primary", "parallelism": 4,
+        "agentModel": "primary", "parallelism": 4,
         "custom": {"nested": [null, "λ"]}});
     // Inspect raw JSON: read_config would hide aliases accidentally left on disk.
     let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -967,7 +1013,7 @@ fn config_set_rejects_unknown_keys_with_suggestions_and_accepts_documented_keys(
     write_config(&path, &json!({"custom": "keep"})).unwrap();
     let original = fs::read(&path).unwrap();
     for (key, suggestion) in [
-        ("descriptonModel", "descriptionModel"),
+        ("agnetModel", "agentModel"),
         ("embeddingapikey", "embeddingApiKey"),
         ("verbosity", "verbose"),
         ("parallelism.limit", "parallelism"),

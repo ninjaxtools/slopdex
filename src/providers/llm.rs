@@ -18,7 +18,7 @@ const MAX_OUTPUT: u64 = 32 * 1024 * 1024;
 pub const TRUST_COMMANDS_KEY: &str = "trustRepositoryCommands";
 
 pub(super) fn create(context: Arc<Context>) -> Result<Box<dyn Llm>> {
-    Ok(Box::new(Harness::new(context, "description")?))
+    Ok(Box::new(Harness::new(context, "agent")?))
 }
 
 /// Constructing a harness is offline. A missing command only fails on use, so
@@ -100,7 +100,7 @@ impl Llm for Harness {
         // invocation without publishing it in status or shared artifacts.
         json!({"provider": "command", "commandHash": crate::hash(json!(self.command).to_string()),
             "configured": !self.command.is_empty(), "model": self.model,
-            "strategyVersion": "harness-transcript-v1"})
+            "strategyVersion": "harness-transcript-v2"})
     }
 
     fn describe_conversation(
@@ -124,7 +124,7 @@ impl Llm for Harness {
         // session: cache hits can skip turns, and retries must not duplicate them.
         let input = serde_json::to_vec(&json!({
             "instructions": system,
-            "task": "Complete the final user message using earlier messages only as context. Return only the answer. Do not use tools or modify files.",
+            "task": "Complete the final user message using earlier messages only as context. Return only the answer. You may use read-only tools such as read, glob, and grep to inspect files. Do not modify files or perform other side effects.",
             "messages": messages,
         }))?;
         self.context.report_call(
@@ -208,7 +208,7 @@ mod tests {
                 config,
                 ollama_verified: Arc::new(std::sync::Mutex::new(false)),
             }),
-            "description",
+            "agent",
         )
         .unwrap()
     }
@@ -223,8 +223,11 @@ mod tests {
             "/opt/bin/opencode",
             "codex.exe",
         ] {
+            let default = harness(json!({"agentCommand":[name,"run","--","literal"]}));
+            assert_eq!(default.invocation(), vec![name, "run", "--", "literal"]);
+            assert!(default.profile()["model"].is_null());
             let h = harness(
-                json!({"descriptionCommand":[name,"run","--","literal"],"descriptionModel":"provider/model#variant"}),
+                json!({"agentCommand":[name,"run","--","literal"],"agentModel":"provider/model#variant"}),
             );
             assert_eq!(
                 h.invocation(),
@@ -237,20 +240,15 @@ mod tests {
                     "literal"
                 ]
             );
+            assert_ne!(default.profile(), h.profile());
         }
-        let h = harness(
-            json!({"descriptionCommand":["wrapper","--custom"],"descriptionModel":"ignored"}),
-        );
+        let h = harness(json!({"agentCommand":["wrapper","--custom"],"agentModel":"ignored"}));
         assert_eq!(h.invocation(), vec!["wrapper", "--custom"]);
-        assert_eq!(
-            harness(json!({"descriptionCommand":["opencode","run"]})).invocation(),
-            vec!["opencode", "run"]
-        );
     }
 
     #[test]
     fn full_transcript_is_sent_over_stdin_without_shell_interpolation() {
-        let h = harness(json!({"descriptionCommand":[agent::executable(),"echo"]}));
+        let h = harness(json!({"agentCommand":[agent::executable(),"echo"]}));
         let messages = [
             Message::user("source with `code`, $(not-a-command), \"quotes\" and λ".into()),
             Message::assistant("earlier answer".into()),
@@ -261,6 +259,11 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(value["messages"], json!(messages));
+        assert_eq!(
+            value["task"],
+            "Complete the final user message using earlier messages only as context. Return only the answer. You may use read-only tools such as read, glob, and grep to inspect files. Do not modify files or perform other side effects."
+        );
+        assert_eq!(h.profile()["strategyVersion"], "harness-transcript-v2");
         assert!(
             value["instructions"]
                 .as_str()
@@ -283,7 +286,7 @@ mod tests {
         ] {
             let timeout = if mode == "sleep" { 100 } else { 30_000 };
             let h = harness(
-                json!({"descriptionCommand":[agent::executable(),mode,arg],"agentTimeoutMs":timeout}),
+                json!({"agentCommand":[agent::executable(),mode,arg],"agentTimeoutMs":timeout}),
             );
             let start = Instant::now();
             let error = h.describe("instructions", "prompt").unwrap_err();
@@ -296,10 +299,10 @@ mod tests {
                 .describe("s", "p")
                 .unwrap_err()
                 .to_string()
-                .contains("descriptionCommand")
+                .contains("agentCommand")
         );
         assert!(
-            harness(json!({"descriptionCommand":["missing-agent-executable"]}))
+            harness(json!({"agentCommand":["missing-agent-executable"]}))
                 .describe("s", "p")
                 .unwrap_err()
                 .to_string()
@@ -309,7 +312,7 @@ mod tests {
 
     #[test]
     fn repository_commands_require_explicit_trust_before_spawning() {
-        let mut config = json!({"descriptionCommand":[agent::executable(),"emit","answer"],CONFIG_ORIGIN_KEY:CONFIG_ORIGIN_REPOSITORY});
+        let mut config = json!({"agentCommand":[agent::executable(),"emit","answer"],CONFIG_ORIGIN_KEY:CONFIG_ORIGIN_REPOSITORY});
         assert!(
             harness(config.clone())
                 .describe("s", "p")
@@ -323,14 +326,13 @@ mod tests {
 
     #[test]
     fn profiles_include_command_arguments_and_model_and_invalid_commands_fail_offline() {
-        let a = harness(json!({"descriptionCommand":["opencode","run"],"descriptionModel":"a"}));
-        let b = harness(
-            json!({"descriptionCommand":["opencode","run","--agent","custom"],"descriptionModel":"a"}),
-        );
-        let c = harness(json!({"descriptionCommand":["opencode","run"],"descriptionModel":"b"}));
+        let a = harness(json!({"agentCommand":["opencode","run"],"agentModel":"a"}));
+        let b =
+            harness(json!({"agentCommand":["opencode","run","--agent","custom"],"agentModel":"a"}));
+        let c = harness(json!({"agentCommand":["opencode","run"],"agentModel":"b"}));
         assert_ne!(a.profile(), b.profile());
         assert_ne!(a.profile(), c.profile());
-        let secret = harness(json!({"descriptionCommand":["wrapper","--token","private-value"]}));
+        let secret = harness(json!({"agentCommand":["wrapper","--token","private-value"]}));
         assert!(!secret.profile().to_string().contains("private-value"));
         for command in [
             json!("sh -c code"),
@@ -339,7 +341,7 @@ mod tests {
             json!(["ok", 4]),
             json!(["ok", "\0"]),
         ] {
-            assert!(super::super::Providers::new(&json!({"descriptionCommand":command})).is_err());
+            assert!(super::super::Providers::new(&json!({"agentCommand":command})).is_err());
         }
     }
 }

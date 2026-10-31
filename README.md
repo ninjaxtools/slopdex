@@ -281,8 +281,7 @@ Text generation runs through your configured agent CLI, using its own login and 
 Embeddings still use their configured API or Ollama provider.
 
 ```console
-$ slopdex config set descriptionCommand '["opencode","run"]'
-$ slopdex config set descriptionModel opencode-go/deepseek-v4.1-flash
+$ slopdex config set agentCommand '["opencode","run"]'
 $ slopdex generate descriptions
 $ slopdex search-descriptions "keep the repository index synchronized"
 ```
@@ -290,15 +289,24 @@ $ slopdex search-descriptions "keep the repository index synchronized"
 Other command examples (choose one):
 
 ```console
-$ slopdex config set descriptionCommand '["pi","--print","--no-tools","--no-session"]'
-$ slopdex config set descriptionCommand '["claude","--print","--output-format","text","--tools",""]'
-$ slopdex config set descriptionCommand '["codex","exec","--sandbox","read-only","--color","never"]'
+$ slopdex config set agentCommand '["pi","--print","--tools","read,grep,find,ls","--no-session"]'
+$ slopdex config set agentCommand '["claude","--print","--output-format","text","--tools","Read,Glob,Grep"]'
+$ slopdex config set agentCommand '["codex","exec","--sandbox","read-only","--color","never"]'
 ```
 
-`descriptionModel` is optional; it becomes `--model <value>` for recognized
-`opencode`, `pi`, `claude`, and `codex` executables. Custom commands receive no
-extra model arguments. Commands receive the full task/transcript as JSON on stdin
-and must return only the answer text on stdout. No shell is used. The harness owns
+With no `agentModel` configured, Slopdex passes no model flag and uses the
+harness's default model. Optionally override it:
+
+```console
+$ slopdex config set agentModel opencode-go/deepseek-v4.1-flash
+```
+
+The override becomes `--model <value>` for recognized `opencode`, `pi`, `claude`,
+and `codex` executables. Custom commands receive no extra model arguments.
+Commands receive the full task/transcript as JSON on stdin
+and must return only the answer text on stdout. The prompt permits read-only
+inspection tools but forbids file modifications and other side effects; configure
+the harness's permissions to enforce this. No shell is used. The harness owns
 credentials, retries, and fallback models. Repository-local commands require
 `--trust-repo-commands` (or an explicit trusted `--config`). See the
 [agent command contract](docs/reference.md#agent-commands).

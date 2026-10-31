@@ -164,7 +164,7 @@ fn model_notices_dedupe_by_kind_provider_and_actual_model() {
 fn construction_is_offline_and_embeddings_preserve_aliases() {
     let mock = Mock::new(vec![]);
     let p = Providers::new(&json!({"embeddingProvider":"jina", "embeddingModel":"jina/jina-embeddings-v4", "embeddingDimensions":16,
-        "descriptionCommand":["not-installed-agent"], "descriptionModel":"provider/arbitrary-model"})).unwrap();
+        "agentCommand":["not-installed-agent"], "agentModel":"provider/arbitrary-model"})).unwrap();
     assert_eq!(p.dimensions(), 16);
     assert_eq!(p.embedding_profile()["provider"], "jina");
     assert_eq!(p.description_profile()["model"], "provider/arbitrary-model");
@@ -483,8 +483,8 @@ fn config_validation_and_endpoint_policy_remain_offline() {
         json!({"dimensions":0}),
         json!({"provider":"unknown"}),
         json!({"model":"jina/foreign"}),
-        json!({"descriptionModel":false}),
-        json!({"descriptionModel":" "}),
+        json!({"agentModel":false}),
+        json!({"agentModel":" "}),
     ] {
         assert!(Providers::new(&config).is_err(), "{config}");
     }

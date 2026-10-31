@@ -639,8 +639,8 @@ fn apply_description(
 
 fn description_settings(config: &Value) -> Value {
     json!({
-        "commandHash": hash(config["descriptionCommand"].to_string()),
-        "descriptionModel": config["descriptionModel"],
+        "commandHash": hash(config["agentCommand"].to_string()),
+        "agentModel": config["agentModel"],
         "agentTimeoutMs": config["agentTimeoutMs"],
     })
 }

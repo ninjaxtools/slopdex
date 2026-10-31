@@ -833,7 +833,7 @@ fn provider_config(temp: &tempfile::TempDir, base: &str) -> Value {
     json!({
         "embeddingProvider":"openai", "embeddingModel":"unit-embedding",
         "embeddingDimensions":2, "symbolDimensions":2,
-        "descriptionCommand":agent::http(base, "unit"), "descriptionModel":"unit-description",
+        "agentCommand":agent::http(base, "unit"), "agentModel":"unit-description",
         "rerankerProvider":"command", "rerankerModel":"unit-reranker",
         "rerankerCommand":agent::http(base, "unit"),
         "embeddingBaseUrl":base,

@@ -95,7 +95,7 @@ class SlopdexOpenCodeOptions(OpenCodeOptions):
     )
     description_model: str = Field(
         default="deepseek-v4.1-flash",
-        description="Description model written to .slopdex/config.json.",
+        description="Agent model written to .slopdex/config.json.",
     )
     prebuild_index: bool = Field(
         default=True,
@@ -238,7 +238,7 @@ class SlopdexOpenCode(OpenCode):
         if self._slopdex_mode == "descriptions":
             return {
                 "descriptionProvider": self._description_provider,
-                "descriptionModel": self._description_model,
+                "agentModel": self._description_model,
                 "descriptionsEnabled": True,
             }
         return {"descriptionsEnabled": False}

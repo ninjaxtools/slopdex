@@ -727,7 +727,7 @@ def slopdex_command(argv: list[str]) -> str:
     }
     value_options = {
         "--root", "--config", "--index", "--provider", "--model", "--dimensions",
-        "--description-provider", "--description-model", "--description-fallback-model",
+        "--description-provider", "--agent-command", "--agent-model", "--description-fallback-model",
         "--reranker-candidates", "--output", "--detail", "--expand-code-threshold",
     }
     flag_options = {"--no-reindex", "--force-reindex", "--rebuild-on-divergence",
@@ -794,7 +794,7 @@ def slopdex_command_counts(calls) -> dict[str, int]:
 def slopdex_call_allowed(arm: str, argv: list[str], *, map_private=None) -> bool:
     if arm in ARM_NAVIGATION:
         protected = {"--root", "--config", "--index", "--provider", "--model", "--dimensions",
-                     "--description-provider", "--description-model", "--description-fallback-model",
+                     "--description-provider", "--agent-command", "--agent-model", "--description-fallback-model",
                      "--reranker-candidates", "--force-reindex", "--yes-really-rebuild-the-index",
                      "--rebuild-on-divergence"}
         for arg in argv:

@@ -164,10 +164,10 @@ Configuration examples:
 
 ```bash
 slopdex config
-slopdex config description
+slopdex config agent
 slopdex help models opencode-go
-slopdex config set descriptionCommand '["opencode","run"]'
-slopdex config set descriptionModel opencode-go/deepseek-v4.1-flash
+slopdex config set agentCommand '["opencode","run"]'
+slopdex config set agentModel opencode-go/deepseek-v4.1-flash # optional override
 slopdex config set rerankerProvider cohere
 slopdex config set rerankingEnabled true
 slopdex config set parallelism 10
@@ -817,7 +817,7 @@ slopdex search 'validate session' --code --symbols
 slopdex search-symbols 'read settings' -q 'configuration' --symbol-threshold 0.7
 slopdex search-code 'validate session' --callers 1 --callees 1 --refs none
 slopdex search-symbols 'read settings' --callers 0 --callees 0 --refs cross-file
-slopdex config set descriptionCommand '["opencode","run"]'
+slopdex config set agentCommand '["opencode","run"]'
 slopdex generate descriptions
 slopdex search-descriptions "keep the repository index synchronized"
 slopdex faq "How are RPC endpoints registered?"
@@ -1747,8 +1747,8 @@ Example `config.json` (user or repository settings):
   "provider": "jina",
   "model": "jina-embeddings-v4",
   "dimensions": 1024,
-  "descriptionCommand": ["opencode", "run"],
-  "descriptionModel": "opencode-go/deepseek-v4.1-flash",
+  "agentCommand": ["opencode", "run"],
+  "agentModel": "opencode-go/deepseek-v4.1-flash",
   "rerankingEnabled": true,
   "rerankerProvider": "command",
   "rerankerCommand": ["opencode", "run"],
@@ -1763,7 +1763,7 @@ Example `config.json` (user or repository settings):
 | --- | --- |
 | `provider`, `model`, `dimensions` | `openai` / `text-embedding-3-large` / `3072`; `jina` defaults to `jina-embeddings-v4` / `1024`; `ollama` defaults to `qwen3-embedding:0.6b` / `1024`. OpenAI small/ada models default to `1536`. CLI: `--provider`, `--model`, `--dimensions`. |
 | `symbolDimensions` | Optional native dimension for name-only symbol embeddings; default `min(256, dimensions)`. OpenAI ada and Ollama models without a known dimension-reduction contract use full dimensions. Separate from content embeddings. |
-| `descriptionCommand`, `descriptionModel` | Nonempty CLI argument array and optional model for descriptions and FAQs. No default command/model. CLI: `--description-command '<JSON array>'`, `--description-model`. See [agent commands](#agent-commands). |
+| `agentCommand`, `agentModel` | Nonempty CLI argument array and optional model for descriptions and FAQs. No default command/model. CLI: `--agent-command '<JSON array>'`, `--agent-model`. See [agent commands](#agent-commands). |
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel`, `rerankerCommand` | Disabled by default. `cohere` defaults to `rerank-v4.0-pro`, `jina` to `jina-reranker-v3.5`; `command` uses an explicit agent command and optional model. |
 | `rerankerCandidates` | Generative (`command`) candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
 | `agentTimeoutMs` | Positive subprocess timeout for text generation, default `300000` (five minutes). No automatic subprocess retries. |
@@ -1795,7 +1795,7 @@ Hosted embedding profiles include `strategyVersion: "rust-v1"`; Ollama uses
 `"ollama-v1"` and includes its pinned digest, endpoint, native/output dimensions,
 context length, and family-specific input strategy. Description profiles
 identify a digest of the configured command (including its arguments) and optional model
-with `strategyVersion: "harness-transcript-v1"`. Generation reuse includes settings, system instruction, and the
+with `strategyVersion: "harness-transcript-v2"`. Generation reuse includes settings, system instruction, and the
 complete ordered effective conversation.
 Credentials are not profile inputs. A configured endpoint enters profiles (and
 therefore `status` output and shared-index identity) without its query string,
@@ -1829,22 +1829,27 @@ model-protocol routing or fallback models.
 
 ### Agent commands
 
+The settings are named `agentCommand` and `agentModel` (formerly
+`descriptionCommand` and `descriptionModel`). Update existing configuration keys
+and use the matching `--agent-command` and `--agent-model` CLI flags.
+
 Configure a non-interactive invocation as an argument array, not a shell string:
 
 ```json
 {
-  "descriptionCommand": ["opencode", "run"],
-  "descriptionModel": "opencode-go/deepseek-v4.1-flash"
+  "agentCommand": ["opencode", "run"]
 }
 ```
 
-Other examples are `["pi","--print","--no-tools","--no-session"]`,
-`["claude","--print","--output-format","text","--tools",""]`, and
+Other examples are `["pi","--print","--tools","read,grep,find,ls","--no-session"]`,
+`["claude","--print","--output-format","text","--tools","Read,Glob,Grep"]`, and
 `["codex","exec","--sandbox","read-only","--color","never"]`.
 Slopdex appends `--model <configured-model>` for executables named `opencode`,
 `pi`, `claude`, or `codex` (including absolute paths and `.exe` executables), before
-an explicit `--` separator. Omit the model to use the harness default. For other
-executables, the model setting is ignored; put supported options directly in the
+an explicit `--` separator. `agentModel` is optional: when omitted, Slopdex
+passes no model flag and the harness selects its default model. To override it,
+use `slopdex config set agentModel <model>` or `--agent-model <model>`.
+For other executables, the model setting is ignored; put supported options directly in the
 array or use a wrapper. Slopdex does not guess flags for unknown harnesses.
 
 Every call supplies one UTF-8 JSON object on stdin with `instructions` (string),
@@ -1858,8 +1863,11 @@ at most 32 MiB. Generative reranking must return `{"ranking":[{"index":0,"score"
 with every candidate exactly once and scores in `[0,1]`.
 
 The child runs in the current working directory with the inherited environment.
-No shell expansion or permission bypass is added. Configure tool restrictions in
-your command; harness configuration, hooks, tools, permissions, and filesystem
+The task guidance permits read-only tools such as read, glob, and grep to inspect
+files, but forbids file modifications and other side effects. This is prompt
+guidance, not a sandbox. No shell expansion or permission bypass is added.
+Configure read-only tool restrictions in your command; harness configuration,
+hooks, tools, permissions, and filesystem
 access remain the harness's responsibility. Do not put API keys in command
 arguments: use the harness's credential store or environment instead. Command
 identity is hashed before entering cache profiles and status output, but configuration

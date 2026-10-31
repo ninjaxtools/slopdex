@@ -451,7 +451,7 @@ fn faq_stale_paraphrases_refresh_one_canonical_question_and_reuse_exact_requests
     assert!(description_prompt(&requests[1].body).contains("43"));
     drop(engine);
     let mut changed_model = config;
-    changed_model["descriptionModel"] = json!("alternate-description-model");
+    changed_model["agentModel"] = json!("alternate-description-model");
     let engine = repo.open(&changed_model)?;
     engine.faq("east original question", &options)?;
     assert_eq!(
@@ -529,7 +529,7 @@ fn faq_promotes_legacy_file_keyed_answers_using_the_matching_entries_original_qu
     let request = mock.requests("/responses").pop().unwrap();
     let profile = slopdex::providers::Providers::new(&config)?.llm().profile();
     let legacy_key = slopdex::hash(json!([
-        "explanation-v3",profile,slopdex::hash(config["descriptionCommand"].to_string()),
+        "explanation-v3",profile,slopdex::hash(config["agentCommand"].to_string()),
         request.body["instructions"],description_prompt(&request.body),{"code.rs":slopdex::hash(&source)}
     ]).to_string());
     let db = repo.db()?;

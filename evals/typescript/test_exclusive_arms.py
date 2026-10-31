@@ -227,7 +227,7 @@ class ExclusiveArmTests(unittest.TestCase):
 
     def test_protected_index_configuration_cannot_be_overridden(self):
         options = ("--root", "--config", "--index", "--provider", "--model", "--dimensions",
-                   "--description-provider", "--description-model", "--description-fallback-model",
+                   "--description-provider", "--agent-command", "--agent-model", "--description-fallback-model",
                    "--reranker-candidates")
         controls = ("--force-reindex", "--yes-really-rebuild-the-index", "--rebuild-on-divergence")
         for option in options:

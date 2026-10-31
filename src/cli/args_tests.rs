@@ -887,13 +887,8 @@ fn readme_commands_parse() {
             "keep the repository index synchronized",
         ],
         vec!["help", "models", "opencode-go"],
-        vec!["config", "set", "descriptionModel", "gpt-5.6-luna"],
-        vec![
-            "config",
-            "set",
-            "descriptionModel",
-            "muse-spark-1.3-contributor",
-        ],
+        vec!["config", "set", "agentModel", "gpt-5.6-luna"],
+        vec!["config", "set", "agentModel", "muse-spark-1.3-contributor"],
         vec!["config"],
         vec!["faq", "I want to implement a new rpc endpoint"],
         vec![
@@ -1215,7 +1210,7 @@ fn validates_combinations_before_opening_an_index() {
         "--output",
         "json",
     ]);
-    parse(&["config", "set", "descriptionModel", "model"]);
+    parse(&["config", "set", "agentModel", "model"]);
     parse(&["config", "set", "rerankerCandidates", "100"]);
     parse(&[
         "update",
@@ -1258,15 +1253,23 @@ fn argument_errors_cover_global_constraints_and_conflicting_model_selections() {
         assert_eq!(error.exit_code(), 2, "{args:?}");
     }
     parse(&["help", "models", "opencode"]);
-    parse(&[
+    let cli = parse(&[
         "status",
-        "--description-command",
+        "--agent-command",
         "[\"opencode\",\"run\"]",
-        "--description-model",
+        "--agent-model",
         "opencode-go/deepseek-v4.1-flash",
         "--trust-repo-commands",
     ]);
-    parse(&["config", "set", "descriptionModel", "same"]);
+    assert_eq!(
+        cli.global.agent_command.as_deref(),
+        Some("[\"opencode\",\"run\"]")
+    );
+    assert_eq!(
+        cli.global.agent_model.as_deref(),
+        Some("opencode-go/deepseek-v4.1-flash")
+    );
+    parse(&["config", "set", "agentModel", "same"]);
     parse(&[
         "update",
         "--target",

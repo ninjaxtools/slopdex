@@ -21,7 +21,7 @@ fn test_config(temp: &TempDir) -> Value {
         "embeddingProvider":"openai", "embeddingModel":"search-fixture",
         "embeddingDimensions":2, "symbolDimensions":2,
         "embeddingBaseUrl":"http://127.0.0.1:1/v1", "embeddingApiKey":"fixture",
-        "descriptionCommand":["fixture-harness-must-not-run"], "descriptionModel":"source-only-no-llm",
+        "agentCommand":["fixture-harness-must-not-run"], "agentModel":"source-only-no-llm",
         "providerMaxRetries":0, "artifactCachePath":temp.path().join("artifacts.sqlite")
     })
 }

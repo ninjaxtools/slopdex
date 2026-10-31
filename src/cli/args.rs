@@ -47,12 +47,12 @@ pub(super) struct Global {
     /// Download a missing Ollama model during update --setup or config embeddings; saves ollamaAutoPull
     #[arg(long, global = true)]
     pub(super) pull: bool,
-    /// Agent CLI command as a JSON argument array (overrides descriptionCommand)
+    /// Agent CLI command as a JSON argument array (overrides agentCommand)
     #[arg(long, global = true)]
-    pub(super) description_command: Option<String>,
-    /// Optional model passed with --model to opencode, pi, claude, or codex
+    pub(super) agent_command: Option<String>,
+    /// Override the model for opencode, pi, claude, or codex (default: harness settings)
     #[arg(long, global = true, value_parser = nonempty)]
-    pub(super) description_model: Option<String>,
+    pub(super) agent_model: Option<String>,
     /// Allow executing agent CLI commands supplied by repository-local settings
     #[arg(long, global = true)]
     pub(super) trust_repo_commands: bool,

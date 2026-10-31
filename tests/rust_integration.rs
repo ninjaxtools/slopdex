@@ -176,7 +176,7 @@ impl Mock {
         json!({
             "embeddingProvider": "openai", "embeddingModel": "integration-embedding",
             "embeddingDimensions": 4, "embeddingBatchSize": 8,
-            "descriptionCommand": agent::http(&self.base, TEST_KEY), "descriptionModel": "integration-description",
+            "agentCommand": agent::http(&self.base, TEST_KEY), "agentModel": "integration-description",
             "rerankerProvider": "cohere", "rerankerModel": "integration-reranker",
             "embeddingBaseUrl": self.base,
             "rerankerBaseUrl": self.base,
@@ -2658,6 +2658,28 @@ fn force_rebuild_for_moved_root_reuses_code_markdown_and_description_artifacts()
 }
 
 #[test]
+fn cli_description_generation_uses_harness_default_without_a_model() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("code.rs", &function("example", "VECTOR_EAST"))?;
+    let mut config = mock.config();
+    config.as_object_mut().unwrap().remove("agentModel");
+    repo.write(".slopdex/config.json", &config.to_string())?;
+
+    repo.cli_json(&["generate", "descriptions"])?;
+    let status = repo.cli_json(&["status"])?;
+    assert_eq!(status["descriptionProfile"]["configured"], true);
+    assert!(status["descriptionProfile"]["model"].is_null());
+    assert_eq!(status["descriptionCount"], 1);
+    assert_eq!(mock.requests("/responses").len(), 2);
+
+    let calls = mock.count();
+    repo.cli_json(&["generate", "descriptions"])?;
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
 fn description_commands_are_never_restored_from_the_index() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
@@ -2668,7 +2690,7 @@ fn description_commands_are_never_restored_from_the_index() -> Result<()> {
     engine.generate_descriptions()?;
     let expected = engine.search("east", "search-descriptions", &all())?;
     drop(engine);
-    for key in ["descriptionCommand", "descriptionModel"] {
+    for key in ["agentCommand", "agentModel"] {
         config.as_object_mut().unwrap().remove(key);
     }
     let calls = mock.count();
@@ -2685,7 +2707,7 @@ fn description_commands_are_never_restored_from_the_index() -> Result<()> {
             .generate_descriptions()
             .unwrap_err()
             .to_string()
-            .contains("descriptionCommand")
+            .contains("agentCommand")
     );
     Ok(())
 }
@@ -3368,7 +3390,7 @@ fn refresh_indexes_source_descriptions_and_generation_excludes_source_provided()
     assert_eq!(row(&generated, "documented"), row(&supplied, "documented"));
     drop(engine);
 
-    config["descriptionModel"] = json!("replacement-description-model");
+    config["agentModel"] = json!("replacement-description-model");
     let mut engine = repo.open(&config)?;
     engine.refresh()?;
     assert_eq!(mock.requests("/responses").len(), 1);
@@ -4630,14 +4652,14 @@ fn regression_description_model_change_invalidates_generated_descriptions_only_o
     assert_eq!(mock.requests("/responses").len(), 3);
     drop(engine);
 
-    config["descriptionModel"] = json!("replacement-description-model");
+    config["agentModel"] = json!("replacement-description-model");
     let mut engine = repo.open(&config)?;
     let noop = engine.refresh()?;
     assert_eq!(noop["filesUpdated"], 0);
     assert_eq!(noop["generation"], generation);
     assert_eq!(
         engine.status()?["descriptionProfile"]["model"],
-        config["descriptionModel"]
+        config["agentModel"]
     );
     assert_eq!(engine.search("east", "search", &all())?, before);
     assert_eq!(mock.count(), calls);
@@ -4683,7 +4705,7 @@ fn regression_description_model_change_invalidates_generated_descriptions_only_o
     );
     assert_eq!(
         engine.status()?["descriptionProfile"]["model"],
-        config["descriptionModel"]
+        config["agentModel"]
     );
     let prompt = description_prompt(&requests[4].body);
     assert!(prompt.starts_with("Describe what"));
@@ -11331,7 +11353,7 @@ fn description_keys_include_path_context_profiles_settings_and_effective_transcr
 
     second.write("src/another.rs", &source)?;
     let mut different_model = config.clone();
-    different_model["descriptionModel"] = json!("alternate-description-model");
+    different_model["agentModel"] = json!("alternate-description-model");
     let mut engine = second.open(&different_model)?;
     engine.refresh()?;
     assert_eq!(
@@ -11361,7 +11383,7 @@ fn description_keys_include_path_context_profiles_settings_and_effective_transcr
     assert!(profile_keys.is_disjoint(&rows.iter().map(|(key, _)| key.clone()).collect()));
     drop(engine);
 
-    different_model["descriptionCommand"]
+    different_model["agentCommand"]
         .as_array_mut()
         .unwrap()
         .push(json!("another-wrapper-option"));
