@@ -1,5 +1,4 @@
-[submodule "evals/typescript/repo"]
-	path = evals/typescript/repo
-	url = https://github.com/microsoft/TypeScript.git
-	branch = main
+[submodule "evals/excalidraw/repo"]
+	path = evals/excalidraw/repo
+	url = https://github.com/excalidraw/excalidraw.git
 	shallow = true

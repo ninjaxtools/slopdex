@@ -10,7 +10,8 @@ evals/harbor/cache/
 evals/swebench/jobs/
 evals/swebench/cache/
 evals/swebench/.venv/
-evals/typescript/jobs/
-evals/typescript/cache/
-evals/typescript/results/*.lock
+evals/excalidraw/jobs/
+evals/excalidraw/cache/
+evals/excalidraw/results/*.lock
 .opencode
+evals/typescript/

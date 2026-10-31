@@ -1,0 +1,486 @@
+{
+  "schema_version": 1,
+  "repository_commit": "a758e93d6a03e9f995973703cb886850a398a6d3",
+  "tasks": [
+    {
+      "id": "container-label-reflow-on-resize",
+      "title": "Re-flowing a shape's label when the shape is resized",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. A user narrows a labeled diamond, ellipse or rectangle; the label re-flows, and the shape grows taller if it no longer fits. Identify exactly 3 implementation functions by these semantic roles: (1) the post-resize routine that recomputes the attached label's text and size, enlarges the container on vertical overflow, and repositions the label; (2) the helper computing the horizontal room a label has inside a container, using inscribed-rectangle geometry for round and rhombus shapes and a minimum for arrow labels; (3) the greedy routine breaking one newline-delimited paragraph into rendered rows by accumulating tokens while tracking source offsets. Explain how they connect, then answer: Why does dragging only the top or bottom handle skip re-flowing? When the container grows, which edge stays anchored? What happens to a word wider than the room, and to whitespace at a soft break? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/element/src/textElement.ts",
+          "symbol": "handleBindTextResize"
+        },
+        {
+          "path": "packages/element/src/textElement.ts",
+          "symbol": "getBoundTextMaxWidth"
+        },
+        {
+          "path": "packages/element/src/textWrapping.ts",
+          "symbol": "wrapLine"
+        }
+      ]
+    },
+    {
+      "id": "transform-handle-hit-detection",
+      "title": "Detecting which resize/rotate handle is under the pointer",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. With one possibly rotated shape selected, the user presses near its selection box; the editor decides between rotation, a corner or edge resize, or nothing. Identify exactly 3 implementation functions by these semantic roles: (1) the selection-tool method that, given the selection and a scene point, refuses in several editor states and otherwise chooses between the single-element path and the multi-selection common-bounds path; (2) the per-element test returning which handle the point falls in, checking the rotation knob first, then handle boxes, then proximity to the rotated outline sides; (3) the function building one element's handle rectangles, omitting handles by element kind, lock state and point layout, and choosing the outline margin. Explain how they connect, then answer: Why do locked elements and elbow arrows never yield a handle? Which handles survive for a two-point line? When is edge resizing disabled entirely? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/components/App.selectionTool.ts",
+          "symbol": "getTransformHandleAt"
+        },
+        {
+          "path": "packages/element/src/resizeTest.ts",
+          "symbol": "resizeTest"
+        },
+        {
+          "path": "packages/element/src/transformHandles.ts",
+          "symbol": "getTransformHandles"
+        }
+      ]
+    },
+    {
+      "id": "frame-membership-after-drag",
+      "title": "Updating frame membership when dropping dragged elements",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. The user drags selected shapes, some grouped, onto a frame and releases; they join that frame, or leave their former one. Identify exactly 3 implementation functions by these semantic roles: (1) the selection-tool drag-release handler that finds the topmost frame under the pointer, adjusts groups when editing inside one, adds qualifying elements and prunes stale memberships; (2) the predicate deciding whether one element counts as inside its target frame during a drag, short-circuiting for elements not being dragged and judging grouped elements as a whole group; (3) the function assigning a frame to a batch of elements, pulling in bound labels, skipping other frames and their children, and moving the batch in stacking order next to the frame's children. Explain the flow, then answer: What happens when the frame itself is selected? Given how the selection's common frame is computed here, are children dragged within their own frame re-ordered on release? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/components/App.selectionTool.ts",
+          "symbol": "handleSelectionDragOnPointerUp"
+        },
+        {
+          "path": "packages/element/src/frame.ts",
+          "symbol": "isElementInFrame"
+        },
+        {
+          "path": "packages/element/src/frame.ts",
+          "symbol": "addElementsToFrame"
+        }
+      ]
+    },
+    {
+      "id": "elbow-arrow-rerouting",
+      "title": "Re-routing a bound elbow arrow",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. An elbow (orthogonal) arrow connects two rectangles. As the user drags one rectangle, or drags the arrow's free endpoint near a shape, the arrow's path is recomputed as horizontal and vertical segments that leave and enter shapes on sensible sides, keep clear of them, and avoid needless bends. Identify exactly 5 implementation functions by these semantic roles: (1) the top-level point-update routine for orthogonal arrows that, given point/segment/binding changes, chooses between renormalization, a no-op short circuit, a fresh route, releasing or moving a user-pinned segment, and endpoint dragging with pinned segments; (2) the fast path trying a one- or two-corner route between two different connected shapes, giving up if a leg is too short for the corner radius or arrowhead or crosses either shape; (3) the grid path search scoring neighbours by Manhattan distance plus a steep direction-change penalty and forbidding reversals; (4) the function choosing the direction an endpoint leaves in, pointing toward the other endpoint without a shape and away from the shape's center when out of binding range; (5) the geometric helper picking one of four directions for a point by testing enlarged triangular cones around a shape's bounding box, with a separate path for rhombuses. Explain how one update flows through these, then answer: When does the fast path hand off to the grid search? How are the true start and end grid nodes kept from being stepped on? What heading results when the endpoint lies exactly on the outline (zero distance)? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/element/src/elbowArrow.ts",
+          "symbol": "updateElbowArrowPoints"
+        },
+        {
+          "path": "packages/element/src/elbowArrow.ts",
+          "symbol": "getSimpleRoute"
+        },
+        {
+          "path": "packages/element/src/elbowArrow.ts",
+          "symbol": "astar"
+        },
+        {
+          "path": "packages/element/src/binding.ts",
+          "symbol": "getHeadingForElbowArrowSnap"
+        },
+        {
+          "path": "packages/element/src/heading.ts",
+          "symbol": "headingForPointFromElement"
+        }
+      ]
+    },
+    {
+      "id": "bound-arrow-follows-moved-shape",
+      "title": "Keeping a straight arrow attached to a moved shape",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. A straight (non-elbow) arrow is attached at both ends to shapes. When the user drags one shape, the attached endpoint follows, staying a small gap off the shape's outline along the line toward the arrow's other end; dragging the arrow alone detaches it instead. Identify exactly 5 implementation functions by these semantic roles: (1) the routine applying a pointer-drag offset to selected elements, moving frame children and shape labels along, triggering attached-arrow updates for moved shapes, and detaching arrows moved without the shapes they connect; (2) the routine that, for one changed shape, walks the arrows recorded on it, skipping stale bindings and arrows moving in the same operation; (3) the per-arrow routine computing new positions for attached endpoints, applying them (keeping interior points fixed when both ends sit on one shape), and re-laying out the arrow's label; (4) the function computing one attached endpoint's new local position from its stored relative anchor, handling inside-attachment, avoiding inversion when the arrow gets too short or the outline point falls inside the other shape, and otherwise snapping to the outline; (5) the shape-agnostic function intersecting a segment with an element's offset outline after a quick bounding-box rejection, dispatching per element type. Explain the flow, then answer: Why can an arrow selected alone be nudged slightly without detaching? When does an endpoint use the raw anchor instead of the outline point, and how do arrowheads matter? For an arrow with more than two points, what does an endpoint aim toward when finding its outline point? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/element/src/dragElements.ts",
+          "symbol": "dragSelectedElements"
+        },
+        {
+          "path": "packages/element/src/binding.ts",
+          "symbol": "updateBoundElements"
+        },
+        {
+          "path": "packages/element/src/binding.ts",
+          "symbol": "updateBoundArrow"
+        },
+        {
+          "path": "packages/element/src/binding.ts",
+          "symbol": "updateBoundPoint"
+        },
+        {
+          "path": "packages/element/src/collision.ts",
+          "symbol": "intersectElementWithLineSegment"
+        }
+      ]
+    },
+    {
+      "id": "bring-forward-one-step",
+      "title": "Bring selection forward by one layer",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. A user selects shapes (possibly while editing a group, or inside a frame) and presses the shortcut to bring the selection forward one layer. Identify exactly 3 implementation functions by these semantic roles: (1) the routine that splits selected positions into contiguous runs and splices the elements array so each run hops over its neighbour, sanity-checking the result before persisting ordering keys; (2) the helper that finds a run's destination position, treating a container with its label, a sibling group, or a frame block as one unit; (3) the function that assigns and validates fresh fractional ordering keys for only the moved elements. Explain how they cooperate, and answer: what happens when, while editing a group, the neighbour lies outside that group; how are deleted elements between selected ones treated; and what is the fallback if key generation throws? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/element/src/zindex.ts",
+          "symbol": "shiftElementsByOne"
+        },
+        {
+          "path": "packages/element/src/zindex.ts",
+          "symbol": "getTargetIndex"
+        },
+        {
+          "path": "packages/element/src/fractionalIndex.ts",
+          "symbol": "syncMovedIndices"
+        }
+      ]
+    },
+    {
+      "id": "duplicate-selection-in-place",
+      "title": "Duplicate selection with Ctrl/Cmd+D",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. A user selects a group, a labeled rectangle and a frame with children, possibly while editing inside a group, and presses Ctrl/Cmd+D; offset copies appear directly above their originals and become selected. Identify exactly 3 implementation functions by these semantic roles: (1) the core routine that copies groups, frames with children, and container/label pairs as units, inserts each batch after its source unit, repairs references between copies and applies per-copy overrides; (2) the helper that remaps a copy's group ids, but only those nested below the group being edited; (3) the function that computes the next selection for target elements, dropping bound labels and letting a selected frame win over its children. Explain the flow, and answer: why isn't a selected frame's child copied twice; how are members of a selected group that weren't individually selected handled; and which copies end up selected when a frame and its children are duplicated? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/element/src/duplicate.ts",
+          "symbol": "duplicateElements"
+        },
+        {
+          "path": "packages/element/src/groups.ts",
+          "symbol": "getNewGroupIdsForDuplication"
+        },
+        {
+          "path": "packages/excalidraw/components/App.selection.ts",
+          "symbol": "getSelectionStateForElements"
+        }
+      ]
+    },
+    {
+      "id": "undo-keyboard-to-delta-application",
+      "title": "Undo from keypress to applied history entry",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. A user presses Ctrl/Cmd+Z after a sequence of edits. Some recorded history entries only change selection of elements that have since been deleted, and one entry references an element that a collaborator force-removed from the scene. Trace how the keypress becomes a restored scene. Identify exactly 5 implementation functions by these semantic roles: (1) the generic keyboard dispatcher that finds the single registered command whose key predicate matches, honoring host-disabled canvas commands, view mode and pending viewport transitions, and forwards the command's result to the editor's updater; (2) the shared guard used by both the undo and redo commands that refuses to act while any drawing, resizing, dragging, text-editing or flowchart gesture is in progress and reorders the returned elements before handing them back without recording a new capture; (3) the history method that pops entries in a loop, applies each, re-derives the delta against the latest state, schedules an immediate store micro-action for sync, pushes the inverse onto the opposite stack, and stops at the first entry producing a visible change; (4) the element lookup used while applying an element delta that falls back to the local snapshot and, failing that, synthesizes a brand-new element from the delta's partial; (5) the app-state routine that decides whether restored selection/editing state is actually visible and nulls out references to deleted elements or groups. Explain the flow and answer: why are version fields excluded when applying history; what flag is raised when an element is recovered from the snapshot; what happens to the undo stack when applying an entry throws; and why can a single keypress consume several entries? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/actions/manager.tsx",
+          "symbol": "handleKeyDown"
+        },
+        {
+          "path": "packages/excalidraw/actions/actionHistory.tsx",
+          "symbol": "executeHistoryAction"
+        },
+        {
+          "path": "packages/excalidraw/history.ts",
+          "symbol": "perform"
+        },
+        {
+          "path": "packages/element/src/delta.ts",
+          "symbol": "createGetter"
+        },
+        {
+          "path": "packages/element/src/delta.ts",
+          "symbol": "filterInvisibleChanges"
+        }
+      ]
+    },
+    {
+      "id": "property-change-to-undo-entry",
+      "title": "Stroke width change captured into the undo stack",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. A user selects several shapes and clicks a different stroke width in the properties panel; later they click the same width again, and they also click empty canvas to deselect. Trace how the edit becomes (or does not become) an undo entry. Identify exactly 5 implementation functions by these semantic roles: (1) the shared properties-panel helper that maps over all scene elements and applies a per-element update callback only to selected elements (optionally including bound labels) or the element whose text is being edited, re-normalizing sticky-note invariants; (2) the immutable element-update helper that returns the original object untouched when no primitive value actually differs, and otherwise produces a copy with a bumped version, fresh nonce and update timestamp; (3) the store method that, for one capture action, either applies a precomputed change or clones the snapshot, emits a durable or ephemeral increment depending on the action, and in all cases decides whether to advance the stored snapshot; (4) the snapshot method that compares the previous and next element maps, marking missing elements as deleted, picking up added or higher-version elements, ignoring uninitialized images and short-circuiting on a repeated version hash; (5) the history method that turns a non-empty, non-history durable delta into an inverse entry on the undo stack and conditionally clears redo. Explain the flow and answer: why does re-clicking the already-active width produce no element change; why does a selection-only change not wipe the redo stack; which capture action advances the snapshot and which does not; and how are elements missing from the next map represented? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/actions/actionProperties.tsx",
+          "symbol": "changeProperty"
+        },
+        {
+          "path": "packages/element/src/mutateElement.ts",
+          "symbol": "newElementWith"
+        },
+        {
+          "path": "packages/element/src/store.ts",
+          "symbol": "processAction"
+        },
+        {
+          "path": "packages/element/src/store.ts",
+          "symbol": "detectChangedElements"
+        },
+        {
+          "path": "packages/excalidraw/history.ts",
+          "symbol": "record"
+        }
+      ]
+    },
+    {
+      "id": "drag-with-object-snapping",
+      "title": "Dragging a selection with object and grid snapping",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. With object snapping enabled, a user drags a selection of shapes near other shapes; sometimes they hold Shift to constrain the drag, sometimes Ctrl/Cmd to toggle snapping, and the grid is also on. Snap guide lines appear and the selection jumps into alignment. Identify exactly 5 implementation functions by these semantic roles: (1) the selection-tool pointer-move handler that, once the pointer hit a selected element or the selection's bounding box, computes the raw drag offset, applies axis locking, handles moving an image's crop region, primes snapping caches, requests a snap, publishes the guide lines, moves the elements and triggers alt-drag duplication; (2) the snapping entry point for a moving selection that returns zero offset when snapping is off, gathers the nearest point and gap snaps, then recomputes them at the snapped position to build guide lines; (3) the helper that compares every corner/center of the moving selection with cached reference points from other elements and keeps only the closest matches per axis; (4) the element-moving routine that skips a lone bound elbow arrow, adds frame children, aborts if an original is missing, then updates coordinates, bound labels and bound arrows and may unbind moved arrows; (5) the helper that combines raw drag, snap offset and grid rounding per axis into the final translation. Explain the flow and answer: how do object snapping and grid snapping interact on an axis that did not snap; why are the snaps computed twice; how does Ctrl/Cmd change the snapping decision and the grid size used; and when does a single bound arrow refuse to move? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/components/App.selectionTool.ts",
+          "symbol": "handleSelectionDragOnPointerMove"
+        },
+        {
+          "path": "packages/excalidraw/snapping.ts",
+          "symbol": "snapDraggedElements"
+        },
+        {
+          "path": "packages/excalidraw/snapping.ts",
+          "symbol": "getPointSnaps"
+        },
+        {
+          "path": "packages/element/src/dragElements.ts",
+          "symbol": "dragSelectedElements"
+        },
+        {
+          "path": "packages/element/src/dragElements.ts",
+          "symbol": "calculateOffset"
+        }
+      ]
+    },
+    {
+      "id": "png-embedded-scene-import",
+      "title": "Importing a scene from an exported PNG",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. A user drops a PNG previously exported with the scene embedded and expects the editable drawing back; another user drops an ordinary screenshot PNG. Identify exactly 3 implementation functions by these semantic roles: (1) the file-content extractor that branches on MIME type, routing PNGs to the image-metadata path, reading other blobs as text (extracting an embedded payload from SVG), and translating failures into user-facing image-scene errors; (2) the PNG metadata reader that checks the text chunk's keyword, accepts a legacy raw scene JSON or an encoded envelope, and distinguishes a missing scene from an unreadable one; (3) the envelope decoder that validates the encoding kind and inflates compressed content back into a string. Explain the flow between them, and answer: What error does the screenshot produce, and how does it differ from a corrupted embedded scene? When is un-encoded JSON accepted? Why is the byte string not decoded twice when compressed? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/data/blob.ts",
+          "symbol": "parseFileContents"
+        },
+        {
+          "path": "packages/excalidraw/data/image.ts",
+          "symbol": "decodePngMetadata"
+        },
+        {
+          "path": "packages/excalidraw/data/encode.ts",
+          "symbol": "decode"
+        }
+      ]
+    },
+    {
+      "id": "element-bitmap-cache-blit",
+      "title": "Per-element bitmap cache on the static canvas",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. The static canvas rasterizes each element into an offscreen bitmap and copies it onto the main canvas every frame. A user zooms far into a huge rectangle, switches to dark mode, and drags a labeled arrow. Identify exactly 3 implementation functions by these semantic roles: (1) the cache lookup deciding whether an element's rasterized bitmap is reusable or must be regenerated, comparing zoom, theme, device scale, render environment, image crop and parent frame opacity; (2) the sizing helper that computes the bitmap's pixel dimensions and lowers its scale to respect browser canvas dimension and area limits; (3) the routine that copies a cached bitmap onto the destination context, rotating and flipping around the element center and snapping to whole device pixels when eligible. Explain how they cooperate in a frame, and answer: Why does an ongoing zoom gesture neither invalidate the cache nor enable snapping? What happens to the scale for an extremely large element at high zoom? How is an arrow's label kept visible without cutting a hole into the bitmap? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/element/src/renderElement.ts",
+          "symbol": "generateElementWithCanvas"
+        },
+        {
+          "path": "packages/element/src/renderElement.ts",
+          "symbol": "cappedElementCanvasSize"
+        },
+        {
+          "path": "packages/element/src/renderElement.ts",
+          "symbol": "drawElementFromCanvas"
+        }
+      ]
+    },
+    {
+      "id": "rough-options-derivation",
+      "title": "Deriving hand-drawn stroke and fill options",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. A user draws a tiny dotted rectangle, a large filled rounded ellipse, and an embeddable with transparent stroke and background, then exports. Each shape becomes a sketchy roughjs drawable that needs per-element drawing options. Identify exactly 3 implementation functions by these semantic roles: (1) the options builder mapping an element's seed, stroke style and width, colors (with dark-mode filtering) and fill style into the generator's options, varying by element type and throwing for unsupported types; (2) the helper deciding whether and how much to dampen sketchiness for small elements; (3) the helper substituting placeholder roughness, background and stroke values for iframe-like elements before options are derived. Explain how they interact when a shape is generated, and answer: Why is multi-stroke disabled and stroke width bumped for non-solid strokes, and why are fill weight and hachure gap set explicitly? Under which conditions is roughness left unchanged? When does the transparent embeddable get a solid gray fill, and how does exporting affect that? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/element/src/shape.ts",
+          "symbol": "generateRoughOptions"
+        },
+        {
+          "path": "packages/element/src/shape.ts",
+          "symbol": "adjustRoughness"
+        },
+        {
+          "path": "packages/element/src/shape.ts",
+          "symbol": "modifyIframeLikeForRoughOptions"
+        }
+      ]
+    },
+    {
+      "id": "legacy-scene-file-restore",
+      "title": "Opening and migrating a legacy scene file",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. A user opens an old .excalidraw JSON file containing a stale selection-rectangle element, a polyline stored under an obsolete type name, text elements with only a combined font string instead of separate size and family, two elements sharing an id, an element type this version does not know, and an app state whose zoom is a plain number. Identify exactly 5 implementation functions by these semantic roles: (1) the entry point that parses the blob's contents as JSON, classifies it as scene or library, restores scene elements with binding repair and invisible-element deletion, and builds app state merged with local theme, file handle and scroll position; (2) the structural predicate deciding whether parsed JSON counts as scene data; (3) the batch element restorer that drops legacy selection elements, tolerates per-element failures, marks invisibly small elements deleted, regenerates duplicate ids, and optionally repairs containers, frames and bindings afterwards; (4) the per-element migrator that switches on element type to normalize type-specific fields and yields nothing for unrecognized types; (5) the app-state restorer that applies legacy key migrations, layers supplied over local over default values, and normalizes zoom, grid, active tool and sidebar. Explain the flow between them, and answer: What happens to the obsolete polyline type, the font string, the unknown type, and the duplicate id? Which value wins when both file and local state define a key? What error results when the JSON is valid but neither a scene nor a library? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/data/blob.ts",
+          "symbol": "loadSceneOrLibraryFromBlob"
+        },
+        {
+          "path": "packages/excalidraw/data/json.ts",
+          "symbol": "isValidExcalidrawData"
+        },
+        {
+          "path": "packages/excalidraw/data/restore.ts",
+          "symbol": "restoreElements"
+        },
+        {
+          "path": "packages/excalidraw/data/restore.ts",
+          "symbol": "restoreElement"
+        },
+        {
+          "path": "packages/excalidraw/data/restore.ts",
+          "symbol": "restoreAppState"
+        }
+      ]
+    },
+    {
+      "id": "svg-export-font-inlining",
+      "title": "Inlining subsetted fonts into SVG exports",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. A user exports a scene with hand-drawn-font text in Latin and Chinese characters to SVG. So the file renders identically elsewhere, the exporter embeds @font-face rules whose sources are data URLs containing only the glyphs actually used. Identify exactly 5 implementation functions by these semantic roles: (1) the static font-registry method that collects used families and per-family characters from the elements, adds the CJK hand-drawn fallback family when needed, generates CSS rules with bounded concurrency, and deduplicates them; (2) the font-face method that skips faces whose unicode range covers none of the used characters and otherwise wraps the resulting source into a CSS rule; (3) the font-face method that tries its candidate source URLs in order, fetching and subsetting each, and returns a fallback string if all fail; (4) the main-thread subsetting entry that prefers a worker pool, transfers a copy of the buffer, and permanently falls back to in-thread subsetting after a worker failure; (5) the shared-chunk routine that subsets on the current thread and encodes a base64 data URL, falling back to the whole font if subsetting throws. Explain the flow from the exporter down to the WebAssembly subsetter, and answer: Why is a buffer copy sent to the worker? Why are fallback families placed first? What ends up in the CSS rule if every URL fails, and which fonts are never inlined? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/fonts/Fonts.ts",
+          "symbol": "generateFontFaceDeclarations"
+        },
+        {
+          "path": "packages/excalidraw/fonts/ExcalidrawFontFace.ts",
+          "symbol": "toCSS"
+        },
+        {
+          "path": "packages/excalidraw/fonts/ExcalidrawFontFace.ts",
+          "symbol": "getContent"
+        },
+        {
+          "path": "packages/excalidraw/subset/subset-main.ts",
+          "symbol": "subsetWoff2GlyphsByCodepoints"
+        },
+        {
+          "path": "packages/excalidraw/subset/subset-shared.chunk.ts",
+          "symbol": "subsetToBase64"
+        }
+      ]
+    },
+    {
+      "id": "collab-remote-scene-update-merge",
+      "title": "Merging an encrypted remote scene update during live collaboration",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. Two people are in the same live-collaboration room. While user A is still resizing a rectangle, an encrypted scene-update message from user B arrives over the websocket containing changed versions of several elements, including that same rectangle and one element A has never seen. Identify exactly 5 implementation functions by these semantic roles: (1) the collaboration-client method that turns the raw ciphertext and IV from the socket into a typed message object, falling back to a sentinel invalid message and alerting the user when that fails; (2) the low-level routine that imports the shared room key from its string form and performs the symmetric authenticated decryption; (3) the collaboration-client method that restores the incoming elements against the current scene, merges them, bumps versions relative to the existing elements, and records the resulting scene version so it is not echoed back; (4) the library routine that builds the merged element list from remote and local elements, re-sorts by fractional index and repairs duplicate indices; (5) the per-element predicate deciding whether the local copy wins over the incoming one. Explain how data flows between them. Also answer: which local editing states protect an element from being overwritten? When local and remote versions are equal, which copy is kept and why is that deterministic for both peers? In what order do remote-only and local-only elements appear before re-sorting? Why must the received scene version be recorded before the scene is updated? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "excalidraw-app/collab/Collab.tsx",
+          "symbol": "decryptPayload"
+        },
+        {
+          "path": "packages/excalidraw/data/encryption.ts",
+          "symbol": "decryptData"
+        },
+        {
+          "path": "excalidraw-app/collab/Collab.tsx",
+          "symbol": "_reconcileElements"
+        },
+        {
+          "path": "packages/excalidraw/data/reconcile.ts",
+          "symbol": "reconcileElements"
+        },
+        {
+          "path": "packages/excalidraw/data/reconcile.ts",
+          "symbol": "shouldDiscardRemoteElement"
+        }
+      ]
+    },
+    {
+      "id": "collab-outgoing-scene-broadcast",
+      "title": "Broadcasting local edits to collaborators",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. In a live-collaboration room, a user moves a shape, deletes another one, and accidentally creates a tiny zero-size line. The app's change handler hands the full scene to the collaboration layer, which must send only what changed, encrypted, to the other peers. Identify exactly 5 implementation functions by these semantic roles: (1) the collaboration-client method that compares the aggregate scene version against the last version sent or received, and only then sends an incremental update, records the new version and schedules a periodic full resend; (2) the socket-wrapper method that selects which elements to send by comparing each element's version with the version last sent for that id (unless a full sync is requested), remembers the sent versions, and kicks off the throttled image-file upload; (3) the socket-wrapper method that serializes a message, encrypts it with the room key and emits it on either the reliable or the volatile server event, but only once the connection is fully initialized; (4) the predicate deciding whether an element may be shared at all, based on deletion age and visible size; (5) the routine that encrypts arbitrary input (string, bytes or blob) with a freshly generated IV using authenticated symmetric encryption. Explain the flow between them. Also answer: how long do deleted elements keep being propagated, and what happens to the zero-size line? Why is a full-scene sync with every element forced when a new user joins, and what guards against an initial-scene message without it? If a send happens before the socket is initialized, what state has already been updated and what eventually repairs a resulting divergence? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "excalidraw-app/collab/Collab.tsx",
+          "symbol": "broadcastElements"
+        },
+        {
+          "path": "excalidraw-app/collab/Portal.tsx",
+          "symbol": "broadcastScene"
+        },
+        {
+          "path": "excalidraw-app/collab/Portal.tsx",
+          "symbol": "_broadcastSocketData"
+        },
+        {
+          "path": "excalidraw-app/data/index.ts",
+          "symbol": "isSyncableElement"
+        },
+        {
+          "path": "packages/excalidraw/data/encryption.ts",
+          "symbol": "encryptData"
+        }
+      ]
+    },
+    {
+      "id": "shareable-link-scene-import",
+      "title": "Opening a read-only shareable link",
+      "difficulty": "advanced",
+      "prompt": "Investigate this Excalidraw checkout. A user who already has a drawing in their browser opens a shareable link of the form whose URL fragment carries a scene id and a decryption key (not a live-collaboration room link). The app must decide whether to replace the local drawing, download the encrypted blob from the backend, and decode it, supporting both the current container format and older uploads. Identify exactly 5 implementation functions by these semantic roles: (1) the app-level startup routine that inspects the URL query and fragment, loads locally saved data, asks for confirmation before overriding a non-empty scene, and restores the imported elements and app state; (2) the routine that fetches the blob by id and attempts to decode it in the current format, falling back to an older decoder on failure; (3) the deprecated decoder that decrypts a buffer with the IV prepended, or else with an all-zero IV, and parses the JSON; (4) the generic routine that unpacks the versioned container into encoding metadata, IV and payload, then decrypts, optionally inflates, and splits out the JSON metadata from the contents; (5) the helper that walks length-prefixed chunks of a concatenated buffer and rejects unknown container versions. Explain the flow between them. Also answer: what does the user see, and what is returned, when the HTTP fetch fails versus when decoding throws? Why is the confirmation skipped for room links or empty scenes, and what happens to the URL after import? Which locally stored app state survives the import? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "excalidraw-app/App.tsx",
+          "symbol": "initializeScene"
+        },
+        {
+          "path": "excalidraw-app/data/index.ts",
+          "symbol": "importFromBackend"
+        },
+        {
+          "path": "excalidraw-app/data/index.ts",
+          "symbol": "legacy_decodeFromBackend"
+        },
+        {
+          "path": "packages/excalidraw/data/encode.ts",
+          "symbol": "decompressData"
+        },
+        {
+          "path": "packages/excalidraw/data/encode.ts",
+          "symbol": "splitBuffers"
+        }
+      ]
+    },
+    {
+      "id": "collab-room-cloud-persistence",
+      "title": "Persisting a collaboration room to the cloud store",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. During live collaboration the app periodically persists the room's elements to a cloud document store, merging with what other peers stored. Identify exactly 3 implementation functions by these semantic roles: (1) the collaboration-client method that triggers the save, feeds the stored result back into the live scene, and maps failures to error dialogs; (2) the routine that, inside a transaction, creates the encrypted room document or decrypts, merges and re-encrypts the existing one; (3) the check comparing the scene version with one cached per socket to skip redundant writes. Explain the flow between them. Also answer: which side is treated as local and which as remote in the merge? Why does the save return elements decrypted from the stored document rather than the in-memory merge? When is the error dialog suppressed on repeat failures? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "excalidraw-app/collab/Collab.tsx",
+          "symbol": "saveCollabRoomToFirebase"
+        },
+        {
+          "path": "excalidraw-app/data/firebase.ts",
+          "symbol": "saveToFirebase"
+        },
+        {
+          "path": "excalidraw-app/data/firebase.ts",
+          "symbol": "isSavedToFirebase"
+        }
+      ]
+    },
+    {
+      "id": "clipboard-paste-parse-dispatch",
+      "title": "Parsing and dispatching pasted clipboard data",
+      "difficulty": "intermediate",
+      "prompt": "Investigate this Excalidraw checkout. A user pastes HTML from a web page, or elements copied from another Excalidraw tab, sometimes holding Shift for a plain paste. Identify exactly 3 implementation functions by these semantic roles: (1) the parser deriving plain text or mixed text/image content from the transfer items, preferring HTML unless plain-pasting; (2) the top-level parser that tries to read the text as serialized drawing data with an element array, flagging the programmatic skeleton variant; (3) the editor method dispatching parsed data by priority (mixed content, tabular data, images/SVG, elements, diagram definitions, embeddable URLs, text). Explain the flow between them. Also answer: when the HTML contains only text nodes, which string becomes the pasted text? What does a Shift-paste of copied Excalidraw elements produce and which branch inserts it? What happens if converting a diagram definition fails? Base your explanation on this checkout's implementation; do not modify code.",
+      "targets": [
+        {
+          "path": "packages/excalidraw/clipboard.ts",
+          "symbol": "parseClipboardEventTextData"
+        },
+        {
+          "path": "packages/excalidraw/clipboard.ts",
+          "symbol": "parseClipboard"
+        },
+        {
+          "path": "packages/excalidraw/components/App.clipboard.ts",
+          "symbol": "insertClipboardContent"
+        }
+      ]
+    }
+  ]
+}

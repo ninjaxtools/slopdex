@@ -251,7 +251,7 @@ def table(lines, headers, rows):
 def markdown(manifest, summary):
     """Render the same summary for job reports or durable saved comparisons."""
     mode = summary["comparison_mode"]
-    lines = ["# TypeScript: no-map versus README-guided map", "", f"TypeScript commit: `{manifest.get('commit', 'unknown')}`",
+    lines = ["# Excalidraw: no-map versus README-guided map", "", f"Excalidraw commit: `{manifest.get('commit', 'unknown')}`",
               f"Comparison mode: **{mode}**.",
               "`off` = saved no-map baseline; `map` = README-guided map.", ""]
     if manifest.get("opencode_version"):

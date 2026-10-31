@@ -1,5 +1,5 @@
 """Optional real-CLI regression: SLOPDEX_EVAL_CHECK_ANN=1 python3 -m unittest
-discover -s evals/typescript -p test_native_ann.py -v.
+discover -s evals/excalidraw -p test_native_ann.py -v.
 
 Only a tiny local Git repository and a stdlib localhost embeddings fixture are
 used. The installed slopdex executable is required when explicitly enabled.

@@ -1,4 +1,4 @@
-"""Offline regression tests: python3 -m unittest discover -s evals/typescript."""
+"""Offline regression tests: python3 -m unittest discover -s evals/excalidraw."""
 
 import copy
 from contextlib import closing
@@ -199,8 +199,9 @@ class EvaluationTests(unittest.TestCase):
         self.write_native_sidecars(directory / "index.sqlite")
         return directory
 
-    def write_native_sidecars(self, index, *, descriptions=False):
-        kinds = {"code": 1, "markdown": 1, "descriptions": 2, "combined": 3} if descriptions else {"symbols": 1}
+    def write_native_sidecars(self, index, *, descriptions=False, content=False):
+        kinds = ({"code": 1, "markdown": 1, "descriptions": 2, "combined": 3} if descriptions else
+                 {"code": 1, "markdown": 1} if content else {"symbols": 1})
         for kind, parts in kinds.items():
             binary = Path(str(index) + f".{kind}.usearch")
             binary.write_bytes(f"native fixture for {kind}".encode())
@@ -295,35 +296,37 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(len(copied["artifacts"]), 8)
         self.assertEqual(copied, runner.native_ann_snapshot(index))
 
-    def test_map_preparation_upgrades_and_repairs_symbol_cache_without_reembedding(self):
+    def test_semantic_preparation_upgrades_and_repairs_ann_cache_without_reembedding(self):
         directory = self.create_index()
+        with closing(sqlite3.connect(directory / "index.sqlite")) as db, db:
+            db.execute("INSERT INTO metadata VALUES ('active_embedding_profile', ?)", (json.dumps({"dimensions": 3, "model": "fixture", "provider": "openai"}),))
         config = copy.deepcopy(self.config)
-        config["slopdex"].update({"model": "fixture", "dimensions": 3, "include": ["*.go"]})
-        metadata = {"identity": {"kind": "map-symbols", "commit": "commit", "slopdex_version": "fixture-version", "config": {**config["slopdex"], "rerankingEnabled": False}},
+        config["slopdex"].update({"model": "fixture", "dimensions": 3, "include": ["*.ts"]})
+        metadata = {"identity": {"kind": "semantic", "commit": "commit", "slopdex_version": "fixture-version", "config": {**config["slopdex"], "rerankingEnabled": False}},
                     "wall_seconds": .1, "status": {"functionCount": 3, "descriptionsEnabled": False}}
         runner.write_json(directory / "manifest.json", metadata)
 
-        def warm(path, saved, binary, workspace, timeout, *, symbol_only):
-            self.assertTrue(symbol_only)
-            self.write_native_sidecars(path / "index.sqlite")
-            saved["native_ann"] = {**runner.native_ann_snapshot(path / "index.sqlite", symbol_only=True), "wall_seconds": .2}
+        def warm(path, saved, binary, workspace, timeout, *, symbol_only=False):
+            self.assertFalse(symbol_only)
+            self.write_native_sidecars(path / "index.sqlite", content=True)
+            saved["native_ann"] = {**runner.native_ann_snapshot(path / "index.sqlite"), "wall_seconds": .2}
             runner.write_json(path / "manifest.json", saved)
             return saved
 
         coverage = {"validated_targets": 3, "parser_diagnostics": 0}
         with patch.object(runner, "digest", return_value="cache"), patch.object(runner, "command", return_value="fixture-version"), patch.object(runner, "index_coverage", return_value=coverage), patch.object(runner, "warm_native_ann", side_effect=warm) as warming, patch.object(runner, "logged_process") as process:
-            path, result = runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task], symbols=True)
+            path, result = runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task])
             self.assertEqual(path, directory)
             self.assertEqual(result["coverage"], coverage)
-            self.assertTrue(runner.native_ann_ready(directory / "index.sqlite", result, symbol_only=True))
+            self.assertTrue(runner.native_ann_ready(directory / "index.sqlite", result))
             self.assertEqual(warming.call_count, 1)
-            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task], symbols=True)
+            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task])
             self.assertEqual(warming.call_count, 1)
-            Path(str(directory / "index.sqlite") + ".symbols.usearch").unlink()
-            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task], symbols=True)
+            Path(str(directory / "index.sqlite") + ".code.usearch").unlink()
+            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task])
             self.assertEqual(warming.call_count, 2)
-            runner.write_json(Path(str(directory / "index.sqlite") + ".symbols.usearch.manifest.json"), None)
-            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task], symbols=True)
+            runner.write_json(Path(str(directory / "index.sqlite") + ".code.usearch.manifest.json"), None)
+            runner.prepare_map_index(config, "commit", self.root, "fixture-slopdex", [self.task])
             self.assertEqual(warming.call_count, 3)
             process.assert_not_called()
 
@@ -368,10 +371,24 @@ class EvaluationTests(unittest.TestCase):
         sandbox.mkdir()
         config = runner.opencode_config(self.config["models"][0], "off", 10)
         with patch.dict(os.environ, {"XDG_DATA_HOME": str(original)}):
+            os.environ.pop("OPENCODE_GO_EVALS_KEY", None)
             env = runner.isolated_environment(sandbox, config)
         copied = runner.read_json(Path(env["XDG_DATA_HOME"]) / "opencode" / "auth.json")
         self.assertEqual(set(copied), {"opencode-go"})
         self.assertEqual(copied["opencode-go"]["key"], "selected-secret")
+
+    def test_dedicated_eval_key_overrides_stored_auth_and_is_not_forwarded(self):
+        original = self.root / "original"
+        runner.write_json(original / "opencode" / "auth.json", {"opencode-go": {"type": "api", "key": "stale-secret"}})
+        sandbox = self.root / "sandbox"
+        sandbox.mkdir()
+        config = runner.opencode_config(self.config["models"][0], "off", 10)
+        self.assertEqual(runner.eval_key_variable("opencode-go"), "OPENCODE_GO_EVALS_KEY")
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(original), "OPENCODE_GO_EVALS_KEY": "eval-secret"}):
+            env = runner.isolated_environment(sandbox, config)
+        copied = runner.read_json(Path(env["XDG_DATA_HOME"]) / "opencode" / "auth.json")
+        self.assertEqual(copied, {"opencode-go": {"type": "api", "key": "eval-secret"}})
+        self.assertNotIn("OPENCODE_GO_EVALS_KEY", env)
 
     def test_paired_schedule_is_reproducible_and_counterbalanced(self):
         tasks = [dict(self.task, id=f"task-{index}") for index in range(10)]
@@ -565,6 +582,7 @@ class EvaluationTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    @patch.object(runner, "TRIAL_SYMBOL_ONLY", True)  # Fixture builds symbol-only sidecars.
     def test_offline_paired_trials_and_report(self):
         """Exercise CLI spawning, both wrappers, scoring, artifacts and pairing."""
         cache = self.create_index()

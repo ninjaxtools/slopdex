@@ -26,7 +26,7 @@ ROOT = HERE.parent.parent
 SUBMODULE = HERE / "repo"
 ANSWER_FORMAT = """
 Return your final answer as a single JSON object, without Markdown fences:
-{"findings": [{"path": "repository/relative/file.go", "symbol": "unqualifiedFunctionName",
+{"findings": [{"path": "repository/relative/file.ts", "symbol": "unqualifiedFunctionName",
 "line": 123, "explanation": "Describe this function's role and relevant behavior."}],
 "flow": "Explain how the required functions interact and answer the task's questions."}
 Include exactly {finding_count} findings, one for each requested implementation role. Cite the
@@ -40,11 +40,16 @@ Investigate this checkout using local tools and cite source evidence. Do not mod
 files, fetch external material, or delegate. Return the requested JSON answer.
 """
 ARM_INSTRUCTIONS = {
-    "off": "\nUse conventional local code navigation: glob, grep/rg, and targeted reads.\nSlopdex is unavailable in this trial; do not invoke it.\n",
-    "map": "\nRequired: one successful `slopdex map` before grep/read; other slopdex navigation is blocked.\nCheckout and symbol vectors are ready; never override root/index/config.\nFor Go discovery add --ignore-errors -g '*.go' -g '!**/*_test.go'.\n",
+    # No arm-specific harness guidance: baseline gets only the base instructions, map
+    # only adds the README snippet. Slopdex is still blocked in baseline by permissions.
+    "off": "",
+    "map": "",
 }
 DEFAULT_ARMS = ["off", "map"]
 ARM_NAVIGATION = {"map": ("map",)}
+ARM_OPTIONAL = {"map": ("faq", "refactor")}
+# Trials copy the full semantic index (code/docs/descriptions/symbols ANN), which faq needs.
+TRIAL_SYMBOL_ONLY = False
 
 
 def readme_agent_instruction(command_name: str) -> str:
@@ -151,26 +156,64 @@ def load_inputs(config_path: Path):
 
 def ensure_source(commit: str):
     # No --remote: git's recorded gitlink, not a moving branch, is authoritative.
-    recorded = command(["git", "ls-files", "--stage", "evals/typescript/repo"]).split()
+    recorded = command(["git", "ls-files", "--stage", "evals/excalidraw/repo"]).split()
     if len(recorded) < 2 or recorded[0] != "160000" or recorded[1] != commit:
         raise ValueError("Submodule gitlink does not match tasks.repository_commit")
-    command(["git", "submodule", "update", "--init", "--depth", "1", "--", "evals/typescript/repo"], timeout=600)
+    command(["git", "submodule", "update", "--init", "--depth", "1", "--", "evals/excalidraw/repo"], timeout=600)
     if command(["git", "rev-parse", "HEAD"], cwd=SUBMODULE) != commit:
-        raise ValueError("TypeScript checkout does not match the pinned commit")
+        raise ValueError("Excalidraw checkout does not match the pinned commit")
     if command(["git", "status", "--porcelain", "--untracked-files=no"], cwd=SUBMODULE):
-        raise ValueError("TypeScript submodule has tracked changes; use a clean checkout")
+        raise ValueError("Excalidraw submodule has tracked changes; use a clean checkout")
+
+
+MODIFIERS = r"(?:(?:export|default|declare|public|private|protected|static|readonly|abstract|override|async|get|set)\s+)*"
+
+
+def declaration_patterns(symbol: str):
+    """TypeScript callable declarations: functions, arrow/function constants, and class members."""
+    name = re.escape(symbol)
+    generics = r"(?:<[^\n]*>)?"
+    return [
+        # function name(...) / export default async function* name<T>(...)
+        re.compile(rf"^[ \t]*{MODIFIERS}function\s*\*?\s*{name}\s*{generics}\s*\(", re.M),
+        # export const name = (...) => / = async <T>(...) => / = function / = memoize(
+        re.compile(rf"^[ \t]*{MODIFIERS}(?:const|let|var)\s+{name}\s*(?::[^=\n]+)?=\s*(?:async\s+)?(?:function\b|{generics}\s*\(|[A-Za-z_$][\w$]*\s*=>)", re.M),
+        # class member: name(...) {, private name = (...) =>, static async name<T>(
+        re.compile(rf"^[ \t]+{MODIFIERS}{name}\s*(?:\?\s*)?(?:{generics}\s*\([^;\n]*(?:\)\s*(?::[^;\n]*)?\{{\s*$|,\s*$|$)|(?::[^=\n]+)?=\s*(?:async\s+)?(?:function\b|{generics}\s*\(|[A-Za-z_$][\w$]*\s*=>))", re.M),
+    ]
+
+
+def declaration_lines(text: str, symbol: str):
+    lines, source_lines = set(), text.split("\n")
+    for kind, pattern in enumerate(declaration_patterns(symbol)):
+        for match in pattern.finditer(text):
+            line = text.count("\n", 0, match.start())
+            content = source_lines[line]
+            if content.lstrip().startswith(("//", "*", "/*")):
+                continue
+            if kind == 2 and not class_member(source_lines, line):
+                continue  # Indented calls/assignments in function bodies are not members.
+            lines.add(line + 1)
+    return sorted(lines)
+
+
+def class_member(source_lines, line: int) -> bool:
+    indent = len(source_lines[line]) - len(source_lines[line].lstrip())
+    for previous in reversed(source_lines[:line]):
+        stripped = previous.lstrip()
+        if stripped and len(previous) - len(stripped) < indent:
+            return re.match(rf"{MODIFIERS}class\b", stripped) is not None
+    return False
 
 
 def target_lines(task, source=SUBMODULE):
     result = {}
     for target in task["targets"]:
-        symbol = re.escape(target["symbol"])
-        pattern = re.compile(rf"^func\s+(?:\([^\n]*\)\s+)?{symbol}\s*(?:\[[^\n]*\])?\s*\(", re.M)
         text = (source / target["path"]).read_text()
-        matches = list(pattern.finditer(text))
-        if len(matches) != 1:
-            raise ValueError(f"Expected one declaration for {target}, found {len(matches)}")
-        result[(target["path"], target["symbol"])] = text.count("\n", 0, matches[0].start()) + 1
+        lines = declaration_lines(text, target["symbol"])
+        if len(lines) != 1:
+            raise ValueError(f"Expected one declaration for {target}, found {len(lines)} at lines {lines}")
+        result[(target["path"], target["symbol"])] = lines[0]
     return result
 
 
@@ -303,7 +346,7 @@ def shared_ann_snapshot(index: Path, metadata: dict, *, symbol_only):
     artifacts, shared = {}, {}
     directory = Path(metadata["global_path"] + ".indexes")
     profile = None if symbol_only else json.loads(metadata["active_embedding_profile"])
-    for kind in (["symbols"] if symbol_only else ["code", "docs", "descriptions"]):
+    for kind in (["symbols"] if symbol_only else ["code", "docs", "descriptions", "symbols"]):
         suffix = f".{kind}.shared.json"
         path = Path(str(index) + suffix)
         pointer = read_json(path)
@@ -321,7 +364,7 @@ def shared_ann_snapshot(index: Path, metadata: dict, *, symbol_only):
         dimensions = base.get("dimensions")
         if (base.get("version") != 1 or base.get("id") != pointer["base_id"] or base.get("contract") != pointer["contract"]
             or not isinstance(dimensions, int) or dimensions <= 0
-            or (profile is not None and dimensions != profile["dimensions"])
+            or (profile is not None and kind != "symbols" and dimensions != profile["dimensions"])
             or native.get("version") != 1 or native.get("dimensions") != dimensions
             or native.get("binary_hash") != file_digest(binary)):
             raise ValueError(f"Shared ANN base is stale or corrupt: {base_path}")
@@ -402,20 +445,24 @@ def warm_native_ann(directory: Path, metadata: dict, binary: str, workspace: Pat
         relocate_index(db, workspace, metadata["identity"]["commit"])
     logs = directory / "ann-warmup"
     logs.mkdir(exist_ok=True)
-    argv = offline_ann_command(binary, workspace, directory / "config.json", index, symbol_only=symbol_only)
-    code, expired, elapsed = logged_process(argv, workspace, os.environ.copy(), logs, timeout)
-    if code or expired:
-        raise RuntimeError(f"Native ANN warm-up failed; see {logs / 'stderr.log'}")
+    elapsed = 0.0
+    # Content search warms code/docs/descriptions; symbol vectors are built lazily by map -q.
+    for mode in ([True] if symbol_only else [False, True]):
+        argv = offline_ann_command(binary, workspace, directory / "config.json", index, symbol_only=mode)
+        code, expired, seconds = logged_process(argv, workspace, os.environ.copy(), logs, timeout)
+        elapsed += seconds
+        if code or expired:
+            raise RuntimeError(f"Native ANN warm-up failed; see {logs / 'stderr.log'}")
     metadata["native_ann"] = {**native_ann_snapshot(index, symbol_only=symbol_only), "wall_seconds": elapsed, "warmup_version": 2}
     metadata["status"]["rootDir"] = str(workspace.resolve())
     write_json(directory / "manifest.json", metadata)
     return metadata
 
 
-def prepare_map_index(config, commit: str, cache: Path, slopdex: str, tasks, *, symbols=True, implementation=None):
-    """Build structure, optionally preembedding names for the README's -q workflow."""
+def prepare_map_index(config, commit: str, cache: Path, slopdex: str, tasks, *, implementation=None):
+    """Build the full semantic index (code, docs, symbols) so map -q and faq work offline-indexed."""
     settings = {**config["slopdex"], "rerankingEnabled": False}
-    identity = {"kind": "map-symbols" if symbols else "map", "commit": commit, "slopdex_version": command([slopdex, "--version"]), "config": settings}
+    identity = {"kind": "semantic", "commit": commit, "slopdex_version": command([slopdex, "--version"]), "config": settings}
     if implementation is not None:
         identity["implementation"] = implementation
     directory = cache / digest(identity)[:20]
@@ -427,25 +474,20 @@ def prepare_map_index(config, commit: str, cache: Path, slopdex: str, tasks, *, 
         metadata = read_json(manifest) if manifest.exists() else {}
         if not index.exists() or metadata.get("identity") != identity:
             write_json(directory / "config.json", {**settings, "artifactCachePath": str(directory / "artifacts.sqlite")})
-            with tempfile.TemporaryDirectory(prefix="slopdex-ts-map-") as temporary:
+            with tempfile.TemporaryDirectory(prefix="slopdex-eval-index-") as temporary:
                 workspace = Path(temporary) / "repo"
                 clone(workspace, commit)
                 argv = [slopdex, "--root", str(workspace), "--config", str(directory / "config.json"), "--index", str(index)]
-                retry = ["--force-reindex", "--yes-really-rebuild-the-index"]
-                if not index.exists():
-                    # Map without an index now parses directly without persisting.
-                    # An empty SQLite file opts into indexed structural preparation.
-                    with closing(sqlite3.connect(index)):
-                        pass
-                code, expired, elapsed = logged_process(argv + retry + ["map", "--private", "-e", "a^"], workspace, os.environ.copy(), directory, config["index_timeout_seconds"])
+                retry = ["--force-reindex", "--yes-really-rebuild-the-index"] if index.exists() else []
+                code, expired, elapsed = logged_process(argv + retry + ["update"], workspace, os.environ.copy(), directory, config["index_timeout_seconds"])
                 if code or expired:
-                    raise RuntimeError(f"Structural index preparation failed; see {directory / 'stderr.log'}")
+                    raise RuntimeError(f"Semantic index preparation failed; see {directory / 'stderr.log'}")
                 status = json.loads(command(argv + ["--no-reindex", "status"], cwd=workspace))
             metadata = {"identity": identity, "wall_seconds": elapsed, "status": status}
             write_json(manifest, metadata)
-        coverage = index_coverage(index, tasks, semantic=False)
-        if symbols and not native_ann_ready(index, metadata, symbol_only=True):
-            metadata = warm_native_ann(directory, metadata, slopdex, SUBMODULE, config["index_timeout_seconds"], symbol_only=True)
+        coverage = index_coverage(index, tasks, semantic=True)
+        if not native_ann_ready(index, metadata):
+            metadata = warm_native_ann(directory, metadata, slopdex, SUBMODULE, config["index_timeout_seconds"])
     return directory, {**metadata, "coverage": coverage}
 
 
@@ -467,6 +509,10 @@ def opencode_config(model, arm: str, steps: int):
     }
 
 
+def eval_key_variable(provider: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "_", provider.upper()) + "_EVALS_KEY"
+
+
 def isolated_environment(sandbox: Path, config: dict):
     env = os.environ.copy()
     # Copy only the selected provider's auth, not sessions or account/organization
@@ -475,10 +521,11 @@ def isolated_environment(sandbox: Path, config: dict):
     old_data_home = Path(env.get("XDG_DATA_HOME", str(home / ".local/share")))
     data_home = sandbox / "data"
     auth_path = old_data_home / "opencode" / "auth.json"
-    if auth_path.exists():
-        auth = read_json(auth_path)
-        provider = config["model"].split("/", 1)[0]
-        credentials = auth.get(provider)
+    provider = config["model"].split("/", 1)[0]
+    # A dedicated eval key (e.g. OPENCODE_GO_EVALS_KEY) takes precedence over stored auth.
+    eval_key = env.get(eval_key_variable(provider))
+    if eval_key or auth_path.exists():
+        credentials = {"type": "api", "key": eval_key} if eval_key else read_json(auth_path).get(provider)
         if credentials:
             if credentials.get("type") == "wellknown":
                 raise ValueError("Remote wellknown auth configuration is incompatible with isolated evals; supply an API key")
@@ -486,7 +533,7 @@ def isolated_environment(sandbox: Path, config: dict):
             write_json(new_auth, {provider: credentials})
             new_auth.chmod(0o600)
     for key in tuple(env):
-        if key.startswith("OPENCODE_") and key not in {"OPENCODE_API_KEY", "OPENCODE_GO_API_KEY"}:
+        if (key.startswith("OPENCODE_") and key not in {"OPENCODE_API_KEY", "OPENCODE_GO_API_KEY"}) or key.endswith("_EVALS_KEY"):
             env.pop(key)
     config_home = sandbox / "config"
     config_home.mkdir()
@@ -629,7 +676,7 @@ def verify_native_ann_reuse(binary: str, workspace: Path, config_path: Path, ind
     return result
 
 
-def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None, index_dir: Path | None, commit: str, *, map_private=None):
+def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None, index_dir: Path | None, commit: str, *, map_private=None, agent_model=None):
     bin_dir = sandbox / "bin"
     bin_dir.mkdir()
     log = sandbox / "slopdex-calls.jsonl"
@@ -637,14 +684,19 @@ def install_wrapper(sandbox: Path, workspace: Path, arm: str, binary: str | None
     if arm != "off":
         # SQLite backup includes any WAL pages; each trial gets an independent index.
         destination = sandbox / "index.sqlite"
-        copy_index(index_dir / "index.sqlite", destination, workspace, commit,
-                   symbol_only=True)
+        copy_index(index_dir / "index.sqlite", destination, workspace, commit, symbol_only=TRIAL_SYMBOL_ONLY)
         config_path = sandbox / "slopdex.json"
-        write_json(config_path, index_config(index_dir / "config.json", destination))
+        settings = index_config(index_dir / "config.json", destination)
+        # faq answers with the trial's own model through the sandboxed OpenCode.
+        settings["agentCommand"] = ["opencode", "run"]
+        if agent_model:
+            settings["agentModel"] = agent_model
+        write_json(config_path, settings)
         arguments = [binary, "--root", str(workspace), "--config", str(config_path), "--index", str(destination), "--no-reindex"]
     script = f"""#!{sys.executable}
 import json, subprocess, sys, time, uuid
 ARM_NAVIGATION = {ARM_NAVIGATION!r}
+ARM_OPTIONAL = {ARM_OPTIONAL!r}
 {inspect.getsource(slopdex_command)}
 {inspect.getsource(slopdex_call_allowed)}
 call_id = uuid.uuid4().hex
@@ -723,7 +775,7 @@ def slopdex_command(argv: list[str]) -> str:
     commands = {
         "search", "search-code", "search-descriptions", "search-md", "describe",
         "cross-search", "map", "status", "index-errors", "update", "refresh",
-        "descriptions", "reindex-files", "models", "config", "help",
+        "descriptions", "reindex-files", "models", "config", "help", "faq", "refactor",
     }
     value_options = {
         "--root", "--config", "--index", "--provider", "--model", "--dimensions",
@@ -807,12 +859,14 @@ def slopdex_call_allowed(arm: str, argv: list[str], *, map_private=None) -> bool
         options = argv
         if "--" in options:
             separator = options.index("--")
-            options = options[separator + 1:] if options[separator + 1:separator + 2] == ["map"] else options[:separator]
+            # `-- map ...` names the command after the separator; after `map --`, everything is positional.
+            command_after = "map" not in options[:separator] and options[separator + 1:separator + 2] == ["map"]
+            options = options[separator + 1:] if command_after else options[:separator]
             if "--" in options:
                 options = options[:options.index("--")]
         if ("--private" in options) != map_private:
             return False
-    return arm in ARM_NAVIGATION and command_name in {*ARM_NAVIGATION[arm], "help", "version"}
+    return arm in ARM_NAVIGATION and command_name in {*ARM_NAVIGATION[arm], *ARM_OPTIONAL.get(arm, ()), "help", "version"}
 
 
 def read_slopdex_calls(path: Path):
@@ -899,7 +953,7 @@ def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, i
     directory.mkdir(parents=True, exist_ok=True)
     prompt = task_prompt(task)
     (directory / "prompt.txt").write_text(prompt)
-    with tempfile.TemporaryDirectory(prefix="slopdex-ts-trial-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="slopdex-eval-trial-") as temporary:
         sandbox = Path(temporary)
         workspace = sandbox / "repo"
         clone(workspace, commit)
@@ -912,11 +966,12 @@ def run_trial(trial, task, gold, config, commit, directory, opencode, slopdex, i
         write_json(directory / "opencode.json", cli_config)
         env = isolated_environment(sandbox, cli_config)
         env["PWD"] = str(workspace)
-        bin_dir, calls = install_wrapper(sandbox, workspace, trial["arm"], slopdex, index_dir, commit, map_private=map_private)
+        bin_dir, calls = install_wrapper(sandbox, workspace, trial["arm"], slopdex, index_dir, commit, map_private=map_private,
+                                         agent_model=trial["model"])
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
         native_ann = None
         if trial["arm"] == "map":
-            native_ann = verify_native_ann_reuse(slopdex, workspace, index_dir / "config.json", sandbox / "index.sqlite", directory, config["index_timeout_seconds"], symbol_only=True)
+            native_ann = verify_native_ann_reuse(slopdex, workspace, index_dir / "config.json", sandbox / "index.sqlite", directory, config["index_timeout_seconds"], symbol_only=TRIAL_SYMBOL_ONLY)
         check_effective_config(opencode, workspace, env, cli_config, directory)
         argv = [opencode, "run", "--model", trial["model"], "--variant", trial["variant"],
                 "--agent", "build", "--format", "json", "--dir", str(workspace), "--title", trial["id"], "--", prompt]
@@ -1058,7 +1113,7 @@ def main(argv=None):
             slopdex = executable("slopdex")
             directory, metadata = prepare_map_index(config, commit, args.cache.resolve(), slopdex, tasks,
                                                     implementation=implementation_identity(slopdex))
-            print(f"Map symbol index ready: {directory}\n{json.dumps(metadata, indent=2)}")
+            print(f"Semantic index ready: {directory}\n{json.dumps(metadata, indent=2)}")
         return
     output = (args.output or HERE / "jobs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1000000:06d}").resolve()
     settings = {"config": config, "tasks": tasks, "commit": commit, "trials": trials,

@@ -41,7 +41,14 @@ class ExclusiveArmTests(unittest.TestCase):
         instructions = runner.arm_instructions("map")
         self.assertEqual(instructions.count(snippets[0]), 1)
         self.assertEqual(runner.readme_agent_instruction("map"), snippets[0])
-        self.assertEqual(set(re.findall(r"`slopdex ([\w-]+)", instructions)), {"map"})
+        self.assertEqual(set(re.findall(r"`slopdex ([\w-]+)", instructions)), {"map", "faq", "refactor"})
+        self.assertEqual(runner.ARM_OPTIONAL, {"map": ("faq", "refactor")})
+        for argv in (["faq", "How are types checked?"], ["refactor", "a.ts::f", "b.ts::g"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(runner.slopdex_call_allowed("map", argv, map_private=True))
+                self.assertFalse(runner.slopdex_call_allowed("off", argv))
+                self.assertEqual(runner.slopdex_protocol_violations("map", [{"argv": argv, "exit_code": 0}]),
+                                 [{"reason": "required_command_not_used_successfully", "command": "map"}])
 
     def test_instructions_read_current_readme_verbatim(self):
         snippet = '- custom symbol guidance: `slopdex map -q "exact concept" src`\n- preserve this second line'
@@ -276,6 +283,7 @@ class ExclusiveArmTests(unittest.TestCase):
         })
         return directory
 
+    @patch.object(runner, "TRIAL_SYMBOL_ONLY", True)  # Fixture builds symbol-only sidecars.
     def test_generated_map_wrapper_blocks_executes_and_journals_with_symbol_snapshot(self):
         directory = self.create_index()
         source = directory / "index.sqlite"
@@ -378,6 +386,7 @@ sys.exit(9 if '--fixture-fail' in sys.argv[1:] else 0)
         self.assertEqual(runner.native_ann_snapshot(copied, symbol_only=True), before)
 
     @unittest.skipUnless(os.name == "posix", "fake CLI execution uses a shebang")
+    @patch.object(runner, "TRIAL_SYMBOL_ONLY", True)  # Fixture builds symbol-only sidecars.
     def test_generated_wrapper_enforces_map_visibility_and_journals_original_argv(self):
         directory = self.create_index()
         physical_workspace = self.root / "physical-workspace"

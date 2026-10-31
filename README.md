@@ -88,9 +88,11 @@ See the [outgoing references](docs/reference.md#callable-context-and-outgoing-re
 > Add this to your `AGENTS.md` to let the agent use the map command to explore the codebase:
 >
 > ```text
-> - Start discovery with one scoped `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" -q "<additional concept>" --private --callers 2 --callees 2 <paths...>` and immediately read plausible implementation ranges from the source files directly.
+> - Start any task by asking a relevant high level question with `slopdex faq "<frequently asked question>"`
+> - To discover relevant file run `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" -q "<additional concept>" --private --callers 2 --callees 2 <paths...>` and immediately read plausible implementation ranges from the source files directly.
 > - Avoid mapping repeatedly, frontload the map in one call.
-> - Don't pipe the output through `head`, instead save it to a file and read from there.
+> - Slopdex is not a replacement for other search tools, but an addition that provides semantic symbol search and mapping functionality.
+> - To rename or move symbols/functions or files, use `slopdex refactor <src> <dest>` with src an dest being a file and an optional symbol like `src/parser.ts::parse`. This correctly updates references for supported languages.
 > ```
 
 ## Count lines
