@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "frontierharness": {
+      "repository": "https://github.com/frontier-harness-eval/eval",
+      "commit": "e837a70bd6beb4e72eeeda62dd06e3bd34f6cb63"
+    },
+    "deep_swe": {
+      "repository": "https://github.com/datacurve-ai/deep-swe",
+      "commit": "435ee89ec2f2e2289f33b0da4f992f0b7b7266b9"
+    },
+    "terminal_bench": {
+      "dataset": "terminal-bench/terminal-bench-2-1"
+    }
+  },
+  "model": {
+    "model": "opencode-go/deepseek-v4.1-flash",
+    "variant": "medium",
+    "options": {
+      "reasoningEffort": "medium"
+    }
+  },
+  "opencode_version": "1.18.34",
+  "agent_hosts": ["opencode.ai", "api.openai.com"],
+  "agent_setup_timeout_multiplier": 10,
+  "concurrency": 2,
+  "seed": 20261101,
+  "builder": {
+    "image": "slopdex-eval-builder:jammy-1.90.0",
+    "rust": "1.90.0"
+  },
+  "slopdex": {
+    "provider": "openai",
+    "model": "text-embedding-3-large",
+    "dimensions": 3072,
+    "rerankingEnabled": false,
+    "maxFileSize": 16777216
+  }
+}

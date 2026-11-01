@@ -1,0 +1,77 @@
+{
+  "agent_cost_usd": 0.05720267400000001,
+  "agent_host_addresses": {
+    "api.openai.com": [
+      "162.159.140.245",
+      "172.66.0.243"
+    ],
+    "opencode.ai": [
+      "172.65.90.20",
+      "172.65.90.21",
+      "172.65.90.22",
+      "172.65.90.23"
+    ]
+  },
+  "agent_seconds": 622.75882,
+  "arm": "map",
+  "cache_tokens": 3390208,
+  "controls": {
+    "agent_hosts": [
+      "opencode.ai",
+      "api.openai.com"
+    ],
+    "agent_setup_timeout_multiplier": 10,
+    "agent_source": [
+      "d10f63cac575dc51c3304e6d80bdd9a28ff5f722270cadad4b2824c6001f2adb",
+      "3b3c72a448bd81aa1b7b4ddd5548695dbeed8335222ec74fed17ed2ffd0bcf98"
+    ],
+    "arm": "map",
+    "binary": "a81cbe4193cc4486fc8e4bb2c211cbc122330f79e67281859a47bccf5c37197c",
+    "harbor_version": "0.23.0",
+    "instructions": "\n## Code navigation\n\n- Start any task by asking a relevant high level question with `slopdex faq \"<frequently asked question>\"`\n- To discover relevant file run `slopdex map -g \"<glob>\" -i -e \"<term|term>\" -q \"<short symbol concept>\" -q \"<additional concept>\" --private --callers 2 --callees 2 <paths...>` and immediately read plausible implementation ranges from the source files directly.\n- Avoid mapping repeatedly, frontload the map in one call.\n- Slopdex is not a replacement for other search tools, but an addition that provides semantic symbol search and mapping functionality.\n- To rename or move symbols/functions or files, use `slopdex refactor <src> <dest>` with src an dest being a file and an optional symbol like `src/parser.ts::parse`. This correctly updates references for supported languages.\n",
+    "model": {
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "options": {
+        "reasoningEffort": "medium"
+      },
+      "variant": "medium"
+    },
+    "opencode_version": "1.18.34",
+    "protocol": 1,
+    "slopdex": {
+      "dimensions": 3072,
+      "maxFileSize": 16777216,
+      "model": "text-embedding-3-large",
+      "provider": "openai",
+      "rerankingEnabled": false
+    },
+    "task_digest": "11b77a0572e6bfb72e047dbe442cfdca8b16fd89028ed75b3aed2d39d18422dd"
+  },
+  "controls_digest": "9d2fba652d00d4476038c2e60fde27b56bde3a704f0e0956e070ecd65defb544",
+  "cost_usd": 0.05851772400000001,
+  "exception": null,
+  "faq_usage": {
+    "calls": 1,
+    "cost_usd": 0.00131505,
+    "tokens": {
+      "cache_read": 0,
+      "cache_write": 0,
+      "input": 8223,
+      "output": 47,
+      "reasoning": 89
+    }
+  },
+  "finished_at": "2026-11-01T07:07:18.888545+00:00",
+  "harbor_exit_code": 0,
+  "input_tokens": 3500527,
+  "opencode_version": "1.18.34",
+  "output_tokens": 20033,
+  "reward": 1.0,
+  "setup_seconds": 103.172837,
+  "slopdex_commands": {
+    "faq": 1
+  },
+  "status": "success",
+  "task": "terminal-bench/kv-store-grpc",
+  "trial_dir": "jobs/map/terminal-bench__kv-store-grpc/20261101T065444Z/trial/kv-store-grpc__TrZ2e7A"
+}

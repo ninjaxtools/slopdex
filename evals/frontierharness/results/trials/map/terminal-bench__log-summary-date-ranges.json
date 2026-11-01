@@ -1,0 +1,69 @@
+{
+  "agent_cost_usd": 0.003933174,
+  "agent_host_addresses": {
+    "api.openai.com": [
+      "162.159.140.245",
+      "172.66.0.243"
+    ],
+    "opencode.ai": [
+      "172.65.90.20",
+      "172.65.90.21",
+      "172.65.90.22",
+      "172.65.90.23"
+    ]
+  },
+  "agent_seconds": 14.379221,
+  "arm": "map",
+  "cache_tokens": 14208,
+  "controls": {
+    "agent_hosts": [
+      "opencode.ai",
+      "api.openai.com"
+    ],
+    "agent_setup_timeout_multiplier": 10,
+    "agent_source": [
+      "d10f63cac575dc51c3304e6d80bdd9a28ff5f722270cadad4b2824c6001f2adb",
+      "3b3c72a448bd81aa1b7b4ddd5548695dbeed8335222ec74fed17ed2ffd0bcf98"
+    ],
+    "arm": "map",
+    "binary": "a81cbe4193cc4486fc8e4bb2c211cbc122330f79e67281859a47bccf5c37197c",
+    "harbor_version": "0.23.0",
+    "instructions": "\n## Code navigation\n\n- Start any task by asking a relevant high level question with `slopdex faq \"<frequently asked question>\"`\n- To discover relevant file run `slopdex map -g \"<glob>\" -i -e \"<term|term>\" -q \"<short symbol concept>\" -q \"<additional concept>\" --private --callers 2 --callees 2 <paths...>` and immediately read plausible implementation ranges from the source files directly.\n- Avoid mapping repeatedly, frontload the map in one call.\n- Slopdex is not a replacement for other search tools, but an addition that provides semantic symbol search and mapping functionality.\n- To rename or move symbols/functions or files, use `slopdex refactor <src> <dest>` with src an dest being a file and an optional symbol like `src/parser.ts::parse`. This correctly updates references for supported languages.\n",
+    "model": {
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "options": {
+        "reasoningEffort": "medium"
+      },
+      "variant": "medium"
+    },
+    "opencode_version": "1.18.34",
+    "protocol": 1,
+    "slopdex": {
+      "dimensions": 3072,
+      "maxFileSize": 16777216,
+      "model": "text-embedding-3-large",
+      "provider": "openai",
+      "rerankingEnabled": false
+    },
+    "task_digest": "881953294e0564893bcb898e19f5a4d9590871b48b3684475ffabf98269645e4"
+  },
+  "controls_digest": "89c6fb32c1d374aaffc0b127cb1b3b261b4987dd9089d39b0f1a0f48a72da08e",
+  "cost_usd": 0.003933174,
+  "exception": null,
+  "faq_usage": {
+    "calls": 0,
+    "cost_usd": 0,
+    "tokens": {}
+  },
+  "finished_at": "2026-11-01T06:54:13.159679+00:00",
+  "harbor_exit_code": 0,
+  "input_tokens": 37813,
+  "opencode_version": "1.18.34",
+  "output_tokens": 477,
+  "reward": 1.0,
+  "setup_seconds": 367.918305,
+  "slopdex_commands": {},
+  "status": "success",
+  "task": "terminal-bench/log-summary-date-ranges",
+  "trial_dir": "jobs/map/terminal-bench__log-summary-date-ranges/20261101T064718Z/trial/log-summary-date-ranges__DDbP73j"
+}

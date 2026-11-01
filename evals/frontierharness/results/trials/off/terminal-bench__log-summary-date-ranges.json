@@ -1,0 +1,60 @@
+{
+  "agent_cost_usd": 0.002737014,
+  "agent_host_addresses": {
+    "api.openai.com": [
+      "162.159.140.245",
+      "172.66.0.243"
+    ],
+    "opencode.ai": [
+      "172.65.90.20",
+      "172.65.90.21",
+      "172.65.90.22",
+      "172.65.90.23"
+    ]
+  },
+  "agent_seconds": 93.479962,
+  "arm": "off",
+  "cache_tokens": 21888,
+  "controls": {
+    "agent_hosts": [
+      "opencode.ai",
+      "api.openai.com"
+    ],
+    "agent_setup_timeout_multiplier": 10,
+    "agent_source": [
+      "d10f63cac575dc51c3304e6d80bdd9a28ff5f722270cadad4b2824c6001f2adb",
+      "3b3c72a448bd81aa1b7b4ddd5548695dbeed8335222ec74fed17ed2ffd0bcf98"
+    ],
+    "arm": "off",
+    "harbor_version": "0.23.0",
+    "model": {
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "options": {
+        "reasoningEffort": "medium"
+      },
+      "variant": "medium"
+    },
+    "opencode_version": "1.18.34",
+    "protocol": 1,
+    "task_digest": "881953294e0564893bcb898e19f5a4d9590871b48b3684475ffabf98269645e4"
+  },
+  "controls_digest": "6045efa4a6b6544ad71deb5fe330db0d77bd66e746c7af11ad7948a7b26ac99f",
+  "cost_usd": 0.002737014,
+  "exception": null,
+  "faq_usage": {
+    "calls": 0,
+    "cost_usd": 0,
+    "tokens": {}
+  },
+  "finished_at": "2026-11-01T06:53:26.021938+00:00",
+  "harbor_exit_code": 0,
+  "input_tokens": 37245,
+  "opencode_version": "1.18.34",
+  "output_tokens": 499,
+  "reward": 1.0,
+  "setup_seconds": 237.509309,
+  "slopdex_commands": {},
+  "status": "success",
+  "task": "terminal-bench/log-summary-date-ranges",
+  "trial_dir": "jobs/off/terminal-bench__log-summary-date-ranges/20261101T064718Z/trial/log-summary-date-ranges__fUrqSgH"
+}
