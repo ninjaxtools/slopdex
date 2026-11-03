@@ -437,3 +437,32 @@ fn ollama_profiles_strip_endpoint_query_strings_and_resolve_against_them() {
     assert!(minimal.get("model").is_none());
     assert!(mock.requests.lock().unwrap().is_empty());
 }
+
+#[test]
+fn repository_ollama_remote_endpoint_and_auto_pull_require_trust() {
+    use crate::providers::{
+        CONFIG_ORIGIN_KEY, CONFIG_ORIGIN_REPOSITORY, TRUST_REPOSITORY_ENDPOINTS_KEY,
+    };
+    let remote = json!({
+        CONFIG_ORIGIN_KEY: CONFIG_ORIGIN_REPOSITORY,
+        "embeddingBaseUrl": "https://ollama.example.invalid/api",
+        "ollamaAutoPull": true,
+    });
+    assert!(ollama::warn_remote_endpoint(&remote).is_err());
+    assert!(!ollama::auto_pull_allowed(&remote));
+    let mut trusted = remote.clone();
+    trusted["trustedEndpointHosts"] = json!(["ollama.example.invalid"]);
+    assert!(ollama::warn_remote_endpoint(&trusted).is_ok());
+    let mut flagged = remote.clone();
+    flagged[TRUST_REPOSITORY_ENDPOINTS_KEY] = json!(true);
+    assert!(ollama::warn_remote_endpoint(&flagged).is_ok());
+    // User-config remote endpoints and auto-pull keep their existing behavior.
+    let user = json!({"embeddingBaseUrl": "https://ollama.example.invalid/api",
+        "ollamaAutoPull": true});
+    assert!(ollama::warn_remote_endpoint(&user).is_ok());
+    assert!(ollama::auto_pull_allowed(&user));
+    assert!(
+        ollama::warn_remote_endpoint(&json!({})).is_ok(),
+        "default is loopback"
+    );
+}

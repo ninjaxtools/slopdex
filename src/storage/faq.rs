@@ -77,7 +77,11 @@ impl Database {
     pub(crate) fn put_faq(&self, contract: &str, entry: &FaqEntry) -> Result<()> {
         validate_embedding_reference(&self.conn, Some(&entry.question_embedding))?;
         validate_embedding_reference(&self.conn, Some(&entry.answer_embedding))?;
-        let tx = self.conn.unchecked_transaction()?;
+        // Immediate: `exists` reads before the schema insert writes.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         // Additive, on-demand migration: ordinary warm opens never acquire a writer.
         if !exists(&tx)? {
             tx.execute_batch(SCHEMA)?;

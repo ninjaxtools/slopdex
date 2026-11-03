@@ -1,8 +1,43 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     path::{Component, Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    time::{Duration, Instant},
 };
+
+/// Upper bound for any single Git invocation. Generous for huge repositories,
+/// but a hung filter or credential helper must not stall indexing forever.
+const GIT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Base blobs are only compared against indexed (size-capped) files; anything
+/// larger cannot match an indexed callable, so it is treated as all-new.
+const MAX_BASE_BLOB_BYTES: usize = 16 * 1024 * 1024;
+/// Environment that would let the caller's shell redirect Git to a different
+/// repository than the `-C` root selects.
+const GIT_ENV_REMOVED: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_NAMESPACE",
+];
+
+fn git_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("--no-optional-locks")
+        // Read-only plumbing must not execute a repository-configured monitor.
+        .args(["-c", "core.fsmonitor=false"])
+        .arg("-C")
+        .arg(root)
+        .stdin(Stdio::null());
+    for key in GIT_ENV_REMOVED {
+        command.env_remove(key);
+    }
+    command
+}
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -53,13 +88,93 @@ pub struct Changes {
 }
 
 fn output(root: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(root)
+    output_capped(root, args, None)
+}
+
+/// Run Git with a deadline. When `stdout_cap` is set, stdout collection stops
+/// at `cap + 1` bytes so an oversized result is rejected without first being
+/// held whole in memory; the extra byte makes overflow detectable.
+fn output_capped(root: &Path, args: &[&str], stdout_cap: Option<usize>) -> Result<Output> {
+    let mut child = git_command(root)
         .args(args)
-        .output()
-        .context("Run Git")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Run Git")?;
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stdout_thread = std::thread::spawn(move || {
+        // Keep draining after reaching cap so child doesn't block on pipe;
+        // retained bytes are only cap+1, enough to detect overflow.
+        let limit = stdout_cap.map(|cap| cap + 1).unwrap_or(usize::MAX);
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stdout_pipe.read(&mut chunk) {
+                Ok(0) => break Ok(buffer),
+                Ok(read) => {
+                    if buffer.len() < limit {
+                        let keep = read.min(limit - buffer.len());
+                        buffer.extend_from_slice(&chunk[..keep]);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    });
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stderr_thread = std::thread::spawn(move || {
+        // Keep only the first 64 KiB of diagnostics, but keep draining the
+        // pipe so a verbose child cannot block on a full stderr buffer.
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stderr_pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if buffer.len() < 64 * 1024 {
+                        let keep = read.min(64 * 1024 - buffer.len());
+                        buffer.extend_from_slice(&chunk[..keep]);
+                    }
+                }
+            }
+        }
+        buffer
+    });
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait().context("Wait for Git")? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "Git timed out after {}s: git {}",
+                    GIT_TIMEOUT.as_secs(),
+                    args.join(" ")
+                );
+            }
+        }
+    };
+    let stdout = stdout_thread
+        .join()
+        .unwrap_or_else(|_| Ok(Vec::new()))
+        .context("Read Git output")?;
+    let stderr = stderr_thread.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn warn_git_discovery_once(message: String) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        crate::ui::warning(format_args!("slopdex: warning: {message}"));
+    });
 }
 
 fn text(root: &Path, args: &[&str]) -> Option<String> {
@@ -110,13 +225,55 @@ fn resolve_commit(root: &Path, reference: &str) -> Option<String> {
 }
 
 pub(crate) fn checkout_root(root: &Path) -> Result<Option<PathBuf>> {
-    let Some(top) = text(
+    let result = output(
         root,
         &["rev-parse", "--path-format=absolute", "--show-toplevel"],
-    ) else {
+    );
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            // A missing Git binary is not the same as "not a checkout": the
+            // directory may well be a repository whose history and ignore
+            // rules we then cannot see. Warn once, then degrade to plain
+            // directory behaviour like the other discovery failures below.
+            let missing = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            });
+            if missing {
+                warn_git_discovery_once(
+                    "Git executable not found; treating directories as non-Git workspaces"
+                        .to_owned(),
+                );
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        // The one silent case: genuinely not inside a work tree. Anything
+        // else (dubious ownership, corrupt repository, ...) otherwise makes
+        // subdirectories silently index as their own wrong root.
+        if !stderr.is_empty() && !stderr.contains("not a git repository") {
+            let first_line = stderr.lines().next().unwrap_or(stderr);
+            warn_git_discovery_once(format!(
+                "Git checkout discovery failed ({first_line}); treating {} as a plain directory",
+                root.display()
+            ));
+        }
+        return Ok(None);
+    }
+    let Ok(top) = String::from_utf8(output.stdout) else {
+        warn_git_discovery_once(
+            "Git reported a non-UTF-8 checkout path; treating the directory as non-Git".to_owned(),
+        );
         return Ok(None);
     };
-    Ok(Some(Path::new(&top).canonicalize()?))
+    let top = top.strip_suffix('\n').unwrap_or(&top);
+    Ok(Some(Path::new(top).canonicalize()?))
 }
 
 fn checkout(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
@@ -438,11 +595,16 @@ fn tree_blobs(checkout: &Path, resolved: &str) -> Result<HashMap<Vec<u8>, String
 /// frame the path (batch input is line-delimited).
 fn filtered_blob(root: &Path, resolved: &str, path: &[u8]) -> Option<Vec<u8>> {
     let path = std::str::from_utf8(path).ok()?;
-    bytes(
+    let output = output_capped(
         root,
         &["cat-file", "--filters", &format!("{resolved}:{path}")],
+        Some(MAX_BASE_BLOB_BYTES),
     )
-    .ok()
+    .ok()?;
+    if !output.status.success() || output.stdout.len() > MAX_BASE_BLOB_BYTES {
+        return None;
+    }
+    Some(output.stdout)
 }
 
 /// Read many blobs as a checkout would write them (EOL conversion, ident, and
@@ -473,10 +635,7 @@ fn filtered_blobs(
         ))
     );
     let terminator = format!("{sentinel} missing\n").into_bytes();
-    let mut child = Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(checkout)
+    let mut child = git_command(checkout)
         .args(["cat-file", "--batch", "--filters"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -496,6 +655,11 @@ fn filtered_blobs(
             loop {
                 let start = content.len();
                 if stdout.read_until(b'\n', &mut content).ok()? == 0 {
+                    return None;
+                }
+                // Converted blobs above the cap cannot match an indexed
+                // callable; abort batch mode instead of holding one whole.
+                if content.len() > MAX_BASE_BLOB_BYTES {
                     return None;
                 }
                 if content[start..] == terminator[..] {
@@ -589,18 +753,18 @@ pub fn changed_identities(root: &Path, resolved: &str, items: &[Item]) -> Result
             .filter(|(_, full)| !full.contains(&b'\n'))
             .filter_map(|(path, full)| Some((*path, (full.as_slice(), blobs.get(full)?.as_str()))))
             .unzip();
-        let mut sources = HashMap::new();
-        if filtered_blobs(&checkout, &requests, |index, source| {
-            sources.insert(batch[index], source);
+        // Parse each blob as it arrives instead of retaining every base
+        // source until the batch finishes. Visited blobs are complete, so a
+        // later batch failure can keep them and fall back for the rest.
+        let batch_complete = filtered_blobs(&checkout, &requests, |index, source| {
+            base.insert(batch[index], symbols(batch[index], source));
         })
-        .is_some()
-        {
+        .is_some();
+        if batch_complete {
             for (path, full) in paths.iter().zip(&full) {
                 if !blobs.contains_key(full) {
                     // Absent from the base commit: every callable is new.
                     base.insert(*path, HashSet::new());
-                } else if let Some(source) = sources.remove(path) {
-                    base.insert(*path, symbols(path, source));
                 }
             }
         }
@@ -638,6 +802,8 @@ mod tests {
             let repo = Self(tempfile::tempdir()?);
             repo.git(&["init", "--quiet", "--template=", "--object-format=sha1"])?;
             repo.git(&["config", "diff.renames", "true"])?;
+            repo.git(&["config", "core.autocrlf", "false"])?;
+            repo.git(&["config", "core.eol", "lf"])?;
             Ok(repo)
         }
 
@@ -1132,6 +1298,8 @@ mod tests {
     fn identity_supports_sha256_object_format() -> Result<()> {
         let repo = Repo(tempfile::tempdir()?);
         repo.git(&["init", "--quiet", "--template=", "--object-format=sha256"])?;
+        repo.git(&["config", "core.autocrlf", "false"])?;
+        repo.git(&["config", "core.eol", "lf"])?;
         repo.write("code.rs", "fn example() {}")?;
         let checkpoint = repo.commit()?;
         let identity = identity(repo.root())?.unwrap();

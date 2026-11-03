@@ -1,7 +1,50 @@
 //! Shared AST access: comments are layout, not expressions or bindings.
 
 use anyhow::{Context, Result};
-use tree_sitter::{Language, Node, Parser, Tree};
+use tree_sitter::{Language, Node, ParseOptions, Parser, Tree};
+
+/// Per-parse wall-clock budget. Ordinary files under the size cap parse in
+/// well under a second; grammars with superlinear worst cases (notably bash
+/// command substitution nesting) must not stall indexing indefinitely.
+const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn parse_bounded_flag(
+    parser: &mut Parser,
+    source: &[u8],
+    timeout: std::time::Duration,
+    timed_out: &mut bool,
+) -> Option<Tree> {
+    let started = std::time::Instant::now();
+    // The progress callback returns `true` to HALT parsing (it is consulted
+    // alongside the cancellation flag and the deprecated timeout clock, at
+    // most once per operation-count cycle, so checking the clock directly
+    // is cheap enough).
+    let mut deadline = |_: &tree_sitter::ParseState| {
+        if started.elapsed() > timeout {
+            *timed_out = true;
+            return true;
+        }
+        false
+    };
+    let len = source.len();
+    parser.parse_with_options(
+        &mut |offset, _| {
+            if offset < len {
+                &source[offset..]
+            } else {
+                Default::default()
+            }
+        },
+        None,
+        Some(ParseOptions::new().progress_callback(&mut deadline)),
+    )
+}
+
+/// Parse with the shared per-file deadline; `None` covers both tree-sitter
+/// failure and a deadline abort (recovery callers simply skip).
+pub(super) fn parse_bounded(parser: &mut Parser, source: impl AsRef<[u8]>) -> Option<Tree> {
+    parse_bounded_flag(parser, source.as_ref(), PARSE_TIMEOUT, &mut false)
+}
 
 /// The tree-sitter grammar for every name [`super::language_for_path`] returns.
 pub(crate) fn grammar(language: &str) -> Option<Language> {
@@ -39,9 +82,23 @@ pub(super) fn parse_with(
     parser
         .set_language(grammar)
         .with_context(|| format!("Cannot initialize {language} parser for {path}"))?;
-    let tree = parser
-        .parse(source, None)
-        .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
+    let mut timed_out = false;
+    let tree = parse_bounded_flag(
+        &mut parser,
+        source.as_bytes(),
+        PARSE_TIMEOUT,
+        &mut timed_out,
+    )
+    .with_context(|| {
+        if timed_out {
+            format!(
+                "Cannot parse {path}: exceeded the {}s per-file parse limit",
+                PARSE_TIMEOUT.as_secs()
+            )
+        } else {
+            format!("Cannot parse {path}: tree-sitter returned no tree")
+        }
+    })?;
     Ok((parser, tree))
 }
 
@@ -256,6 +313,26 @@ pub(super) fn shell_owner(mut node: Node<'_>) -> Option<Node<'_>> {
 mod tests {
     use super::*;
     use tree_sitter::Parser;
+
+    #[test]
+    fn parse_deadline_aborts_and_reports_the_timeout() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .unwrap();
+        let source = "function f() { return 1; }\n".repeat(20_000);
+        let mut timed_out = false;
+        let tree = parse_bounded_flag(
+            &mut parser,
+            source.as_bytes(),
+            std::time::Duration::ZERO,
+            &mut timed_out,
+        );
+        assert!(tree.is_none());
+        assert!(timed_out);
+        // The same source parses normally with the real budget.
+        assert!(parse_bounded(&mut parser, &source).is_some());
+    }
 
     #[test]
     fn text_reads_original_unicode_source_after_offset_preserving_repairs() {

@@ -497,6 +497,15 @@ pub(crate) fn spin<T>(label: &str, work: impl FnOnce() -> Result<T>) -> Result<T
     result
 }
 
+/// Messages can embed repository file paths and other untrusted text; on a
+/// terminal, control characters (ESC above all) must not reach it raw.
+fn sanitize_terminal(message: String) -> String {
+    message
+        .chars()
+        .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
+        .collect()
+}
+
 /// Engine/library calls remain silent unless a CLI operation owns the display.
 pub(crate) fn progress(message: impl Display) {
     if let Some(active) = ACTIVE
@@ -504,7 +513,7 @@ pub(crate) fn progress(message: impl Display) {
         .unwrap_or_else(PoisonError::into_inner)
         .as_mut()
     {
-        active.state.message(message.to_string());
+        active.state.message(sanitize_terminal(message.to_string()));
         active.render();
     }
 }
@@ -520,8 +529,10 @@ fn log(level: Level, message: impl Display) {
     let active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(display) = active.as_ref().and_then(|active| active.display.as_ref()) {
         // MultiProgress serializes notices from HTTP workers above the animation.
+        let message = sanitize_terminal(message);
         display.group.println(&message);
     } else if terminal() {
+        let message = sanitize_terminal(message);
         let _ = match level {
             Level::Info => cliclack::log::info(&message),
             Level::Warning => cliclack::log::warning(&message),

@@ -1,0 +1,18 @@
+name: Dependency advisories
+
+on:
+  schedule:
+    # Mondays 06:17 UTC; advisories arrive independently of pushes.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check advisories

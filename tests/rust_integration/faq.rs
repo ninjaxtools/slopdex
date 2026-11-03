@@ -628,6 +628,13 @@ fn faq_and_description_request_caches_survive_index_deletion_and_default_pruning
     let repo = Repo::new()?;
     let config = mock.config();
     repo.write(".slopdex/config.json", &config.to_string())?;
+    // Repository-selected config cannot choose the artifact store; pruning
+    // adopts the destination from this fixture's user config instead.
+    std::fs::create_dir_all(repo.home.join("slopdex"))?;
+    std::fs::write(
+        repo.home.join("slopdex/config.json"),
+        json!({"artifactCachePath": config["artifactCachePath"]}).to_string(),
+    )?;
     repo.write("code.rs", &function("selected", "VECTOR_EAST"))?;
     let mut engine = repo.open(&config)?;
     engine.refresh()?;

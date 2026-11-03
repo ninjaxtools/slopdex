@@ -136,6 +136,30 @@ impl Llm for Harness {
     }
 }
 
+/// Kill the harness and anything it spawned. Unix children run in their own
+/// process group; Windows uses taskkill's tree mode. Falls back to killing
+/// only the direct child everywhere.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: the negative pid targets exactly the process group created
+        // for this child; a group that already exited makes kill a no-op error.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 fn run(args: &[String], input: Vec<u8>, timeout: Duration) -> Result<String> {
     // Use files instead of pipes: a child may write before consuming stdin, or
     // leave inherited stdout open in a background process. Neither may deadlock
@@ -146,21 +170,28 @@ fn run(args: &[String], input: Vec<u8>, timeout: Duration) -> Result<String> {
     stdin.seek(SeekFrom::Start(0))?;
     let mut stdout = tempfile::tempfile()?;
     let stderr = tempfile::tempfile()?;
-    let mut child = Command::new(&args[0])
+    let mut command = Command::new(&args[0]);
+    command
         .args(&args[1..])
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout.try_clone()?))
-        .stderr(Stdio::from(stderr.try_clone()?))
-        .spawn()
-        .map_err(|_| {
-            anyhow!("Could not start agent command; check the executable and arguments")
-        })?;
+        .stderr(Stdio::from(stderr.try_clone()?));
+    // Own process group (Unix) so a timeout can kill grandchildren a harness
+    // spawned, not only its direct child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|_| {
+        anyhow!("Could not start agent command; check the executable and arguments")
+    })?;
     let start = Instant::now();
     let status = loop {
         if stdout.metadata().map_or(true, |m| m.len() > MAX_OUTPUT)
             || stderr.metadata().map_or(true, |m| m.len() > MAX_OUTPUT)
         {
-            let _ = child.kill();
+            kill_tree(&mut child);
             let _ = child.wait();
             bail!("Agent output exceeds size limit");
         }
@@ -168,7 +199,7 @@ fn run(args: &[String], input: Vec<u8>, timeout: Duration) -> Result<String> {
             Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() < timeout => thread::sleep(Duration::from_millis(10)),
             result => {
-                let _ = child.kill();
+                kill_tree(&mut child);
                 let _ = child.wait();
                 if result.is_err() {
                     bail!("Could not wait for agent command");

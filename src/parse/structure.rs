@@ -188,7 +188,10 @@ fn unquote(value: &str) -> String {
     value.trim_matches(['\'', '"', '`', '<', '>']).to_owned()
 }
 
-fn callable(kind: &str) -> bool {
+/// The node kinds that own a callable body. The one definition every
+/// consumer (structure, filter, map, call graph) shares, so adding a kind
+/// cannot diverge between them.
+pub(crate) fn is_callable_kind(kind: &str) -> bool {
     matches!(kind, "function" | "method" | "constructor" | "generator")
 }
 
@@ -628,7 +631,7 @@ impl Collector<'_> {
                     | "field_definition"
             ) {
                 if let Some(value) = value(node) {
-                    if callable(kind) || container(kind) || value.kind() == "object" {
+                    if is_callable_kind(kind) || container(kind) || value.kind() == "object" {
                         self.walk_bound(value, id, kind, in_callable);
                     } else {
                         self.walk(value, parent, in_callable);
@@ -636,7 +639,7 @@ impl Collector<'_> {
                 }
                 return;
             }
-            let local = if callable(kind) {
+            let local = if is_callable_kind(kind) {
                 true
             } else if container(kind) {
                 false
@@ -686,7 +689,7 @@ impl Collector<'_> {
                 ) {
                     continue;
                 }
-                let child_parent = if callable(kind)
+                let child_parent = if is_callable_kind(kind)
                     || container(kind)
                     || type_scope && syntax == "property_signature"
                 {
@@ -734,7 +737,7 @@ impl Collector<'_> {
     }
 
     fn walk_bound(&mut self, value: Node<'_>, id: usize, kind: &str, in_callable: bool) {
-        if callable(kind) {
+        if is_callable_kind(kind) {
             if let Some(body) = value.child_by_field_name("body") {
                 self.walk(body, Some(id), true);
             }
@@ -1199,7 +1202,7 @@ impl Collector<'_> {
                 kind = "constant";
             }
         }
-        if callable(kind)
+        if is_callable_kind(kind)
             && (syntax.contains("generator")
                 || value(node).is_some_and(|v| v.kind() == "generator_function")
                 || {
@@ -1410,7 +1413,7 @@ impl Collector<'_> {
             edits.push((args.start_byte(), args.end_byte()));
         }
         if let Some(body) = node.child_by_field_name("body")
-            && (callable(kind)
+            && (is_callable_kind(kind)
                 || container(kind)
                 || matches!(
                     syntax,

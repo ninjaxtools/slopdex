@@ -199,7 +199,8 @@ impl Engine {
                         if !metadata.is_file() {
                             return None;
                         }
-                        fs::read(path).ok().map(hash)
+                        let max_size = self.config["maxFileSize"].as_u64().unwrap_or(1_048_576);
+                        discovery::hash_file_capped(&path, max_size)
                     })
                     .as_ref()
                     == Some(expected)

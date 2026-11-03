@@ -1,6 +1,6 @@
 //! Tree-sitter structure for configuration and markup, with bounded text search units.
 
-use super::syntax::{grammar, parse_with, text};
+use super::syntax::{grammar, parse_bounded, parse_with, text};
 use super::{Diagnostic, FileStructure, ParsedFile, StructureNode};
 use anyhow::{Context, Result};
 use std::{
@@ -35,8 +35,7 @@ pub(super) fn parse(
         Cow::Borrowed(source)
     };
     if matches!(input, Cow::Owned(_)) {
-        tree = parser
-            .parse(input.as_bytes(), None)
+        tree = parse_bounded(&mut parser, input.as_bytes())
             .with_context(|| format!("Cannot parse {path}: tree-sitter returned no tree"))?;
     }
     let mut errors = Vec::new();

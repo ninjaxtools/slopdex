@@ -15,6 +15,7 @@
 //! Do not incrementally reparse the returned tree: its grammar scaffold has been
 //! translated into original coordinates, rather than parsed incrementally there.
 
+use super::syntax::parse_bounded;
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
@@ -57,7 +58,7 @@ pub(super) fn recover(parser: &mut Parser, mut tree: Tree, source: &str) -> Tree
 /// Shell line continuations join identifier fragments without adding spaces.
 pub(super) fn function_name(source: &str, node: Node<'_>) -> Option<String> {
     let name = node.child_by_field_name("name")?;
-    Some(join_continuations(&source[name.byte_range()]))
+    Some(join_continuations(super::syntax::text(source, name)))
 }
 
 /// The callable header excludes its body and all executable redirection data.
@@ -204,7 +205,7 @@ fn reparse(parser: &mut Parser, source: &str, edits: &[Edit]) -> Option<Tree> {
         position = edit.range.end;
     }
     input.extend_from_slice(&source.as_bytes()[position..]);
-    let mut tree = parser.parse(&input, None)?;
+    let mut tree = parse_bounded(parser, &input)?;
     for inverse in inverses.iter().rev() {
         tree.edit(inverse);
     }
@@ -553,7 +554,7 @@ fn expansion_end(parser: &mut Parser, source: &str, start: usize, end: usize) ->
 
 /// Length of a complete expansion at the beginning of `fragment`, if any.
 fn parsed_expansion_end(parser: &mut Parser, fragment: &str) -> Option<usize> {
-    let tree = parser.parse(fragment, None)?;
+    let tree = parse_bounded(parser, fragment)?;
     descendants(tree.root_node())
         .find(|n| {
             n.start_byte() == 0
@@ -590,7 +591,7 @@ impl ExpansionChunk {
             stop += 1;
         }
         let mut ends = std::collections::HashMap::new();
-        if let Some(tree) = parser.parse(&source[start..stop], None) {
+        if let Some(tree) = parse_bounded(parser, &source[start..stop]) {
             for node in descendants(tree.root_node()) {
                 if matches!(
                     node.kind(),
@@ -828,7 +829,7 @@ fn scaffold_header_sibling(
     if start >= header.end {
         return;
     }
-    let Some(fragment) = parser.parse(&source[start..header.end], None) else {
+    let Some(fragment) = parse_bounded(parser, &source[start..header.end]) else {
         return;
     };
     if !fragment.root_node().has_error() {
@@ -1007,7 +1008,7 @@ fn recover_functions(
         ) {
             continue;
         }
-        let Some(parsed) = parser.parse(&source[body..], None) else {
+        let Some(parsed) = parse_bounded(parser, &source[body..]) else {
             continue;
         };
         let Some(command) = descendants(parsed.root_node()).find(|n| {

@@ -44,6 +44,10 @@ impl Repo {
         };
         if git {
             repo.git(&["init", "--quiet"])?;
+            // Persist the EOL policy (AGENTS.md): in-process Engine Git
+            // children do not inherit this fixture's per-child isolation.
+            repo.git(&["config", "--local", "core.autocrlf", "false"])?;
+            repo.git(&["config", "--local", "core.eol", "lf"])?;
         }
         Ok(repo)
     }
@@ -425,9 +429,11 @@ mod unix {
             let locked = repo.root.join("locked");
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
             if fs::read_dir(&locked).is_ok() {
-                // Privileged users bypass directory permissions.
+                // Privileged users bypass directory permissions. Skip only
+                // this iteration, visibly, instead of passing the whole test.
                 fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
-                return Ok(());
+                eprintln!("skipping unreadable-directory case git={git}: permissions bypassed");
+                continue;
             }
             let result = repo.open().and_then(|mut engine| {
                 let first = engine.refresh_structure()?;

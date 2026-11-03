@@ -139,13 +139,13 @@ By default code and docs indexes are searched and ranked together, see `--format
 
 ```console
 $ slopdex search "keep the repository index synchronized"
-*** src/engine.rs
-@@ 914-1082 @@ score=0.4284
+*** src/engine/search.rs
+@@ 274-296 @@ score=0.4284
 impl Engine
-  pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>>
+  pub(crate) fn search_limited(&self, query: &str, kind: &str, options: &Value) -> Result<LimitedResults<Value>>
 
-*** src/engine.rs
-@@ 376-409 @@ score=0.4200
+*** src/engine/presentation.rs
+@@ 12-16 @@ score=0.4200
 impl Engine
   pub fn map(&self, options: &Value) -> Result<Vec<Value>>
 ...

@@ -108,21 +108,11 @@ impl Engine {
                 let occurrence = occurrences
                     .entry(callable.qualified_name.clone())
                     .or_default();
-                let identity = hash(
-                    json!([
-                        prepared.file.path,
-                        callable.qualified_name,
-                        callable.kind,
-                        *occurrence
-                    ])
-                    .to_string(),
-                );
+                let identity =
+                    crate::storage::callable_identity(&prepared.file.path, callable, *occurrence);
                 *occurrence += 1;
-                let mut data = serde_json::to_value(callable)?;
-                data["path"] = json!(prepared.file.path);
-                data["sourceMode"] = json!(prepared.file.source_mode);
+                let mut data = crate::storage::callable_data(&prepared.file, callable)?;
                 let old = existing.get(identity.as_str()).copied();
-                data["sourceDescription"] = json!(callable.description.is_some());
                 let unchanged = old.is_some_and(|item| {
                     item.data["sourceHash"] == data["sourceHash"]
                         && item.data["description"].is_string()
@@ -424,18 +414,21 @@ impl Engine {
             .collect();
         if self.readonly {
             for (key, _) in &keys {
-                if self.db.embedding(key)?.is_none() {
+                if !self.db.embedding_exists(key)? {
                     return Err(NeedsWrite.into());
                 }
             }
             return Ok(());
         }
         self.artifacts.hydrate_embeddings(&self.db, &keys)?;
+        // Keys were computed once above for hydration, in flattened group
+        // order; consume them instead of re-serializing the profile per input.
+        let mut keys = keys.into_iter();
         for inputs in groups {
             let mut pending = BTreeMap::new();
             for input in inputs {
-                let key = Database::embedding_key(&profile, query, &input);
-                if seen.insert(key.clone()) && self.db.embedding(&key)?.is_none() {
+                let (key, _) = keys.next().expect("keys mirror the input groups");
+                if seen.insert(key.clone()) && !self.db.embedding_exists(&key)? {
                     pending.insert(key, input);
                 }
             }
@@ -459,12 +452,11 @@ impl Engine {
                 let conn = crate::cache::open_store(global_path, true)?;
                 let mut found = BTreeMap::new();
                 let mut missing = Vec::new();
+                let mut existing =
+                    conn.prepare_cached("SELECT vector FROM embeddings WHERE key=?")?;
                 for (key, text) in entries {
-                    let bytes: Option<Vec<u8>> = conn
-                        .query_row("SELECT vector FROM embeddings WHERE key=?", [key], |row| {
-                            row.get(0)
-                        })
-                        .optional()?;
+                    let bytes: Option<Vec<u8>> =
+                        existing.query_row([key], |row| row.get(0)).optional()?;
                     match bytes {
                         Some(bytes) => {
                             found.insert(key.clone(), crate::storage::decode(&bytes)?);
@@ -494,8 +486,13 @@ impl Engine {
                     vectors.len() == entries.len(),
                     "Provider returned the wrong number of embeddings"
                 );
+                self.db.put_embeddings(
+                    entries
+                        .iter()
+                        .zip(&vectors)
+                        .map(|((key, _), vector)| (key.as_str(), vector.as_slice())),
+                )?;
                 for ((key, _), vector) in entries.iter().zip(vectors) {
-                    self.db.put_embedding(key, &vector)?;
                     self.artifacts.put_embedding(&self.db, key, &vector);
                 }
                 Ok(())
@@ -504,9 +501,11 @@ impl Engine {
     }
 
     fn parallelism(&self) -> Result<usize> {
+        // Config validation bounds this at open; clamp again so no config
+        // path can spawn an unbounded thread window in run_jobs.
         let parallelism = self.config["parallelism"].as_u64().unwrap_or(10) as usize;
         ensure!(parallelism > 0, "parallelism must be positive");
-        Ok(parallelism)
+        Ok(parallelism.min(256))
     }
 
     fn embedding_parallelism(&self) -> Result<usize> {
@@ -524,7 +523,7 @@ impl Engine {
             .and_then(Value::as_u64)
             .unwrap_or(default) as usize;
         ensure!(value > 0, "embeddingParallelism must be positive");
-        Ok(value)
+        Ok(value.min(256))
     }
 
     pub(super) fn embed_one(&self, input: &str, query: bool) -> Result<String> {

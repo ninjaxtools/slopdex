@@ -122,6 +122,22 @@ pub(super) fn source_paths_subset(
     let mut walker = ignore::WalkBuilder::new(root);
     let filter_root = root.to_owned();
     let candidates = candidates.cloned();
+    // Ancestor directories of every candidate, computed once: the per-entry
+    // filter would otherwise allocate a joined PathBuf per (directory x
+    // candidate) pair, quadratic on large candidate sets.
+    let candidate_directories: Option<std::collections::HashSet<PathBuf>> =
+        candidates.as_ref().map(|paths| {
+            paths
+                .iter()
+                .flat_map(|path| {
+                    filter_root
+                        .join(path)
+                        .ancestors()
+                        .map(Path::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        });
     let global_path = crate::cache::store_path(config)?;
     walker
         .hidden(false)
@@ -142,11 +158,9 @@ pub(super) fn source_paths_subset(
                 {
                     return false;
                 }
-                return candidates.as_ref().is_none_or(|paths| {
-                    paths
-                        .iter()
-                        .any(|path| filter_root.join(path).starts_with(entry.path()))
-                });
+                return candidate_directories
+                    .as_ref()
+                    .is_none_or(|directories| directories.contains(entry.path()));
             }
             candidates.as_ref().is_none_or(|paths| {
                 relative(&filter_root, entry.path())
@@ -338,8 +352,11 @@ pub(super) fn indexing_policy(
         }
     }
     let global_ignore = git::excludes_file(root).or_else(|| {
+        // Only absolute XDG values count (as in user_config_path); a relative
+        // one would make the fingerprinted ignore path cwd-dependent.
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
             .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
             .map(|directory| directory.join("git/ignore"))
     });
@@ -357,14 +374,55 @@ thread_local! {
 }
 
 pub(crate) fn read_source(root: &Path, path: &str, max_size: u64) -> Result<String> {
+    use std::io::Read;
     #[cfg(test)]
     SOURCE_READS.with(|reads| reads.set(reads.get() + 1));
     let path = root.join(path);
+    // Open once and judge the same handle that is read: a path checked with
+    // metadata and then reopened could have grown (or been swapped for a
+    // non-regular file) past the cap in between.
+    let file = fs::File::open(&path)?;
     ensure!(
-        fs::metadata(&path)?.len() <= max_size,
+        file.metadata()?.is_file(),
+        "Source path is not a regular file: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.take(max_size + 1)
+        .read_to_end(&mut bytes)
+        .context("Cannot read UTF-8 source")?;
+    ensure!(
+        bytes.len() as u64 <= max_size,
         "File exceeds maxFileSize ({max_size} bytes)"
     );
-    fs::read_to_string(&path).context("Cannot read UTF-8 source")
+    String::from_utf8(bytes).context("Cannot read UTF-8 source")
+}
+
+/// Streaming SHA-256 of a regular file, `None` for anything unreadable,
+/// non-regular, or larger than `max_size` -- callers treat all of those as
+/// "changed", so a growing file is never loaded whole just to compare hashes.
+pub(super) fn hash_file_capped(path: &Path, max_size: u64) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read as u64)?;
+        if total > max_size {
+            return None;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 pub(crate) fn normalize_path(root: &Path, path: &str) -> Result<String> {

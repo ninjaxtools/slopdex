@@ -290,8 +290,25 @@ fn build(dimensions: usize, vectors: &[(u64, Vec<f32>)]) -> Result<Index> {
     Ok(index)
 }
 
+/// Stream-hash a file without holding it in memory.
+fn hash_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn load_cached(path: &Path, dimensions: usize) -> Result<(Index, Manifest)> {
-    let manifest: Manifest = serde_json::from_slice(&fs::read(manifest_path(path))?)?;
+    let manifest: Manifest = serde_json::from_reader(fs::File::open(manifest_path(path))?)?;
     ensure!(
         manifest.version == VERSION
             && manifest.usearch_version == usearch::version()
@@ -302,11 +319,22 @@ fn load_cached(path: &Path, dimensions: usize) -> Result<(Index, Manifest)> {
         manifest.fingerprint == manifest.compute_fingerprint()?,
         "invalid snapshot fingerprint"
     );
-    let binary = fs::read(path)?;
+    // Reject implausibly large binaries and verify the hash by streaming
+    // before loading anything: a corrupt or planted oversized file must not
+    // be read whole into memory just to discover it does not match.
+    let per_vector = (dimensions as u64).saturating_mul(4).saturating_add(8192);
+    let size_cap = (manifest.vectors.len() as u64)
+        .saturating_mul(per_vector)
+        .saturating_add(16 * 1024 * 1024);
     ensure!(
-        crate::hash(&binary) == manifest.binary_hash,
+        fs::metadata(path)?.len() <= size_cap,
+        "vector binary is larger than its manifest allows"
+    );
+    ensure!(
+        hash_file(path)? == manifest.binary_hash,
         "vector binary hash mismatch"
     );
+    let binary = fs::read(path)?;
 
     let index = new_index(dimensions)?;
     // USearch's load_from_buffer copies through its bounds-checked input stream.

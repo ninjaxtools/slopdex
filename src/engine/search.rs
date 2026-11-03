@@ -310,23 +310,27 @@ impl Engine {
         if !content && !symbols {
             return Ok(Vec::new());
         }
+        // Completeness is judged only over the paths this search can return:
+        // an unselected file missing its embedding must not fail a narrow
+        // read-only search that could never surface it.
         ensure!(
             (!content || !self.structural_only)
                 && self.items.iter().all(|item| {
-                    content_group(item).is_none_or(|group| !groups.contains(&group))
+                    !formats.path_matches(&item.path)
+                        || content_group(item).is_none_or(|group| !groups.contains(&group))
                         || !item.embedding.is_empty()
                 })
                 && (!descriptions
                     || (self
                         .items
                         .iter()
-                        .filter(|item| formats.format_matches(&item.path))
+                        .filter(|item| formats.path_matches(&item.path))
                         .all(|item| !item.data["description"].is_string()
                             || item.description_embedding.is_some())
                         && self
                             .files
                             .values()
-                            .filter(|file| formats.format_matches(&file.path))
+                            .filter(|file| formats.path_matches(&file.path))
                             .all(|file| file.description.is_none()
                                 || file.description_embedding.is_some()))),
             "Semantic index is incomplete for the configured profiles; run without --no-reindex to prepare it"

@@ -6,7 +6,18 @@ use std::os::unix::fs::symlink;
 fn git_command(root: &Path, args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("git")
         .current_dir(root)
-        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", root.join(".fixture-gitconfig"))
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .args(args)
         .output()?;
     ensure!(
@@ -22,6 +33,8 @@ fn git_fixture() -> Result<(tempfile::TempDir, Engine)> {
     let root = temp.path().join("repo");
     fs::create_dir(&root)?;
     git_command(&root, &["init", "-q"])?;
+    git_command(&root, &["config", "--local", "core.autocrlf", "false"])?;
+    git_command(&root, &["config", "--local", "core.eol", "lf"])?;
     fs::write(root.join("source.rs"), "pub fn first() {}\n")?;
     git_command(&root, &["add", "."])?;
     git_command(&root, &["commit", "-qm", "initial"])?;
@@ -994,4 +1007,12 @@ fn config_globs_and_selector_globs_keep_their_documented_dialects() -> Result<()
     assert!(selector("!a.rs", "b.rs")?);
     assert!(!selector("!a.rs", "a.rs")?);
     Ok(())
+}
+
+#[test]
+fn cosine_is_neutral_for_zero_or_mismatched_vectors() {
+    assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    assert_eq!(cosine(&[1.0], &[1.0, 0.0]), 0.0);
+    assert_eq!(cosine(&[], &[]), 0.0);
+    assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-9);
 }

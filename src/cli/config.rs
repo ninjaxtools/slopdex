@@ -62,8 +62,15 @@ pub(super) fn redacted(value: &Value) -> Value {
             object
                 .iter()
                 .map(|(key, value)| {
+                    // Command arguments may carry wrapper credentials (see
+                    // providers::llm); show only the executable name.
                     let shown = if is_secret_key(key) && !value.is_null() {
                         json!("<redacted>")
+                    } else if matches!(key.as_str(), "agentCommand" | "rerankerCommand")
+                        && let Some(args) = value.as_array()
+                        && args.len() > 1
+                    {
+                        json!([args[0], "<redacted>"])
                     } else {
                         redacted(value)
                     };
@@ -158,6 +165,33 @@ fn mark_repository_config_from(config: &mut Value, global: &Global, user: &Path)
     object.remove("trustedEndpointHosts");
     object.remove(TRUST_REPOSITORY_ENDPOINTS_KEY);
     object.remove(crate::providers::TRUST_COMMANDS_KEY);
+    // Local destination, remote artifact sharing, and model download keys are
+    // grants of local/network authority: a repository must not redirect the
+    // workspace index or artifact store, upload artifacts to its own bucket
+    // with ambient credentials, or trigger downloads. Values from the user's
+    // own config are adopted below, and an explicit --index still applies.
+    let mut stripped = Vec::new();
+    for key in [
+        "artifactCachePath",
+        "artifactS3",
+        "indexPath",
+        "ollamaAutoPull",
+    ] {
+        // effective_config inserts an explicit --index before marking, so
+        // that value is the caller's choice rather than the repository's.
+        if key == "indexPath" && global.index.is_some() {
+            continue;
+        }
+        if object.remove(key).is_some_and(|value| !value.is_null()) {
+            stripped.push(key);
+        }
+    }
+    if !stripped.is_empty() {
+        ui::warning(format_args!(
+            "slopdex: warning: ignoring repository-config {} (set in user config to allow)",
+            stripped.join(", ")
+        ));
+    }
     if global.trust_repo_commands {
         object.insert(crate::providers::TRUST_COMMANDS_KEY.into(), json!(true));
     }
@@ -168,6 +202,26 @@ fn mark_repository_config_from(config: &mut Value, global: &Global, user: &Path)
     if let Some(hosts) = user.get("trustedEndpointHosts") {
         validate_trusted_hosts(hosts)?;
         config["trustedEndpointHosts"] = hosts.clone();
+    }
+    if let Some(value) = user.get("artifactS3").filter(|value| !value.is_null()) {
+        ensure!(
+            value.is_object(),
+            "artifactS3 in user config must be an object"
+        );
+        config["artifactS3"] = value.clone();
+    }
+    // The stripped destination keys may still come from the user's own config.
+    for key in ["indexPath", "artifactCachePath"] {
+        if let Some(value) = user.get(key).filter(|value| !value.is_null()) {
+            ensure!(
+                value.as_str().is_some_and(|text| !text.trim().is_empty()),
+                "{key} in user config must be a non-empty string"
+            );
+            config[key] = value.clone();
+        }
+    }
+    if let Some(index) = &global.index {
+        config["indexPath"] = json!(absolute(index)?);
     }
     Ok(())
 }
@@ -182,12 +236,25 @@ fn validate_trusted_hosts(value: &Value) -> Result<()> {
     Ok(())
 }
 
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
 fn read_config(path: &Path) -> Result<Value> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(json!({})),
         Err(error) => return Err(error).with_context(|| format!("read config {}", path.display())),
     };
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(
+        &mut io::Read::take(&mut file, MAX_CONFIG_BYTES as u64 + 1),
+        &mut bytes,
+    )
+    .with_context(|| format!("read config {}", path.display()))?;
+    ensure!(
+        bytes.len() <= MAX_CONFIG_BYTES,
+        "config exceeds the {MAX_CONFIG_BYTES}-byte limit: {}",
+        path.display()
+    );
     let mut value: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse config {}", path.display()))?;
     ensure!(
@@ -372,24 +439,8 @@ fn validate_config(config: &Value) -> Result<()> {
             );
         }
     }
-    for key in [
-        "dimensions",
-        "maxFileSize",
-        "embeddingBatchSize",
-        "parallelism",
-        "embeddingParallelism",
-        "agentTimeoutMs",
-        "ollamaNativeDimensions",
-        "ollamaContextLength",
-        "ollamaPullTimeoutMs",
-    ] {
-        if let Some(value) = config.get(key) {
-            ensure!(
-                value.as_u64().is_some_and(|n| n > 0),
-                "{key} must be a positive integer"
-            );
-        }
-    }
+    // Numeric bounds live in limits::validate_config (called above), shared
+    // with the library Engine entry points.
     for key in [
         "rerankingEnabled",
         "verbose",
@@ -428,14 +479,7 @@ fn validate_config(config: &Value) -> Result<()> {
                 "rerankerModel must be a non-empty string"
             );
         }
-        if config["rerankerProvider"] == "command"
-            && let Some(count) = config.get("rerankerCandidates")
-        {
-            ensure!(
-                count.as_u64().is_some_and(|n| (1..=100).contains(&n)),
-                "rerankerCandidates must be between 1 and 100"
-            );
-        }
+        // rerankerCandidates bounds are validated unconditionally above.
     }
     if let Some(s3) = config.get("artifactS3") {
         ensure!(s3.is_object(), "artifactS3 must be an object");
@@ -537,8 +581,9 @@ fn exclude_cross_search(global: &Global, config: &mut Value, args: &[String]) ->
         } else {
             0
         };
+        // Last separator: Unix file names may themselves contain ':'.
         let separator = selector[start..]
-            .find(':')
+            .rfind(':')
             .map(|index| index + start)
             .context("expected <file>:<symbol> for cross-search exclusion")?;
         let (file, symbol) = (&selector[..separator], &selector[separator + 1..]);
@@ -547,6 +592,16 @@ fn exclude_cross_search(global: &Global, config: &mut Value, args: &[String]) ->
             "expected <file>:<symbol> for cross-search exclusion"
         );
         let path = root.join(file);
+        // Absolute selectors outside the root are an established user-supplied
+        // input form; the size bound still applies. A metadata failure falls
+        // through to the read so its error keeps the "read source" context.
+        let max_size = config["maxFileSize"].as_u64().unwrap_or(1_048_576);
+        if let Ok(metadata) = fs::metadata(&path) {
+            ensure!(
+                metadata.len() <= max_size,
+                "cross-search exclusion file exceeds maxFileSize ({max_size} bytes): {file}"
+            );
+        }
         let source =
             fs::read_to_string(&path).with_context(|| format!("read source {}", path.display()))?;
         let parsed = parse::parse(file, &source)?;
@@ -723,12 +778,21 @@ pub(super) fn run_config(
         exclude_cross_search(global, &mut config, args)?
     } else if !interactive {
         ensure!(args.len() == 3, "usage: slopdex config set <key> <value>");
-        let key = &args[1];
         ensure!(
-            key.split('.').all(|part| !part.is_empty()),
+            args[1].split('.').all(|part| !part.is_empty()),
             "config set expects a non-empty key path"
         );
-        check_settable_key(key)?;
+        check_settable_key(&args[1])?;
+        // Aliases are read-time compatibility only. Writing the alias key
+        // would be silently discarded on the next load (canonical wins), so
+        // store under the canonical name and report that name back.
+        let key = match args[1].as_str() {
+            "embeddingProvider" => "provider".to_owned(),
+            "embeddingModel" => "model".to_owned(),
+            "embeddingDimensions" => "dimensions".to_owned(),
+            other => other.to_owned(),
+        };
+        let key = &key;
         let value = serde_json::from_str::<Value>(&args[2]).unwrap_or_else(|_| json!(args[2]));
         if let Some(value) = value.as_str() {
             match key.as_str() {
@@ -815,7 +879,11 @@ pub(super) fn run_config(
             "verbose",
         ]
         .iter()
-        .filter_map(|key| config.get(*key).map(|value| format!("{key}: {value}")))
+        .filter_map(|key| {
+            redacted(&config)
+                .get(*key)
+                .map(|value| format!("{key}: {value}"))
+        })
         .collect::<Vec<_>>()
         .join("\n");
         cliclack::note("Saved settings", summary)?;

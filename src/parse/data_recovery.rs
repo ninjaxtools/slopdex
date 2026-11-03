@@ -1,7 +1,7 @@
 //! Bounded repairs of unexpected scalar tokens. Never blank an ERROR subtree:
 //! grammars can include healthy siblings, strings, or heredocs in that range.
 
-use super::super::syntax::text;
+use super::super::syntax::{parse_bounded, text};
 use tree_sitter::{Node, Parser, Tree};
 
 const MAX_REPAIRS: usize = 16;
@@ -90,7 +90,7 @@ pub(super) fn recover(parser: &mut Parser, mut tree: Tree, source: &str, languag
                 continue;
             }
             repaired[byte] = b'0';
-            if let Some(candidate) = parser.parse(&repaired, None)
+            if let Some(candidate) = parse_bounded(parser, &repaired)
                 && errors(candidate.root_node()) < score
                 && candidate.root_node().end_byte() >= tree.root_node().end_byte()
             {

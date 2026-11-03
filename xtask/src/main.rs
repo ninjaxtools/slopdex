@@ -92,7 +92,7 @@ fn run() -> Result<()> {
             "--help",
         ],
     )?;
-    for name in ["search", "cross-search", "faq", "lines", "refactor"] {
+    for name in EXPECTED_COMMANDS {
         if !help.contains(name) {
             return Err(format!("Native help is missing {name}").into());
         }
@@ -149,12 +149,7 @@ fn check_package_contents() -> Result<()> {
         .collect();
     let unwanted: Vec<_> = files
         .iter()
-        .filter(|file| {
-            ["evals/", ".github/", "npm/"]
-                .iter()
-                .any(|prefix| file.starts_with(prefix))
-                || file.ends_with(".png")
-        })
+        .filter(|file| is_unwanted_package_file(file))
         .collect();
     if !unwanted.is_empty() {
         return Err(format!(
@@ -168,6 +163,34 @@ fn check_package_contents() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Every top-level subcommand the native binary must advertise in --help.
+const EXPECTED_COMMANDS: &[&str] = &[
+    "search",
+    "search-code",
+    "search-descriptions",
+    "search-docs",
+    "search-symbols",
+    "faq",
+    "cross-search",
+    "map",
+    "lines",
+    "refactor",
+    "status",
+    "index",
+    "generate",
+    "update",
+    "cache",
+    "help",
+    "config",
+];
+
+fn is_unwanted_package_file(file: &str) -> bool {
+    ["evals/", ".github/", "npm/"]
+        .iter()
+        .any(|prefix| file.starts_with(prefix))
+        || file.ends_with(".png")
 }
 
 fn command(program: &str, args: &[&str]) -> Result<()> {
@@ -189,4 +212,38 @@ fn capture(program: &str, args: &[&str]) -> Result<String> {
         return Err(format!("{program} {} failed ({})", args.join(" "), output.status).into());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EXPECTED_COMMANDS, is_unwanted_package_file};
+
+    #[test]
+    fn package_exclusions_cover_harnesses_artwork_and_release_plumbing() {
+        for file in [
+            "evals/run.py",
+            ".github/workflows/rust.yml",
+            "npm/package.json",
+            "dexter.png",
+            "docs/logo.png",
+        ] {
+            assert!(is_unwanted_package_file(file), "{file}");
+        }
+        for file in [
+            "README.md",
+            "LICENSE",
+            "src/lib.rs",
+            "tests/rust_integration.rs",
+        ] {
+            assert!(!is_unwanted_package_file(file), "{file}");
+        }
+    }
+
+    #[test]
+    fn expected_commands_are_unique_and_nonempty() {
+        assert!(EXPECTED_COMMANDS.len() >= 17);
+        let unique: std::collections::HashSet<_> = EXPECTED_COMMANDS.iter().collect();
+        assert_eq!(unique.len(), EXPECTED_COMMANDS.len());
+        assert!(EXPECTED_COMMANDS.iter().all(|name| !name.is_empty()));
+    }
 }

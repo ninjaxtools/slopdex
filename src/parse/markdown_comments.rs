@@ -1,7 +1,7 @@
 //! Comment spans from Markdown's block and inline ASTs. Code spans and fenced
 //! or indented examples are literal content, even when they look like HTML.
 
-use super::super::syntax::text;
+use super::super::syntax::{parse_bounded, text};
 use super::document::{self, Positions, children};
 use anyhow::{Context, Result};
 use std::ops::Range;
@@ -217,14 +217,12 @@ pub(super) fn collect(root: Node<'_>, source: &str) -> Result<Vec<Range<usize>>>
                 inline_parser
                     .set_included_ranges(&ranges)
                     .context("Cannot select Markdown inline ranges")?;
-                let tree = inline_parser
-                    .parse(source, None)
+                let tree = parse_bounded(&mut inline_parser, source)
                     .context("Cannot parse Markdown inline content")?;
                 html_parser
                     .set_included_ranges(&ranges)
                     .context("Cannot select Markdown inline HTML ranges")?;
-                let html = html_parser
-                    .parse(source, None)
+                let html = parse_bounded(&mut html_parser, source)
                     .context("Cannot parse Markdown inline HTML")?;
                 let protected =
                     protected_html_spans(html.root_node(), tree.root_node(), source, node, true);
@@ -241,14 +239,12 @@ pub(super) fn collect(root: Node<'_>, source: &str) -> Result<Vec<Range<usize>>>
                 html_parser
                     .set_included_ranges(&[node.range()])
                     .context("Cannot select Markdown HTML range")?;
-                let tree = html_parser
-                    .parse(source, None)
+                let tree = parse_bounded(&mut html_parser, source)
                     .context("Cannot parse Markdown HTML content")?;
                 inline_parser
                     .set_included_ranges(&[node.range()])
                     .context("Cannot select Markdown HTML token range")?;
-                let inline = inline_parser
-                    .parse(source, None)
+                let inline = parse_bounded(&mut inline_parser, source)
                     .context("Cannot parse Markdown HTML tokens")?;
                 let protected =
                     protected_html_spans(tree.root_node(), inline.root_node(), source, node, false);

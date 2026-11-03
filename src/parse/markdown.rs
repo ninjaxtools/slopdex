@@ -1,7 +1,7 @@
 //! Tree-sitter Markdown headings and heading-aware search chunks.
 
 use super::data::document::{self, Positions, children};
-use super::syntax::text;
+use super::syntax::{parse_bounded, text};
 use super::{FileStructure, MarkdownChunk, ParsedFile, StructureNode};
 use crate::hash;
 use anyhow::{Context, Result};
@@ -162,8 +162,7 @@ pub(super) fn parse(
     parser
         .set_language(&tree_sitter_md_025::LANGUAGE.into())
         .context("Cannot initialize Markdown parser")?;
-    let mut tree = parser
-        .parse(source, None)
+    let mut tree = parse_bounded(&mut parser, source)
         .context("Cannot parse Markdown: tree-sitter returned no tree")?;
     // The block grammar accepts a closing fence indented four columns beyond
     // its opener. CommonMark treats it as code. Mask only those false closers
@@ -195,8 +194,7 @@ pub(super) fn parse(
         if !changed {
             break;
         }
-        tree = parser
-            .parse(&masked, None)
+        tree = parse_bounded(&mut parser, &masked)
             .context("Cannot recover Markdown fence: tree-sitter returned no tree")?;
     }
     let mut comments = comments::collect(tree.root_node(), source)?;

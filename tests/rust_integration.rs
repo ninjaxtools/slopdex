@@ -682,7 +682,16 @@ impl Repo {
     /// resolves from its XDG_CACHE_HOME) unless the test chose another one.
     fn isolated_config(&self, config: &Value) -> Value {
         let mut config = config.clone();
-        if !self.index.exists() && config.get("artifactCachePath").is_none_or(Value::is_null) {
+        if self.index.exists() {
+            // A CLI child may have created this index after ignoring the
+            // repository config's artifactCachePath, binding it to the
+            // fixture's XDG default store instead. Reopen through that
+            // persisted binding rather than presenting a conflicting path.
+            config
+                .as_object_mut()
+                .expect("fixture config is an object")
+                .remove("artifactCachePath");
+        } else if config.get("artifactCachePath").is_none_or(Value::is_null) {
             config["artifactCachePath"] = json!(self.home.join("cache/slopdex/global-v1.sqlite"));
         }
         assert_isolated_open(&self.index, &config);
@@ -3891,19 +3900,20 @@ fn git_changed_since_filters_symbols_while_uncommitted_includes_staged_and_untra
 
 #[test]
 fn cli_missing_resolved_source_indexes_fail_without_artifacts_or_provider_calls() -> Result<()> {
-    for selection in ["default", "explicit", "config"] {
+    for selection in ["default", "explicit", "explicit-config"] {
         let mock = Mock::start()?;
         let repo = Repo::new()?;
         let mut config = mock.config();
         config["rerankingEnabled"] = json!(true);
-        if selection == "config" {
+        if selection == "explicit-config" {
             config["indexPath"] = json!("uncreated/configured.sqlite");
         }
         repo.write(".slopdex/config.json", &config.to_string())?;
         repo.write("api.rs", &function("alpha", "VECTOR_EAST"))?;
         repo.write("guide.md", "# Guide\n\nVECTOR_EAST documentation.\n")?;
         // A lower-priority existing index must not mask the missing selected
-        // path: --index beats config, and config beats the XDG default.
+        // path: --index beats an explicitly selected config, and that config
+        // beats the XDG default. A repository-selected config cannot do so.
         if selection != "default" {
             let decoy = if selection == "explicit" {
                 repo.index.clone()
@@ -3935,6 +3945,11 @@ fn cli_missing_resolved_source_indexes_fail_without_artifacts_or_provider_calls(
                 "cross-search",
             ] {
                 let mut command = isolated_cli(&repo, index);
+                if selection == "explicit-config" {
+                    command
+                        .arg("--config")
+                        .arg(repo.root.join(".slopdex/config.json"));
+                }
                 command.args(["--output", "json"]);
                 if no_reindex {
                     command.arg("--no-reindex");
@@ -4108,7 +4123,9 @@ fn cli_refresh_search_no_reindex_jsonl_and_provider_failure_are_end_to_end() -> 
 fn cli_redirected_progress_preserves_json_plain_diagnostics_and_offline_mode() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
-    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    let mut config = mock.config();
+    config.as_object_mut().unwrap().remove("artifactCachePath");
+    repo.write(".slopdex/config.json", &config.to_string())?;
     repo.write("code.rs", &function("alpha", "VECTOR_EAST"))?;
     fs::write(repo.root.join("invalid.rs"), [0xff])?;
 
@@ -4971,7 +4988,7 @@ fn regression_failed_generation_reuses_completed_descriptions_after_generation_c
 }
 
 #[test]
-fn cli_external_map_uses_checkout_config_and_saved_snapshot() -> Result<()> {
+fn cli_external_map_ignores_checkout_destination_config_and_parses_live_source() -> Result<()> {
     let invoker = Repo::new()?;
     let mut external = Repo::new()?;
     external.root = invoker._temp.path().join("external-checkout");
@@ -5008,7 +5025,7 @@ fn cli_external_map_uses_checkout_config_and_saved_snapshot() -> Result<()> {
         let rows: Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(
             map_names(rows.as_array().unwrap()),
-            strings(&["saved_external"])
+            strings(&["live_external"])
         );
         assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["path"], "nested/api.rs");
@@ -5111,17 +5128,17 @@ fn cli_external_map_combines_independent_repositories_and_warns_for_missing_path
     let invoker = Repo::new()?;
     let first = Repo::new()?;
     let second = Repo::new()?;
-    for (repo, name) in [
-        (&invoker, "local_saved"),
-        (&first, "first_saved"),
-        (&second, "second_saved"),
+    for (repo, name, live_name) in [
+        (&invoker, "local_saved", "local_live"),
+        (&first, "first_saved", "first_live"),
+        (&second, "second_saved", "second_live"),
     ] {
         repo.init_git()?;
         let config = json!({"indexPath": repo.index});
         repo.write(".slopdex/config.json", &config.to_string())?;
         repo.write("src/api.rs", &function(name, "saved"))?;
         repo.open_map(&config)?.refresh_structure()?;
-        repo.write("src/api.rs", &function("live_not_saved", "edited"))?;
+        repo.write("src/api.rs", &function(live_name, "edited"))?;
     }
     let missing = second.root.join("missing.rs");
     for include_local in [false, true] {
@@ -5151,9 +5168,9 @@ fn cli_external_map_combines_independent_repositories_and_warns_for_missing_path
         // Parsing the entire stdout rejects concatenated per-workspace JSON arrays.
         let rows: Value = serde_json::from_slice(&output.stdout)?;
         let expected = if include_local {
-            strings(&["local_saved", "first_saved", "second_saved"])
+            strings(&["local_live", "first_live", "second_live"])
         } else {
-            strings(&["first_saved", "second_saved"])
+            strings(&["first_live", "second_live"])
         };
         assert_eq!(rows.as_array().unwrap().len(), expected.len());
         assert_eq!(map_names(rows.as_array().unwrap()), expected);
@@ -5243,7 +5260,7 @@ fn cli_external_map_explicit_config_and_index_override_source_defaults() -> Resu
 }
 
 #[test]
-fn cli_external_cross_source_uses_checkout_snapshot_and_preserves_target_options() -> Result<()> {
+fn cli_external_cross_source_uses_default_snapshot_and_preserves_target_options() -> Result<()> {
     let mock = Mock::start()?;
     let invoker = Repo::new()?;
     let mut source = Repo::new()?;
@@ -5251,9 +5268,15 @@ fn cli_external_cross_source_uses_checkout_snapshot_and_preserves_target_options
     source.root = invoker._temp.path().join("source-checkout");
     fs::create_dir(&source.root)?;
     source.init_git()?;
+    source.index = invoker
+        .home
+        .join("cache/slopdex/worktrees-v1")
+        .join(slopdex::hash(
+            source.root.canonicalize()?.as_os_str().as_encoded_bytes(),
+        ))
+        .join("index.sqlite");
     invoker.write(".slopdex/config.json", "not valid JSON")?;
-    let mut config = mock.config();
-    config["indexPath"] = json!(source.index);
+    let config = mock.config();
     source.write(".slopdex/config.json", &config.to_string())?;
     source.write("nested/same.rs", &function("source_saved", "VECTOR_EAST"))?;
     source.write("other.rs", &function("source_not_selected", "VECTOR_EAST"))?;

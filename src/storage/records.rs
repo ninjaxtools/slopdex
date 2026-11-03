@@ -43,7 +43,10 @@ impl Database {
         value: &str,
         contents: &[(String, String)],
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         for (content_hash, content) in contents {
             ensure!(
                 hash(content) == *content_hash,
@@ -80,15 +83,34 @@ impl Database {
     }
 
     pub fn put_embedding(&self, key: &str, vector: &[f32]) -> Result<()> {
-        ensure!(
-            !vector.is_empty() && vector.iter().all(|v| v.is_finite()),
-            "Invalid embedding"
-        );
-        let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO global.embeddings VALUES(?,?)",
-            params![key, bytes],
+        self.put_embeddings([(key, vector)])
+    }
+
+    /// Store a batch of embeddings in one transaction instead of one
+    /// autocommit (and, under synchronous=FULL, one fsync) per vector.
+    pub(crate) fn put_embeddings<'a>(
+        &self,
+        entries: impl IntoIterator<Item = (&'a str, &'a [f32])>,
+    ) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
         )?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT OR IGNORE INTO global.embeddings VALUES(?,?)")?;
+            for (key, vector) in entries {
+                ensure!(
+                    !vector.is_empty()
+                        && vector.iter().all(|v| v.is_finite())
+                        && vector.iter().any(|v| *v != 0.0),
+                    "Invalid embedding"
+                );
+                let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+                insert.execute(params![key, bytes])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -216,7 +238,10 @@ impl Database {
     pub fn set_projection_profile(&self, profile: &Value) -> Result<()> {
         let value = profile.to_string();
         if self.meta("active_embedding_profile")?.as_deref() != Some(&value) {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             tx.execute("INSERT INTO metadata VALUES('active_embedding_profile',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [value])?;
             tx.execute("DELETE FROM search_cache", [])?;
             tx.commit()?;
@@ -243,7 +268,7 @@ impl Database {
         )?;
         stmt.query_map([], |r| {
             Ok((
-                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
@@ -272,6 +297,7 @@ impl Database {
                 description_hash,
                 description,
             ) = r?;
+            let id = u64::try_from(id).context("Invalid search unit id")?;
             let mut data: Value = serde_json::from_str(&data)?;
             ensure!(data.is_object(), "Invalid stored search unit");
             data.as_object_mut()
@@ -329,6 +355,22 @@ impl Database {
             .conn
             .prepare_cached("SELECT path FROM files ORDER BY path")?
             .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every (path, source hash) pair whose stored structure is current for
+    /// `version`, in one scan -- the bulk form of `structure_current` for
+    /// refresh loops that would otherwise run one statement per file.
+    pub(crate) fn current_structure_hashes(
+        &self,
+        version: &str,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT path,hash FROM files WHERE structure_hash=hash AND parser_version=?",
+            )?
+            .query_map([version], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
 

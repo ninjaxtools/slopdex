@@ -255,6 +255,9 @@ pub(crate) fn open_store(path: &Path, readonly: bool) -> Result<Connection> {
         path.display()
     );
     if !readonly {
+        // Matches the workspace connection: artifacts must be durable when a
+        // publication binds them. Connection-local; warm opens stay read-only.
+        conn.execute_batch("PRAGMA synchronous=FULL;")?;
         let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
         if journal != "wal" {
             conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -966,11 +969,21 @@ impl Remote {
         if self.unavailable.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let data = self.bucket.get_object(self.path(kind, key))?;
+        // Ranged GET: never ask a (possibly hostile or compromised) endpoint
+        // to send more than the size limit plus one overflow byte. A server
+        // that ignores Range is still caught by the length check below.
+        let data = self.bucket.get_object_range(
+            self.path(kind, key),
+            0,
+            Some(MAX_S3_OBJECT_BYTES as u64),
+        )?;
         if data.status_code() == 404 {
             return Ok(None);
         }
-        anyhow::ensure!(data.status_code() == 200, "S3 cache GET failed");
+        anyhow::ensure!(
+            matches!(data.status_code(), 200 | 206),
+            "S3 cache GET failed"
+        );
         anyhow::ensure!(
             data.as_slice().len() <= MAX_S3_OBJECT_BYTES,
             "S3 artifact too large"
@@ -1688,6 +1701,158 @@ mod tests {
         let oversized =
             zstd::stream::encode_all(vec![b'x'; MAX_S3_OBJECT_BYTES + 66].as_slice(), 3)?;
         assert_eq!(decode_object(&oversized), None);
+        Ok(())
+    }
+
+    /// Minimal in-process S3: stores PUT bodies by path and answers GET
+    /// (including Range), so the Remote surface is exercised in normal CI
+    /// without a MinIO service. One request per connection.
+    struct MockS3 {
+        endpoint: String,
+        objects: std::sync::Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    }
+
+    fn mock_s3() -> MockS3 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let objects = std::sync::Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let store = objects.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut received = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let (head_len, content_length) = loop {
+                    let Ok(read) = stream.read(&mut chunk) else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    received.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = received.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let head = String::from_utf8_lossy(&received[..end]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (end + 4, length);
+                    }
+                };
+                while received.len() < head_len + content_length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => received.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&received[..head_len]).into_owned();
+                let mut parts = head.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_owned();
+                let raw_path = parts.next().unwrap_or_default().to_owned();
+                let path = raw_path.split('?').next().unwrap_or_default().to_owned();
+                let range = head
+                    .lines()
+                    .find(|line| line.to_lowercase().starts_with("range:"))
+                    .and_then(|line| {
+                        let value = line.split('=').nth(1)?;
+                        let (start, end) = value.trim().split_once('-')?;
+                        Some((
+                            start.trim().parse::<usize>().ok()?,
+                            end.trim().parse::<usize>().ok(),
+                        ))
+                    });
+                let respond = |stream: &mut std::net::TcpStream, status: &str, body: &[u8]| {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                };
+                match method.as_str() {
+                    "PUT" => {
+                        store
+                            .lock()
+                            .unwrap()
+                            .insert(path, received[head_len..head_len + content_length].to_vec());
+                        respond(&mut stream, "200 OK", &[]);
+                    }
+                    "GET" => match store.lock().unwrap().get(&path).cloned() {
+                        Some(body) => match range {
+                            Some((start, end)) => {
+                                let start = start.min(body.len());
+                                let end = end.map_or(body.len(), |end| (end + 1).min(body.len()));
+                                respond(&mut stream, "206 Partial Content", &body[start..end]);
+                            }
+                            None => respond(&mut stream, "200 OK", &body),
+                        },
+                        None => respond(&mut stream, "404 Not Found", &[]),
+                    },
+                    _ => respond(&mut stream, "405 Method Not Allowed", &[]),
+                }
+            }
+        });
+        MockS3 { endpoint, objects }
+    }
+
+    fn mock_remote(endpoint: &str) -> Result<Remote> {
+        let bucket = Bucket::new(
+            "test-bucket",
+            Region::Custom {
+                region: "us-east-1".into(),
+                endpoint: endpoint.into(),
+            },
+            Credentials::anonymous()?,
+        )?
+        .with_path_style()
+        .with_request_timeout(Duration::from_secs(10))?;
+        Ok(Remote {
+            bucket,
+            prefix: "test".into(),
+            identity: "mock".into(),
+            unavailable: AtomicBool::new(false),
+            uploaded_content: Mutex::new(HashSet::new()),
+        })
+    }
+
+    #[test]
+    fn remote_round_trips_through_an_in_process_s3() -> Result<()> {
+        let mock = mock_s3();
+        let remote = mock_remote(&mock.endpoint)?;
+        let key = hash("payload");
+        assert_eq!(remote.get("cache", &key)?, None);
+        remote.put("cache", &key, b"hello artifacts")?;
+        assert_eq!(
+            remote.get("cache", &key)?.as_deref(),
+            Some(b"hello artifacts".as_slice())
+        );
+        let content_key = hash("description body");
+        remote.put_content(&content_key, "description body")?;
+        assert_eq!(
+            remote.get("content", &content_key)?.as_deref(),
+            Some(b"description body".as_slice())
+        );
+        // A stored body that is not a valid checked frame decodes to None
+        // (the ranged GET's 206 path is exercised by every round trip above).
+        // Insert it under the actual request path the bucket uses.
+        let big_key = hash("big");
+        let stored_path = mock
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .find(|path| path.ends_with(&key))
+            .expect("put stored an object")
+            .replace(&key, &big_key);
+        mock.objects
+            .lock()
+            .unwrap()
+            .insert(stored_path, vec![b'x'; 1024 * 1024]);
+        assert_eq!(remote.get("cache", &big_key)?, None);
         Ok(())
     }
 }

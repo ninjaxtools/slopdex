@@ -230,6 +230,12 @@ impl Engine {
             fingerprints.remove(path);
         }
         let mut changed = Vec::new();
+        // One scan up front; the files table does not change during the loop
+        // (publication happens after), so per-file currency stays exact.
+        let current_structures = self.db.current_structure_hashes(STRUCTURE_PARSER_VERSION)?;
+        let structure_current = |path: &str, hash: &str| {
+            current_structures.contains(&(path.to_owned(), hash.to_owned()))
+        };
         let indexing = ui::counted("Indexing files", paths.len());
         for path in &paths {
             let path = path.clone();
@@ -255,9 +261,7 @@ impl Engine {
                 } else {
                     fingerprint[0].as_u64().is_some_and(|size| size <= max_size)
                 }
-                && self
-                    .db
-                    .structure_current(&path, &previous.hash, STRUCTURE_PARSER_VERSION)?
+                && structure_current(&path, &previous.hash)
             {
                 indexing.inc(1);
                 continue;
@@ -270,9 +274,7 @@ impl Engine {
                     ];
                     // The same failure is already published: nothing to rewrite.
                     if previous.is_some_and(|f| f.source_mode == source_mode && f.errors == errors)
-                        && self
-                            .db
-                            .structure_current(&path, &hash(""), STRUCTURE_PARSER_VERSION)?
+                        && structure_current(&path, &hash(""))
                     {
                         indexing.inc(1);
                         continue;
@@ -301,9 +303,7 @@ impl Engine {
             // shares the empty-content hash and must still be replaced.
             if previous.is_some_and(|f| {
                 f.hash == source_hash && f.source_mode == source_mode && !has_read_error(f)
-            }) && self
-                .db
-                .structure_current(&path, &source_hash, STRUCTURE_PARSER_VERSION)?
+            }) && structure_current(&path, &source_hash)
             {
                 indexing.inc(1);
                 continue;
@@ -432,7 +432,10 @@ impl Engine {
         policy: &str,
         directories: &HashSet<String>,
     ) -> Result<()> {
-        let tx = self.db.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         for (key, value) in [
             ("dirty_paths", serde_json::to_string(dirty)?),
             ("file_fingerprints", serde_json::to_string(fingerprints)?),

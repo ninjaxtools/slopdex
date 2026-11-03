@@ -133,10 +133,7 @@ mod arc_files {
 }
 
 fn callable(node: &StructureNode) -> bool {
-    matches!(
-        node.kind.as_str(),
-        "function" | "method" | "constructor" | "generator"
-    )
+    crate::parse::is_callable_kind(&node.kind)
 }
 
 /// Structure ids are file-local vector indexes; verify rather than scan.
@@ -193,10 +190,9 @@ impl CallGraph {
         let mut structures = BTreeMap::new();
         let mut indexed = BTreeSet::new();
         for (path, parsed) in files {
+            let nodes = crate::map::NodeIndex::new(&parsed.structure);
             for callable in &parsed.callables {
-                if let Some(node) =
-                    crate::map::matching_node(&parsed.structure, &serde_json::to_value(callable)?)
-                {
+                if let Some(node) = nodes.matching(&serde_json::to_value(callable)?) {
                     indexed.insert(Key {
                         path: path.to_owned(),
                         id: node.id,

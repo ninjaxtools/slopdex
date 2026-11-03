@@ -515,7 +515,7 @@ fn assert_callable_scopes(path: &str, source: &str) -> crate::parse::ParsedFile 
     for callable in &parsed.callables {
         assert!(
             parsed.structure.nodes.iter().any(|node| {
-                super::callable(&node.kind)
+                super::is_callable_kind(&node.kind)
                     && node.qualified_name == callable.qualified_name
                     && node.start_line <= callable.start_line
                     && node.end_line >= callable.end_line

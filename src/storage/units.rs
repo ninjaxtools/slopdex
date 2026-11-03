@@ -5,6 +5,27 @@ use super::*;
 
 type Description = (Option<String>, String, Option<String>);
 
+/// Stable per-file callable identity. Engine preparation and storage must
+/// derive the same value for the same callable occurrence, or prepared
+/// descriptions would attach to the wrong search unit.
+pub(crate) fn callable_identity(
+    path: &str,
+    callable: &crate::parse::Callable,
+    occurrence: usize,
+) -> String {
+    hash(json!([path, callable.qualified_name, callable.kind, occurrence]).to_string())
+}
+
+/// The shared search-unit JSON for one callable, before each caller applies
+/// its own description policy.
+pub(crate) fn callable_data(file: &File, callable: &crate::parse::Callable) -> Result<Value> {
+    let mut data = serde_json::to_value(callable)?;
+    data["path"] = json!(file.path);
+    data["sourceMode"] = json!(file.source_mode);
+    data["sourceDescription"] = json!(callable.description.is_some());
+    Ok(data)
+}
+
 pub(super) fn unit_payload(data: &Value) -> Result<String> {
     ensure!(data.is_object(), "Invalid stored search unit");
     let mut content = serde_json::Map::new();
@@ -365,27 +386,17 @@ pub(super) fn read_all_structures(
 }
 
 pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>> {
+    let nodes = map::NodeIndex::new(&parsed.structure);
     let mut occurrences = HashMap::<&str, usize>::new();
     let mut callable_symbols = HashSet::new();
     let mut items = Vec::with_capacity(parsed.callables.len() + parsed.chunks.len());
     for callable in &parsed.callables {
         let occurrence = occurrences.entry(&callable.qualified_name).or_default();
-        let identity = hash(
-            json!([
-                file.path,
-                callable.qualified_name,
-                callable.kind,
-                *occurrence
-            ])
-            .to_string(),
-        );
+        let identity = callable_identity(&file.path, callable, *occurrence);
         *occurrence += 1;
-        let mut data = serde_json::to_value(callable)?;
-        data["path"] = json!(file.path);
-        data["sourceMode"] = json!(file.source_mode);
+        let mut data = callable_data(file, callable)?;
         data["description"] = json!(callable.description);
-        data["sourceDescription"] = json!(callable.description.is_some());
-        if let Some(node) = map::matching_node(&parsed.structure, &data) {
+        if let Some(node) = nodes.matching(&data) {
             callable_symbols.insert(node.id);
         }
         items.push(Item {
@@ -688,5 +699,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
         values.iter().all(|v| v.is_finite()),
         "Non-finite stored vector"
     );
+    ensure!(values.iter().any(|v| *v != 0.0), "Zero stored vector");
     Ok(values)
 }

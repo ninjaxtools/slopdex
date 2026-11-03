@@ -31,7 +31,12 @@ impl std::error::Error for StdoutBrokenPipe {
     }
 }
 
-pub(super) struct StdoutWriter<W>(W);
+pub(super) struct StdoutWriter<W> {
+    inner: W,
+    /// Strip terminal escape initiators from untrusted source text when the
+    /// destination is a real terminal (JSON is unaffected: it escapes them).
+    sanitize: bool,
+}
 
 fn stdout_error(error: io::Error) -> io::Error {
     if error.kind() == io::ErrorKind::BrokenPipe {
@@ -43,19 +48,35 @@ fn stdout_error(error: io::Error) -> io::Error {
 
 impl<W: Write> Write for StdoutWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.write(bytes).map_err(stdout_error)
+        if !self.sanitize {
+            return self.inner.write(bytes).map_err(stdout_error);
+        }
+        // Byte-wise filtering is chunk-boundary safe: removing ESC and the
+        // other C0 controls (keeping newline and tab) leaves any sequence
+        // body as inert literal text.
+        let clean: Vec<u8> = bytes
+            .iter()
+            .copied()
+            .filter(|byte| *byte == b'\n' || *byte == b'\t' || (*byte >= 0x20 && *byte != 0x7f))
+            .collect();
+        self.inner.write_all(&clean).map_err(stdout_error)?;
+        Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush().map_err(stdout_error)
+        self.inner.flush().map_err(stdout_error)
     }
 }
 
 pub(super) fn with_stdout<W: Write>(
     writer: W,
+    sanitize: bool,
     run: impl FnOnce(&mut StdoutWriter<W>) -> Result<()>,
 ) -> Result<()> {
-    let mut out = StdoutWriter(writer);
+    let mut out = StdoutWriter {
+        inner: writer,
+        sanitize,
+    };
     let result = run(&mut out).and_then(|()| out.flush().map_err(Into::into));
     match result {
         Err(error) if error.chain().any(|cause| cause.is::<ClosedStdout>()) => Ok(()),

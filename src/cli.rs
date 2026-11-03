@@ -30,7 +30,7 @@ use anyhow::Result;
 use clap::Parser;
 use serde_json::Value;
 use std::{
-    io::{self as stdio, Write},
+    io::{self as stdio, IsTerminal, Write},
     path::PathBuf,
 };
 
@@ -92,7 +92,8 @@ pub fn run() -> Result<()> {
             .exit();
     }
     let stdout = stdio::stdout();
-    with_stdout(stdout.lock(), |out| run_cli(&cli, out))
+    let sanitize = stdout.is_terminal();
+    with_stdout(stdout.lock(), sanitize, |out| run_cli(&cli, out))
 }
 
 fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {

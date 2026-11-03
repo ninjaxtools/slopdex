@@ -10,7 +10,13 @@
 //! delimiters/prefixes removed and indentation cleaned; escapes remain source
 //! text. Comments and docstrings combine with a paragraph break.
 
-use super::{FileStructure, ParsedFile, code, data::document::Positions};
+use super::{FileStructure, ParsedFile, code, data::document::Positions, syntax};
+
+/// Comment spans come from tree-sitter byte ranges, which can split a
+/// character in recovered trees; slice defensively.
+fn slice<'a>(source: &'a str, span: &Range<usize>) -> &'a str {
+    source.get(span.clone()).unwrap_or("")
+}
 use std::{collections::HashMap, ops::Range};
 use tree_sitter::Node;
 
@@ -33,7 +39,7 @@ impl SourceDescriptions {
         while let Some(node) = stack.pop() {
             if matches!(node.kind(), "comment" | "line_comment" | "block_comment") {
                 // A shebang is an interpreter directive, not documentation.
-                if !source[node.byte_range()].starts_with("#!") {
+                if !syntax::text(source, node).starts_with("#!") {
                     self.comments.push(node.byte_range());
                 }
                 continue;
@@ -103,7 +109,7 @@ impl SourceDescriptions {
         // Some grammars include the newline in a line-comment node. Trim layout
         // before measuring gaps so CRLF and LF have identical blank-line rules.
         for span in &mut self.comments {
-            let raw = &source[span.clone()];
+            let raw = slice(source, span);
             span.end -= raw.len() - raw.trim_end().len();
         }
         self.comments.sort_by_key(|span| span.start);
@@ -117,7 +123,7 @@ impl SourceDescriptions {
             if !source[line_start..span.start].trim().is_empty() && !follows_comment {
                 continue; // A trailing comment describes no subsequent symbol.
             }
-            let prose = comment_prose(&source[span.clone()]);
+            let prose = comment_prose(slice(source, &span));
             if let Some(previous) = groups.last_mut()
                 && adjacent(source, previous.span.end, span.start)
             {
@@ -289,7 +295,7 @@ fn python_prose(source: &str, value: Node<'_>) -> Option<String> {
     };
     let mut prose = String::new();
     for literal in literals {
-        let raw = &source[literal.byte_range()];
+        let raw = syntax::text(source, literal);
         let quote = raw.find(['\'', '"'])?;
         let raw = &raw[quote..];
         let delimiter = if raw.starts_with("\"\"\"") || raw.starts_with("'''") {

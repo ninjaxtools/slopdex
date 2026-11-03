@@ -50,7 +50,8 @@ pub(super) fn walk(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 pub(super) fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
-    &source[node.byte_range()]
+    // Recovered trees can carry ranges that split a character; never panic.
+    source.get(node.byte_range()).unwrap_or("")
 }
 
 pub(super) fn edited(source: &str, mut edits: Vec<Edit>) -> Result<String> {

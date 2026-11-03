@@ -71,6 +71,10 @@ No former default index or cache is copied, migrated, imported, or used as a see
 Explicit relative
 config/index paths, including JSON `indexPath`, resolve against the working
 directory. CLI overrides are applied after canonicalizing supported config aliases.
+When the selected file is the repository config, marking discards its
+`indexPath` and `artifactCachePath`, then adopts either key from the user config
+and finally reapplies an explicit `--index`; repository values never select
+either destination.
 Config updates use a same-directory temporary file, `sync_all`, and rename.
 Embedding-only interactive setup offers the selected config versus repository
 `.slopdex/config.json`, defaulting to repository settings when they differ;
@@ -303,7 +307,8 @@ paths are never imported or used as compatibility seeds. See the
 | Global `workspaces` | Canonical index/root registrations used for reachability and missing-worktree cleanup. |
 
 The worktree connection attaches the global store as `global`. Both databases are
-needed to read a saved snapshot. `artifactCachePath` selects the global store when
+needed to read a saved snapshot. An effective `artifactCachePath` (never one from
+a repository-selected config) selects the global store when
 creating an index; its canonical path is persisted in the worktree binding.
 Omitting the override subsequently retains that binding. A conflicting explicit
 override requires a new worktree index path, even with `--force-reindex`.
@@ -587,6 +592,11 @@ environment keys for repository-configured remote hosts unless trusted.
 The CLI loader marks repository-selected settings with the reserved
 `configOrigin` key (`cli/config.rs::mark_repository_config`), discarding any
 `trustedEndpointHosts` from that file and adopting the user config's list.
+It likewise discards `artifactS3`, `ollamaAutoPull`, `indexPath`, and
+`artifactCachePath` from that file, adopting user-config values for `artifactS3`
+and the two destination keys instead and then reapplying an explicit `--index`.
+External-workspace snapshots therefore resolve through each source root's
+default index unless the caller supplies an explicit config or index.
 Profiles record endpoints through `profile_endpoint`, which drops query strings.
 
 ## npm installation

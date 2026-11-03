@@ -328,6 +328,10 @@ matching. No implicit callable-graph traversal is added.
 The shared `-g`, `--formats` (default `code,docs`), `-i`, and semantic-threshold
 options apply. File discovery respects ignore files, configured includes/excludes,
 and `maxFileSize`, just like `map`. Positional paths support multiple workspaces.
+A missing positional path produces a warning on stderr and is ignored — including
+when every named path is missing, which succeeds with the same no-files result as
+a query with no matches. This tolerance is intentional for agent callers, which may
+hallucinate a path; `map` and `lines` do not fail the whole command for it.
 An existing index refreshes only structure; `--no-reindex` uses its saved source.
 Without an index, ordinary counts and regex selectors work locally without
 creating one. `-q` creates a structure-only index if needed and may call the
@@ -380,9 +384,13 @@ root, including when invoked from another working directory. Absolute paths and
 the selected root uses its own Git checkout root, configuration, and index, as if
 invoked from that source's directory. Without Git, that directory is the root.
 Explicit `--config` and `--index` overrides still apply and remain relative to the
-invocation directory; relative paths saved in an external source's configuration
-resolve from the source's directory. Missing paths produce warnings on stderr and
-are ignored. Multiple paths form a union, intersected with the shared selectors;
+invocation directory; relative destination paths in an explicitly selected config
+resolve from the external source's directory, while destinations in its
+automatically selected repository config are ignored. Missing paths produce warnings on stderr and
+are ignored — even when every explicitly named path is missing. Map then succeeds
+with an empty result (`[]` for JSON), rather than failing. This is deliberate for
+agent callers, which may hallucinate a path while still being able to use results
+from any valid paths. Multiple paths form a union, intersected with the shared selectors;
 paths in different workspaces are processed independently, with JSON results
 combined into one array. Returned paths remain relative to their respective roots.
 
@@ -1630,7 +1638,8 @@ slopdex --index /path/to/new-index.sqlite update
 ```
 
 Use that same `--index` path on subsequent commands, or save it as `indexPath` in
-config. Rebuilding scans current files and obtains embeddings from matching
+the user config or in an explicitly selected `--config` file; a repository-selected
+`.slopdex/config.json` cannot select the index. Rebuilding scans current files and obtains embeddings from matching
 global/S3 artifacts or the configured providers, including available source
 descriptions. Run `generate descriptions` separately to prepare generated prose
 where source descriptions are absent; old database artifacts and saved
@@ -1732,10 +1741,13 @@ selected using that root in this order:
    `~/.config/slopdex/config.json` when `XDG_CONFIG_HOME` is unset, empty, or not absolute.
 
 Only the selected file is loaded: repository settings replace, rather than merge
-with, user settings. A missing selected file means defaults. `--config` does not
-select config-format results (use `--formats config` for that).
-`--index` overrides `indexPath`, otherwise
-the index defaults to the per-workspace XDG cache path described above. Explicit relative config/index
+with, user settings, apart from the user-only authority keys described under
+[repository settings](#repository-settings-and-remote-endpoints). A missing
+selected file means defaults. `--config` does not select config-format results
+(use `--formats config` for that).
+`--index` overrides `indexPath`; a repository-selected `indexPath` is ignored in
+favor of any user-config `indexPath`, otherwise the index defaults to the
+per-workspace XDG cache path described above. Explicit relative config/index
 paths and relative JSON `indexPath` resolve from **the process working directory**,
 not the root or config's directory.
 
@@ -1783,8 +1795,8 @@ Example `config.json` (user or repository settings):
 | `agentTimeoutMs` | Positive subprocess timeout for text generation, default `300000` (five minutes). No automatic subprocess retries. |
 | `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, the source search behind generated FAQ answers, map direct matches, and cross-search output. `--limit` overrides it (for `faq`, `--limit` instead caps the ranked FAQ questions returned, default `1`). |
 | `faqThreshold` | FAQ cache cosine cutoff in `[-1,1]`, default `0.7`; the best question or answer score must be strictly greater. `--faq-threshold` overrides it. |
-| `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
-| `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
+| `indexPath`, `include`, `exclude`, `maxFileSize` | Index path (ignored in repository-selected settings; use `--index`, `--config`, or the user config), glob arrays, and positive byte limit as described above. |
+| `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index; ignored in repository-selected settings) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle (also ignored there), as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`, Ollama `8` (maximum `64`); larger configured values are capped. The full config wizard defaults to `8` for Ollama and `32` otherwise; embedding-only setup leaves batching defaults to the provider. |
 | `embeddingBaseUrl`, `rerankerBaseUrl` | Embedding/native-reranking HTTP(S) endpoint overrides; JSON only. Hosted APIs include the API version, e.g. `http://localhost:8080/v1`. Ollama uses the API base, default `http://localhost:11434/api`. Non-loopback, non-default hosted endpoints require `https` unless explicitly allowed. |
 | `allowInsecureEndpoints` | Boolean, default `false`. Permits plain `http` hosted endpoints on non-loopback hosts (for example an internal gateway). The custom-host warning still applies. |
@@ -1920,8 +1932,19 @@ provider policy:
   explicit port), pass `--trust-repo-endpoints` for one invocation, or put the key
   into the repository config, where it travels with the endpoint. A
   `trustedEndpointHosts` list inside the repository file is ignored.
-- Ollama endpoints are local inference and keep their separate non-loopback
-  warning; they never carry credentials.
+- Ollama endpoints are local inference; they never carry credentials. A
+  non-loopback Ollama endpoint supplied by the repository config is refused
+  unless the host is in the user config's `trustedEndpointHosts` or
+  `--trust-repo-endpoints` is passed, because embedding requests would send
+  source text to that server. `ollamaAutoPull` from a repository config is
+  ignored, so merely opening a repository cannot start a model download.
+- `artifactS3`, `indexPath`, and `artifactCachePath` from a repository config
+  are ignored with a stderr warning. The repository cannot redirect the
+  workspace index, choose the global artifact store, or share artifacts to its
+  own bucket. Values for these keys in the user config are adopted instead;
+  `--index` and an explicitly selected `--config` file also retain their usual
+  effect. Without a user-config destination, the per-workspace default index
+  and default global artifact store are used.
 
 The loader marks repository settings with the reserved `configOrigin:
 "repository"` key (and `trustRepositoryEndpoints` for the flag) in the effective

@@ -136,7 +136,7 @@ impl Selection {
     }
 
     fn callable_source_matches(&self, kind: &str, source: Option<&str>) -> bool {
-        matches!(kind, "function" | "method" | "constructor" | "generator")
+        crate::parse::is_callable_kind(kind)
             && self
                 .names
                 .as_ref()
@@ -438,12 +438,8 @@ fn locally_private(
     if matches!(node.kind.as_str(), "heading" | "import") {
         return false;
     }
-    if parent.is_some_and(|parent| {
-        matches!(
-            parent.kind.as_str(),
-            "function" | "method" | "constructor" | "generator"
-        )
-    }) && !typescript_type_member(node, nodes)
+    if parent.is_some_and(|parent| crate::parse::is_callable_kind(&parent.kind))
+        && !typescript_type_member(node, nodes)
     {
         return true;
     }

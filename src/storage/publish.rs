@@ -104,7 +104,11 @@ impl Database {
             global.execute_batch("PRAGMA synchronous=FULL;")?;
             persist_publication_artifacts(&mut global, changed)?;
         }
-        let tx = self.conn.transaction()?;
+        // Immediate: this transaction reads rows it then writes, and a
+        // deferred read-to-write upgrade cannot be retried by busy_timeout.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for path in removed {
             tx.execute("DELETE FROM files WHERE path=?", [path])?;
         }
@@ -203,7 +207,7 @@ pub(super) fn persist_publication_artifacts(
     global: &mut Connection,
     changed: &[(File, Vec<Item>, Option<FileStructure>)],
 ) -> Result<()> {
-    let tx = global.transaction()?;
+    let tx = global.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (file, items, structure) in changed {
         ensure!(
             hash(&file.source) == file.hash,

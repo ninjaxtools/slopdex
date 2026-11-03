@@ -66,6 +66,10 @@ usearch = "2.26.2"
 zstd = { version = "0.14", default-features = false }
 tempfile = "3"
 
+[target.'cfg(unix)'.dependencies]
+# Process-group termination for timed-out agent harnesses.
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 

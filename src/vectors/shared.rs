@@ -568,7 +568,8 @@ fn read_base(
     dimensions: usize,
 ) -> Result<BaseManifest> {
     ensure!(full_hash(id), "invalid shared base ID");
-    let base: BaseManifest = serde_json::from_slice(&fs::read(base_manifest_path(directory, id))?)?;
+    let base: BaseManifest =
+        serde_json::from_reader(fs::File::open(base_manifest_path(directory, id))?)?;
     base.validate(contract, dimensions)?;
     ensure!(base.id == id, "shared base ID mismatch");
     Ok(base)

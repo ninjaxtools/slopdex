@@ -30,7 +30,7 @@ fn stdout_boundary_only_ignores_its_own_broken_pipes() {
                     write_error: (!on_flush).then_some(kind),
                     flush_error: on_flush.then_some(kind),
                 };
-                let result = with_stdout(writer, |out| {
+                let result = with_stdout(writer, false, |out| {
                     if json {
                         print_json(out, &json!({"output": "value"}))
                     } else {
@@ -52,7 +52,7 @@ fn stdout_boundary_only_ignores_its_own_broken_pipes() {
         anyhow::Error::from(io::Error::from(io::ErrorKind::BrokenPipe)),
         anyhow::Error::from(serde_json::Error::io(io::ErrorKind::BrokenPipe.into())),
     ] {
-        let result = with_stdout(Vec::new(), |_| Err(error.context("provider failed")));
+        let result = with_stdout(Vec::new(), false, |_| Err(error.context("provider failed")));
         assert!(result.is_err());
     }
 
@@ -61,12 +61,32 @@ fn stdout_boundary_only_ignores_its_own_broken_pipes() {
             write_error: Some(io::ErrorKind::BrokenPipe),
             flush_error: None,
         },
+        false,
         |out| {
             let _ = writeln!(out, "output");
             Err(io::Error::from(io::ErrorKind::BrokenPipe).into())
         },
     );
     assert!(result.is_err(), "an unrelated error must still propagate");
+}
+
+#[test]
+fn sanitized_stdout_strips_terminal_escapes_from_untrusted_text() {
+    let mut out = Vec::new();
+    with_stdout(&mut out, true, |writer| {
+        writer.write_all(b"a\x1b[31mred\x1b]0;title\x07\x01b\tc\nd\r\n")?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(out, b"a[31mred]0;titleb\tc\nd\n");
+    // Unsanitized (piped/file) output stays byte-identical.
+    let mut raw = Vec::new();
+    with_stdout(&mut raw, false, |writer| {
+        writer.write_all(b"a\x1b[31m\r\n")?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(raw, b"a\x1b[31m\r\n");
 }
 
 #[test]

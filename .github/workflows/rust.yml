@@ -34,8 +34,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned (not floating stable) so new clippy lints cannot break CI
+      # spontaneously; bump deliberately after checking `cargo verify`.
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo verify
+
+  msrv:
+    name: msrv-1.90
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.90
+      - uses: Swatinem/rust-cache@v2
+      # Compilation only: the declared rust-version must keep building even
+      # though development uses a newer pinned toolchain.
+      - run: cargo check --locked --workspace --all-targets

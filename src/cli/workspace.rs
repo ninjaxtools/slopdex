@@ -169,7 +169,7 @@ pub(super) fn require_index(index: &Path) -> Result<()> {
     Ok(())
 }
 
-fn canonical_identity(path: &Path) -> Result<PathBuf> {
+pub(super) fn canonical_identity(path: &Path) -> Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

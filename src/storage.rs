@@ -21,7 +21,7 @@ mod snapshot;
 mod units;
 
 pub(crate) use faq::FaqEntry;
-pub(crate) use units::{decode, parsed_items};
+pub(crate) use units::{callable_data, callable_identity, decode, parsed_items};
 
 /// Bump when the structure or search-unit extraction contract changes.
 pub const STRUCTURE_PARSER_VERSION: &str = "structure-v14-symbol-references";
@@ -311,6 +311,11 @@ impl Database {
             conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         }
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        // Connection-local (not a database write, so warm opens stay
+        // read-only): workspace commits bind artifacts committed earlier
+        // through the attached store, so both must survive power loss
+        // together rather than leaving dangling artifact references.
+        conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA global.synchronous=FULL;")?;
         let global_text = global_path
             .to_str()
             .context("Global artifact store path is not UTF-8")?;

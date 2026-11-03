@@ -101,6 +101,7 @@ fn maintenance_waits_for_all_shared_users_then_proceeds() -> Result<()> {
     let (sender, receiver) = mpsc::channel();
     let worker = {
         let barrier = barrier.clone();
+        let store = store.clone();
         thread::spawn(move || {
             barrier.wait();
             let result = store_usage(&store, true, Duration::from_secs(5)).map(drop);
@@ -108,20 +109,15 @@ fn maintenance_waits_for_all_shared_users_then_proceeds() -> Result<()> {
         })
     };
     barrier.wait();
-    let waited_for_both = receiver.recv_timeout(Duration::from_millis(60));
+    // Deterministic contention probes instead of wall-clock negatives: with
+    // either shared guard held, an immediate maintenance attempt is busy, so
+    // the worker above cannot have proceeded no matter how it was scheduled.
+    expect_busy(store_usage(&store, true, Duration::ZERO))?;
     drop(first);
-    let waited_for_second = receiver.recv_timeout(Duration::from_millis(60));
+    expect_busy(store_usage(&store, true, Duration::ZERO))?;
     drop(second);
     let finished = receiver.recv_timeout(Duration::from_secs(5));
     worker.join().expect("maintenance worker");
-    assert!(matches!(
-        waited_for_both,
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
-    assert!(matches!(
-        waited_for_second,
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
     finished??;
     Ok(())
 }
@@ -169,11 +165,12 @@ fn maintenance_blocks_writable_and_readonly_database_opens() -> Result<()> {
             })
         };
         barrier.wait();
-        let waited = receiver.recv_timeout(Duration::from_millis(60));
+        // While maintenance is held, shared usage (what a database open
+        // acquires first) is busy -- the opener cannot have opened yet.
+        expect_busy(store_usage(&store, false, Duration::ZERO))?;
         drop(maintenance);
         let finished = receiver.recv_timeout(Duration::from_secs(5));
         worker.join().expect("database opener");
-        assert!(matches!(waited, Err(mpsc::RecvTimeoutError::Timeout)));
         finished??;
     }
     Ok(())

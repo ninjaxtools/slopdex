@@ -397,12 +397,7 @@ pub(crate) fn prepare(
             file.nodes
                 .iter()
                 .map(|&index| &file.structure.nodes[index])
-                .filter(|node| {
-                    matches!(
-                        node.kind.as_str(),
-                        "function" | "method" | "constructor" | "generator"
-                    )
-                })
+                .filter(|node| parse::is_callable_kind(&node.kind))
                 .map(|node| Key {
                     path: path.clone(),
                     id: node.id,
@@ -1105,38 +1100,71 @@ pub fn hunk(start: usize, end: usize, annotation: Option<&str>) -> String {
     }
 }
 
-/// Resolve a search hit to its structural declaration. Repeated names and
-/// overloads use source coordinates rather than just a qualified name.
+/// Name index over one file's declarations, for callers resolving many
+/// units against the same structure: building it once turns each lookup from
+/// a whole-file scan into a scan of same-named candidates only.
+pub struct NodeIndex<'a> {
+    by_qualified: HashMap<&'a str, Vec<&'a StructureNode>>,
+    by_name: HashMap<&'a str, Vec<&'a StructureNode>>,
+}
+
+impl<'a> NodeIndex<'a> {
+    pub fn new(structure: &'a FileStructure) -> Self {
+        let mut by_qualified: HashMap<_, Vec<_>> = HashMap::new();
+        let mut by_name: HashMap<_, Vec<_>> = HashMap::new();
+        for node in &structure.nodes {
+            by_qualified
+                .entry(node.qualified_name.as_str())
+                .or_default()
+                .push(node);
+            by_name.entry(node.name.as_str()).or_default().push(node);
+        }
+        Self {
+            by_qualified,
+            by_name,
+        }
+    }
+
+    /// Resolve a search hit to its structural declaration. Repeated names and
+    /// overloads use source coordinates rather than just a qualified name.
+    pub fn matching(&self, unit: &Value) -> Option<&'a StructureNode> {
+        let start = unit["startLine"].as_u64()? as usize;
+        let end = unit["endLine"].as_u64().unwrap_or(start as u64) as usize;
+        let qualified = unit["qualifiedName"].as_str();
+        let name = unit["name"].as_str();
+        let any_kind = unit["startByte"].is_u64();
+        let column = unit["startColumn"].as_u64().unwrap_or(1) as usize;
+        let qualified_candidates = qualified
+            .and_then(|key| self.by_qualified.get(key))
+            .map_or([].as_slice(), Vec::as_slice);
+        let name_candidates = name
+            .and_then(|key| self.by_name.get(key))
+            .map_or([].as_slice(), Vec::as_slice);
+        qualified_candidates
+            .iter()
+            .chain(name_candidates)
+            .copied()
+            .filter(|node| {
+                (any_kind || parse::is_callable_kind(&node.kind))
+                    && (qualified == Some(node.qualified_name.as_str())
+                        || name == Some(node.name.as_str())
+                            && node.start_line <= end
+                            && node.end_line >= start)
+            })
+            .min_by_key(|node| {
+                (
+                    qualified != Some(node.qualified_name.as_str()),
+                    node.start_line.abs_diff(start) + node.end_line.abs_diff(end),
+                    node.start_column.abs_diff(column),
+                    node.id,
+                )
+            })
+    }
+}
+
+/// One-off lookup; see [`NodeIndex`] for repeated lookups on one structure.
 pub fn matching_node<'a>(structure: &'a FileStructure, unit: &Value) -> Option<&'a StructureNode> {
-    let start = unit["startLine"].as_u64()? as usize;
-    let end = unit["endLine"].as_u64().unwrap_or(start as u64) as usize;
-    let qualified = unit["qualifiedName"].as_str();
-    let name = unit["name"].as_str();
-    // Hoisted: this runs once per unit over every node of the file.
-    let any_kind = unit["startByte"].is_u64();
-    let column = unit["startColumn"].as_u64().unwrap_or(1) as usize;
-    structure
-        .nodes
-        .iter()
-        .filter(|node| {
-            (any_kind
-                || matches!(
-                    node.kind.as_str(),
-                    "function" | "method" | "constructor" | "generator"
-                ))
-                && (qualified == Some(node.qualified_name.as_str())
-                    || name == Some(node.name.as_str())
-                        && node.start_line <= end
-                        && node.end_line >= start)
-        })
-        .min_by_key(|node| {
-            (
-                qualified != Some(node.qualified_name.as_str()),
-                node.start_line.abs_diff(start) + node.end_line.abs_diff(end),
-                node.start_column.abs_diff(column),
-                node.id,
-            )
-        })
+    NodeIndex::new(structure).matching(unit)
 }
 
 #[cfg(test)]

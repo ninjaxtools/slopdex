@@ -3,7 +3,7 @@ use serde_json::json;
 use std::path::Path;
 
 #[test]
-fn external_source_saved_config_paths_use_its_directory() -> Result<()> {
+fn external_source_repository_config_paths_are_ignored_unless_explicit() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let current = dir.path().join("current");
     let external = dir.path().join("external");
@@ -34,6 +34,28 @@ fn external_source_saved_config_paths_use_its_directory() -> Result<()> {
     )?;
     let rows: Value = serde_json::from_slice(&out)?;
     assert_eq!(rows[0]["path"], "code.rs");
+    // Automatic selection of the external checkout's config must not let it
+    // select its saved index or artifact store, so map parses the live source.
+    assert_eq!(rows[0]["nodes"][0]["name"], "changed");
+
+    // Naming that same file with --config is an explicit user choice: its
+    // relative saved paths resolve from the external source directory.
+    let mut out = Vec::new();
+    run_cli(
+        &parse(&[
+            "--root",
+            current.to_str().unwrap(),
+            "--config",
+            external.join(".slopdex/config.json").to_str().unwrap(),
+            "--output",
+            "json",
+            "--no-reindex",
+            "map",
+            external.join("code.rs").to_str().unwrap(),
+        ]),
+        &mut out,
+    )?;
+    let rows: Value = serde_json::from_slice(&out)?;
     assert_eq!(rows[0]["nodes"][0]["name"], "cached");
     Ok(())
 }

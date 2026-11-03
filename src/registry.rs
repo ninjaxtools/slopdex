@@ -430,6 +430,11 @@ pub(crate) fn lock_exclusive_until(file: &fs::File, deadline: Instant) -> std::i
     lock_until(file, true, deadline)
 }
 
+/// Poll for a shared advisory lock until `deadline`; see `lock_exclusive_until`.
+pub(crate) fn lock_shared_until(file: &fs::File, deadline: Instant) -> std::io::Result<bool> {
+    lock_until(file, false, deadline)
+}
+
 fn lock_until(file: &fs::File, exclusive: bool, deadline: Instant) -> std::io::Result<bool> {
     loop {
         let attempt = if exclusive {
@@ -693,6 +698,8 @@ mod tests {
             let root = self.path(name);
             fs::create_dir(&root)?;
             self.git(&root, &["init", "--quiet", "--object-format=sha1"])?;
+            self.git(&root, &["config", "--local", "core.autocrlf", "false"])?;
+            self.git(&root, &["config", "--local", "core.eol", "lf"])?;
             fs::write(root.join("source.txt"), name)?;
             self.git(&root, &["add", "."])?;
             self.git(&root, &["commit", "--quiet", "-m", name])?;
@@ -931,10 +938,15 @@ mod tests {
             Ok(())
         });
         ready_rx.recv_timeout(Duration::from_secs(5))?;
-        assert!(matches!(
-            done_rx.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
+        // The lock is provably held (an immediate exclusive attempt on the
+        // same lock file fails), so the waiter cannot have read the cache yet
+        // -- no wall-clock negative needed.
+        let probe = open_lock_file(
+            &lock_directory(db.global_path()).join(lock_file_name("description", "key")?),
+            false,
+        )?;
+        assert!(!lock_exclusive_until(&probe, Instant::now())?);
+        drop(probe);
         db.cache_put("description", "key", "computed once")?;
         drop(held);
         assert_eq!(
@@ -963,13 +975,19 @@ mod tests {
                 Ok(())
             });
             ready_rx.recv_timeout(Duration::from_secs(5))?;
-            let waited = done_rx.recv_timeout(Duration::from_millis(100));
+            // Provably held: an immediate exclusive attempt fails, so the
+            // worker cannot have acquired it yet.
+            let probe = open_lock_file(
+                &lock_directory(&global).join(lock_file_name("embedding", "key")?),
+                false,
+            )?;
+            assert!(!lock_exclusive_until(&probe, Instant::now())?);
+            drop(probe);
             drop(held);
             // Release and join before judging, so a regression cannot strand
             // the worker for the full lock timeout.
             let finished = done_rx.recv_timeout(Duration::from_secs(5));
             worker.join().unwrap()?;
-            assert!(matches!(waited, Err(mpsc::RecvTimeoutError::Timeout)));
             finished?;
             Ok(())
         })

@@ -1,6 +1,6 @@
 //! Tree-sitter callable extraction and recoverable syntax diagnostics.
 
-use super::syntax::{Descent, children, parse_code, text, unwrap_value as unwrap};
+use super::syntax::{Descent, children, parse_bounded, parse_code, text, unwrap_value as unwrap};
 use super::{CallSite, Callable, Diagnostic, ParsedFile};
 use crate::hash;
 use anyhow::{Context, Result};
@@ -142,12 +142,7 @@ fn collect_calls(
 ) {
     let nodes = &mut structure.nodes;
     let mut owners: Vec<usize> = (0..nodes.len())
-        .filter(|&id| {
-            matches!(
-                nodes[id].kind.as_str(),
-                "function" | "method" | "constructor" | "generator"
-            )
-        })
+        .filter(|&id| super::structure::is_callable_kind(&nodes[id].kind))
         .collect();
     owners.sort_by_key(|&id| {
         (
@@ -1037,7 +1032,7 @@ fn recover_typescript(parser: &mut Parser, tree: &Tree, source: &str) -> Option<
     if !changed {
         return None;
     }
-    let recovered = parser.parse(&masked, None)?;
+    let recovered = parse_bounded(parser, &masked)?;
     (!recovered.root_node().has_error()).then_some(recovered)
 }
 

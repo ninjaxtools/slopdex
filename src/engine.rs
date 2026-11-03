@@ -139,8 +139,10 @@ impl Engine {
 
     /// Fail if a prepared file's bytes changed since they were hashed.
     fn verify_source_unchanged(&self, file: &File) -> Result<()> {
+        let max_size = self.config["maxFileSize"].as_u64().unwrap_or(1_048_576);
         ensure!(
-            hash(fs::read(self.root.join(&file.path))?) == file.hash,
+            discovery::hash_file_capped(&self.root.join(&file.path), max_size).as_deref()
+                == Some(file.hash.as_str()),
             "Source changed during indexing: {}; rerun",
             file.path
         );
@@ -447,9 +449,18 @@ fn score(value: &Value, key: &str) -> f64 {
     value[key].as_f64().unwrap_or(0.0)
 }
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    // Mismatched or zero-norm vectors have no meaningful similarity; report
+    // neutral 0 instead of a NaN that JSON would render as null.
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
     let dot: f64 = a.iter().zip(b).map(|(a, b)| *a as f64 * *b as f64).sum();
     let norm = |v: &[f32]| v.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
-    (dot / (norm(a) * norm(b))).clamp(-1.0, 1.0)
+    let denominator = norm(a) * norm(b);
+    if denominator == 0.0 {
+        return 0.0;
+    }
+    (dot / denominator).clamp(-1.0, 1.0)
 }
 
 #[cfg(test)]

@@ -1196,3 +1196,93 @@ fn repository_config_marking_adopts_only_the_user_trust_list() {
         "the user config itself rejects an invalid trust list"
     );
 }
+
+#[test]
+fn repository_config_marking_ignores_repository_destinations() {
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("user/config.json");
+    write_config(
+        &user,
+        &json!({"indexPath": "/user/index.sqlite",
+            "artifactCachePath": "/user/artifacts.sqlite",
+            "artifactS3": {"bucket": "user-bucket"}}),
+    )
+    .unwrap();
+    let mut config = json!({"indexPath": "/repo/index.sqlite",
+        "artifactCachePath": "/repo/artifacts.sqlite",
+        "artifactS3": {"bucket": "repo-bucket"}, "ollamaAutoPull": true});
+    super::mark_repository_config_from(&mut config, &parse(&["status"]).global, &user).unwrap();
+    // Repository values never survive marking; the user's own destinations do.
+    assert_eq!(config["indexPath"], "/user/index.sqlite");
+    assert_eq!(config["artifactCachePath"], "/user/artifacts.sqlite");
+    assert_eq!(config["artifactS3"]["bucket"], "user-bucket");
+    assert!(config.get("ollamaAutoPull").is_none());
+
+    // An explicit --index remains a command-line choice, not repository support.
+    let mut config = json!({"indexPath": "/repo/index.sqlite"});
+    super::mark_repository_config_from(
+        &mut config,
+        &parse(&["--index", "/cli/index.sqlite", "status"]).global,
+        &user,
+    )
+    .unwrap();
+    assert_eq!(
+        config["indexPath"],
+        json!(crate::cli::workspace::absolute(std::path::Path::new("/cli/index.sqlite")).unwrap())
+    );
+
+    let bare_user = temp.path().join("bare/config.json");
+    let mut config = json!({"indexPath": "/repo/index.sqlite",
+        "artifactCachePath": "/repo/artifacts.sqlite",
+        "artifactS3": {"bucket": "repo-bucket"}, "ollamaAutoPull": true});
+    super::mark_repository_config_from(&mut config, &parse(&["status"]).global, &bare_user)
+        .unwrap();
+    assert!(config.get("indexPath").is_none());
+    assert!(config.get("artifactCachePath").is_none());
+    assert!(config.get("artifactS3").is_none());
+    assert!(config.get("ollamaAutoPull").is_none());
+}
+
+#[test]
+fn config_set_alias_writes_the_canonical_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    write_config(
+        &path,
+        &json!({"provider": "openai", "model": "old", "dimensions": 8}),
+    )
+    .unwrap();
+    config_action_json(&path, &["config", "set", "embeddingModel", "new-model"]);
+    config_action_json(&path, &["config", "set", "embeddingDimensions", "16"]);
+    let saved = read_config(&path).unwrap();
+    assert_eq!(saved["model"], "new-model");
+    assert_eq!(saved["dimensions"], 16);
+    let raw: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(raw.get("embeddingModel").is_none());
+    assert!(raw.get("embeddingDimensions").is_none());
+}
+
+#[test]
+fn config_set_rejects_out_of_range_numeric_values_at_save_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    write_config(&path, &json!({})).unwrap();
+    for (key, value) in [
+        ("providerMaxRetries", "99"),
+        ("retryDelayMs", "999999999"),
+        ("providerTimeoutMs", "999999999"),
+        ("symbolDimensions", "999999"),
+        ("maxFileSize", "999999999999"),
+        ("rerankerCandidates", "101"),
+        ("parallelism", "100000"),
+    ] {
+        let cli = parse(&["config", "set", key, value]);
+        let Command::Config { args } = cli.command else {
+            panic!()
+        };
+        let error = run_config(&cli.global, &path, &args, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(key), "{key}: {error}");
+    }
+}

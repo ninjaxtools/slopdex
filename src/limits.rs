@@ -74,6 +74,54 @@ pub(crate) fn validate_config(config: &Value) -> Result<()> {
         ResultLimit::from_value(value)
             .map_err(|_| anyhow::anyhow!("defaultLimit must be a positive integer or \"none\""))?;
     }
+    validate_numeric_config(config)
+}
+
+/// Every documented numeric setting, bounded in one place shared by the CLI
+/// and the library entry points, so a value accepted by `config set` cannot
+/// fail later inside a provider and a repository config cannot defeat the
+/// resource caps with huge values. An explicit null is an error for these
+/// keys (existing contract); only absence means unset. The two HTTP retry
+/// settings are the exception: null already means unset there.
+pub(crate) fn validate_numeric_config(config: &Value) -> Result<()> {
+    for (key, max) in [
+        ("dimensions", 16_384u64),
+        ("symbolDimensions", 16_384),
+        ("ollamaNativeDimensions", 16_384),
+        ("maxFileSize", 64 * 1024 * 1024),
+        ("embeddingBatchSize", 10_000),
+        ("parallelism", 256),
+        ("embeddingParallelism", 256),
+        ("agentTimeoutMs", 3_600_000),
+        ("providerTimeoutMs", 3_600_000),
+        ("ollamaPullTimeoutMs", 10_800_000),
+        ("ollamaContextLength", 1_000_000),
+        ("rerankerCandidates", 100),
+    ] {
+        if let Some(value) = config.get(key) {
+            anyhow::ensure!(
+                value
+                    .as_u64()
+                    .is_some_and(|number| number > 0 && number <= max),
+                "{key} must be an integer between 1 and {max}"
+            );
+        }
+    }
+    if let Some(value) = config
+        .get("providerMaxRetries")
+        .filter(|value| !value.is_null())
+    {
+        anyhow::ensure!(
+            value.as_u64().is_some_and(|number| number <= 5),
+            "providerMaxRetries must be an integer between 0 and 5"
+        );
+    }
+    if let Some(value) = config.get("retryDelayMs").filter(|value| !value.is_null()) {
+        anyhow::ensure!(
+            value.as_u64().is_some_and(|number| number <= 60_000),
+            "retryDelayMs must be an integer between 0 and 60000"
+        );
+    }
     Ok(())
 }
 
@@ -120,5 +168,25 @@ mod tests {
             ResultLimit::None
         );
         assert_eq!("7".parse::<ResultLimit>().unwrap(), ResultLimit::Count(7));
+    }
+
+    #[test]
+    fn numeric_config_values_are_bounded_for_library_callers_too() {
+        assert!(validate_config(&json!({"maxFileSize": 1024, "parallelism": 4})).is_ok());
+        for config in [
+            json!({"maxFileSize": "1024"}),
+            json!({"maxFileSize": 1.5}),
+            json!({"maxFileSize": null}),
+            json!({"maxFileSize": 999_999_999_999u64}),
+            json!({"parallelism": 0}),
+            json!({"providerMaxRetries": 99}),
+            json!({"dimensions": 1_000_000}),
+        ] {
+            assert!(validate_config(&config).is_err(), "{config}");
+        }
+        // The HTTP retry settings keep their null-means-unset contract.
+        assert!(
+            validate_config(&json!({"providerMaxRetries": null, "retryDelayMs": null})).is_ok()
+        );
     }
 }

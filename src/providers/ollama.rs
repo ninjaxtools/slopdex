@@ -22,7 +22,7 @@ fn cloud_alias(name: &str) -> bool {
     name.ends_with(":cloud") || name.ends_with("-cloud")
 }
 
-fn warn_remote_endpoint(config: &Value) -> Result<()> {
+pub(super) fn warn_remote_endpoint(config: &Value) -> Result<()> {
     let url = super::validate_url(&url(config, "embed")?)?;
     let host = url.host_str().unwrap_or("").trim_matches(['[', ']']);
     let loopback = host.trim_end_matches('.') == "localhost"
@@ -30,11 +30,40 @@ fn warn_remote_endpoint(config: &Value) -> Result<()> {
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback());
     if !loopback {
+        // Ollama is local inference with no credential travelling with the
+        // endpoint, so there is no hosted-provider exemption: a repository
+        // config may not silently route source text to a remote server.
+        if config[super::CONFIG_ORIGIN_KEY] == super::CONFIG_ORIGIN_REPOSITORY
+            && config[super::TRUST_REPOSITORY_ENDPOINTS_KEY] != true
+        {
+            let label = super::host_label(&url);
+            let trusted = config["trustedEndpointHosts"]
+                .as_array()
+                .is_some_and(|hosts| {
+                    hosts.iter().filter_map(Value::as_str).any(|entry| {
+                        let entry = entry.trim();
+                        entry.eq_ignore_ascii_case(&label) || entry.eq_ignore_ascii_case(host)
+                    })
+                });
+            ensure!(
+                trusted,
+                "The repository config routes Ollama embedding requests to non-loopback host {label}, which would send source text there. \
+                 To allow this, add {label:?} to trustedEndpointHosts in your user config or run with --trust-repo-endpoints"
+            );
+        }
         crate::ui::warning(
             "slopdex: Ollama embedding endpoint is not loopback; inputs will be sent to the configured server, which may be remote",
         );
     }
     Ok(())
+}
+
+/// Downloads need an explicit user action: an explicit pull request always
+/// counts, but `ollamaAutoPull` from a repository config never does (the CLI
+/// also strips it when marking; this keeps library callers safe).
+pub(super) fn auto_pull_allowed(config: &Value) -> bool {
+    config["ollamaAutoPull"] == true
+        && config[super::CONFIG_ORIGIN_KEY] != super::CONFIG_ORIGIN_REPOSITORY
 }
 
 /// Native output sizes for the built-in Ollama presets. Other models are probed.
@@ -148,7 +177,7 @@ fn installed(config: &Value, http: &Http, name: &str, pull: bool) -> Result<Valu
     let mut models = tags(config, http)?;
     if find(&models, name).is_none() {
         ensure!(
-            pull || config["ollamaAutoPull"] == true,
+            pull || auto_pull_allowed(config),
             "Ollama model {name} is not installed; run `slopdex config embeddings --provider ollama --model {name} --pull` or `ollama pull {name}`"
         );
         let timeout = positive(config, &["ollamaPullTimeoutMs"], 1_800_000)?;
