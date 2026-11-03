@@ -33,8 +33,8 @@ impl ResultLimit {
         }
     }
 
-    fn from_value(value: &Value) -> Result<Self> {
-        if value.as_str() == Some("none") {
+    pub(crate) fn from_value(value: &Value) -> Result<Self> {
+        if matches!(value.as_str(), Some("none" | "off")) {
             return Ok(Self::None);
         }
         if let Some(count) = value.as_u64().and_then(|count| usize::try_from(count).ok())
@@ -42,7 +42,7 @@ impl ResultLimit {
         {
             return Ok(Self::Count(count));
         }
-        bail!("limit must be a positive integer or \"none\"")
+        bail!("limit must be a positive integer, \"none\", or \"off\"")
     }
 }
 
@@ -50,7 +50,7 @@ impl FromStr for ResultLimit {
     type Err = String;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        if value == "none" {
+        if matches!(value, "none" | "off") {
             return Ok(Self::None);
         }
         value
@@ -58,7 +58,7 @@ impl FromStr for ResultLimit {
             .ok()
             .filter(|count| *count > 0)
             .map(Self::Count)
-            .ok_or_else(|| "limit must be a positive integer or 'none'".into())
+            .ok_or_else(|| "limit must be a positive integer, 'none', or 'off'".into())
     }
 }
 
@@ -114,6 +114,11 @@ mod tests {
             assert!(value.parse::<ResultLimit>().is_err());
         }
         assert_eq!("none".parse::<ResultLimit>().unwrap(), ResultLimit::None);
+        assert_eq!("off".parse::<ResultLimit>().unwrap(), ResultLimit::None);
+        assert_eq!(
+            resolve(&json!({}), &json!({"limit": "off"})).unwrap(),
+            ResultLimit::None
+        );
         assert_eq!("7".parse::<ResultLimit>().unwrap(), ResultLimit::Count(7));
     }
 }

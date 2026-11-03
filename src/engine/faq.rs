@@ -9,7 +9,7 @@ pub(crate) fn threshold(config: &Value, options: &Value) -> Result<f64> {
         .get("faqThreshold")
         .or_else(|| config.get("faqThreshold"));
     match value {
-        None => Ok(0.9),
+        None => Ok(0.7),
         Some(value) => value
             .as_f64()
             .filter(|n| n.is_finite() && (-1.0..=1.0).contains(n))
@@ -17,10 +17,27 @@ pub(crate) fn threshold(config: &Value, options: &Value) -> Result<f64> {
     }
 }
 
+/// How many ranked FAQ matches to return: `faqLimit` (or the shared `limit`
+/// option), defaulting to one. The configured `defaultLimit` does not apply
+/// here; it caps the source search that feeds answer generation instead.
+fn faq_limit(options: &Value) -> Result<limits::ResultLimit> {
+    let Some(value) = options.get("faqLimit").or_else(|| options.get("limit")) else {
+        return Ok(limits::ResultLimit::Count(1));
+    };
+    limits::ResultLimit::from_value(value)
+        .map_err(|_| anyhow::anyhow!("faqLimit must be a positive integer, \"none\", or \"off\""))
+}
+
 impl Engine {
-    /// Answer a question, reusing the best valid question/answer match above the cutoff.
+    /// Answer a question, reusing valid question/answer matches above the
+    /// cutoff. Each returned answer carries its vector-search `score` (a
+    /// freshly generated answer scores `1.0`). Returns a single answer
+    /// object by default, or an array of ranked answers when the FAQ limit
+    /// (`faqLimit`/`limit`) is greater than one or off.
     pub fn faq(&self, query: &str, options: &Value) -> Result<Value> {
         let cutoff = threshold(&self.config, options)?;
+        let faq_limit = faq_limit(options)?;
+        let single = faq_limit == limits::ResultLimit::Count(1);
         ensure!(!query.trim().is_empty(), "FAQ question must not be empty");
         ensure!(
             query.len() + 80 <= FAQ_PROMPT_BYTES,
@@ -40,10 +57,15 @@ impl Engine {
             "FAQ requires a writable search engine"
         );
         let mut context = options.clone();
-        context
-            .as_object_mut()
-            .context("FAQ options must be an object")?
-            .remove("faqThreshold");
+        {
+            let context = context
+                .as_object_mut()
+                .context("FAQ options must be an object")?;
+            // The cutoff and the number of answers returned do not change
+            // what an answer is generated from, so neither isolates entries.
+            context.remove("faqThreshold");
+            context.remove("faqLimit");
+        }
         context["limit"] = limits::resolve(&self.config, options)?.value();
         let contract = hash(
             json!([
@@ -72,25 +94,59 @@ impl Engine {
         ui::progress("Searching FAQ answers");
         let index = self.faq_index(&entries)?;
         // Both occurrences point at the same entry: the best of either embedding wins.
-        let matched = index
-            .search_filtered(&query_vector, 1, |_| true)?
-            .first()
-            .filter(|(_, similarity)| *similarity > cutoff)
-            .map(|(id, _)| {
-                entries
-                    .iter()
-                    .find(|entry| entry.id == id / 2)
-                    .context("Missing FAQ entry")
-            })
-            .transpose()?;
-        if let Some(entry) = matched
-            && self.faq_files_current(&entry.files, &mut HashMap::new())
-        {
-            let mut result = entry.result.clone();
-            result["query"] = json!(query);
-            ui::progress("Reusing FAQ answer");
-            return Ok(result);
+        // One answer needs only the best occurrence; several need every
+        // occurrence so duplicates and stale entries cannot crowd out matches.
+        let occurrences = if single {
+            1
+        } else {
+            entries.len().saturating_mul(2)
+        };
+        let mut ranked: Vec<(&FaqEntry, f64)> = Vec::new();
+        for (id, similarity) in index.search_filtered(&query_vector, occurrences, |_| true)? {
+            if similarity <= cutoff {
+                continue;
+            }
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == id / 2)
+                .context("Missing FAQ entry")?;
+            if !ranked.iter().any(|(ranked, _)| ranked.id == entry.id) {
+                ranked.push((entry, similarity));
+            }
         }
+        let matched = ranked.first().copied();
+        if single {
+            if let Some((entry, score)) = matched
+                && self.faq_files_current(&entry.files, &mut HashMap::new())
+            {
+                let mut result = entry.result.clone();
+                result["query"] = json!(query);
+                result["score"] = json!(score);
+                ui::progress("Reusing FAQ answer");
+                return Ok(result);
+            }
+        } else {
+            // Stale entries are never served; with no valid match the best
+            // stale entry below still anchors a regenerated answer.
+            let mut checked = HashMap::new();
+            let mut results = Vec::new();
+            for (entry, score) in &ranked {
+                if results.len() == faq_limit.count().unwrap_or(usize::MAX) {
+                    break;
+                }
+                if self.faq_files_current(&entry.files, &mut checked) {
+                    let mut result = entry.result.clone();
+                    result["query"] = json!(query);
+                    result["score"] = json!(score);
+                    results.push(result);
+                }
+            }
+            if !results.is_empty() {
+                ui::progress("Reusing FAQ answer");
+                return Ok(json!(results));
+            }
+        }
+        let matched = matched.map(|(entry, _)| entry);
 
         let question = matched.map_or(query, |entry| entry.question.as_str());
         let question_embedding =
@@ -119,7 +175,11 @@ impl Engine {
             }
         }
         result["query"] = json!(query);
-        Ok(result)
+        // A generated answer was not matched by vector search; it scores a
+        // perfect 1. The score is per-query, so it is set only after the
+        // scoreless result above may have been stored as a cache entry.
+        result["score"] = json!(1.0);
+        Ok(if single { result } else { json!([result]) })
     }
 
     pub(super) fn faq_files_current(
@@ -502,5 +562,43 @@ mod tests {
             .clone()
         );
         assert_eq!(tracked, files);
+    }
+
+    #[test]
+    fn threshold_defaults_to_point_seven_and_faq_limit_defaults_to_one() {
+        assert_eq!(threshold(&json!({}), &json!({})).unwrap(), 0.7);
+        assert_eq!(
+            threshold(&json!({"faqThreshold": 0.9}), &json!({})).unwrap(),
+            0.9
+        );
+        assert_eq!(
+            threshold(&json!({"faqThreshold": 0.9}), &json!({"faqThreshold": 0.5})).unwrap(),
+            0.5
+        );
+        assert_eq!(
+            faq_limit(&json!({})).unwrap(),
+            limits::ResultLimit::Count(1)
+        );
+        assert_eq!(
+            faq_limit(&json!({"faqLimit": 3})).unwrap(),
+            limits::ResultLimit::Count(3)
+        );
+        for value in ["off", "none"] {
+            assert_eq!(
+                faq_limit(&json!({"faqLimit": value})).unwrap(),
+                limits::ResultLimit::None
+            );
+        }
+        assert_eq!(
+            faq_limit(&json!({"limit": 2})).unwrap(),
+            limits::ResultLimit::Count(2)
+        );
+        assert_eq!(
+            faq_limit(&json!({"faqLimit": 2, "limit": 5})).unwrap(),
+            limits::ResultLimit::Count(2)
+        );
+        for value in [json!(0), json!(-1), json!(1.5), json!("all"), json!(null)] {
+            assert!(faq_limit(&json!({"faqLimit": value})).is_err());
+        }
     }
 }

@@ -731,10 +731,12 @@ Common query/cross-search filters:
 - `--threshold <number|min-max>`: default `0.8` for cross-search and `0.3` for
   query commands (including `faq`); finite endpoints in `[-1,1]`,
   inclusive minimum and exclusive maximum. A range requires minimum < maximum.
-- `--limit <positive integer|none>`: default `4096`, configurable with
-  `defaultLimit` in the selected config file. `--limit none` disables the output
-  limit, overriding the config. Caps query results (including Markdown), or the
-  context matches for `faq`. For `map`, it caps direct declaration matches
+- `--limit <positive integer|none|off>`: default `4096`, configurable with
+  `defaultLimit` in the selected config file. `--limit none` (or `--limit off`)
+  disables the output limit, overriding the config. Caps query results
+  (including Markdown). For `faq` it instead caps the ranked FAQ questions
+  returned (default `1`, unaffected by `defaultLimit`; see
+  [Frequently asked questions](#frequently-asked-questions)). For `map`, it caps direct declaration matches
   across files and mapped workspaces; ancestor and call-graph context do not count.
   When mapping multiple workspaces, the first workspace supplies the configured
   default unless `--limit` is explicit. For cross-search it caps
@@ -1105,14 +1107,16 @@ match are silently dropped, as are any line numbers the model supplies.
 Responses that are not the requested JSON object are treated as a plain
 description with no references. Reranker order informs the prompt.
 JSON output contains `query` (the current question), `question` (the original
-cached question), `description`, `references`, `omitted`, and `limit`. Each
+cached question), `description`, `references`, `omitted`, `limit`, and `score`:
+the cosine similarity of the vector-search match that produced the answer, or
+`1` when the answer was generated rather than matched. Each
 kept reference is `{"path": ...}` for a whole file or
 `{"path": ..., "symbol": <canonical qualified name>, "startLine": ..., "endLine": ...}`
 with the line range taken from the rendered context, in cited order without
 duplicates.
-Text output labels the generated prose `Explanation` and follows it with
-`References`, one location per line (`path`, or `path:start-end:symbol` in the
-shared symbol-location format). The prose is model-generated; its
+Text output labels the generated prose `Explanation (score=...)` and follows it
+with `References`, one location per line (`path`, or `path:start-end:symbol` in
+the shared symbol-location format). The prose is model-generated; its
 format and wording are not deterministic.
 
 Each workspace maintains a separate `faq` vector index backed by SQLite entries.
@@ -1123,11 +1127,21 @@ question embedding (query mode) and the plain-text LLM answer embedding
 stored in the entry or included in the answer embedding.
 
 Before searching code, FAQ compares the incoming question to both embeddings and
-selects the best entry whose cosine similarity is **strictly greater than
-`0.9`**. If its dependencies are still valid, its answer is returned immediately.
+ranks the entries whose cosine similarity is **strictly greater than
+`0.7`** by that best question-or-answer score. Entries whose dependencies are
+still valid are returned immediately, best first, each with its `score`.
 `--faq-threshold N` overrides config `faqThreshold`; both accept a finite
 number in `[-1,1]`. This is independent of `--threshold`, which filters source
 search results on a miss. A cutoff of `1` disables semantic reuse.
+`--limit N` caps how many ranked FAQ questions are returned (default `1`);
+`--limit off` (or `--limit none`) returns every match above the cutoff. With a
+limit of `1` the output is the single answer object described above; with any
+other limit it is a JSON array of such objects in ranked order (text output
+prints each matched question with its answer). A limit above `1` on a miss
+still generates only one new answer, returned as a one-element array with
+`score` `1`. The FAQ `--limit` does not cap the source search behind a
+generated answer; that search keeps using `defaultLimit`. Changing only the
+FAQ cutoff or limit does not isolate cached entries.
 
 FAQ hits reuse the original references without searching, reranking, or calling
 the LLM again; a new question may still require a query embedding. Entries persist
@@ -1767,8 +1781,8 @@ Example `config.json` (user or repository settings):
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel`, `rerankerCommand` | Disabled by default. `cohere` defaults to `rerank-v4.0-pro`, `jina` to `jina-reranker-v3.5`; `command` uses an explicit agent command and optional model. |
 | `rerankerCandidates` | Generative (`command`) candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
 | `agentTimeoutMs` | Positive subprocess timeout for text generation, default `300000` (five minutes). No automatic subprocess retries. |
-| `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, FAQ, map direct matches, and cross-search output. `--limit` overrides it. |
-| `faqThreshold` | FAQ cache cosine cutoff in `[-1,1]`, default `0.9`; the best question or answer score must be strictly greater. `--faq-threshold` overrides it. |
+| `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, the source search behind generated FAQ answers, map direct matches, and cross-search output. `--limit` overrides it (for `faq`, `--limit` instead caps the ranked FAQ questions returned, default `1`). |
+| `faqThreshold` | FAQ cache cosine cutoff in `[-1,1]`, default `0.7`; the best question or answer score must be strictly greater. `--faq-threshold` overrides it. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path, glob arrays, and positive byte limit as described above. |
 | `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle, as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`, Ollama `8` (maximum `64`); larger configured values are capped. The full config wizard defaults to `8` for Ollama and `32` otherwise; embedding-only setup leaves batching defaults to the provider. |

@@ -103,6 +103,158 @@ fn faq_cutoff_is_configurable_strict_and_does_not_change_context_identity() -> R
 }
 
 #[test]
+fn faq_reports_scores_and_limits_ranked_vector_matches() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("code.rs", &function("selected", "VECTOR_EAST"))?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    // A generated answer reports a perfect score.
+    let north = engine.faq("VECTOR_NORTH question", &all())?;
+    assert_eq!(north["score"], json!(1.0), "{north}");
+    assert!(north.is_object());
+    // The stored entry carries no score: a later hit reports its own similarity.
+    let stored: String = repo
+        .db()?
+        .query_row("SELECT result FROM faq_entries", [], |row| row.get(0))?;
+    assert!(
+        serde_json::from_str::<Value>(&stored)?
+            .get("score")
+            .is_none()
+    );
+    // MID scores 0.6 against the north question but 0.8 against its eastward
+    // answer, so only the new 0.7 default cutoff (not the old 0.9) reuses it.
+    let calls = mock.requests("/responses").len();
+    let hit = engine.faq("VECTOR_MID paraphrase", &all())?;
+    assert_eq!(hit["question"], "VECTOR_NORTH question");
+    assert_eq!(hit["description"], north["description"]);
+    let score = hit["score"].as_f64().unwrap();
+    assert!((score - 0.8).abs() < 1e-6, "score {score}");
+    assert_eq!(mock.requests("/responses").len(), calls);
+    assert_eq!(entries(&repo)?, 1);
+    // Force a second, distinct cached entry.
+    let mut forced = all();
+    forced["faqThreshold"] = json!(1);
+    let mid = engine.faq("VECTOR_MID question", &forced)?;
+    assert_eq!(mid["score"], json!(1.0));
+    assert_eq!(entries(&repo)?, 2);
+    // A north query scores 1 against the north question and 0.6 against the
+    // mid question (both answer vectors are eastward, hence orthogonal here).
+    let mut ranked = all();
+    ranked["faqThreshold"] = json!(0.5);
+    ranked["faqLimit"] = json!("off");
+    let calls = mock.requests("/responses").len();
+    let results = engine.faq("VECTOR_NORTH again", &ranked)?;
+    let results = results.as_array().expect("faqLimit off returns an array");
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(results[0]["question"], "VECTOR_NORTH question");
+    assert_eq!(results[0]["description"], north["description"]);
+    assert!((results[0]["score"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    assert_eq!(results[1]["question"], "VECTOR_MID question");
+    assert_eq!(results[1]["description"], mid["description"]);
+    assert!((results[1]["score"].as_f64().unwrap() - 0.6).abs() < 1e-6);
+    assert!(
+        results
+            .iter()
+            .all(|result| result["query"] == "VECTOR_NORTH again")
+    );
+    assert_eq!(mock.requests("/responses").len(), calls);
+    // A miss under a multi-answer limit generates one answer in an array.
+    ranked["faqLimit"] = json!("off");
+    let generated = engine.faq("VECTOR_WEST unrelated", &ranked)?;
+    let generated = generated.as_array().expect("faqLimit off returns an array");
+    assert_eq!(generated.len(), 1, "{generated:?}");
+    assert_eq!(generated[0]["question"], "VECTOR_WEST unrelated");
+    assert_eq!(generated[0]["score"], json!(1.0));
+    // An explicit limit of one keeps the single-object shape.
+    ranked["faqLimit"] = json!(1);
+    let single = engine.faq("VECTOR_NORTH again", &ranked)?;
+    assert!(single.is_object(), "{single}");
+    assert_eq!(single["question"], "VECTOR_NORTH question");
+    // Invalid limits fail before any provider request.
+    let calls = mock.count();
+    for value in [json!(0), json!(-1), json!(1.5), json!("all"), json!(null)] {
+        assert!(
+            engine
+                .faq("VECTOR_NORTH again", &json!({"faqLimit": value}))
+                .is_err(),
+            "{value}"
+        );
+    }
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
+fn faq_cli_limit_returns_ranked_cached_questions() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write("code.rs", &function("selected", "VECTOR_EAST"))?;
+    repo.cli_json(&["update"])?;
+    for question in ["VECTOR_NORTH question", "VECTOR_MID question"] {
+        let generated =
+            repo.cli_json(&["faq", question, "--threshold", "-1", "--faq-threshold", "1"])?;
+        assert_eq!(generated["score"], json!(1.0), "{generated}");
+    }
+    let base = [
+        "faq",
+        "VECTOR_NORTH again",
+        "--threshold",
+        "-1",
+        "--faq-threshold",
+        "0.5",
+    ];
+    // By default --limit is 1: a single answer object.
+    let single = repo.cli_json(&base)?;
+    assert!(single.is_object(), "{single}");
+    assert_eq!(single["question"], "VECTOR_NORTH question");
+    assert!((single["score"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    // --limit off returns every ranked match above the cutoff.
+    let mut args = base.to_vec();
+    args.extend(["--limit", "off"]);
+    let results = repo.cli_json(&args)?;
+    let results = results.as_array().expect("--limit off returns an array");
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(results[0]["question"], "VECTOR_NORTH question");
+    assert_eq!(results[1]["question"], "VECTOR_MID question");
+    assert!((results[1]["score"].as_f64().unwrap() - 0.6).abs() < 1e-6);
+    // --limit 2 matches --limit off here; --limit 1 stays a single object.
+    let mut args = base.to_vec();
+    args.extend(["--limit", "2"]);
+    assert_eq!(repo.cli_json(&args)?.as_array().unwrap().len(), 2);
+    let mut args = base.to_vec();
+    args.extend(["--limit", "1"]);
+    assert!(repo.cli_json(&args)?.is_object());
+    // Text output lists each matched question with its score.
+    let mut args = base.to_vec();
+    args.extend(["--limit", "off"]);
+    let text = repo.cli_format(&args, "text")?;
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let text = String::from_utf8(text.stdout)?;
+    assert!(text.contains("VECTOR_NORTH question"), "{text}");
+    assert!(text.contains("VECTOR_MID question"), "{text}");
+    assert!(text.contains("score=1.00"), "{text}");
+    assert!(text.contains("score=0.60"), "{text}");
+    // The generation-time search limit is not the FAQ limit: the two cached
+    // answers were the only LLM work.
+    assert_eq!(mock.requests("/responses").len(), 2);
+    for value in ["0", "all"] {
+        assert!(
+            !repo
+                .cli(&["faq", "east", "--limit", value])?
+                .status
+                .success()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn faq_invalidates_changed_deleted_and_renamed_files_but_not_unrelated_edits() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
@@ -253,6 +405,11 @@ fn faq_cli_replaces_describe_and_threshold_override_reuses_saved_references() ->
     assert_eq!(second["question"], "east");
     assert_eq!(second["description"], first["description"]);
     assert_eq!(second["references"], first["references"]);
+    assert_eq!(first["score"], json!(1.0), "generated answers score 1");
+    assert!(
+        (second["score"].as_f64().unwrap() - 0.8).abs() < 1e-6,
+        "a vector-search hit reports its cosine score: {second}"
+    );
     assert_eq!(mock.requests("/responses").len(), 1);
     let text = repo.cli_format(&["faq", "east", "--threshold", "-1"], "text")?;
     assert!(
@@ -261,7 +418,10 @@ fn faq_cli_replaces_describe_and_threshold_override_reuses_saved_references() ->
         String::from_utf8_lossy(&text.stderr)
     );
     let text = String::from_utf8(text.stdout)?;
-    assert!(text.starts_with("Explanation\nanswer grounded"), "{text}");
+    assert!(
+        text.starts_with("Explanation (score=1.00)\nanswer grounded"),
+        "{text}"
+    );
     assert!(
         text.contains("\nReferences\ncode.rs:1-4:selected\n"),
         "{text}"

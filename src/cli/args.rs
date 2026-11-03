@@ -646,10 +646,15 @@ impl Command {
 }
 
 #[derive(Debug, Args)]
+#[command(mut_arg("limit", |arg| {
+    arg.help(
+        "Positive number of ranked FAQ questions to return, or 'off'/'none' for all matches (default: 1)",
+    )
+}))]
 pub(super) struct FaqArgs {
     #[command(flatten)]
     pub(super) query: QueryArgs,
-    /// Reuse the best question/answer cosine match strictly above this value (config faqThreshold; default: 0.9)
+    /// Reuse question/answer cosine matches strictly above this value (config faqThreshold; default: 0.7)
     #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
     pub(super) faq_threshold: Option<f64>,
 }

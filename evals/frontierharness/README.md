@@ -1,7 +1,15 @@
 # FrontierHarness Eval: OpenCode versus slopdex map
 
-Runs the 30 published [FrontierHarness Eval](https://frontierharness.org) v1 tasks
-(21 Terminal-Bench 2.1, 9 DeepSWE) twice with OpenCode:
+Runs the published [FrontierHarness Eval](https://frontierharness.org) v1 tasks
+twice with OpenCode. There are two modes:
+
+- **`deepswe`** (default): the 9 DeepSWE tasks. These are real repositories,
+  which is where slopdex actually gets used. In the full run the agent called
+  slopdex in all 9 DeepSWE tasks but in only 2 of the 21 Terminal-Bench tasks,
+  most of which have little or no code to index.
+- **`full`**: all 30 tasks (21 Terminal-Bench 2.1 + 9 DeepSWE), as published.
+
+The two arms:
 
 - **`off`**: plain OpenCode, as in the published FrontierHarness OpenCode row.
 - **`map`**: slopdex installed and indexed. It gets the root README map snippet as
@@ -44,7 +52,8 @@ per pass) is printed only for context.
 ## Run
 
 ```sh
-# Freeze tasks (git clones + `harbor download`, no model calls) and list them.
+# Freeze tasks (git clones + `harbor download`, no model calls) and list the
+# DeepSWE tasks; add `--mode full` to list all 30.
 python3 evals/frontierharness/run.py list
 
 # Build the portable slopdex binary (Ubuntu 22.04 / glibc 2.35 container, like the
@@ -52,15 +61,19 @@ python3 evals/frontierharness/run.py list
 python3 evals/frontierharness/run.py prepare
 python3 evals/frontierharness/run.py run --dry-run
 
-# Run every missing or changed trial, then print results/report.md.
+# Run every missing or changed DeepSWE trial, then print results/report-deepswe.md.
 python3 evals/frontierharness/run.py run
+
+# The same for all 30 tasks, printing results/report-full.md.
+python3 evals/frontierharness/run.py run --mode full
 
 # Subsets.
 python3 evals/frontierharness/run.py run --arms off
 python3 evals/frontierharness/run.py run --task terminal-bench/regex-log --task datacurve/httpx-multipart-response-parsing
 
-# Regenerate the report from saved trials.
+# Regenerate a mode's report from saved trials.
 python3 evals/frontierharness/run.py report
+python3 evals/frontierharness/run.py report --mode full
 ```
 
 Requirements:
@@ -119,7 +132,8 @@ Use `--concurrency` or `config.json` to change it.
 `results/trials/<arm>/*.json` hold one record per trial: status, reward, agent and
 setup time, tokens, agent and faq cost, slopdex command counts, the exact
 controls, and the path of the full Harbor job under the ignored `jobs/`.
-`results/report.md` and `results/summary.json` give, per arm:
+Trial records are shared between modes, so a full run also fills the DeepSWE
+report. `results/report-<mode>.md` and `results/summary-<mode>.json` give, per arm:
 
 - pass rate;
 - effective cost per pass (all valid trials' cost / passes, as FrontierHarness defines it);

@@ -14,7 +14,7 @@ use super::{MapOutput, emit_map, warn_errors};
 use crate::engine::Engine;
 use crate::{limits, lines, ui};
 use anyhow::{Context, Result, ensure};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -172,44 +172,77 @@ fn faq(session: &mut Session, args: &FaqArgs, out: &mut impl Write) -> Result<()
     if let Some(threshold) = args.faq_threshold {
         options["faqThreshold"] = json!(threshold);
     }
+    // For faq, --limit counts the ranked FAQ questions returned, not the
+    // source-search results feeding generation (those keep using the
+    // configured defaultLimit).
+    if let Some(limit) = args.query.filters.limit {
+        options["faqLimit"] = limit.value();
+        if let Some(options) = options.as_object_mut() {
+            options.remove("limit");
+        }
+    }
     let engine = session.engine();
     let result = ui::spin("Answering FAQ", || engine.faq(&args.query.query, &options))?;
     // A semantic hit returns the original answer and references, never a fresh search.
     if format == Format::Json {
         print_json(out, &result)?;
+    } else if let Some(results) = result.as_array() {
+        for (index, result) in results.iter().enumerate() {
+            if index > 0 {
+                writeln!(out)?;
+            }
+            print_faq_answer(out, result, true)?;
+        }
     } else {
+        print_faq_answer(out, &result, false)?;
+    }
+    // The omitted/limit notice describes the source search behind a single
+    // generated answer; an array of ranked FAQ matches has no such search.
+    let (omitted, limit) = if result.is_array() {
+        (false, None)
+    } else {
+        (
+            result["omitted"].as_bool().unwrap_or(false),
+            result["limit"].as_u64().map(|n| n as usize),
+        )
+    };
+    print_limit_notice(out, format, omitted, limit)
+}
+
+fn print_faq_answer(out: &mut impl Write, result: &Value, show_question: bool) -> Result<()> {
+    if show_question {
         writeln!(
             out,
-            "Explanation\n{}",
-            result["description"].as_str().unwrap_or("")
+            "Question: {}",
+            result["question"].as_str().unwrap_or("")
         )?;
-        let references = result["references"].as_array().cloned().unwrap_or_default();
-        if !references.is_empty() {
-            writeln!(out, "\nReferences")?;
-            for reference in &references {
-                let path = reference["path"].as_str().unwrap_or("");
-                match reference["symbol"].as_str() {
-                    Some(symbol) => writeln!(
-                        out,
-                        "{}",
-                        crate::map::symbol_location(
-                            path,
-                            reference["startLine"].as_u64().unwrap_or(1) as usize,
-                            reference["endLine"].as_u64().unwrap_or(1) as usize,
-                            symbol,
-                        )
-                    )?,
-                    None => writeln!(out, "{path}")?,
-                }
+    }
+    let description = result["description"].as_str().unwrap_or("");
+    match result["score"].as_f64() {
+        Some(score) => writeln!(out, "Explanation (score={score:.2})\n{description}")?,
+        None => writeln!(out, "Explanation\n{description}")?,
+    }
+    let references = result["references"].as_array().cloned().unwrap_or_default();
+    if !references.is_empty() {
+        writeln!(out, "\nReferences")?;
+        for reference in &references {
+            let path = reference["path"].as_str().unwrap_or("");
+            match reference["symbol"].as_str() {
+                Some(symbol) => writeln!(
+                    out,
+                    "{}",
+                    crate::map::symbol_location(
+                        path,
+                        reference["startLine"].as_u64().unwrap_or(1) as usize,
+                        reference["endLine"].as_u64().unwrap_or(1) as usize,
+                        symbol,
+                    )
+                )?,
+                None => writeln!(out, "{path}")?,
             }
         }
     }
-    print_limit_notice(
-        out,
-        format,
-        result["omitted"].as_bool().unwrap_or(false),
-        result["limit"].as_u64().map(|n| n as usize),
-    )
+    Ok(())
 }
 
 fn cross_search(session: &mut Session, args: &CrossArgs, out: &mut impl Write) -> Result<()> {

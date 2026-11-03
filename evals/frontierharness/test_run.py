@@ -179,6 +179,31 @@ class SummaryTest(unittest.TestCase):
             self.assertFalse(run.reusable(path, control))
 
 
+class ModeTest(unittest.TestCase):
+    TASKS = ["terminal-bench/regex-log", "datacurve/httpx-multipart-response-parsing", "datacurve/expr-try-catch-errors"]
+
+    def test_default_mode_is_deepswe_only(self):
+        self.assertEqual(run.DEFAULT_MODE, "deepswe")
+        self.assertEqual(run.mode_tasks(self.TASKS, "deepswe"), self.TASKS[1:])
+        self.assertEqual(run.mode_tasks(self.TASKS, "full"), self.TASKS)
+
+    def test_reports_are_per_mode_from_shared_trials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = Path(directory)
+            for task_id in self.TASKS:
+                for arm in run.ARMS:
+                    run.write_json(run.record_path(results, arm, task_id), {"status": "success", "cost_usd": 1.0})
+            deepswe = run.write_report(results, self.TASKS, CONFIG, "deepswe")
+            full = run.write_report(results, self.TASKS, CONFIG, "full")
+            self.assertNotIn("terminal-bench/regex-log", deepswe)
+            self.assertNotIn("Kimi K3", deepswe)
+            self.assertIn("terminal-bench/regex-log", full)
+            self.assertIn("Kimi K3", full)
+            summary = run.read_json(run.report_paths(results, "deepswe")[1])
+            self.assertEqual((summary["mode"], summary["arms"]["off"]["valid"]), ("deepswe", 2))
+            self.assertEqual(run.read_json(run.report_paths(results, "full")[1])["arms"]["map"]["valid"], 3)
+
+
 @unittest.skipUnless(NODE, "node is required to execute the container shims")
 class ShimTest(unittest.TestCase):
     def setUp(self):

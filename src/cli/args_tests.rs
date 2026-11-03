@@ -1100,6 +1100,7 @@ fn limits_accept_none_preserve_unspecified_and_resolve_config_defaults() {
             (None, None),
             (Some("7"), Some(json!(7))),
             (Some("none"), Some(json!("none"))),
+            (Some("off"), Some(json!("none"))),
         ] {
             let mut argv = vec![command];
             if !matches!(command, "map" | "cross-search") {
