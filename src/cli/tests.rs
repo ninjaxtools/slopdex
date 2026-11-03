@@ -1,4 +1,5 @@
 use super::{test_support::parse, *};
+use crate::engine::OpenOptions;
 use serde_json::json;
 use std::path::Path;
 
@@ -12,7 +13,8 @@ fn external_source_repository_config_paths_are_ignored_unless_explicit() -> Resu
     std::fs::write(external.join("code.rs"), "pub fn cached() {}\n")?;
     let config = json!({"artifactCachePath": dir.path().join("artifacts.sqlite")});
     let index = external.join("saved.sqlite");
-    let mut engine = Engine::open_map(&external, &index, config.clone())?;
+    let mut engine =
+        Engine::open_with(&external, &index, config.clone(), OpenOptions::structure())?;
     engine.refresh_structure()?;
     drop(engine);
     let mut saved = config;
@@ -108,7 +110,8 @@ fn map_cli_uses_config_limits_explicit_overrides_and_actual_omission_notices() -
         let mut config =
             json!({"artifactCachePath": dir.path().join("artifacts.sqlite"), "defaultLimit": 2});
         if indexed {
-            let mut engine = Engine::open_map(dir.path(), &index, config.clone())?;
+            let mut engine =
+                Engine::open_with(dir.path(), &index, config.clone(), OpenOptions::structure())?;
             engine.refresh_structure()?;
         }
         for (default, explicit, expected) in [
@@ -213,7 +216,7 @@ fn multi_workspace_map_shares_declaration_budget_without_counting_ancestor_conte
             let config = json!({"artifactCachePath": root.join("artifacts.sqlite"), "indexPath": index, "defaultLimit": if i == 0 { 2 } else { 99 }});
             std::fs::write(root.join(".slopdex/config.json"), config.to_string())?;
             if indexed[i] {
-                let mut engine = Engine::open_map(root, &index, config)?;
+                let mut engine = Engine::open_with(root, &index, config, OpenOptions::structure())?;
                 engine.refresh_structure()?;
             }
         }

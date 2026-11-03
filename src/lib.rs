@@ -1,24 +1,43 @@
-pub mod cache;
-pub mod callgraph;
-pub mod cli;
-pub mod engine;
-pub mod filter;
-pub mod formats;
-pub mod git;
+//! slopdex: a local code index with structural, semantic, and FAQ search.
+//!
+//! The crate exposes a deliberately small facade. Implementation modules are
+//! private; everything a library or test caller needs is re-exported here.
+
+mod cache;
+mod callgraph;
+mod cli;
+mod config;
+mod engine;
+mod filter;
+mod formats;
+mod git;
 mod limits;
 mod lines;
-pub mod map;
-pub mod models;
-pub mod parse;
-pub mod providers;
-pub mod refactor;
+mod map;
+mod models;
+mod parse;
+mod providers;
+mod refactor;
 mod registry;
-pub mod storage;
+mod storage;
 mod symbols;
 #[cfg(all(test, unix))]
 mod test_support;
 mod ui;
-pub mod vectors;
+mod vectors;
+
+pub use cache::{Artifacts, store_path};
+pub use cli::{report_error, run};
+pub use config::Config;
+pub use engine::{Access, Engine, OpenMode, OpenOptions};
+pub use parse::{
+    CallSite, Callable, Diagnostic, FileStructure, ImportBinding, LanguageId, MarkdownChunk,
+    NodeKind, ParsedFile, ReferenceSite, StructureNode, language_for_path, parse,
+};
+pub use providers::{Providers, prepare_embeddings};
+pub use refactor::{FileChange, Plan};
+pub use storage::{Database, File, Item, STRUCTURE_PARSER_VERSION, UnitKind};
+pub use ui::{NoProgress, ProgressReporter, StageId};
 
 pub fn hash(input: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};

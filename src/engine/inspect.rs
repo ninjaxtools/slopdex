@@ -32,6 +32,7 @@ struct Record {
 impl Engine {
     /// Show all supported channels, including empty and not-yet-embedded ones.
     pub fn index_catalog(&self) -> Result<Vec<Value>> {
+        self.reporting(|| {
         CHANNELS.iter().map(|name| {
             let rows = self.inspection_records(name)?;
             let vectors = rows.iter().flat_map(|row| &row.embeddings).filter(|embedding| embedding.present).count();
@@ -39,11 +40,12 @@ impl Engine {
             Ok(json!({"name":name,"entryCount":rows.len(),"vectorCount":vectors,"pendingCount":pending,"exists":!rows.is_empty(),
                 "state":if rows.is_empty() { "empty" } else if pending > 0 { "pending" } else { "ready" }}))
         }).collect()
+        })
     }
 
     /// List or rank saved entries, including their complete metadata and vector values.
     pub fn index_entries(&self, name: &str, options: &Value) -> Result<Vec<Value>> {
-        Ok(self.index_entries_limited(name, options)?.rows)
+        self.reporting(|| Ok(self.index_entries_limited(name, options)?.rows))
     }
 
     pub(crate) fn index_entries_limited(
@@ -243,7 +245,7 @@ impl Engine {
                 kind: if descriptions {
                     "description".into()
                 } else {
-                    item.kind.clone()
+                    item.kind.as_str().into()
                 },
                 path: Some(item.path.clone()),
                 name: item.data["qualifiedName"]

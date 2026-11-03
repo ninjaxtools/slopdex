@@ -1,4 +1,5 @@
 use super::*;
+use crate::parse::NodeKind;
 
 #[derive(Clone)]
 struct Import {
@@ -157,7 +158,7 @@ impl Workspace {
     fn java_site(&self, path: &str, site: &EditSite) -> Result<Option<Key>> {
         let module = &self.files[path];
         if let Some(id) = site.binding_id
-            && module.structure.nodes[id].kind != "import"
+            && module.structure.nodes[id].kind != NodeKind::Import
         {
             return if site.receiver.is_none() {
                 Ok(Some((path.into(), id)))
@@ -399,12 +400,9 @@ impl Workspace {
                 }
             }
             if is_type && other == path {
-                for constructor in module
-                    .structure
-                    .nodes
-                    .iter()
-                    .filter(|node| node.parent_id == Some(key.1) && node.kind == "constructor")
-                {
+                for constructor in module.structure.nodes.iter().filter(|node| {
+                    node.parent_id == Some(key.1) && node.kind == NodeKind::Constructor
+                }) {
                     let node = module.declaration(constructor.id)?;
                     if let Some(name) = node.child_by_field_name("name") {
                         edits.entry(other.clone()).or_default().push(Edit {
@@ -651,7 +649,7 @@ impl Workspace {
     ) -> Result<()> {
         let symbol = self.files[from].symbol(selected)?;
         ensure!(
-            symbol.kind == "method" && modifier(symbol, "static"),
+            symbol.kind == NodeKind::Method && modifier(symbol, "static"),
             "Move Java static methods with file::Class.method; move types using file paths"
         );
         ensure!(
@@ -674,7 +672,7 @@ impl Workspace {
             });
         let target = self.files[to].symbol(scope)?;
         ensure!(
-            type_node(target) && target.parent_id.is_none() && target.kind != "interface",
+            type_node(target) && target.parent_id.is_none() && target.kind != NodeKind::Interface,
             "Destination must be a top-level Java class"
         );
         ensure!(
@@ -798,7 +796,7 @@ impl Workspace {
             !site.declaration && range.start <= site.range.start && site.range.end <= range.end
         }) {
             if let Some(id) = site.binding_id
-                && source.structure.nodes[id].kind == "import"
+                && source.structure.nodes[id].kind == NodeKind::Import
             {
                 let import = source_imports
                     .iter()

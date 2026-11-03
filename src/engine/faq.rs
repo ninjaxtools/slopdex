@@ -35,151 +35,156 @@ impl Engine {
     /// object by default, or an array of ranked answers when the FAQ limit
     /// (`faqLimit`/`limit`) is greater than one or off.
     pub fn faq(&self, query: &str, options: &Value) -> Result<Value> {
-        let cutoff = threshold(&self.config, options)?;
-        let faq_limit = faq_limit(options)?;
-        let single = faq_limit == limits::ResultLimit::Count(1);
-        ensure!(!query.trim().is_empty(), "FAQ question must not be empty");
-        ensure!(
-            query.len() + 80 <= FAQ_PROMPT_BYTES,
-            "FAQ question exceeds the prompt size limit"
-        );
-        // Validate context options even on a hit, before any provider requests.
-        let expand_callers = options["expandCallers"].as_u64().unwrap_or(2) as usize;
-        let expand_callees = options["expandCallees"].as_u64().unwrap_or(2) as usize;
-        crate::map::reference_mode(
-            options,
-            (options["callers"].as_u64().unwrap_or(0) as usize).max(expand_callers),
-            (options["callees"].as_u64().unwrap_or(0) as usize).max(expand_callees),
-        )?;
-        Selection::compile(options)?;
-        ensure!(
-            !self.readonly && !self.structural_only,
-            "FAQ requires a writable search engine"
-        );
-        let mut context = options.clone();
-        {
-            let context = context
-                .as_object_mut()
-                .context("FAQ options must be an object")?;
-            // The cutoff and the number of answers returned do not change
-            // what an answer is generated from, so neither isolates entries.
-            context.remove("faqThreshold");
-            context.remove("faqLimit");
-        }
-        context["limit"] = limits::resolve(&self.config, options)?.value();
-        let contract = hash(
-            json!([
-                "faq-v3",
-                SYSTEM,
-                STRUCTURE_PARSER_VERSION,
-                self.providers.vector().profile(),
-                self.description_generation_profile(),
-                self.config["include"],
-                self.config["exclude"],
-                self.config["maxFileSize"],
-                self.config["rerankingEnabled"],
-                self.config["rerankerProvider"],
-                self.config["rerankerModel"],
-                self.config["rerankerBaseUrl"],
-                self.config["rerankerCandidates"],
-                context
-            ])
-            .to_string(),
-        );
-        let question_embedding = self.embed_one(query, true)?;
-        let query_vector = self.vector(&question_embedding)?;
-        // Retain stale entries as question anchors, never as authoritative answers.
-        // A paraphrase can refresh the same question instead of changing the LLM request.
-        let entries = self.db.faq_entries(&contract)?;
-        ui::progress("Searching FAQ answers");
-        let index = self.faq_index(&entries)?;
-        // Both occurrences point at the same entry: the best of either embedding wins.
-        // One answer needs only the best occurrence; several need every
-        // occurrence so duplicates and stale entries cannot crowd out matches.
-        let occurrences = if single {
-            1
-        } else {
-            entries.len().saturating_mul(2)
-        };
-        let mut ranked: Vec<(&FaqEntry, f64)> = Vec::new();
-        for (id, similarity) in index.search_filtered(&query_vector, occurrences, |_| true)? {
-            if similarity <= cutoff {
-                continue;
-            }
-            let entry = entries
-                .iter()
-                .find(|entry| entry.id == id / 2)
-                .context("Missing FAQ entry")?;
-            if !ranked.iter().any(|(ranked, _)| ranked.id == entry.id) {
-                ranked.push((entry, similarity));
-            }
-        }
-        let matched = ranked.first().copied();
-        if single {
-            if let Some((entry, score)) = matched
-                && self.faq_files_current(&entry.files, &mut HashMap::new())
+        self.reporting(|| {
+            let cutoff = self.config.faq_threshold(options)?;
+            let faq_limit = faq_limit(options)?;
+            let single = faq_limit == limits::ResultLimit::Count(1);
+            ensure!(!query.trim().is_empty(), "FAQ question must not be empty");
+            ensure!(
+                query.len() + 80 <= FAQ_PROMPT_BYTES,
+                "FAQ question exceeds the prompt size limit"
+            );
+            // Validate context options even on a hit, before any provider requests.
+            let expand_callers = options["expandCallers"].as_u64().unwrap_or(2) as usize;
+            let expand_callees = options["expandCallees"].as_u64().unwrap_or(2) as usize;
+            crate::map::reference_mode(
+                options,
+                (options["callers"].as_u64().unwrap_or(0) as usize).max(expand_callers),
+                (options["callees"].as_u64().unwrap_or(0) as usize).max(expand_callees),
+            )?;
+            Selection::compile(options)?;
+            ensure!(
+                !self.readonly() && !self.structural_only(),
+                "FAQ requires a writable search engine"
+            );
+            let mut context = options.clone();
             {
-                let mut result = entry.result.clone();
-                result["query"] = json!(query);
-                result["score"] = json!(score);
-                ui::progress("Reusing FAQ answer");
-                return Ok(result);
+                let context = context
+                    .as_object_mut()
+                    .context("FAQ options must be an object")?;
+                // The cutoff and the number of answers returned do not change
+                // what an answer is generated from, so neither isolates entries.
+                context.remove("faqThreshold");
+                context.remove("faqLimit");
             }
-        } else {
-            // Stale entries are never served; with no valid match the best
-            // stale entry below still anchors a regenerated answer.
-            let mut checked = HashMap::new();
-            let mut results = Vec::new();
-            for (entry, score) in &ranked {
-                if results.len() == faq_limit.count().unwrap_or(usize::MAX) {
-                    break;
+            context["limit"] = self.config.resolve_limit(options)?.value();
+            // Identity input: raw config fragments (null when absent) keep the
+            // FAQ contract hash byte-identical.
+            let raw = self.config.raw();
+            let contract = hash(
+                json!([
+                    "faq-v3",
+                    SYSTEM,
+                    STRUCTURE_PARSER_VERSION,
+                    self.providers.vector().profile(),
+                    self.description_generation_profile(),
+                    raw["include"],
+                    raw["exclude"],
+                    raw["maxFileSize"],
+                    raw["rerankingEnabled"],
+                    raw["rerankerProvider"],
+                    raw["rerankerModel"],
+                    raw["rerankerBaseUrl"],
+                    raw["rerankerCandidates"],
+                    context
+                ])
+                .to_string(),
+            );
+            let question_embedding = self.embed_one(query, true)?;
+            let query_vector = self.vector(&question_embedding)?;
+            // Retain stale entries as question anchors, never as authoritative answers.
+            // A paraphrase can refresh the same question instead of changing the LLM request.
+            let entries = self.db.faq_entries(&contract)?;
+            ui::progress("Searching FAQ answers");
+            let index = self.faq_index(&entries)?;
+            // Both occurrences point at the same entry: the best of either embedding wins.
+            // One answer needs only the best occurrence; several need every
+            // occurrence so duplicates and stale entries cannot crowd out matches.
+            let occurrences = if single {
+                1
+            } else {
+                entries.len().saturating_mul(2)
+            };
+            let mut ranked: Vec<(&FaqEntry, f64)> = Vec::new();
+            for (id, similarity) in index.search_filtered(&query_vector, occurrences, |_| true)? {
+                if similarity <= cutoff {
+                    continue;
                 }
-                if self.faq_files_current(&entry.files, &mut checked) {
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.id == id / 2)
+                    .context("Missing FAQ entry")?;
+                if !ranked.iter().any(|(ranked, _)| ranked.id == entry.id) {
+                    ranked.push((entry, similarity));
+                }
+            }
+            let matched = ranked.first().copied();
+            if single {
+                if let Some((entry, score)) = matched
+                    && self.faq_files_current(&entry.files, &mut HashMap::new())
+                {
                     let mut result = entry.result.clone();
                     result["query"] = json!(query);
                     result["score"] = json!(score);
-                    results.push(result);
+                    ui::progress("Reusing FAQ answer");
+                    return Ok(result);
+                }
+            } else {
+                // Stale entries are never served; with no valid match the best
+                // stale entry below still anchors a regenerated answer.
+                let mut checked = HashMap::new();
+                let mut results = Vec::new();
+                for (entry, score) in &ranked {
+                    if results.len() == faq_limit.count().unwrap_or(usize::MAX) {
+                        break;
+                    }
+                    if self.faq_files_current(&entry.files, &mut checked) {
+                        let mut result = entry.result.clone();
+                        result["query"] = json!(query);
+                        result["score"] = json!(score);
+                        results.push(result);
+                    }
+                }
+                if !results.is_empty() {
+                    ui::progress("Reusing FAQ answer");
+                    return Ok(json!(results));
                 }
             }
-            if !results.is_empty() {
-                ui::progress("Reusing FAQ answer");
-                return Ok(json!(results));
-            }
-        }
-        let matched = matched.map(|(entry, _)| entry);
+            let matched = matched.map(|(entry, _)| entry);
 
-        let question = matched.map_or(query, |entry| entry.question.as_str());
-        let question_embedding =
-            matched.map_or(question_embedding, |entry| entry.question_embedding.clone());
-        let (mut result, files) =
-            self.answer_faq(question, options, matched.map(|entry| &entry.files))?;
-        // A saved snapshot may deliberately differ from disk under --no-reindex.
-        // It can still answer, but must never publish a stale semantic cache entry.
-        if !files.is_empty() && self.faq_files_current(&files, &mut HashMap::new()) {
-            let answer = result["description"]
-                .as_str()
-                .context("Missing FAQ answer")?;
-            let answer_embedding = self.embed_one(answer, false)?;
-            // Provider work may have overlapped an editor write; validate again.
-            if self.faq_files_current(&files, &mut HashMap::new()) {
-                let entry = FaqEntry {
-                    id: 0,
-                    question: question.into(),
-                    result: result.clone(),
-                    files,
-                    question_embedding,
-                    answer_embedding,
-                };
-                self.try_write_index(|| self.db.put_faq(&contract, &entry))?;
-                self.faq_index(&self.db.faq_entries(&contract)?)?;
+            let question = matched.map_or(query, |entry| entry.question.as_str());
+            let question_embedding =
+                matched.map_or(question_embedding, |entry| entry.question_embedding.clone());
+            let (mut result, files) =
+                self.answer_faq(question, options, matched.map(|entry| &entry.files))?;
+            // A saved snapshot may deliberately differ from disk under --no-reindex.
+            // It can still answer, but must never publish a stale semantic cache entry.
+            if !files.is_empty() && self.faq_files_current(&files, &mut HashMap::new()) {
+                let answer = result["description"]
+                    .as_str()
+                    .context("Missing FAQ answer")?;
+                let answer_embedding = self.embed_one(answer, false)?;
+                // Provider work may have overlapped an editor write; validate again.
+                if self.faq_files_current(&files, &mut HashMap::new()) {
+                    let entry = FaqEntry {
+                        id: 0,
+                        question: question.into(),
+                        result: result.clone(),
+                        files,
+                        question_embedding,
+                        answer_embedding,
+                    };
+                    self.try_write_index(|| self.db.put_faq(&contract, &entry))?;
+                    self.faq_index(&self.db.faq_entries(&contract)?)?;
+                }
             }
-        }
-        result["query"] = json!(query);
-        // A generated answer was not matched by vector search; it scores a
-        // perfect 1. The score is per-query, so it is set only after the
-        // scoreless result above may have been stored as a cache entry.
-        result["score"] = json!(1.0);
-        Ok(if single { result } else { json!([result]) })
+            result["query"] = json!(query);
+            // A generated answer was not matched by vector search; it scores a
+            // perfect 1. The score is per-query, so it is set only after the
+            // scoreless result above may have been stored as a cache entry.
+            result["score"] = json!(1.0);
+            Ok(if single { result } else { json!([result]) })
+        })
     }
 
     pub(super) fn faq_files_current(
@@ -199,7 +204,7 @@ impl Engine {
                         if !metadata.is_file() {
                             return None;
                         }
-                        let max_size = self.config["maxFileSize"].as_u64().unwrap_or(1_048_576);
+                        let max_size = self.config.max_file_size();
                         discovery::hash_file_capped(&path, max_size)
                     })
                     .as_ref()
@@ -292,7 +297,8 @@ impl Engine {
         let request = json!([
             "explanation-request-v1",
             self.providers.llm().profile(),
-            hash(self.config["agentCommand"].to_string()),
+            // Identity input: raw agentCommand serialization.
+            hash(self.config.raw()["agentCommand"].to_string()),
             system,
             prompt
         ]);

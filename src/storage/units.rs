@@ -2,6 +2,7 @@
 
 use super::publish::*;
 use super::*;
+use crate::parse::NodeKind;
 
 type Description = (Option<String>, String, Option<String>);
 
@@ -196,7 +197,7 @@ pub(super) fn write_structure(
             .transpose()?;
         let metadata = json!({"attributes":node.attributes,"imports":node.imports,"headingLevel":node.heading_level,"calls":node.calls,"references":node.references,"descriptionHash":description_hash,"declarationStartLine":node.declaration_start_line,"declarationStartByte":node.declaration_start_byte});
         conn.execute("INSERT INTO symbols(path,id,parent_id,ordinal,language,kind,name,qualified_name,signature,start_byte,end_byte,start_line,start_column,end_line,end_column,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![path, i64::try_from(node.id)?, node.parent_id.map(i64::try_from).transpose()?, i64::try_from(ordinal)?, node.language, node.kind, node.name, node.qualified_name,
+            params![path, i64::try_from(node.id)?, node.parent_id.map(i64::try_from).transpose()?, i64::try_from(ordinal)?, node.language.as_str(), node.kind.as_str(), node.name, node.qualified_name,
                 node.signature, i64::try_from(node.start_byte)?, i64::try_from(node.end_byte)?, i64::try_from(node.start_line)?, i64::try_from(node.start_column)?, i64::try_from(node.end_line)?, i64::try_from(node.end_column)?, metadata.to_string()])?;
         for (ordinal, name) in node.names.iter().enumerate() {
             conn.execute(
@@ -239,8 +240,23 @@ fn structure_node(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<St
             .get::<_, Option<i64>>(offset + 1)?
             .map(|_| row_usize(row, offset + 1))
             .transpose()?,
-        language: row.get(offset + 2)?,
-        kind: row.get(offset + 3)?,
+        language: crate::parse::LanguageId::from_name(&row.get::<_, String>(offset + 2)?)
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    offset + 2,
+                    rusqlite::types::Type::Text,
+                    "unsupported stored language".into(),
+                )
+            })?,
+        kind: crate::parse::NodeKind::from_name(&row.get::<_, String>(offset + 3)?).ok_or_else(
+            || {
+                rusqlite::Error::FromSqlConversionFailure(
+                    offset + 3,
+                    rusqlite::types::Type::Text,
+                    "unsupported stored node kind".into(),
+                )
+            },
+        )?,
         name: row.get(offset + 4)?,
         qualified_name: row.get(offset + 5)?,
         signature: row.get(offset + 6)?,
@@ -403,7 +419,7 @@ pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>
             id: 0,
             path: file.path.clone(),
             identity,
-            kind: "function".into(),
+            kind: UnitKind::Function,
             data,
             embedding: String::new(),
             description_embedding: None,
@@ -446,7 +462,7 @@ pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>
             id: 0,
             path: file.path.clone(),
             identity,
-            kind: "symbol-description".into(),
+            kind: UnitKind::SymbolDescription,
             data,
             embedding: String::new(),
             description_embedding: None,
@@ -456,9 +472,9 @@ pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>
         let kind = if crate::formats::FormatGroup::for_language(&file.language)
             == Some(crate::formats::FormatGroup::Docs)
         {
-            "markdown"
+            UnitKind::Markdown
         } else {
-            "document"
+            UnitKind::Document
         };
         let mut data = serde_json::to_value(chunk)?;
         data["path"] = json!(file.path);
@@ -466,8 +482,8 @@ pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>
         items.push(Item {
             id: 0,
             path: file.path.clone(),
-            identity: hash(json!([file.path, kind, ordinal]).to_string()),
-            kind: kind.into(),
+            identity: hash(json!([file.path, kind.as_str(), ordinal]).to_string()),
+            kind,
             data,
             embedding: String::new(),
             description_embedding: None,
@@ -477,10 +493,10 @@ pub(crate) fn parsed_items(file: &File, parsed: &ParsedFile) -> Result<Vec<Item>
 }
 
 pub(super) fn symbol_for(item: &Item, structure: &FileStructure) -> Option<usize> {
-    if item.kind == "document" {
+    if item.kind == UnitKind::Document {
         return None;
     }
-    if item.kind == "symbol-description" {
+    if item.kind == UnitKind::SymbolDescription {
         let start = item.data["startLine"].as_u64()? as usize;
         let end = item.data["endLine"].as_u64().unwrap_or(start as u64) as usize;
         return structure
@@ -490,7 +506,7 @@ pub(super) fn symbol_for(item: &Item, structure: &FileStructure) -> Option<usize
                 item.data["qualifiedName"].as_str() == Some(node.qualified_name.as_str())
                     && item.data["kind"]
                         .as_str()
-                        .is_none_or(|kind| kind == node.kind)
+                        .is_none_or(|kind| kind == node.kind.as_str())
             })
             .min_by_key(|node| {
                 (
@@ -502,7 +518,7 @@ pub(super) fn symbol_for(item: &Item, structure: &FileStructure) -> Option<usize
             })
             .map(|node| node.id);
     }
-    if item.kind != "markdown" {
+    if item.kind != UnitKind::Markdown {
         return map::matching_node(structure, &item.data).map(|node| node.id);
     }
     let start = item.data["startLine"].as_u64()? as usize;
@@ -510,7 +526,9 @@ pub(super) fn symbol_for(item: &Item, structure: &FileStructure) -> Option<usize
     structure
         .nodes
         .iter()
-        .filter(|node| node.kind == "heading" && node.start_line <= start && node.end_line >= start)
+        .filter(|node| {
+            node.kind == NodeKind::Heading && node.start_line <= start && node.end_line >= start
+        })
         .min_by_key(|node| {
             (
                 node.start_line.abs_diff(start) + node.end_line.abs_diff(end),
@@ -606,7 +624,7 @@ pub(super) fn write_units(
         // Structural publication is authoritative for comment removal. During
         // semantic preparation, canonical source prose outranks generated prose.
         if !structural
-            && matches!(item.kind.as_str(), "function" | "symbol-description")
+            && item.kind.is_code()
             && let Some(text) = symbol
                 .and_then(|id| structure.nodes.iter().find(|node| node.id == id))
                 .and_then(|node| node.description.as_ref())
@@ -647,7 +665,7 @@ pub(super) fn write_units(
             [&item.identity],
             |r| r.get(0),
         )?;
-        if item.kind != "symbol-description" {
+        if item.kind != UnitKind::SymbolDescription {
             associate(conn, id, "code", profile, input, &item.embedding)?;
         }
         conn.execute(

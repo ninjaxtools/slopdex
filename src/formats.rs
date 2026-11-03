@@ -32,18 +32,11 @@ impl FormatGroup {
     }
 
     pub fn for_language(language: &str) -> Option<Self> {
-        match language {
-            "typescript" | "tsx" | "javascript" | "jsx" | "python" | "rust" | "go" | "java"
-            | "c" | "bash" => Some(Self::Code),
-            "markdown" => Some(Self::Docs),
-            "json" | "terraform" | "yaml" | "toml" => Some(Self::Config),
-            "xml" | "html" | "css" => Some(Self::Markup),
-            _ => None,
-        }
+        crate::parse::LanguageId::from_name(language).map(crate::parse::LanguageId::format_group)
     }
 
     pub fn for_path(path: &str) -> Option<Self> {
-        crate::parse::language_for_path(path).and_then(Self::for_language)
+        crate::parse::LanguageId::for_path(path).map(crate::parse::LanguageId::format_group)
     }
 
     /// Parse one group name; the selection-only `all` shorthand is not a group.

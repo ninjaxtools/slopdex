@@ -1,6 +1,7 @@
 //! Syntactic symbol uses with lexical bindings. Unknown bindings deliberately
 //! block lookup: a local or parameter is not evidence about its runtime type.
 
+use crate::parse::NodeKind;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tree_sitter::Node;
@@ -83,7 +84,11 @@ fn collect_inner(
         return;
     }
     let mut scopes = vec![Scope::default()];
-    let headers = language == "c" && structure.nodes.iter().any(|node| node.kind == "import");
+    let headers = language == "c"
+        && structure
+            .nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::Import);
     let mut by_start: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut by_end: HashMap<usize, Vec<usize>> = HashMap::new();
     for symbol in &structure.nodes {
@@ -126,7 +131,7 @@ fn collect_inner(
                 .flatten()
                 .map(|&id| &structure.nodes[id])
                 .find(|symbol| {
-                    symbol.kind == "import"
+                    symbol.kind == NodeKind::Import
                         && symbol.start_byte <= node.start_byte()
                         && symbol.end_byte == node.end_byte()
                 })
@@ -328,7 +333,7 @@ fn collect_inner(
             .copied()
             .filter(|&id| {
                 let symbol = &structure.nodes[id];
-                symbol.kind != "import" && node.end_byte() <= symbol.end_byte
+                symbol.kind != NodeKind::Import && node.end_byte() <= symbol.end_byte
             })
             .min_by_key(|&id| {
                 let symbol = &structure.nodes[id];
@@ -373,7 +378,7 @@ fn symbol_id(
         .chain(by_end.get(&declaration.end_byte()).into_iter().flatten())
         .map(|&id| &structure.nodes[id])
         .filter(|symbol| {
-            symbol.kind != "impl"
+            symbol.kind != NodeKind::Impl
                 && (symbol.name == name || symbol.names.iter().any(|n| n == name))
                 && (symbol.end_byte == declaration.end_byte()
                     || symbol.start_byte == declaration.start_byte())

@@ -1,7 +1,7 @@
 use std::{
     cell::{OnceCell, Ref, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fs::{self, OpenOptions},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::{
     cache::{Artifacts, DescriptionArtifact, DescriptionGeneration},
+    config::Config,
     filter::Selection,
     formats::FormatGroup,
     git, hash,
@@ -23,8 +24,9 @@ use crate::{
     parse,
     providers::Providers,
     registry,
-    storage::{Database, File, Item, STRUCTURE_PARSER_VERSION},
-    symbols, ui,
+    storage::{Database, File, Item, STRUCTURE_PARSER_VERSION, UnitKind},
+    symbols,
+    ui::{self, NoProgress, ProgressReporter},
     vectors::SharedIndex,
 };
 
@@ -44,24 +46,104 @@ pub(crate) use cross::cross_search_exclusions;
 pub(crate) use discovery::{normalize_path, read_source, source_paths, under};
 use presentation::SymbolIndex;
 
+/// What an opened engine loads and serves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Structure, content, embeddings, and descriptions.
+    #[default]
+    Full,
+    /// Structure only: no semantic records, providers, or model selection.
+    Structure,
+}
+
+/// Whether an opened engine may write its index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Access {
+    #[default]
+    ReadWrite,
+    ReadOnly,
+}
+
+/// How to open an [`Engine`]. `OpenOptions::default()` opens a full,
+/// writable index that reports no progress.
+#[derive(Clone)]
+pub struct OpenOptions {
+    pub mode: OpenMode,
+    pub access: Access,
+    pub progress: Arc<dyn ProgressReporter>,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            mode: OpenMode::Full,
+            access: Access::ReadWrite,
+            progress: Arc::new(NoProgress),
+        }
+    }
+}
+
+impl std::fmt::Debug for OpenOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenOptions")
+            .field("mode", &self.mode)
+            .field("access", &self.access)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpenOptions {
+    /// A structure-only, writable open.
+    pub fn structure() -> Self {
+        Self {
+            mode: OpenMode::Structure,
+            ..Self::default()
+        }
+    }
+
+    pub fn read_only(mut self) -> Self {
+        self.access = Access::ReadOnly;
+        self
+    }
+
+    pub fn with_progress(mut self, progress: Arc<dyn ProgressReporter>) -> Self {
+        self.progress = progress;
+        self
+    }
+}
+
+/// Query-time structures derived from the loaded snapshot. Reconstructible;
+/// cleared whenever committed records are reloaded.
+#[derive(Default)]
+struct DerivedCaches {
+    vectors: RefCell<HashMap<String, Vec<f32>>>,
+    indexes: RefCell<HashMap<String, SharedIndex>>,
+    structures: RefCell<HashMap<String, Option<Arc<parse::FileStructure>>>>,
+    symbol_index: RefCell<Option<SymbolIndex>>,
+}
+
+impl DerivedCaches {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub struct Engine {
     root: PathBuf,
     db: Database,
     artifacts: Artifacts,
-    config: Value,
+    config: Config,
     providers: Providers,
+    // The committed snapshot loaded from the index.
     items: Vec<Item>,
     files: HashMap<String, File>,
     sources: HashMap<String, OnceCell<String>>,
-    vectors: RefCell<HashMap<String, Vec<f32>>>,
-    indexes: RefCell<HashMap<String, SharedIndex>>,
-    // Derived from committed records; cleared whenever they are reloaded.
-    structures: RefCell<HashMap<String, Option<Arc<parse::FileStructure>>>>,
-    symbol_index: RefCell<Option<SymbolIndex>>,
-    structural_only: bool,
+    derived: DerivedCaches,
+    mode: OpenMode,
+    access: Access,
+    progress: Arc<dyn ProgressReporter>,
     // Shared while reading/preparing, exclusive only during workspace writes.
     lock: IndexLock,
-    readonly: bool,
 }
 
 #[derive(Debug)]
@@ -106,40 +188,74 @@ fn lock_index_with_timeout(lock: &fs::File, readonly: bool, timeout: Duration) -
 }
 
 impl Engine {
-    pub fn open(root: &Path, index: &Path, mut config: Value) -> Result<Self> {
-        Self::open_internal(root, index, config.take(), false, false)
+    /// The typed configuration this engine was opened with.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
-    pub fn open_map(root: &Path, index: &Path, config: Value) -> Result<Self> {
-        Self::open_internal(root, index, config, true, false)
+    /// Open a full, writable index with no progress reporting.
+    /// `config` may be a validated [`Config`] or raw JSON (validated here).
+    pub fn open(root: &Path, index: &Path, config: impl Into<Config>) -> Result<Self> {
+        Self::open_with(root, index, config, OpenOptions::default())
     }
 
-    pub fn open_map_readonly(root: &Path, index: &Path, config: Value) -> Result<Self> {
-        Self::open_internal(root, index, config, true, true)
+    pub fn open_with(
+        root: &Path,
+        index: &Path,
+        config: impl Into<Config>,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        let progress = options.progress.clone();
+        ui::with_reporter(&progress, || {
+            Self::open_internal(root, index, config.into(), options)
+        })
     }
 
     pub(crate) fn open_symbol_map(
         root: &Path,
         index: &Path,
-        config: Value,
-        readonly: bool,
+        config: impl Into<Config>,
+        options: OpenOptions,
     ) -> Result<Self> {
-        let mut engine = Self::open_internal(root, index, config, true, readonly)?;
+        let mut engine = Self::open_with(
+            root,
+            index,
+            config,
+            OpenOptions {
+                mode: OpenMode::Structure,
+                ..options
+            },
+        )?;
         crate::providers::resolve_embeddings(
-            &mut engine.config,
+            engine.config.raw_mut(),
             engine.db.meta("active_embedding_profile")?.as_deref(),
         )?;
-        engine.providers = Providers::new(&engine.config)?;
+        engine.config.refresh_typed();
+        engine.providers = Providers::from_config(&engine.config)?;
         Ok(engine)
     }
 
-    pub fn open_readonly(root: &Path, index: &Path, config: Value) -> Result<Self> {
-        Self::open_internal(root, index, config, false, true)
+    /// Replace the reporter that receives progress from this engine's work.
+    pub fn set_progress(&mut self, progress: Arc<dyn ProgressReporter>) {
+        self.progress = progress;
+    }
+
+    /// Run `work` with this engine's reporter installed for the thread.
+    fn reporting<T>(&self, work: impl FnOnce() -> T) -> T {
+        ui::with_reporter(&self.progress, work)
+    }
+
+    fn structural_only(&self) -> bool {
+        self.mode == OpenMode::Structure
+    }
+
+    fn readonly(&self) -> bool {
+        self.access == Access::ReadOnly
     }
 
     /// Fail if a prepared file's bytes changed since they were hashed.
     fn verify_source_unchanged(&self, file: &File) -> Result<()> {
-        let max_size = self.config["maxFileSize"].as_u64().unwrap_or(1_048_576);
+        let max_size = self.config.max_file_size();
         ensure!(
             discovery::hash_file_capped(&self.root.join(&file.path), max_size).as_deref()
                 == Some(file.hash.as_str()),
@@ -152,12 +268,12 @@ impl Engine {
     fn open_internal(
         root: &Path,
         index: &Path,
-        mut config: Value,
-        structural_only: bool,
-        readonly: bool,
+        mut config: Config,
+        options: OpenOptions,
     ) -> Result<Self> {
-        limits::validate_config(&config)?;
-        faq::threshold(&config, &json!({}))?;
+        let structural_only = options.mode == OpenMode::Structure;
+        let readonly = options.access == Access::ReadOnly;
+        config.validate()?;
         let root = root
             .canonicalize()
             .context("Repository root does not exist")?;
@@ -179,14 +295,14 @@ impl Engine {
         lock_path.push(".lock");
         let lock = IndexLock::open(&PathBuf::from(lock_path))?;
         let db = if readonly {
-            Database::open_readonly_with_config(&index, &root, &config)?
-        } else if flag(&config, "forceReindex") {
+            Database::open_readonly_with_config(&index, &root, config.raw())?
+        } else if config.force_reindex() {
             let _write = lock.write()?;
-            Database::open_with_config(&index, &root, &config, true)?
+            Database::open_with_config(&index, &root, config.raw(), true)?
         } else {
             let started = Instant::now();
             loop {
-                match Database::open_existing_with_config(&index, &root, &config) {
+                match Database::open_existing_with_config(&index, &root, config.raw()) {
                     Err(error) if error.is::<NeedsWrite>() => {
                         ensure!(
                             started.elapsed() < Duration::from_secs(10),
@@ -196,34 +312,35 @@ impl Engine {
                         // after short waits rather than waiting exclusively for
                         // an initialization that is no longer necessary.
                         if let Some(_write) = lock.write_for(Duration::from_millis(50))? {
-                            break Database::open_with_config(&index, &root, &config, false)?;
+                            break Database::open_with_config(&index, &root, config.raw(), false)?;
                         }
                     }
                     result => break result?,
                 }
             }
         };
-        config["artifactCachePath"] = json!(db.global_path());
+        config.set("artifactCachePath", json!(db.global_path()));
         let artifacts = if readonly {
-            Artifacts::open_readonly(&config)?
+            Artifacts::open_readonly(config.raw())?
         } else {
-            Artifacts::open(&config)?
+            Artifacts::open(config.raw())?
         };
         if !readonly {
             registry::register(&db, &root)?;
         }
         // Never restore executable commands from an index or shared artifact.
         // Generation requires an explicitly configured, trusted command.
-        let map_config = json!({});
+        let map_config = Config::default();
         if !structural_only {
             crate::providers::resolve_embeddings(
-                &mut config,
+                config.raw_mut(),
                 db.meta("active_embedding_profile")?.as_deref(),
             )?;
+            config.refresh_typed();
         }
         // Provider construction is offline. Structural map does not validate or
         // resolve a semantic model selection.
-        let providers = Providers::new(if structural_only {
+        let providers = Providers::from_config(if structural_only {
             &map_config
         } else {
             &config
@@ -237,13 +354,11 @@ impl Engine {
             items: Vec::new(),
             files: HashMap::new(),
             sources: HashMap::new(),
-            vectors: RefCell::new(HashMap::new()),
-            indexes: RefCell::new(HashMap::new()),
-            structures: RefCell::new(HashMap::new()),
-            symbol_index: RefCell::new(None),
-            structural_only,
+            derived: DerivedCaches::default(),
+            mode: options.mode,
+            access: options.access,
+            progress: options.progress,
             lock,
-            readonly,
         };
         if !structural_only && !readonly {
             let profile = engine.providers.vector().profile();
@@ -270,7 +385,7 @@ impl Engine {
     }
 
     fn write_index<T>(&mut self, write: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        ensure!(!self.readonly, "Cannot write a read-only index");
+        ensure!(!self.readonly(), "Cannot write a read-only index");
         let before = self.workspace_stamp()?;
         let guard = self.lock.write()?;
         ensure!(
@@ -284,7 +399,7 @@ impl Engine {
     /// Query caches and derived pointers are optional. A read must not wait for
     /// other readers merely to persist a reconstructible optimization.
     fn try_write_index(&self, write: impl FnOnce() -> Result<()>) -> Result<()> {
-        ensure!(!self.readonly, "Cannot write a read-only index");
+        ensure!(!self.readonly(), "Cannot write a read-only index");
         let before = self.workspace_stamp()?;
         match self.lock.try_write()? {
             Some(guard) => self.finish_index_write(before, guard, write),
@@ -325,12 +440,12 @@ impl Engine {
     fn load(&mut self) -> Result<()> {
         ui::progress("Loading index records");
         let profile = self.providers.vector().profile();
-        self.items = if self.structural_only {
+        self.items = if self.structural_only() {
             Vec::new()
         } else {
             self.db.items_for_profile(&profile)?
         };
-        let files = if self.structural_only {
+        let files = if self.structural_only() {
             self.db.file_records()?
         } else {
             let mut files = self.db.file_records()?;
@@ -355,10 +470,7 @@ impl Engine {
             .keys()
             .map(|path| (path.clone(), OnceCell::new()))
             .collect();
-        self.vectors.get_mut().clear();
-        self.indexes.get_mut().clear();
-        self.structures.get_mut().clear();
-        *self.symbol_index.get_mut() = None;
+        self.derived.clear();
         for item in &mut self.items {
             item.data["id"] = json!(item.id);
         }
@@ -366,8 +478,9 @@ impl Engine {
     }
 
     pub fn status(&self) -> Result<Value> {
+        self.reporting(|| {
         let errors = self.errors()?;
-        let mut status = json!({"rootDir":self.root,"indexPath":self.db.path,"generation":self.db.generation()?,"gitCheckpoint":self.db.meta("checkpoint")?,"fileCount":self.files.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"markdownChunkCount":self.items.iter().filter(|i|i.kind=="markdown").count(),"embeddingProfile":self.providers.vector().profile(),"descriptionProfile":self.providers.llm().profile(),"descriptionCount":self.items.iter().filter(|i|i.description_embedding.is_some()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count(),"staleFileDescriptionCount":self.files.values().filter(|f|f.description.is_some() && f.description_hash.as_deref()!=Some(&f.hash) && !f.description_hash.as_deref().is_some_and(|h|h.starts_with("source:"))).count(),"indexingErrorCount":errors.len(),"failedFileCount":self.files.values().filter(|f|!f.errors.is_empty()).count(),"vectorBackend":"usearch","storageBackend":"sqlite"});
+        let mut status = json!({"rootDir":self.root,"indexPath":self.db.path,"generation":self.db.generation()?,"gitCheckpoint":self.db.meta("checkpoint")?,"fileCount":self.files.len(),"functionCount":self.items.iter().filter(|i|i.kind==UnitKind::Function).count(),"markdownChunkCount":self.items.iter().filter(|i|i.kind==UnitKind::Markdown).count(),"embeddingProfile":self.providers.vector().profile(),"descriptionProfile":self.providers.llm().profile(),"descriptionCount":self.items.iter().filter(|i|i.description_embedding.is_some()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count(),"staleFileDescriptionCount":self.files.values().filter(|f|f.description.is_some() && f.description_hash.as_deref()!=Some(&f.hash) && !f.description_hash.as_deref().is_some_and(|h|h.starts_with("source:"))).count(),"indexingErrorCount":errors.len(),"failedFileCount":self.files.values().filter(|f|!f.errors.is_empty()).count(),"vectorBackend":"usearch","storageBackend":"sqlite"});
         status["globalStorePath"] = json!(self.db.global_path());
         status["snapshot"] = json!(self.db.meta("snapshot")?);
         status["repositoryIdentity"] = self
@@ -377,10 +490,11 @@ impl Engine {
             .transpose()?
             .unwrap_or(Value::Null);
         Ok(status)
+        })
     }
 
     pub fn errors(&self) -> Result<Vec<Value>> {
-        Ok(self.files.values().flat_map(|f| f.errors.clone()).collect())
+        self.reporting(|| Ok(self.files.values().flat_map(|f| f.errors.clone()).collect()))
     }
 
     fn normalize_path(&self, path: &str) -> Result<String> {
@@ -423,7 +537,7 @@ impl crate::map::StructureSource for Engine {
     }
 
     fn release_structures(&self) {
-        self.structures.borrow_mut().clear();
+        self.derived.structures.borrow_mut().clear();
     }
 
     fn file_description(&self, path: &str) -> Option<&str> {

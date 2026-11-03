@@ -10,9 +10,11 @@ pub(super) struct SymbolIndex {
 
 impl Engine {
     pub fn map(&self, options: &Value) -> Result<Vec<Value>> {
-        let mut options = options.clone();
-        options["limit"] = limits::resolve(&self.config, &options)?.value();
-        crate::map::query(self, &self.root, &options)
+        self.reporting(|| {
+            let mut options = options.clone();
+            options["limit"] = self.config.resolve_limit(&options)?.value();
+            crate::map::query(self, &self.root, &options)
+        })
     }
 
     pub(crate) fn map_prepared(
@@ -21,7 +23,7 @@ impl Engine {
         label_invocations: bool,
     ) -> Result<(crate::map::PreparedMap, Selection)> {
         let mut options = options.clone();
-        options["limit"] = limits::resolve(&self.config, &options)?.value();
+        options["limit"] = self.config.resolve_limit(&options)?.value();
         crate::map::prepare(self, &self.root, &options, label_invocations)
     }
 
@@ -136,7 +138,7 @@ impl Engine {
                 }
             }
         }
-        if !self.readonly {
+        if !self.readonly() {
             self.try_write_index(|| {
                 self.db.put_search_cache(
                     &cache_key()?,
@@ -166,11 +168,11 @@ impl Engine {
     /// several statements per file. The index lock held for the engine's
     /// lifetime keeps the files table in step with the loaded snapshot.
     pub(super) fn preload_structures(&self) -> Result<()> {
-        if self.structures.borrow().len() >= self.files.len() {
+        if self.derived.structures.borrow().len() >= self.files.len() {
             return Ok(());
         }
         let mut all = self.db.all_structures(STRUCTURE_PARSER_VERSION)?;
-        let mut cache = self.structures.borrow_mut();
+        let mut cache = self.derived.structures.borrow_mut();
         for path in self.files.keys() {
             cache
                 .entry(path.clone())
@@ -182,11 +184,11 @@ impl Engine {
     /// One vocabulary index per loaded snapshot: selectors and symbol results in
     /// the same command share it instead of reopening the shared base.
     fn symbol_index(&self) -> Result<Ref<'_, SymbolIndex>> {
-        if self.symbol_index.borrow().is_none() {
+        if self.derived.symbol_index.borrow().is_none() {
             let index = self.open_symbol_index()?;
-            *self.symbol_index.borrow_mut() = Some(index);
+            *self.derived.symbol_index.borrow_mut() = Some(index);
         }
-        Ok(Ref::map(self.symbol_index.borrow(), |index| {
+        Ok(Ref::map(self.derived.symbol_index.borrow(), |index| {
             index.as_ref().expect("initialized symbol index")
         }))
     }
@@ -236,9 +238,9 @@ impl Engine {
             &path,
             &profile,
             &vectors,
-            self.readonly,
+            self.readonly(),
         )?;
-        if !self.readonly
+        if !self.readonly()
             && (prepared.needs_publication()
                 || self.db.meta("index_state_symbols")?.as_deref() != Some(prepared.fingerprint()))
         {
@@ -289,7 +291,7 @@ impl Engine {
                 .then(|| self.source(&path))
                 .transpose()?;
             for node in &structure.nodes {
-                if !selection.kind_matches(&node.kind)
+                if !selection.kind_matches(node.kind)
                     || !selection.symbol_matches_in(&path, node, source)
                 {
                     continue;
@@ -317,9 +319,11 @@ impl Engine {
     /// offline indexes can still return hits without current structure; callers
     /// can fall back to the search unit's declaration metadata in that case.
     pub fn presentation_structure(&self, path: &str) -> Result<Option<parse::FileStructure>> {
-        Ok(self
-            .cached_structure(path)?
-            .map(|structure| (*structure).clone()))
+        self.reporting(|| {
+            Ok(self
+                .cached_structure(path)?
+                .map(|structure| (*structure).clone()))
+        })
     }
 
     /// Plan source edits against current indexed structure. CLI callers refresh
@@ -330,42 +334,40 @@ impl Engine {
         destination: &str,
         cwd: &Path,
     ) -> Result<crate::refactor::Plan> {
-        let mut files = BTreeMap::new();
-        for (path, file) in &self.files {
-            if !crate::refactor::supported(path)
-                || !crate::refactor::same_family(
-                    source.split_once("::").map_or(source, |(path, _)| path),
-                    path,
-                )
-            {
-                continue;
+        self.reporting(|| {
+            let mut files = BTreeMap::new();
+            for (path, file) in &self.files {
+                if !crate::refactor::supported(path)
+                    || !crate::refactor::same_family(
+                        source.split_once("::").map_or(source, |(path, _)| path),
+                        path,
+                    )
+                {
+                    continue;
+                }
+                ensure!(
+                    file.errors.is_empty(),
+                    "Cannot refactor with indexing errors in {path}"
+                );
+                let text = read_source(&self.root, path, self.config.max_file_size())?;
+                ensure!(
+                    hash(&text) == file.hash,
+                    "Stale source for {path}; refresh structure before refactoring"
+                );
+                let structure = self.presentation_structure(path)?.with_context(|| {
+                    format!(
+                        "Missing current structure for {path}; refresh structure before refactoring"
+                    )
+                })?;
+                files.insert(path.clone(), (text, structure));
             }
-            ensure!(
-                file.errors.is_empty(),
-                "Cannot refactor with indexing errors in {path}"
-            );
-            let text = read_source(
-                &self.root,
-                path,
-                self.config["maxFileSize"].as_u64().unwrap_or(1_048_576),
-            )?;
-            ensure!(
-                hash(&text) == file.hash,
-                "Stale source for {path}; refresh structure before refactoring"
-            );
-            let structure = self.presentation_structure(path)?.with_context(|| {
-                format!(
-                    "Missing current structure for {path}; refresh structure before refactoring"
-                )
-            })?;
-            files.insert(path.clone(), (text, structure));
-        }
-        crate::refactor::plan(&self.root, cwd, files, source, destination)
+            crate::refactor::plan(&self.root, cwd, files, source, destination)
+        })
     }
 
     /// Committed structure for one file, loaded at most once per snapshot load.
     pub(super) fn cached_structure(&self, path: &str) -> Result<Option<Arc<parse::FileStructure>>> {
-        if let Some(cached) = self.structures.borrow().get(path) {
+        if let Some(cached) = self.derived.structures.borrow().get(path) {
             return Ok(cached.clone());
         }
         let structure = match self.files.get(path) {
@@ -380,13 +382,14 @@ impl Engine {
             }
             _ => None,
         };
-        self.structures
+        self.derived
+            .structures
             .borrow_mut()
             .insert(path.to_owned(), structure.clone());
         Ok(structure)
     }
 
-    pub fn call_graph(&self) -> Result<crate::callgraph::CallGraph> {
+    pub(crate) fn call_graph(&self) -> Result<crate::callgraph::CallGraph> {
         ensure!(
             self.db
                 .missing_structure_paths(STRUCTURE_PARSER_VERSION)?
@@ -410,7 +413,7 @@ impl Engine {
             self.symbol_structures()?,
             crate::callgraph::CallGraph::indexed_keys(&self.db)?,
         );
-        if !self.readonly {
+        if !self.readonly() {
             self.db
                 .cache_put("callgraph", &key, &serde_json::to_string(&graph)?)?;
         }
@@ -432,7 +435,7 @@ impl Engine {
             return serde_json::from_str(&cached)
                 .with_context(|| format!("Invalid cached line totals for {path}"));
         }
-        if self.readonly {
+        if self.readonly() {
             return Err(NeedsWrite.into());
         }
         let _lock = registry::artifact_lock(&self.db, crate::lines::CACHE_KIND, &key)?;

@@ -2,6 +2,7 @@
 
 use super::discovery::*;
 use super::*;
+use crate::storage::UnitKind;
 
 const DESCRIPTION_SYSTEM: &str = "Describe existing source code accurately. When asked about a file, return exactly one concise paragraph about its purpose, responsibilities, and important relationships. When asked about a callable, return exactly one sentence describing what it does, including relevant inputs, outputs, or side effects. Use plain text without a heading, bullets, or a preamble. Do not propose changes.";
 // A byte cap is deliberately conservative even for providers with different tokenizers.
@@ -299,7 +300,8 @@ impl Engine {
                         None
                     },
                     profile: llm.profile(),
-                    settings: description_settings(&self.config),
+                    // Identity input: raw agent values (null when absent).
+                    settings: description_settings(self.config.raw()),
                     system: DESCRIPTION_SYSTEM.into(),
                     prompt: messages.last().unwrap().content.clone(),
                     messages,
@@ -412,7 +414,7 @@ impl Engine {
             .flatten()
             .map(|input| (Database::embedding_key(&profile, query, input), dimensions))
             .collect();
-        if self.readonly {
+        if self.readonly() {
             for (key, _) in &keys {
                 if !self.db.embedding_exists(key)? {
                     return Err(NeedsWrite.into());
@@ -501,29 +503,13 @@ impl Engine {
     }
 
     fn parallelism(&self) -> Result<usize> {
-        // Config validation bounds this at open; clamp again so no config
-        // path can spawn an unbounded thread window in run_jobs.
-        let parallelism = self.config["parallelism"].as_u64().unwrap_or(10) as usize;
-        ensure!(parallelism > 0, "parallelism must be positive");
-        Ok(parallelism.min(256))
+        // Config validation bounds this at open; the typed accessor clamps
+        // again so no config path can spawn an unbounded thread window.
+        self.config.parallelism()
     }
 
     fn embedding_parallelism(&self) -> Result<usize> {
-        let default = if self.config["provider"] == "ollama"
-            || self.config["embeddingProvider"] == "ollama"
-        {
-            1
-        } else {
-            10
-        };
-        let value = self
-            .config
-            .get("embeddingParallelism")
-            .or_else(|| self.config.get("parallelism"))
-            .and_then(Value::as_u64)
-            .unwrap_or(default) as usize;
-        ensure!(value > 0, "embeddingParallelism must be positive");
-        Ok(value.min(256))
+        self.config.embedding_parallelism()
     }
 
     pub(super) fn embed_one(&self, input: &str, query: bool) -> Result<String> {
@@ -538,81 +524,86 @@ impl Engine {
     pub(super) fn description_generation_profile(&self) -> Value {
         json!([
             self.providers.llm().profile(),
-            description_settings(&self.config),
+            // Identity input: raw agent values (null when absent).
+            description_settings(self.config.raw()),
             DESCRIPTION_SYSTEM
         ])
     }
 
     pub fn generate_descriptions(&mut self) -> Result<Value> {
-        ensure!(
-            !self.readonly && !self.structural_only,
-            "Description generation requires a writable search engine"
-        );
-        let profile = self.description_generation_profile().to_string();
-        let settings_changed =
-            self.db.meta("description_generation_profile")?.as_deref() != Some(&profile);
-        let needs_callables: HashSet<&str> = self
-            .items
-            .iter()
-            .filter(|item| {
-                item.kind == "function"
-                    && !flag(&item.data, "sourceDescription")
-                    && (settings_changed || !item.data["description"].is_string())
-            })
-            .map(|item| item.path.as_str())
-            .collect();
-        let mut inputs = Vec::new();
-        for file in self.files.values() {
-            // A file that could not be read has no source to describe. Parse
-            // diagnostics only mark damaged regions: its other callables are fine.
-            if FormatGroup::for_path(&file.path) == Some(FormatGroup::Docs) || has_read_error(file)
-            {
-                continue;
+        let progress = self.progress.clone();
+        ui::with_reporter(&progress, || {
+            ensure!(
+                !self.readonly() && !self.structural_only(),
+                "Description generation requires a writable search engine"
+            );
+            let profile = self.description_generation_profile().to_string();
+            let settings_changed =
+                self.db.meta("description_generation_profile")?.as_deref() != Some(&profile);
+            let needs_callables: HashSet<&str> = self
+                .items
+                .iter()
+                .filter(|item| {
+                    item.kind == UnitKind::Function
+                        && !flag(&item.data, "sourceDescription")
+                        && (settings_changed || !item.data["description"].is_string())
+                })
+                .map(|item| item.path.as_str())
+                .collect();
+            let mut inputs = Vec::new();
+            for file in self.files.values() {
+                // A file that could not be read has no source to describe. Parse
+                // diagnostics only mark damaged regions: its other callables are fine.
+                if FormatGroup::for_path(&file.path) == Some(FormatGroup::Docs)
+                    || has_read_error(file)
+                {
+                    continue;
+                }
+                let source_description = file
+                    .description_hash
+                    .as_deref()
+                    .is_some_and(|h| h.starts_with("source:"));
+                let regenerate_file = !source_description
+                    && (settings_changed || file.description_hash.as_deref() != Some(&file.hash));
+                let needs_callable = needs_callables.contains(file.path.as_str());
+                if regenerate_file || needs_callable {
+                    inputs.push(PrepareInput {
+                        path: file.path.clone(),
+                        source: self.source(&file.path)?.to_owned(),
+                        source_mode: file.source_mode.clone(),
+                        regenerate_file,
+                        regenerate_callables: settings_changed,
+                        generate_descriptions: true,
+                    });
+                }
             }
-            let source_description = file
-                .description_hash
-                .as_deref()
-                .is_some_and(|h| h.starts_with("source:"));
-            let regenerate_file = !source_description
-                && (settings_changed || file.description_hash.as_deref() != Some(&file.hash));
-            let needs_callable = needs_callables.contains(file.path.as_str());
-            if regenerate_file || needs_callable {
-                inputs.push(PrepareInput {
-                    path: file.path.clone(),
-                    source: self.source(&file.path)?.to_owned(),
-                    source_mode: file.source_mode.clone(),
-                    regenerate_file,
-                    regenerate_callables: settings_changed,
-                    generate_descriptions: true,
-                });
+            inputs.sort_by(|a, b| a.path.cmp(&b.path));
+            let changed = self.prepare_all(inputs)?;
+            let checkpoint = self.db.meta("checkpoint")?;
+            ensure!(
+                git::head(&self.root) == checkpoint,
+                "Git HEAD changed during indexing; rerun"
+            );
+            for (file, _) in &changed {
+                self.verify_source_unchanged(file)?;
             }
-        }
-        inputs.sort_by(|a, b| a.path.cmp(&b.path));
-        let changed = self.prepare_all(inputs)?;
-        let checkpoint = self.db.meta("checkpoint")?;
-        ensure!(
-            git::head(&self.root) == checkpoint,
-            "Git HEAD changed during indexing; rerun"
-        );
-        for (file, _) in &changed {
-            self.verify_source_unchanged(file)?;
-        }
-        self.write_index(|engine| {
-            engine.db.apply(&changed, &[], checkpoint.as_deref())?;
-            engine
-                .db
-                .set_meta("description_generation_profile", &profile)?;
-            engine.db.set_meta(
-                "description_profile",
-                &engine.providers.llm().profile().to_string(),
-            )?;
-            Ok(())
-        })?;
-        self.load()?;
-        self.artifacts.backfill_remote(&self.db);
-        Ok(
-            json!({"filesPrepared":changed.len(),"descriptionCount":self.items.iter().filter(|i|i.data["description"].is_string()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count()}),
-        )
+            self.write_index(|engine| {
+                engine.db.apply(&changed, &[], checkpoint.as_deref())?;
+                engine
+                    .db
+                    .set_meta("description_generation_profile", &profile)?;
+                engine.db.set_meta(
+                    "description_profile",
+                    &engine.providers.llm().profile().to_string(),
+                )?;
+                Ok(())
+            })?;
+            self.load()?;
+            self.artifacts.backfill_remote(&self.db);
+            Ok(
+                json!({"filesPrepared":changed.len(),"descriptionCount":self.items.iter().filter(|i|i.data["description"].is_string()).count(),"fileDescriptionCount":self.files.values().filter(|f|f.description.is_some()).count()}),
+            )
+        })
     }
 }
 
@@ -658,14 +649,18 @@ fn run_jobs<T: Sync, R: Send>(
         return Ok(());
     }
     let progress = ui::counted(label, jobs.iter().map(&units).sum());
+    // Provider warnings (retries, fallbacks) raised on workers must reach the
+    // same reporter as the caller's progress.
+    let reporter = ui::current();
     for window in jobs.chunks(parallelism) {
         std::thread::scope(|scope| -> Result<()> {
             let (sender, receiver) = std::sync::mpsc::channel();
             for job in window {
                 let sender = sender.clone();
                 let work = &work;
+                let reporter = reporter.as_ref();
                 scope.spawn(move || {
-                    let _ = sender.send((job, work(job)));
+                    let _ = sender.send((job, ui::inherit(reporter, || work(job))));
                 });
             }
             drop(sender);
@@ -686,4 +681,48 @@ fn run_jobs<T: Sync, R: Send>(
     }
     progress.finish();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Warnings(Mutex<Vec<String>>);
+
+    impl ui::ProgressReporter for Warnings {
+        fn warning(&self, text: &str) {
+            self.0.lock().unwrap().push(text.to_owned());
+        }
+    }
+
+    #[test]
+    fn run_jobs_workers_report_warnings_to_the_callers_reporter() -> Result<()> {
+        let warnings = Arc::new(Warnings::default());
+        let reporter: Arc<dyn ui::ProgressReporter> = warnings.clone();
+        let mut persisted = Vec::new();
+        ui::with_reporter(&reporter, || {
+            run_jobs(
+                "Jobs",
+                &[1, 2, 3],
+                2,
+                |_| 1,
+                |job| {
+                    ui::warning(format_args!("retrying {job}"));
+                    Ok(*job)
+                },
+                |_, value| {
+                    persisted.push(value);
+                    Ok(())
+                },
+            )
+        })?;
+        persisted.sort();
+        assert_eq!(persisted, [1, 2, 3]);
+        let mut seen = warnings.0.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, ["retrying 1", "retrying 2", "retrying 3"]);
+        Ok(())
+    }
 }

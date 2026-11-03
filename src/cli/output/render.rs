@@ -1,4 +1,5 @@
 use super::{array, number, text};
+use crate::parse::NodeKind;
 use crate::{
     callgraph::{CallGraph, Expansion, Key},
     cli::args::{CallDepths, Detail},
@@ -29,7 +30,7 @@ pub(super) fn markdown_map_bodies(
     let mut headings: Vec<_> = structure
         .nodes
         .iter()
-        .filter(|node| node.kind == "heading")
+        .filter(|node| node.kind == NodeKind::Heading)
         .collect();
     headings.sort_by_key(|node| node.start_line);
     headings
@@ -197,7 +198,7 @@ impl<'a> Presentation<'a> {
         let path = function["path"].as_str()?;
         let structure = self.graph.as_ref()?.files.get(path)?;
         let node = map::matching_node(structure, function)?;
-        if node.kind == "heading" {
+        if node.kind == NodeKind::Heading {
             return None;
         }
         Some(Key {
@@ -248,7 +249,7 @@ impl<'a> Presentation<'a> {
         similarity: Option<f64>,
         detail: Detail,
     ) -> Option<String> {
-        if node.kind == "heading" {
+        if node.kind == NodeKind::Heading {
             return None;
         }
         let forced = self.force_code.contains(&Key {
@@ -822,7 +823,7 @@ fn print_ranked_file(
                     .entry(matched.id)
                     .or_insert_with(String::new)
                     .push_str(&markdown_extra(hit.item, Some(&matched.signature), detail));
-            } else if hit.row["type"] == "symbol" && matched.kind == "heading" {
+            } else if hit.row["type"] == "symbol" && matched.kind == NodeKind::Heading {
                 if let Some(body) = heading_bodies.get(&matched.id) {
                     let extra = extras.entry(matched.id).or_insert_with(String::new);
                     if !extra.contains(body) {

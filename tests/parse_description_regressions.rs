@@ -1,7 +1,7 @@
 mod parse_support;
 
 use parse_support::{callables, clean, named};
-use slopdex::parse::{ParsedFile, parse};
+use slopdex::{ParsedFile, parse};
 
 #[test]
 fn descriptions_cover_every_supported_language() {

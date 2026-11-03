@@ -1,14 +1,23 @@
 //! Search regressions use durable, deterministic vectors and make no model calls.
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use slopdex::{
-    engine::Engine,
-    hash, parse,
-    providers::Providers,
-    storage::{Database, File},
-};
+use slopdex::OpenOptions;
+use slopdex::UnitKind;
+use slopdex::{Database, Engine, File, Providers, hash, language_for_path, parse};
 use std::{collections::BTreeSet, fs, path::PathBuf};
 use tempfile::TempDir;
+
+/// Fault injection below the public API: a separate connection to the index
+/// file with the shared store attached under the schema name it uses.
+fn raw_sql(db: &Database) -> Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db.index_path())?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    conn.execute(
+        "ATTACH DATABASE ? AS global",
+        [db.global_path().to_string_lossy()],
+    )?;
+    Ok(conn)
+}
 
 struct Fixture {
     temp: TempDir,
@@ -60,13 +69,13 @@ impl Fixture {
         let mut records = Vec::new();
         for &(path, source) in sources {
             fs::write(temp.path().join(path), source)?;
-            let parsed = parse::parse(path, source)?;
+            let parsed = parse(path, source)?;
             records.push((
                 File {
                     path: path.into(),
                     hash: hash(source),
                     source: source.into(),
-                    language: parse::language_for_path(path).unwrap().into(),
+                    language: language_for_path(path).unwrap().into(),
                     source_mode: "working-tree".into(),
                     description: None,
                     description_hash: None,
@@ -164,14 +173,14 @@ impl Fixture {
     }
 
     fn source_hash(&self, path: &str) -> Result<String> {
-        let parsed = parse::parse(path, &fs::read_to_string(self.temp.path().join(path))?)?;
+        let parsed = parse(path, &fs::read_to_string(self.temp.path().join(path))?)?;
         Ok(parsed.callables[0].source_hash.clone())
     }
 
     fn seed_code_vectors(&self, vectors: &[(&str, [f32; 2])]) -> Result<()> {
         let db = Database::open_with_config(&self.index, self.temp.path(), &self.config, false)?;
         // Replace the fixture's uniform vectors before opening any search indexes.
-        db.conn.execute("DELETE FROM global.embeddings", [])?;
+        raw_sql(&db)?.execute("DELETE FROM global.embeddings", [])?;
         let profile = Providers::new(&self.config)?.embedding_profile();
         for item in db.items()? {
             let (_, vector) = vectors.iter().find(|(path, _)| *path == item.path).unwrap();
@@ -513,7 +522,7 @@ fn configuration_fixture() -> Result<Fixture> {
         Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
     let mut records = Vec::new();
     for file in db.files()? {
-        let mut parsed = parse::parse(&file.path, &file.source)?;
+        let mut parsed = parse(&file.path, &file.source)?;
         assert!(
             parsed.errors.is_empty(),
             "{}: {:?}",
@@ -536,7 +545,7 @@ fn configuration_fixture() -> Result<Fixture> {
         records.push((file, parsed));
     }
     db.apply_structure(&records, &[], None)?;
-    db.conn.execute("DELETE FROM global.embeddings", [])?;
+    raw_sql(&db)?.execute("DELETE FROM global.embeddings", [])?;
     let profile = Providers::new(&fixture.config)?.embedding_profile();
     for item in db.items()? {
         let vector = if item.path.starts_with("z.") {
@@ -609,7 +618,7 @@ fn configuration_and_markup_remain_indexed_but_map_requires_opt_in() -> Result<(
         assert!(
             db.items()?
                 .iter()
-                .any(|item| item.path == *path && item.kind == "document")
+                .any(|item| item.path == *path && item.kind == UnitKind::Document)
         );
     }
     assert_eq!(all, engine.map(&options)?);
@@ -748,7 +757,9 @@ fn configuration_and_markup_search_filter_every_stream_before_limits_and_cache_o
             .context("missing content membership")?;
         let expected: BTreeSet<_> = items
             .iter()
-            .filter(|item| item.kind != "symbol-description" && paths.contains(&item.path.as_str()))
+            .filter(|item| {
+                item.kind != UnitKind::SymbolDescription && paths.contains(&item.path.as_str())
+            })
             .map(|item| item.id.to_string())
             .collect();
         assert!(!expected.is_empty(), "{group}");
@@ -813,7 +824,7 @@ fn selected_content_queries_ignore_missing_or_corrupt_excluded_group_vectors() -
             } else {
                 "DELETE FROM global.embeddings WHERE key=?"
             };
-            db.conn.execute(sql, [&item.embedding])?;
+            raw_sql(&db)?.execute(sql, [&item.embedding])?;
         }
         let engine = fixture.engine()?;
         let options = json!({"formats":"all", "minSimilarity":-1});
@@ -848,7 +859,7 @@ fn identical_content_inputs_reuse_embeddings_but_not_format_index_contracts() ->
         Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
     let mut records = Vec::new();
     for file in db.files()? {
-        let mut parsed = parse::parse(&file.path, &file.source)?;
+        let mut parsed = parse(&file.path, &file.source)?;
         assert_eq!(parsed.chunks.len(), 1);
         parsed.chunks[0].embedding_input = "identical content input".into();
         records.push((file, parsed));
@@ -878,7 +889,7 @@ fn identical_content_inputs_reuse_embeddings_but_not_format_index_contracts() ->
         contracts.insert(pointer["contract"].as_str().unwrap().to_owned());
     }
     assert_eq!(contracts.len(), 2);
-    let count: i64 = db.conn.query_row(
+    let count: i64 = raw_sql(&db)?.query_row(
         "SELECT count(*) FROM global.embeddings WHERE key=?",
         [&shared_key],
         |row| row.get(0),
@@ -995,7 +1006,7 @@ fn cross_search_is_code_only_and_keeps_target_globs_and_names_source_only() -> R
             .unwrap();
         // Config parsers have no callables. Publish a synthetic legacy callable
         // to exercise the query-layer gate independently of parser behavior.
-        let parsed = parse::parse(
+        let parsed = parse(
             "synthetic.rs",
             "pub fn run() {\n    println!(\"configuration callable\");\n}\n",
         )?;
@@ -1106,7 +1117,8 @@ fn cross_search_is_code_only_and_keeps_target_globs_and_names_source_only() -> R
                 .items()?
                 .iter()
                 .filter(|item| {
-                    item.kind == "function" && item.path.ends_with(".rs") == (group == "code")
+                    item.kind == UnitKind::Function
+                        && item.path.ends_with(".rs") == (group == "code")
                 })
                 .map(|item| item.id.to_string())
                 .collect();
@@ -1280,7 +1292,7 @@ fn cross_search_description_scores_do_not_affect_ranking_limits_or_thresholds() 
     let db =
         Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
     // Embeddings are immutable; replace the fixture's uniform vectors before opening.
-    db.conn.execute("DELETE FROM global.embeddings", [])?;
+    raw_sql(&db)?.execute("DELETE FROM global.embeddings", [])?;
     let profile = Providers::new(&fixture.config)?.embedding_profile();
     let files = db.files()?;
     for item in db.items()? {
@@ -1595,7 +1607,7 @@ fn cross_search_excluded_function_returns_after_its_source_hash_changes() -> Res
     drop(engine);
 
     fs::write(fixture.temp.path().join("edited.rs"), changed)?;
-    let parsed = parse::parse("edited.rs", changed)?;
+    let parsed = parse("edited.rs", changed)?;
     assert_ne!(parsed.callables[0].source_hash, excluded_hash);
     let mut db =
         Database::open_with_config(&fixture.index, fixture.temp.path(), &fixture.config, false)?;
@@ -1647,7 +1659,12 @@ fn code_search_description_selectors_are_precise_and_union_regex() -> Result<()>
 fn structural_map_description_queries_select_precise_declarations() -> Result<()> {
     let fixture = Fixture::new(false)?;
     fixture.seed_symbols(true)?;
-    let engine = Engine::open_map(fixture.temp.path(), &fixture.index, fixture.config.clone())?;
+    let engine = Engine::open_with(
+        fixture.temp.path(),
+        &fixture.index,
+        fixture.config.clone(),
+        OpenOptions::structure(),
+    )?;
     let options = json!({"symbolQuery":"copper token", "symbolThreshold":0.9, "private":true});
     let rows = engine.map(&options)?;
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1662,11 +1679,11 @@ fn structural_map_description_queries_select_precise_declarations() -> Result<()
             .all(|item| item.description_embedding.is_none())
     );
     let generation = db.generation()?;
-    db.conn.execute(
+    raw_sql(&db)?.execute(
         "INSERT OR IGNORE INTO global.description_content(hash,content) VALUES(?,'silver token')",
         [hash("silver token")],
     )?;
-    db.conn.execute(
+    raw_sql(&db)?.execute(
         "UPDATE descriptions SET content_hash=? WHERE scope='callable' AND path='a.rs'
          AND identity=(SELECT identity FROM search_units WHERE path='a.rs' AND kind='function')",
         [hash("silver token")],
@@ -2061,7 +2078,7 @@ fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Resul
         ),
     ] {
         fs::write(temp.path().join(path), source)?;
-        let parsed = parse::parse(path, source)?;
+        let parsed = parse(path, source)?;
         assert_eq!(
             parsed.description.as_deref(),
             Some("file overview"),
@@ -2173,7 +2190,7 @@ fn refresh_and_generate_preserve_source_comments_without_llm_requests() -> Resul
             assert_eq!(item.data["sourceDescription"], true);
             assert!(item.description_embedding.is_some());
         }
-        if item.kind == "symbol-description" {
+        if item.kind == UnitKind::SymbolDescription {
             assert!(item.embedding.is_empty());
         }
     }

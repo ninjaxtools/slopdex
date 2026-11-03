@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use slopdex::engine::Engine;
+use slopdex::{Engine, OpenOptions};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -53,7 +53,7 @@ const PROGRESS_GUARD: Duration = Duration::from_secs(20);
 /// forbids tests from touching it, and the library's own guard is compiled
 /// only into unit tests, so integration fixtures enforce it here.
 fn per_user_store() -> Option<PathBuf> {
-    slopdex::cache::store_path(&json!({})).ok()
+    slopdex::store_path(&json!({})).ok()
 }
 
 /// Fail fast when an in-process Engine/Database open could reach the real
@@ -70,7 +70,7 @@ fn assert_isolated_open(index: &Path, config: &Value) {
         );
         return;
     };
-    let configured = slopdex::cache::store_path(&json!({ "artifactCachePath": configured }))
+    let configured = slopdex::store_path(&json!({ "artifactCachePath": configured }))
         .expect("artifactCachePath must be a usable path");
     assert_ne!(
         Some(configured),
@@ -711,7 +711,12 @@ impl Repo {
     }
 
     fn open_map(&self, config: &Value) -> Result<Engine> {
-        Engine::open_map(&self.root, &self.index, self.isolated_config(config))
+        Engine::open_with(
+            &self.root,
+            &self.index,
+            self.isolated_config(config),
+            OpenOptions::structure(),
+        )
     }
 
     fn child(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -1025,10 +1030,11 @@ fn git_clean_repeated_refresh_and_cached_reopen_do_not_read_sources_or_shared_ba
         );
     }
     drop(engine);
-    let reader = Engine::open_readonly(
+    let reader = Engine::open_with(
         &repo.root,
         &repo.index,
         isolated(&repo.index, config.clone()),
+        OpenOptions::default().read_only(),
     )?;
     assert_eq!(reader.search("east", "search-code", &all())?, expected);
     assert!(
@@ -1183,14 +1189,13 @@ fn parser_upgrade_refreshes_nested_type_members_without_source_changes() -> Resu
     let source = "export type MyType = { config: { prop1: string } };\n";
     repo.write(path, source)?;
     let config = repo.isolated_config(&json!({}));
-    let mut db =
-        slopdex::storage::Database::open_with_config(&repo.index, &repo.root, &config, false)?;
-    let mut parsed = slopdex::parse::parse(path, source)?;
+    let mut db = slopdex::Database::open_with_config(&repo.index, &repo.root, &config, false)?;
+    let mut parsed = slopdex::parse(path, source)?;
     // The previous parser exposed the direct field, but not its nested member.
     parsed.structure.nodes.truncate(2);
     let old_version = "structure-v12-nesting-limit-heading-names";
     let source_hash = slopdex::hash(source);
-    let file = slopdex::storage::File {
+    let file = slopdex::File {
         path: path.into(),
         hash: source_hash.clone(),
         source: source.into(),
@@ -1212,12 +1217,8 @@ fn parser_upgrade_refreshes_nested_type_members_without_source_changes() -> Resu
     assert_eq!(map_names(&rows), strings(&["MyType", "config", "prop1"]));
     assert_eq!(rows[0]["nodes"][2]["qualifiedName"], "MyType.config.prop1");
     assert_eq!(engine.refresh_structure()?["filesUpdated"], 0);
-    let db = slopdex::storage::Database::open_readonly(&repo.index, &repo.root)?;
-    assert!(db.structure_current(
-        path,
-        &source_hash,
-        slopdex::storage::STRUCTURE_PARSER_VERSION
-    )?);
+    let db = slopdex::Database::open_readonly(&repo.index, &repo.root)?;
+    assert!(db.structure_current(path, &source_hash, slopdex::STRUCTURE_PARSER_VERSION)?);
     assert!(db.cache("parse", &old_key)?.is_some());
     Ok(())
 }
@@ -1269,16 +1270,13 @@ fn global_parses_reuse_renamed_same_dialect_paths_and_isolate_languages() -> Res
         .prepare("SELECT DISTINCT parser_version FROM files")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    assert_eq!(
-        versions,
-        strings(&[slopdex::storage::STRUCTURE_PARSER_VERSION])
-    );
+    assert_eq!(versions, strings(&[slopdex::STRUCTURE_PARSER_VERSION]));
     Ok(())
 }
 
 fn file_record(repo: &Repo, path: &str) -> Result<Value> {
     assert_isolated_open(&repo.index, &Value::Null);
-    let db = slopdex::storage::Database::open_readonly(&repo.index, &repo.root.canonicalize()?)?;
+    let db = slopdex::Database::open_readonly(&repo.index, &repo.root.canonicalize()?)?;
     let file = db
         .files()?
         .into_iter()
@@ -3925,8 +3923,13 @@ fn cli_missing_resolved_source_indexes_fail_without_artifacts_or_provider_calls(
                     ))
                     .join("index.sqlite")
             };
-            Engine::open_map(&repo.root, &decoy, isolated(&decoy, config.clone()))?
-                .refresh_structure()?;
+            Engine::open_with(
+                &repo.root,
+                &decoy,
+                isolated(&decoy, config.clone()),
+                OpenOptions::structure(),
+            )?
+            .refresh_structure()?;
             if selection == "explicit" {
                 config["indexPath"] = json!(decoy);
                 repo.write(".slopdex/config.json", &config.to_string())?;
@@ -4221,7 +4224,12 @@ fn uncached_queries_share_the_index_and_skip_optional_workspace_writes() -> Resu
     engine.refresh_structure()?;
     let (root, index, reader_config) = (repo.root.clone(), repo.index.clone(), config.clone());
     mock.on_next_request(move || {
-        let reader = Engine::open_map_readonly(&root, &index, reader_config)?;
+        let reader = Engine::open_with(
+            &root,
+            &index,
+            reader_config,
+            OpenOptions::structure().read_only(),
+        )?;
         ensure!(
             reader.status()?["fileCount"] == 1,
             "reader lost the published structure"
@@ -4230,7 +4238,12 @@ fn uncached_queries_share_the_index_and_skip_optional_workspace_writes() -> Resu
     });
     engine.refresh()?;
 
-    let reader = Engine::open_map_readonly(&repo.root, &repo.index, config.clone())?;
+    let reader = Engine::open_with(
+        &repo.root,
+        &repo.index,
+        config.clone(),
+        OpenOptions::structure().read_only(),
+    )?;
     let db = repo.db()?;
     let before: i64 = db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
     assert_eq!(
@@ -4353,10 +4366,11 @@ fn open_waits_for_index_writes_and_no_reindex_uses_the_persisted_snapshot() -> R
     );
     drop(opened?);
 
-    let shared_search = Engine::open_readonly(
+    let shared_search = Engine::open_with(
         &repo.root,
         &repo.index,
         isolated(&repo.index, config.clone()),
+        OpenOptions::default().read_only(),
     )?;
     assert_eq!(
         shared_search.search("east", "search-code", &all())?,
@@ -4369,15 +4383,17 @@ fn open_waits_for_index_writes_and_no_reindex_uses_the_persisted_snapshot() -> R
     );
     drop(shared_search);
 
-    let first_reader = Engine::open_map_readonly(
+    let first_reader = Engine::open_with(
         &repo.root,
         &repo.index,
         isolated(&repo.index, config.clone()),
+        OpenOptions::structure().read_only(),
     )?;
-    let second_reader = Engine::open_map_readonly(
+    let second_reader = Engine::open_with(
         &repo.root,
         &repo.index,
         isolated(&repo.index, config.clone()),
+        OpenOptions::structure().read_only(),
     )?;
     assert_eq!(first_reader.status()?, second_reader.status()?);
     drop(first_reader);
@@ -4454,8 +4470,12 @@ fn current_map_reads_share_the_lock_and_stale_maps_wait_for_writers() -> Result<
         Ok(output)
     };
 
-    let mut reader =
-        Engine::open_map_readonly(&repo.root, &repo.index, isolated(&repo.index, json!({})))?;
+    let mut reader = Engine::open_with(
+        &repo.root,
+        &repo.index,
+        isolated(&repo.index, json!({})),
+        OpenOptions::structure().read_only(),
+    )?;
     let generation = reader.status()?["generation"].clone();
     assert_eq!(reader.refresh_structure()?["filesUpdated"], 0);
     let output = child_map()?;
@@ -5219,8 +5239,13 @@ fn cli_external_map_explicit_config_and_index_override_source_defaults() -> Resu
         (&explicit_index, "explicit_snapshot"),
     ] {
         external.write("nested/api.rs", &function(name, "saved"))?;
-        Engine::open_map(&external.root, index, isolated(index, config.clone()))?
-            .refresh_structure()?;
+        Engine::open_with(
+            &external.root,
+            index,
+            isolated(index, config.clone()),
+            OpenOptions::structure(),
+        )?
+        .refresh_structure()?;
     }
     external.write("nested/api.rs", &function("live_snapshot", "edited"))?;
     let mut alternate = config.clone();
@@ -9226,11 +9251,11 @@ fn search_symbols_native_dimensions_share_map_vectors_and_support_cached_readonl
         calls,
         "positional symbol queries reuse map -q embeddings"
     );
-    let mut profile = slopdex::providers::Providers::new(&config)?.embedding_profile();
+    let mut profile = slopdex::Providers::new(&config)?.embedding_profile();
     profile["dimensions"] = json!(2);
     profile["symbolNormalizationVersion"] = json!("symbols-v1");
     for query in [false, true] {
-        let key = slopdex::storage::Database::embedding_key(&profile, query, "http 2 vector north");
+        let key = slopdex::Database::embedding_key(&profile, query, "http 2 vector north");
         let bytes: i64 = first.db()?.query_row(
             "SELECT length(vector) FROM global.embeddings WHERE key=?",
             [key],
@@ -9244,10 +9269,11 @@ fn search_symbols_native_dimensions_share_map_vectors_and_support_cached_readonl
     }
     drop(engine);
     for _ in 0..2 {
-        let reader = Engine::open_readonly(
+        let reader = Engine::open_with(
             &first.root,
             &first.index,
             isolated(&first.index, config.clone()),
+            OpenOptions::default().read_only(),
         )?;
         let before = filesystem_snapshot(first._temp.path())?;
         assert_eq!(
@@ -9843,12 +9869,7 @@ fn symbol_selection_cache_is_cleared_when_live_snapshot_is_reset() -> Result<()>
     );
     // Match the canonical root identity stored by Engine, including Windows' verbatim prefix.
     assert_isolated_open(&repo.index, &Value::Null);
-    let db = slopdex::storage::Database::open(
-        &repo.index,
-        &repo.root.canonicalize()?,
-        &Value::Null,
-        false,
-    )?;
+    let db = slopdex::Database::open(&repo.index, &repo.root.canonicalize()?, &Value::Null, false)?;
     db.reset()?;
     drop(db);
     repo.write("api.ts", "export function VectorNorthNew() {}\n")?;
@@ -9901,14 +9922,14 @@ fn symbol_native_dimensions_profiles_and_shared_cache_are_isolated_and_reusable(
     }
     let manifest = symbol_manifest(&first)?;
     assert_eq!(shared_base(&first, &manifest)?["dimensions"], 2);
-    let content_profile = slopdex::providers::Providers::new(&small)?.embedding_profile();
+    let content_profile = slopdex::Providers::new(&small)?.embedding_profile();
     assert_eq!(content_profile["dimensions"], 4);
     assert!(content_profile.get("symbolNormalizationVersion").is_none());
     let mut symbol_profile = content_profile.clone();
     symbol_profile["dimensions"] = json!(2);
     symbol_profile["symbolNormalizationVersion"] = json!("symbols-v1");
     let bytes_for = |repo: &Repo, profile: &Value, query| -> Result<i64> {
-        let key = slopdex::storage::Database::embedding_key(profile, query, "vector north");
+        let key = slopdex::Database::embedding_key(profile, query, "vector north");
         Ok(repo.db()?.query_row(
             "SELECT length(vector) FROM global.embeddings WHERE key=?",
             [key],
@@ -10990,8 +11011,8 @@ fn minio_shares_artifacts_across_machine_local_caches_and_survives_outage() -> R
         "missing context must trigger provider fallback"
     );
     let paid_after_missing = mock.count();
-    let profile = slopdex::providers::Providers::new(&config)?.embedding_profile();
-    let key = slopdex::storage::Database::embedding_key(&profile, true, "uncached-query");
+    let profile = slopdex::Providers::new(&config)?.embedding_profile();
+    let key = slopdex::Database::embedding_key(&profile, true, "uncached-query");
     let zero = [0_u8; 16];
     let mut corrupt = format!("{}\n", slopdex::hash(zero)).into_bytes();
     corrupt.extend_from_slice(&zero);

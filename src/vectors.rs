@@ -136,23 +136,6 @@ impl VectorIndex {
         Ok(Self { index, dimensions })
     }
 
-    /// Use the persisted index if it matches, otherwise rebuild in memory.
-    /// Multiple readers can do this without publishing sidecar files.
-    #[cfg(test)]
-    pub fn open_readonly(
-        path: &Path,
-        dimensions: usize,
-        generation: u64,
-        vectors: &[(u64, Vec<f32>)],
-    ) -> Result<Self> {
-        let manifest = Manifest::new(dimensions, generation, vectors)?;
-        let index = match load_cached(path, dimensions) {
-            Ok((index, old)) if old.fingerprint == manifest.fingerprint => index,
-            _ => build(dimensions, vectors)?,
-        };
-        Ok(Self { index, dimensions })
-    }
-
     /// Return up to `limit` allowed keys with cosine similarity.
     ///
     /// Filtering is applied inside USearch's graph traversal, not to an unfiltered
@@ -223,6 +206,7 @@ impl VectorIndex {
         self.index.size()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

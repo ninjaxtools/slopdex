@@ -302,8 +302,8 @@ fn structure(source: &str, headings: &[Heading]) -> FileStructure {
         result.nodes.push(StructureNode {
             id,
             parent_id,
-            language: "markdown".into(),
-            kind: "heading".into(),
+            language: super::LanguageId::Markdown,
+            kind: super::NodeKind::Heading,
             name: title.clone(),
             names: vec![title.clone()],
             qualified_name,

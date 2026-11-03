@@ -1,4 +1,4 @@
-use slopdex::parse::{ParsedFile, StructureNode, parse};
+use slopdex::{ParsedFile, StructureNode, parse};
 
 pub fn clean(path: &str, source: &str) -> ParsedFile {
     let parsed = parse(path, source).unwrap();

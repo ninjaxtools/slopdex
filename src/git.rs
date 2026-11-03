@@ -1,3 +1,4 @@
+use crate::storage::UnitKind;
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
@@ -720,7 +721,7 @@ pub fn changed_identities(root: &Path, resolved: &str, items: &[Item]) -> Result
     }
     let mut paths: Vec<&str> = items
         .iter()
-        .filter(|item| item.kind == "function")
+        .filter(|item| item.kind == UnitKind::Function)
         .map(|item| item.path.as_str())
         .collect();
     paths.sort_unstable();
@@ -778,7 +779,7 @@ pub fn changed_identities(root: &Path, resolved: &str, items: &[Item]) -> Result
         }
     }
     let mut changed = HashSet::new();
-    for item in items.iter().filter(|i| i.kind == "function") {
+    for item in items.iter().filter(|i| i.kind == UnitKind::Function) {
         if !base[item.path.as_str()].contains(&(
             item.data["qualifiedName"].as_str().unwrap_or("").into(),
             item.data["sourceHash"].as_str().unwrap_or("").into(),
@@ -858,7 +859,7 @@ mod tests {
             id,
             path: path.into(),
             identity: format!("{path}:{id}"),
-            kind: "function".into(),
+            kind: crate::storage::UnitKind::Function,
             data: serde_json::to_value(&parsed.callables[0])?,
             embedding: "unused".into(),
             description_embedding: None,
@@ -1007,7 +1008,7 @@ mod tests {
         repo.write("a.rs", edited)?;
         fs::remove_file(repo.root().join("b.rs"))?;
         let mut markdown = item(5, "a.rs", edited)?;
-        markdown.kind = "markdown".into();
+        markdown.kind = crate::storage::UnitKind::Markdown;
         markdown.data = json!({"content": "not a callable"});
         let items = [
             item(1, "a.rs", &format!("\n\n{original}"))?,

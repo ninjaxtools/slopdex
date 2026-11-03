@@ -30,7 +30,7 @@ fn record(path: &str) -> (File, Vec<Item>) {
         id: 0,
         path: path.into(),
         identity: format!("{path}:example"),
-        kind: "function".into(),
+        kind: UnitKind::Function,
         data: json!({"qualifiedName": "example", "startLine": 1,"sourceHash":"callable-hash",
                 "embeddingInput":"fn example() {}","description":"Callable description"}),
         embedding: "code".into(),
@@ -1687,7 +1687,7 @@ fn markdown_and_empty_structures_are_versioned_without_embeddings() -> Result<()
             item.identity,
             hash(json!(["readme.md", "markdown", ordinal]).to_string())
         );
-        assert_eq!(item.kind, "markdown");
+        assert_eq!(item.kind, UnitKind::Markdown);
         assert!(item.embedding.is_empty());
     }
     let mut semantic = empty.0.clone();
@@ -1773,7 +1773,7 @@ fn source_descriptions_publish_without_vectors_and_hydrate_for_each_profile() ->
     assert_eq!(
         items
             .iter()
-            .filter(|item| item.kind == "symbol-description")
+            .filter(|item| item.kind == UnitKind::SymbolDescription)
             .count(),
         2
     );
@@ -1810,7 +1810,7 @@ fn source_descriptions_publish_without_vectors_and_hydrate_for_each_profile() ->
     db.set_projection_profile(&a)?;
     let mut items = db.items_for_profile(&a)?;
     for item in &mut items {
-        if item.kind == "symbol-description" {
+        if item.kind == UnitKind::SymbolDescription {
             item.data.as_object_mut().unwrap().remove("startByte");
             item.data.as_object_mut().unwrap().remove("endByte");
         }
@@ -1974,4 +1974,20 @@ fn symbol_description_occurrences_and_vectors_survive_structural_edits() -> Resu
         0
     );
     Ok(())
+}
+
+#[test]
+fn unit_kinds_round_trip_their_stored_names() {
+    for kind in UnitKind::ALL {
+        assert_eq!(UnitKind::from_name(kind.as_str()), Some(kind));
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
+    }
+    assert_eq!(
+        UnitKind::ALL.map(UnitKind::as_str),
+        ["function", "symbol-description", "markdown", "document"]
+    );
+    // Declaration kinds are not unit kinds: callables are stored as `function`.
+    assert_eq!(UnitKind::from_name("method"), None);
+    assert!(UnitKind::Function.is_code() && UnitKind::SymbolDescription.is_code());
+    assert!(!UnitKind::Markdown.is_code() && !UnitKind::Document.is_code());
 }

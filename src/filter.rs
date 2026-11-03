@@ -1,5 +1,6 @@
 //! Shared repository-relative path and symbol selection for search and structure maps.
 
+use crate::parse::NodeKind;
 use crate::{
     formats::{self, FormatGroup},
     parse::{FileStructure, StructureNode},
@@ -18,11 +19,12 @@ pub struct Selection {
     semantic_names: Option<HashSet<String>>,
     semantic_symbols: HashSet<(String, usize)>,
     semantic_paths: HashSet<String>,
-    kinds: HashSet<&'static str>,
+    kinds: HashSet<NodeKind>,
     private: bool,
     formats: BTreeSet<FormatGroup>,
 }
 
+#[cfg(test)]
 pub(crate) struct SelectedStructure {
     pub(crate) nodes: Vec<StructureNode>,
     /// Read by the selection limit tests; map queries use `SelectedIndexes`.
@@ -188,7 +190,9 @@ impl Selection {
                     .nodes
                     .iter()
                     .filter(|node| {
-                        node.kind == "heading" && node.name == title && node.start_line <= start
+                        node.kind == NodeKind::Heading
+                            && node.name == title
+                            && node.start_line <= start
                     })
                     .max_by_key(|node| node.start_line)
             })
@@ -248,6 +252,7 @@ impl Selection {
         }
     }
 
+    #[cfg(test)]
     /// Declaration names use the same qualified-name contract as search. Imports
     /// additionally expose their source paths and aliases; multi-binding names
     /// are qualified in the declaration's enclosing scope. Semantic selection
@@ -280,7 +285,7 @@ impl Selection {
         if !self.format_matches(path) {
             return false;
         }
-        let prefix = if node.kind == "import" {
+        let prefix = if node.kind == NodeKind::Import {
             ""
         } else {
             node.qualified_name.strip_suffix(&node.name).unwrap_or("")
@@ -290,7 +295,7 @@ impl Selection {
                 .names
                 .iter()
                 .any(|name| self.name_matches(&format!("{prefix}{name}")))
-            || self.callable_source_matches(&node.kind, source);
+            || self.callable_source_matches(node.kind.as_str(), source);
         let semantic_matches = self.semantic_paths.contains(path)
             || self.semantic_symbols.contains(&(path.to_owned(), node.id))
             || self.semantic_name_matches(&node.name)
@@ -301,10 +306,11 @@ impl Selection {
         self.combine_name_matches(regex_matches, semantic_matches)
     }
 
-    pub fn kind_matches(&self, kind: &str) -> bool {
-        self.kinds.is_empty() || self.kinds.contains(kind)
+    pub fn kind_matches(&self, kind: NodeKind) -> bool {
+        self.kinds.is_empty() || self.kinds.contains(&kind)
     }
 
+    #[cfg(test)]
     /// Keep direct kind+name matches and all their ancestors as context. Never
     /// expand a matched parent to its unmatched children. IDs and source order
     /// remain unchanged, even if IDs are sparse or parents follow their children.
@@ -312,11 +318,13 @@ impl Selection {
         self.select_structure_at("", structure)
     }
 
+    #[cfg(test)]
     pub fn select_structure_at(&self, path: &str, structure: &FileStructure) -> Vec<StructureNode> {
         self.select_structure_limited_at(path, structure, None)
             .nodes
     }
 
+    #[cfg(test)]
     /// Cap direct matches in original source order before adding ancestor context.
     /// A zero remaining budget still checks for one more eligible match.
     pub(crate) fn select_structure_limited_at(
@@ -328,6 +336,7 @@ impl Selection {
         self.select_structure_limited_in(path, structure, None, limit)
     }
 
+    #[cfg(test)]
     pub(crate) fn select_structure_limited_in(
         &self,
         path: &str,
@@ -371,7 +380,7 @@ impl Selection {
         for (_, node) in &ordered {
             if (!self.private
                 && symbol_is_private(node.id, &nodes, &mut visibility, &mut HashSet::new()))
-                || !self.kind_matches(&node.kind)
+                || !self.kind_matches(node.kind)
                 || !self.symbol_matches_in(path, node, source)
             {
                 continue;
@@ -422,7 +431,7 @@ fn symbol_is_private(
     }
     let parent = node.parent_id.and_then(|id| nodes.get(&id).copied());
     let inherited_private = parent.is_some_and(|parent| {
-        parent.kind != "impl" && symbol_is_private(parent.id, nodes, cache, visiting)
+        parent.kind != NodeKind::Impl && symbol_is_private(parent.id, nodes, cache, visiting)
     });
     let private = inherited_private || locally_private(node, parent, nodes);
     visiting.remove(&id);
@@ -438,7 +447,7 @@ fn locally_private(
     if matches!(node.kind.as_str(), "heading" | "import") {
         return false;
     }
-    if parent.is_some_and(|parent| crate::parse::is_callable_kind(&parent.kind))
+    if parent.is_some_and(|parent| parent.kind.is_callable())
         && !typescript_type_member(node, nodes)
     {
         return true;
@@ -446,36 +455,42 @@ fn locally_private(
     // In languages without a `private` modifier, a leading underscore on a
     // callable or variable conventionally marks implementation-only names.
     // Explicit exports and Rust's `pub` visibility still take precedence.
-    let underscore_private = matches!(node.language.as_str(), "c" | "bash" | "javascript" | "jsx")
-        && matches!(
-            node.kind.as_str(),
-            "function" | "method" | "generator" | "variable" | "constant" | "field"
-        )
-        && !node.names.is_empty()
+    let underscore_private = matches!(
+        node.language,
+        crate::parse::LanguageId::C
+            | crate::parse::LanguageId::Bash
+            | crate::parse::LanguageId::JavaScript
+            | crate::parse::LanguageId::Jsx
+    ) && matches!(
+        node.kind.as_str(),
+        "function" | "method" | "generator" | "variable" | "constant" | "field"
+    ) && !node.names.is_empty()
         && node
             .names
             .iter()
             .all(|name| name.starts_with('_') && name.len() > 1);
-    match node.language.as_str() {
-        "rust" => rust_private(node, parent),
-        "javascript" | "jsx" => {
+    match node.language {
+        crate::parse::LanguageId::Rust => rust_private(node, parent),
+        crate::parse::LanguageId::JavaScript | crate::parse::LanguageId::Jsx => {
             javascript_private(node, parent)
                 || underscore_private
                     && !node.attributes.iter().any(|attr| attr == "export")
                     && !node.signature.trim_start().starts_with("export ")
         }
-        "typescript" | "tsx" => javascript_private(node, parent),
-        "python" => node.names.iter().all(|name| name.starts_with('_')),
-        "go" => go_private(node),
-        "java" => java_private(node, parent),
-        "c" => has_word(&node.signature, "static") || underscore_private,
-        "bash" => underscore_private,
+        crate::parse::LanguageId::TypeScript | crate::parse::LanguageId::Tsx => {
+            javascript_private(node, parent)
+        }
+        crate::parse::LanguageId::Python => node.names.iter().all(|name| name.starts_with('_')),
+        crate::parse::LanguageId::Go => go_private(node),
+        crate::parse::LanguageId::Java => java_private(node, parent),
+        crate::parse::LanguageId::C => has_word(&node.signature, "static") || underscore_private,
+        crate::parse::LanguageId::Bash => underscore_private,
         _ => false,
     }
 }
 
 fn typescript_type_member(node: &StructureNode, nodes: &HashMap<usize, &StructureNode>) -> bool {
-    if !matches!(node.language.as_str(), "typescript" | "tsx") {
+    if !node.language.is_typescript() {
         return false;
     }
     let mut parent = node.parent_id;
@@ -494,21 +509,21 @@ fn typescript_type_member(node: &StructureNode, nodes: &HashMap<usize, &Structur
 }
 
 fn rust_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
-    if node.kind == "impl" {
+    if node.kind == NodeKind::Impl {
         return true;
     }
     if parent.is_some_and(|parent| {
         matches!(parent.kind.as_str(), "trait" | "enum" | "variant")
-            || parent.kind == "impl" && parent.signature.contains(" for ")
+            || parent.kind == NodeKind::Impl && parent.signature.contains(" for ")
     }) {
         return false;
     }
-    node.kind == "macro"
+    node.kind == NodeKind::Macro
         && !node
             .attributes
             .iter()
             .any(|attr| attr.contains("macro_export"))
-        || node.kind != "macro" && !node.signature.trim_start().starts_with("pub")
+        || node.kind != NodeKind::Macro && !node.signature.trim_start().starts_with("pub")
 }
 
 fn javascript_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
@@ -525,7 +540,7 @@ fn javascript_private(node: &StructureNode, parent: Option<&StructureNode>) -> b
 }
 
 fn go_private(node: &StructureNode) -> bool {
-    if node.kind == "module" {
+    if node.kind == NodeKind::Module {
         return false;
     }
     let name = node
@@ -534,7 +549,7 @@ fn go_private(node: &StructureNode) -> bool {
         .find(|part| !part.is_empty())
         .unwrap_or(&node.name);
     !name.chars().next().is_some_and(char::is_uppercase)
-        || node.kind == "method"
+        || node.kind == NodeKind::Method
             && node
                 .qualified_name
                 .split('.')
@@ -544,13 +559,14 @@ fn go_private(node: &StructureNode) -> bool {
 }
 
 fn java_private(node: &StructureNode, parent: Option<&StructureNode>) -> bool {
-    if node.kind == "module" {
+    if node.kind == NodeKind::Module {
         return false;
     }
-    if parent.is_some_and(|parent| parent.kind == "interface") {
+    if parent.is_some_and(|parent| parent.kind == NodeKind::Interface) {
         return has_word(&node.signature, "private");
     }
-    if node.kind == "variant" && parent.is_some_and(|parent| parent.kind == "enum") {
+    if node.kind == NodeKind::Variant && parent.is_some_and(|parent| parent.kind == NodeKind::Enum)
+    {
         return false;
     }
     !has_word(&node.signature, "public")
@@ -610,37 +626,42 @@ pub fn normalize_kind(input: &str) -> Result<String> {
     Ok(kind.to_owned())
 }
 
-fn kind_group(kind: &str) -> Result<&'static [&'static str]> {
+fn kind_group(kind: &str) -> Result<&'static [NodeKind]> {
     Ok(match kind {
-        "functions" => &["function", "method", "constructor", "generator"],
-        "types" => &[
-            "type",
-            "class",
-            "struct",
-            "union",
-            "interface",
-            "trait",
-            "enum",
+        "functions" => &[
+            NodeKind::Function,
+            NodeKind::Method,
+            NodeKind::Constructor,
+            NodeKind::Generator,
         ],
-        "alias" => &["type"],
-        "method" => &["method"],
-        "constructor" => &["constructor"],
-        "generator" => &["generator"],
-        "class" => &["class"],
-        "struct" => &["struct"],
-        "union" => &["union"],
-        "interface" => &["interface"],
-        "trait" => &["trait"],
-        "enum" => &["enum"],
-        "variant" => &["variant"],
-        "field" => &["field"],
-        "impl" => &["impl"],
-        "module" => &["module"],
-        "constant" => &["constant"],
-        "variable" => &["variable"],
-        "import" => &["import"],
-        "macro" => &["macro"],
-        "heading" => &["heading"],
+        "types" => &[
+            NodeKind::Type,
+            NodeKind::Class,
+            NodeKind::Struct,
+            NodeKind::Union,
+            NodeKind::Interface,
+            NodeKind::Trait,
+            NodeKind::Enum,
+        ],
+        "alias" => &[NodeKind::Type],
+        "method" => &[NodeKind::Method],
+        "constructor" => &[NodeKind::Constructor],
+        "generator" => &[NodeKind::Generator],
+        "class" => &[NodeKind::Class],
+        "struct" => &[NodeKind::Struct],
+        "union" => &[NodeKind::Union],
+        "interface" => &[NodeKind::Interface],
+        "trait" => &[NodeKind::Trait],
+        "enum" => &[NodeKind::Enum],
+        "variant" => &[NodeKind::Variant],
+        "field" => &[NodeKind::Field],
+        "impl" => &[NodeKind::Impl],
+        "module" => &[NodeKind::Module],
+        "constant" => &[NodeKind::Constant],
+        "variable" => &[NodeKind::Variable],
+        "import" => &[NodeKind::Import],
+        "macro" => &[NodeKind::Macro],
+        "heading" => &[NodeKind::Heading],
         _ => bail!("unknown structure kind: {kind}"),
     })
 }
@@ -1003,13 +1024,13 @@ mod tests {
         assert!(nodes.iter().any(|node| node.name == "deleteFile"));
         assert!(!nodes.iter().any(|node| node.name == "unrelated"));
         assert!(
-            nodes.iter().any(|node| node.kind == "import"),
+            nodes.iter().any(|node| node.kind == NodeKind::Import),
             "{:?}",
             parsed.structure.nodes
         );
         // Either the import source path or a semantic alias can select the declaration.
         let alias = StructureNode {
-            kind: "import".into(),
+            kind: crate::parse::NodeKind::Import,
             qualified_name: "fs".into(),
             name: "fs".into(),
             names: vec!["readFile".into()],
@@ -1209,14 +1230,20 @@ mod tests {
             "struct",
             "heading",
         ] {
-            assert!(selection.kind_matches(kind), "{kind}");
+            assert!(
+                selection.kind_matches(NodeKind::from_name(kind).unwrap()),
+                "{kind}"
+            );
         }
         for kind in ["import", "field", "variable"] {
-            assert!(!selection.kind_matches(kind), "{kind}");
+            assert!(
+                !selection.kind_matches(NodeKind::from_name(kind).unwrap()),
+                "{kind}"
+            );
         }
         let methods = Selection::compile(&json!({"kinds": "methods"})).unwrap();
-        assert!(methods.kind_matches("method"));
-        assert!(!methods.kind_matches("function"));
+        assert!(methods.kind_matches(NodeKind::Method));
+        assert!(!methods.kind_matches(NodeKind::Function));
     }
 
     #[test]
@@ -1494,21 +1521,21 @@ mod tests {
                     parent_id: Some(10),
                     name: "match".into(),
                     qualified_name: "match".into(),
-                    kind: "method".into(),
+                    kind: crate::parse::NodeKind::Method,
                     ..StructureNode::default()
                 },
                 StructureNode {
                     id: 10,
                     parent_id: Some(30),
                     name: "parent".into(),
-                    kind: "class".into(),
+                    kind: crate::parse::NodeKind::Class,
                     ..StructureNode::default()
                 },
                 StructureNode {
                     id: 20,
                     parent_id: Some(10),
                     name: "sibling".into(),
-                    kind: "method".into(),
+                    kind: crate::parse::NodeKind::Method,
                     ..StructureNode::default()
                 },
             ],

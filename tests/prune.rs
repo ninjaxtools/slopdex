@@ -507,7 +507,7 @@ fn provider_prune_flags_are_independent_and_preserve_live_workspace_bindings() -
 #[test]
 fn prune_without_workspaces_does_not_create_an_index() -> Result<()> {
     let fixture = Fixture::new()?;
-    drop(slopdex::cache::Artifacts::open(
+    drop(slopdex::Artifacts::open(
         &json!({"artifactCachePath":fixture.store}),
     )?);
     let conn = Connection::open(&fixture.store)?;

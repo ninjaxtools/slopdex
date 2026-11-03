@@ -262,8 +262,10 @@ impl Collector<'_> {
         self.nodes.push(StructureNode {
             id,
             parent_id: parent,
-            language: self.language.into(),
-            kind: kind.into(),
+            language: super::LanguageId::from_name(self.language)
+                .expect("data extraction only runs for registry languages"),
+            kind: super::NodeKind::from_name(kind)
+                .expect("data extraction only yields registry node kinds"),
             name: name.clone(),
             names: vec![name],
             qualified_name,
@@ -602,7 +604,7 @@ impl Collector<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parse::{language_for_path, parse};
+    use crate::parse::{LanguageId, language_for_path, parse};
 
     #[test]
     fn css_compatibility_only_rewrites_supported_at_rules() {
@@ -680,7 +682,7 @@ mod tests {
             assert!(!parsed.chunks[0].content.is_empty());
             for (id, node) in parsed.structure.nodes.iter().enumerate() {
                 assert_eq!(node.id, id);
-                assert_eq!(node.language, language_for_path(path).unwrap());
+                assert_eq!(node.language, LanguageId::for_path(path).unwrap());
                 assert!(node.end_byte <= source.len());
             }
         }

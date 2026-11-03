@@ -1,12 +1,13 @@
 //! Conservative, snapshot-based call resolution and bounded graph traversal.
+use crate::parse::{LanguageId, NodeKind};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     parse::{FileStructure, ImportBinding, ParsedFile, ReferenceSite, StructureNode},
-    storage::{Database, STRUCTURE_PARSER_VERSION},
+    storage::Database,
 };
 
 /// Outgoing symbol comments are independent of bounded callable traversal.
@@ -133,7 +134,7 @@ mod arc_files {
 }
 
 fn callable(node: &StructureNode) -> bool {
-    crate::parse::is_callable_kind(&node.kind)
+    node.kind.is_callable()
 }
 
 /// Structure ids are file-local vector indexes; verify rather than scan.
@@ -142,23 +143,6 @@ fn node_by_id(structure: &FileStructure, id: usize) -> Option<&StructureNode> {
 }
 
 impl CallGraph {
-    pub fn load(db: &Database) -> Result<Self> {
-        // A stale graph would silently point at declarations from a different
-        // parser generation, particularly under --no-reindex.
-        let files = db.all_structures(STRUCTURE_PARSER_VERSION)?;
-        for path in db.paths()? {
-            ensure!(
-                files.contains_key(&path),
-                "Call graph requires current structure for {path}; run without --no-reindex"
-            );
-        }
-        let files = files
-            .into_iter()
-            .map(|(path, structure)| (path, std::sync::Arc::new(structure)))
-            .collect();
-        Ok(Self::from_structures(files, Self::indexed_keys(db)?))
-    }
-
     /// Search-indexed callable keys: only these can be call-graph edge ends.
     pub fn indexed_keys(db: &Database) -> Result<BTreeSet<Key>> {
         let mut indexed = BTreeSet::new();
@@ -255,7 +239,7 @@ impl CallGraph {
                         // Shell command lookup has a separate namespace from
                         // variables. Its static callable sites already supply
                         // the conservative function references we can support.
-                        if node.language == "bash" {
+                        if node.language == LanguageId::Bash {
                             references
                                 .entry(from.clone())
                                 .or_default()
@@ -399,7 +383,7 @@ fn bare_name_reaches(language: &str, ancestor: &StructureNode) -> bool {
         language,
         "python" | "javascript" | "jsx" | "typescript" | "tsx"
     ) || callable(ancestor)
-        || ancestor.kind == "module"
+        || ancestor.kind == NodeKind::Module
 }
 
 /// `Foo` for `impl Foo`, `impl<T> Foo<T>`, and `impl Trait for Foo<T>`.
@@ -422,12 +406,14 @@ fn container_named(container: &StructureNode, receiver: &str) -> bool {
 
 /// A member reachable through its type's name rather than an instance.
 fn static_member(node: &StructureNode) -> bool {
-    node.kind == "constructor"
+    node.kind == NodeKind::Constructor
         || node.signature.contains("static")
         || node.attributes.iter().any(|attribute| {
             attribute.contains("staticmethod") || attribute.contains("classmethod")
         })
-        || node.language == "rust" && node.kind == "method" && !rust_self_receiver(&node.signature)
+        || node.language == LanguageId::Rust
+            && node.kind == NodeKind::Method
+            && !rust_self_receiver(&node.signature)
 }
 
 /// Whether a Rust signature's parameter list starts with a `self` receiver.
@@ -505,7 +491,7 @@ impl<'a> FileIndex<'a> {
             children: HashMap::new(),
         };
         for node in &structure.nodes {
-            if node.kind == "import" {
+            if node.kind == NodeKind::Import {
                 index.imports.push(node);
             }
             index
@@ -800,10 +786,10 @@ impl<'a> Resolver<'a> {
         let binding = site.binding_id.and_then(|id| node_by_id(structure, id));
         let mut candidates = BTreeSet::new();
         if let Some(binding) = binding {
-            if binding.kind == "import" {
+            if binding.kind == NodeKind::Import {
                 for import in &binding.imports {
                     let root = site.receiver.as_deref().unwrap_or(&site.name);
-                    if local_name(&owner.language, import) != Some(root)
+                    if local_name(owner.language.as_str(), import) != Some(root)
                         || import.wildcard && site.receiver.is_none()
                     {
                         continue;
@@ -815,7 +801,7 @@ impl<'a> Resolver<'a> {
                             binding,
                             import,
                             site,
-                            &owner.language,
+                            owner.language.as_str(),
                         )
                     });
                     for target in local.into_iter().flatten() {
@@ -831,7 +817,7 @@ impl<'a> Resolver<'a> {
                     };
                     let key = TargetKey::new(
                         path,
-                        &owner.language,
+                        owner.language.as_str(),
                         import,
                         TargetKind::Reference {
                             receiver: site.receiver.is_some(),
@@ -852,7 +838,9 @@ impl<'a> Resolver<'a> {
                             }
                             let valid = if let Some(receiver) = site.receiver.as_deref() {
                                 if target.parent_id.is_none() {
-                                    namespace && (owner.language != "go" || target.kind != "method")
+                                    namespace
+                                        && (owner.language != LanguageId::Go
+                                            || target.kind != NodeKind::Method)
                                 } else {
                                     let container = import.name.as_deref().unwrap_or(receiver);
                                     target
@@ -865,7 +853,7 @@ impl<'a> Resolver<'a> {
                                 }
                             } else {
                                 target.parent_id.is_none()
-                                    || owner.language == "java"
+                                    || owner.language == LanguageId::Java
                                         && target
                                             .parent_id
                                             .and_then(|id| node_by_id(other, id))
@@ -896,7 +884,7 @@ impl<'a> Resolver<'a> {
                     let parent = target.parent_id.and_then(|id| node_by_id(structure, id));
                     let valid = parent.is_some_and(|parent| {
                         (parent.id == binding.id
-                            || parent.kind == "impl"
+                            || parent.kind == NodeKind::Impl
                                 && binding.parent_id == parent.parent_id
                                 && impl_type(&parent.name) == binding.name)
                             && reference_static_member(target, parent)
@@ -909,7 +897,7 @@ impl<'a> Resolver<'a> {
                     }
                 }
             }
-        } else if owner.language == "c" && site.receiver.is_none() {
+        } else if owner.language == LanguageId::C && site.receiver.is_none() {
             // Includes provide explicit cross-file evidence, unlike a globally
             // unique name. Several headers defining the name remain ambiguous.
             let bindings = self
@@ -918,7 +906,8 @@ impl<'a> Resolver<'a> {
                 .map(FileIndex::bindings)
                 .unwrap_or_default();
             for binding in bindings {
-                let key = TargetKey::new(path, &owner.language, binding, TargetKind::Header);
+                let key =
+                    TargetKey::new(path, owner.language.as_str(), binding, TargetKind::Header);
                 for other_path in self.file_targets(key) {
                     let other = &files[other_path];
                     let Some(index) = self.indexes.get(other_path) else {
@@ -927,12 +916,13 @@ impl<'a> Resolver<'a> {
                     for target in index.named(&site.name) {
                         if (target.name == site.name || target.names.contains(&site.name))
                             && (target.parent_id.is_none()
-                                || target.kind == "variant"
+                                || target.kind == NodeKind::Variant
                                     && target
                                         .parent_id
                                         .and_then(|id| node_by_id(other, id))
                                         .is_some_and(|parent| {
-                                            parent.kind == "enum" && parent.parent_id.is_none()
+                                            parent.kind == NodeKind::Enum
+                                                && parent.parent_id.is_none()
                                         }))
                             && !matches!(target.kind.as_str(), "import" | "impl")
                         {
@@ -999,7 +989,7 @@ impl<'a> Resolver<'a> {
                     node_by_id(structure, *id).and_then(|node| node.parent_id)
                 })
                 .filter_map(|id| node_by_id(structure, id))
-                .find(|node| node.kind == "module")
+                .find(|node| node.kind == NodeKind::Module)
                 .map(|node| {
                     node.qualified_name
                         .split('.')
@@ -1111,11 +1101,11 @@ impl<'a> Resolver<'a> {
         }
         if receiver.is_none() && candidates.is_empty() {
             for class in index.named(name) {
-                if class.kind != "class" || class.name != name {
+                if class.kind != NodeKind::Class || class.name != name {
                     continue;
                 }
                 for constructor in index.children.get(&class.id).into_iter().flatten() {
-                    if constructor.kind == "constructor" && constructor.name == "__init__" {
+                    if constructor.kind == NodeKind::Constructor && constructor.name == "__init__" {
                         let key = Key {
                             path: path.to_owned(),
                             id: constructor.id,
@@ -1166,7 +1156,7 @@ impl<'a> Resolver<'a> {
                         // Go methods are top-level declarations too, but only
                         // functions are reachable through a package name.
                         (Some(_), None) => {
-                            namespace && (language != "go" || node.kind == "function")
+                            namespace && (language != "go" || node.kind == NodeKind::Function)
                         }
                         (Some(receiver), Some(parent)) => {
                             let container = binding.name.as_deref().unwrap_or(receiver);
@@ -1248,13 +1238,13 @@ impl HeaderPattern {
 }
 
 fn reference_static_member(node: &StructureNode, parent: &StructureNode) -> bool {
-    parent.kind == "module"
+    parent.kind == NodeKind::Module
         || matches!(parent.kind.as_str(), "variable" | "constant")
-        || node.kind == "variant"
+        || node.kind == NodeKind::Variant
         || callable(node)
-            && (node.kind == "constructor"
-                || if node.language == "rust" {
-                    node.kind == "method" && !rust_self_receiver(&node.signature)
+            && (node.kind == NodeKind::Constructor
+                || if node.language == LanguageId::Rust {
+                    node.kind == NodeKind::Method && !rust_self_receiver(&node.signature)
                 } else {
                     node.signature
                         .split_whitespace()
@@ -1264,8 +1254,9 @@ fn reference_static_member(node: &StructureNode, parent: &StructureNode) -> bool
                         })
                 })
         || !callable(node)
-            && (node.language == "python"
-                || node.language == "rust" && matches!(node.kind.as_str(), "constant" | "type")
+            && (node.language == LanguageId::Python
+                || node.language == LanguageId::Rust
+                    && matches!(node.kind.as_str(), "constant" | "type")
                 || node
                     .signature
                     .split_whitespace()

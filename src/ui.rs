@@ -2,9 +2,14 @@
 //! Results stay on stdout; interactive rendering is confined to terminal stderr.
 
 use std::{
+    cell::RefCell,
     fmt::Display,
     io::{self, IsTerminal, Write},
-    sync::{Arc, Mutex, PoisonError, mpsc},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -12,7 +17,7 @@ use std::{
 use anyhow::Result;
 
 struct Active {
-    id: ScopeId,
+    id: Arc<()>,
     label: String,
     display: Option<TerminalDisplay>,
     state: ProgressState,
@@ -68,9 +73,9 @@ impl DelayedText {
     }
 }
 
-// Tokens belong to a scope, rather than a stack index or display generation:
-// a late increment/drop cannot affect another scope or a later CLI operation.
-type ScopeId = Arc<()>;
+// Tokens belong to a stage, rather than a stack index or display generation:
+// a late increment/drop cannot affect another stage or a later CLI operation.
+type ScopeId = StageId;
 
 struct Count {
     label: String,
@@ -163,13 +168,19 @@ impl ProgressState {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, label: String, total: usize) -> ScopeId {
-        let id = Arc::new(());
+        let id = StageId::next();
+        self.push_stage(id, label, total);
+        id
+    }
+
+    fn push_stage(&mut self, id: ScopeId, label: String, total: usize) {
         if self.scopes.is_empty() {
             self.last = None;
         }
         self.scopes.push(Scope {
-            id: id.clone(),
+            id,
             count: Count {
                 label,
                 completed: 0,
@@ -179,11 +190,11 @@ impl ProgressState {
             since: Instant::now(),
             bar_visible: false,
         });
-        id
     }
 
+    #[cfg(test)]
     fn inc(&mut self, id: &ScopeId, delta: usize) {
-        if let Some(scope) = self.scopes.iter_mut().find(|s| Arc::ptr_eq(&s.id, id)) {
+        if let Some(scope) = self.scopes.iter_mut().find(|s| s.id == *id) {
             scope.count.completed = scope
                 .count
                 .completed
@@ -192,8 +203,14 @@ impl ProgressState {
         }
     }
 
+    fn set_completed(&mut self, id: &ScopeId, completed: usize) {
+        if let Some(scope) = self.scopes.iter_mut().find(|s| s.id == *id) {
+            scope.count.completed = completed.min(scope.count.total);
+        }
+    }
+
     fn end(&mut self, id: &ScopeId, success: bool) {
-        if let Some(index) = self.scopes.iter().position(|s| Arc::ptr_eq(&s.id, id)) {
+        if let Some(index) = self.scopes.iter().position(|s| s.id == *id) {
             let scope = self.scopes.remove(index);
             // Only retain the outer task's summary. Nested completion restores
             // its parent without printing or accumulating a row per child.
@@ -359,32 +376,188 @@ fn progress_value(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-/// A counted scope is silent unless an enclosing CLI spin owns the display.
+/// Identifies one counted stage reported to a [`ProgressReporter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StageId(u64);
+
+impl StageId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Receives progress and diagnostics from engine work. Inject one with
+/// [`crate::Engine::set_progress`]. Progress methods default to doing
+/// nothing; `info` and `warning` default to writing to stderr.
+///
+/// Stages nest: a stage started while another is running is its child.
+/// Methods may be called from worker threads. Text may contain untrusted
+/// repository content (paths, parser messages); sanitize before rendering.
+pub trait ProgressReporter: Send + Sync {
+    /// A free-form status update, such as the file currently being indexed.
+    /// The text may contain untrusted repository content.
+    fn message(&self, _text: &str) {}
+    /// A counted stage of `total` units started.
+    fn stage_started(&self, _stage: StageId, _label: &str, _total: usize) {}
+    /// A counted stage has now completed `completed` of `total` units.
+    fn stage_advanced(&self, _stage: StageId, _completed: usize, _total: usize) {}
+    /// A counted stage ended; `success` is false when it was abandoned.
+    fn stage_finished(&self, _stage: StageId, _success: bool) {}
+    /// An informational notice, such as a model download starting.
+    fn info(&self, text: &str) {
+        log(Level::Info, text);
+    }
+    /// A recoverable problem: skipped files, parse errors, an unavailable
+    /// remote cache, provider retries.
+    fn warning(&self, text: &str) {
+        log(Level::Warning, text);
+    }
+}
+
+/// The default reporter: discards progress; notices still go to stderr.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoProgress;
+
+impl ProgressReporter for NoProgress {}
+
+thread_local! {
+    static CURRENT: RefCell<Option<Arc<dyn ProgressReporter>>> = const { RefCell::new(None) };
+}
+
+/// Route progress reported on this thread to `reporter` while `work` runs.
+/// Engine entry points install their injected reporter here, so deeper code
+/// (index construction, parsing) need not thread it through every call.
+pub(crate) fn with_reporter<T>(
+    reporter: &Arc<dyn ProgressReporter>,
+    work: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<dyn ProgressReporter>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CURRENT.with(|current| *current.borrow_mut() = previous);
+        }
+    }
+    let previous = CURRENT.with(|current| current.borrow_mut().replace(reporter.clone()));
+    let _restore = Restore(previous);
+    work()
+}
+
+/// The reporter installed on this thread, if any. Capture it before spawning
+/// workers and reinstall it there with [`inherit`].
+pub(crate) fn current() -> Option<Arc<dyn ProgressReporter>> {
+    CURRENT.with(|current| current.borrow().clone())
+}
+
+/// Run `work` under a reporter captured on another thread with [`current`].
+pub(crate) fn inherit<T>(
+    reporter: Option<&Arc<dyn ProgressReporter>>,
+    work: impl FnOnce() -> T,
+) -> T {
+    match reporter {
+        Some(reporter) => with_reporter(reporter, work),
+        None => work(),
+    }
+}
+
+/// The CLI's reporter: renders into the terminal display owned by [`spin`].
+/// Silent when no spin owns the display (or stderr is not a terminal).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TerminalProgress;
+
+impl TerminalProgress {
+    pub(crate) fn shared() -> Arc<dyn ProgressReporter> {
+        Arc::new(Self)
+    }
+}
+
+impl ProgressReporter for TerminalProgress {
+    fn message(&self, text: &str) {
+        if let Some(active) = ACTIVE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            active.state.message(sanitize_terminal(text.to_owned()));
+            active.render();
+        }
+    }
+
+    fn stage_started(&self, stage: StageId, label: &str, total: usize) {
+        if let Some(active) = ACTIVE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            active
+                .state
+                .push_stage(stage, sanitize_terminal(label.to_owned()), total);
+            active.render();
+        }
+    }
+
+    fn stage_advanced(&self, stage: StageId, completed: usize, _total: usize) {
+        if let Some(active) = ACTIVE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            active.state.set_completed(&stage, completed);
+            active.render();
+        }
+    }
+
+    fn stage_finished(&self, stage: StageId, success: bool) {
+        if let Some(active) = ACTIVE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            if success
+                && let Some(scope) = active.state.scopes.first()
+                && scope.id == stage
+            {
+                // A fast subsequent stage can otherwise replace the last
+                // frame before the terminal ever displays its completion.
+                active.println(scope.count.message(true));
+            }
+            active.state.end(&stage, success);
+            active.render();
+        }
+    }
+}
+
+/// A counted stage token for the reporter current when it was created.
 /// Only inc records completed work; finish and Drop never fill missing counts.
 pub(crate) struct Progress {
-    id: Option<ScopeId>,
+    stage: Option<(Arc<dyn ProgressReporter>, StageId)>,
+    completed: AtomicUsize,
+    total: usize,
 }
 
 pub(crate) fn counted(label: impl Display, total: usize) -> Progress {
-    let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
-    let id = active.as_mut().map(|active| {
-        let id = active.state.push(label.to_string(), total);
-        active.render();
-        id
+    let stage = current().map(|reporter| {
+        let id = StageId::next();
+        reporter.stage_started(id, &label.to_string(), total);
+        (reporter, id)
     });
-    Progress { id }
+    Progress {
+        stage,
+        completed: AtomicUsize::new(0),
+        total,
+    }
 }
 
 impl Progress {
     pub(crate) fn inc(&self, delta: usize) {
-        if let Some(id) = &self.id
-            && let Some(active) = ACTIVE
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_mut()
-        {
-            active.state.inc(id, delta);
-            active.render();
+        if let Some((reporter, id)) = &self.stage {
+            let completed = self
+                .completed
+                .fetch_add(delta, Ordering::Relaxed)
+                .saturating_add(delta)
+                .min(self.total);
+            reporter.stage_advanced(*id, completed, self.total);
         }
     }
 
@@ -393,22 +566,8 @@ impl Progress {
     }
 
     fn end(&mut self, success: bool) {
-        if let Some(id) = self.id.take()
-            && let Some(active) = ACTIVE
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_mut()
-        {
-            if success
-                && let Some(scope) = active.state.scopes.first()
-                && Arc::ptr_eq(&scope.id, &id)
-            {
-                // A fast subsequent stage can otherwise replace the last
-                // frame before the terminal ever displays its completion.
-                active.println(scope.count.message(true));
-            }
-            active.state.end(&id, success);
-            active.render();
+        if let Some((reporter, id)) = self.stage.take() {
+            reporter.stage_finished(id, success);
         }
     }
 }
@@ -492,7 +651,10 @@ impl Drop for DisplayGuard {
 
 pub(crate) fn spin<T>(label: &str, work: impl FnOnce() -> Result<T>) -> Result<T> {
     let mut display = DisplayGuard::start(label);
-    let result = work();
+    let result = match current() {
+        Some(_) => work(),
+        None => with_reporter(&TerminalProgress::shared(), work),
+    };
     display.finish(result.is_ok());
     result
 }
@@ -506,15 +668,10 @@ fn sanitize_terminal(message: String) -> String {
         .collect()
 }
 
-/// Engine/library calls remain silent unless a CLI operation owns the display.
+/// Report a status message to the current reporter, if any.
 pub(crate) fn progress(message: impl Display) {
-    if let Some(active) = ACTIVE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_mut()
-    {
-        active.state.message(sanitize_terminal(message.to_string()));
-        active.render();
+    if let Some(reporter) = current() {
+        reporter.message(&message.to_string());
     }
 }
 
@@ -543,12 +700,20 @@ fn log(level: Level, message: impl Display) {
     }
 }
 
+/// Report a notice to the current reporter, or to stderr without one.
 pub(crate) fn info(message: impl Display) {
-    log(Level::Info, message);
+    match current() {
+        Some(reporter) => reporter.info(&message.to_string()),
+        None => log(Level::Info, message),
+    }
 }
 
+/// Report a warning to the current reporter, or to stderr without one.
 pub(crate) fn warning(message: impl Display) {
-    log(Level::Warning, message);
+    match current() {
+        Some(reporter) => reporter.warning(&message.to_string()),
+        None => log(Level::Warning, message),
+    }
 }
 
 pub(crate) fn error(message: impl Display) {
@@ -558,6 +723,55 @@ pub(crate) fn error(message: impl Display) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct Notices(Mutex<Vec<String>>);
+
+    impl ProgressReporter for Notices {
+        fn info(&self, text: &str) {
+            self.0.lock().unwrap().push(format!("info {text}"));
+        }
+
+        fn warning(&self, text: &str) {
+            self.0.lock().unwrap().push(format!("warning {text}"));
+        }
+    }
+
+    #[test]
+    fn notices_route_to_the_installed_reporter_and_restore_on_exit() {
+        let outer = Arc::new(Notices::default());
+        let inner = Arc::new(Notices::default());
+        let (outer_dyn, inner_dyn): (Arc<dyn ProgressReporter>, Arc<dyn ProgressReporter>) =
+            (outer.clone(), inner.clone());
+        with_reporter(&outer_dyn, || {
+            warning("first");
+            with_reporter(&inner_dyn, || info("nested"));
+            warning(format_args!("after {}", 1));
+        });
+        assert_eq!(
+            *outer.0.lock().unwrap(),
+            ["warning first", "warning after 1"]
+        );
+        assert_eq!(*inner.0.lock().unwrap(), ["info nested"]);
+        assert!(current().is_none());
+    }
+
+    #[test]
+    fn inherit_carries_a_captured_reporter_to_worker_threads() {
+        let notices = Arc::new(Notices::default());
+        let reporter: Arc<dyn ProgressReporter> = notices.clone();
+        with_reporter(&reporter, || {
+            let captured = current();
+            thread::scope(|scope| {
+                scope.spawn(|| warning("uninherited")).join().unwrap();
+                scope
+                    .spawn(|| inherit(captured.as_ref(), || warning("inherited")))
+                    .join()
+                    .unwrap();
+            });
+        });
+        assert_eq!(*notices.0.lock().unwrap(), ["warning inherited"]);
+    }
 
     fn visible_message(state: &mut ProgressState, now: Instant) -> Option<String> {
         state.visible(now).map(|render| render.message)

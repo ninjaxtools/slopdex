@@ -69,8 +69,8 @@ CREATE TABLE IF NOT EXISTS search_cache(key TEXT PRIMARY KEY,value TEXT NOT NULL
 
 /// SQLite is authoritative. USearch files are disposable materialized indexes.
 pub struct Database {
-    pub conn: Connection,
-    pub path: PathBuf,
+    pub(crate) conn: Connection,
+    pub(crate) path: PathBuf,
     global_path: PathBuf,
     // Declared after the connection so it remains held until that connection closes.
     _store_usage: registry::ArtifactLock,
@@ -89,12 +89,69 @@ pub struct File {
     pub errors: Vec<Value>,
 }
 
+/// The kind of a stored search unit. Distinct from [`crate::NodeKind`]: every
+/// callable unit is `Function` regardless of its declaration kind, and
+/// `Markdown`/`Document` are chunk flavours rather than declarations.
+/// Serialized names match the `search_units.kind` column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnitKind {
+    Function,
+    SymbolDescription,
+    Markdown,
+    Document,
+}
+
+impl UnitKind {
+    pub const ALL: [Self; 4] = [
+        Self::Function,
+        Self::SymbolDescription,
+        Self::Markdown,
+        Self::Document,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::SymbolDescription => "symbol-description",
+            Self::Markdown => "markdown",
+            Self::Document => "document",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
+
+    /// Units searched as code: callables and their symbol descriptions.
+    pub fn is_code(self) -> bool {
+        matches!(self, Self::Function | Self::SymbolDescription)
+    }
+}
+
+impl std::fmt::Display for UnitKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for UnitKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl rusqlite::ToSql for UnitKind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Item {
     pub id: u64,
     pub path: String,
     pub identity: String,
-    pub kind: String,
+    pub kind: UnitKind,
     pub data: Value,
     pub embedding: String,
     pub description_embedding: Option<String>,
@@ -127,6 +184,12 @@ impl Database {
         Self::open_internal(path, root, config, false, true, false)
     }
 
+    /// The workspace index file.
+    pub fn index_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The shared artifact store, attached to the connection as `global`.
     pub fn global_path(&self) -> &Path {
         &self.global_path
     }

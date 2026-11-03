@@ -4,7 +4,8 @@
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use slopdex::engine::Engine;
+use slopdex::Engine;
+use slopdex::OpenOptions;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -95,11 +96,21 @@ impl Repo {
     }
 
     fn open_at(&self, root: &Path) -> Result<Engine> {
-        Engine::open_map(root, &self.index, self.config.clone())
+        Engine::open_with(
+            root,
+            &self.index,
+            self.config.clone(),
+            OpenOptions::structure(),
+        )
     }
 
     fn reader(&self) -> Result<Engine> {
-        Engine::open_map_readonly(&self.root, &self.index, self.config.clone())
+        Engine::open_with(
+            &self.root,
+            &self.index,
+            self.config.clone(),
+            OpenOptions::structure().read_only(),
+        )
     }
 
     /// Stand-in for a cached query answer: publication deletes the whole cache.

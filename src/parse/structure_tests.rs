@@ -39,10 +39,10 @@ fn rust_bodyless_items_variants_attributes_nested_scopes_and_imports() {
         "fn run(&self) -> Self::Item"
     );
     assert_eq!(named(&s, "inner.T.X").signature, "const X: i32");
-    assert_eq!(named(&s, "E.B.value").kind, "field");
+    assert_eq!(named(&s, "E.B.value").kind, NodeKind::Field);
     assert_eq!(named(&s, "E.C.0").signature, "0: u8");
     assert_eq!(named(&s, "E.C.1").signature, "1: String");
-    assert_eq!(named(&s, "S.go.nested").kind, "function");
+    assert_eq!(named(&s, "S.go.nested").kind, NodeKind::Function);
     assert!(
         s.nodes.iter().all(|n| !n.signature.contains("hidden")),
         "{s:#?}"
@@ -142,7 +142,7 @@ fn typescript_union_object_branches_remain_in_type_signatures() {
             "Combined.left",
             "Combined.right",
         ] {
-            assert_eq!(named(&s, name).kind, "field");
+            assert_eq!(named(&s, name).kind, NodeKind::Field);
         }
         let compacted: Vec<_> = s
             .nodes
@@ -165,8 +165,8 @@ fn javascript_jsx_tsx_and_bound_functions() {
             "export class View { render() { return <div/>; } field = hidden(); } const render = () => <View/>; function outer() { class Inner { run() {} } }",
         );
         assert_eq!(named(&s, "View.render").signature, "render()");
-        assert_eq!(named(&s, "render").kind, "function");
-        assert_eq!(named(&s, "outer.Inner.run").kind, "method");
+        assert_eq!(named(&s, "render").kind, NodeKind::Function);
+        assert_eq!(named(&s, "outer.Inner.run").kind, NodeKind::Method);
         assert!(s.nodes.iter().all(|n| !n.signature.contains("hidden")
             && !n.signature.contains("<div")
             && !n.signature.contains("<View")));
@@ -290,11 +290,11 @@ fn c_prototypes_function_pointers_tags_fields_and_macros() {
     ] {
         named(&s, name);
     }
-    assert_eq!(named(&s, "callback").kind, "variable");
+    assert_eq!(named(&s, "callback").kind, NodeKind::Variable);
     assert_eq!(
         s.nodes
             .iter()
-            .filter(|n| n.name == "f" && n.kind == "function")
+            .filter(|n| n.name == "f" && n.kind == NodeKind::Function)
             .count(),
         2
     );
@@ -441,7 +441,7 @@ fn native_bound_functions_records_and_trait_impl_identity() {
         "x.go",
         "package p\nvar F = func(x int) int { return hidden() }\nfunc Outer() { inner := func() { hidden() }; _ = inner }",
     );
-    assert_eq!(named(&s, "F").kind, "function");
+    assert_eq!(named(&s, "F").kind, NodeKind::Function);
     named(&s, "Outer.inner");
     assert!(
         s.nodes.iter().all(|n| !n.signature.contains("hidden")),
@@ -480,12 +480,12 @@ fn c_forward_declarations_and_anonymous_typedef_members() {
     );
     assert_eq!(named(&s, "Forward").signature, "struct Forward");
     assert_eq!(named(&s, "Record").signature, "typedef struct Record");
-    assert_eq!(named(&s, "Record.value").kind, "field");
-    assert_eq!(named(&s, "Record.inner.a").kind, "field");
-    assert_eq!(named(&s, "Record.inner.b").kind, "field");
-    assert_eq!(named(&s, "Callback").kind, "type");
+    assert_eq!(named(&s, "Record.value").kind, NodeKind::Field);
+    assert_eq!(named(&s, "Record.inner.a").kind, NodeKind::Field);
+    assert_eq!(named(&s, "Record.inner.b").kind, NodeKind::Field);
+    assert_eq!(named(&s, "Callback").kind, NodeKind::Type);
     assert!(named(&s, "Callback").signature.starts_with("typedef int"));
-    assert_eq!(named(&s, "make").kind, "function");
+    assert_eq!(named(&s, "make").kind, NodeKind::Function);
 }
 
 #[test]
@@ -504,9 +504,9 @@ fn literal_types_and_parenthesized_c_declarators_are_preserved() {
         "int (f)(int); int (*callback)(int); int (*factory(void))(int); int *plain(void);",
     );
     for name in ["f", "factory", "plain"] {
-        assert_eq!(named(&s, name).kind, "function");
+        assert_eq!(named(&s, name).kind, NodeKind::Function);
     }
-    assert_eq!(named(&s, "callback").kind, "variable");
+    assert_eq!(named(&s, "callback").kind, NodeKind::Variable);
 }
 
 fn assert_callable_scopes(path: &str, source: &str) -> crate::parse::ParsedFile {
@@ -515,7 +515,7 @@ fn assert_callable_scopes(path: &str, source: &str) -> crate::parse::ParsedFile 
     for callable in &parsed.callables {
         assert!(
             parsed.structure.nodes.iter().any(|node| {
-                super::is_callable_kind(&node.kind)
+                node.kind.is_callable()
                     && node.qualified_name == callable.qualified_name
                     && node.start_line <= callable.start_line
                     && node.end_line >= callable.end_line
@@ -556,7 +556,7 @@ it("should drop snapshot overlap before changing the visible error or transcript
             parsed.structure
         );
         assert_eq!(parsed.structure.nodes[0].name, "restore");
-        assert_eq!(parsed.structure.nodes[0].kind, "function");
+        assert_eq!(parsed.structure.nodes[0].kind, NodeKind::Function);
         assert_eq!(
             crate::map::render_nodes(&parsed.structure.nodes, None),
             "@@ 4-13 @@\nf.client.restore = async () =>\n"

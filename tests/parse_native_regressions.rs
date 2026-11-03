@@ -1,7 +1,8 @@
 mod parse_support;
 
 use parse_support::{byte_at, callables, clean, declarations as symbols, named};
-use slopdex::parse::ParsedFile;
+use slopdex::NodeKind;
+use slopdex::ParsedFile;
 
 fn assert_callable(parsed: &ParsedFile, name: &str) {
     let names: Vec<_> = callables(parsed)
@@ -101,9 +102,9 @@ fn python_named_declarations_survive_runtime_values_and_keep_real_class_fields()
 fn python_local_generic_type_alias_uses_its_identifier_and_keeps_its_type_signature() {
     let source = "def outer():\n    runtime = compute()\n    type Alias = int\n    type Generic[T] = list[T]\n";
     let parsed = clean("types.py", source);
-    assert_eq!(named(&parsed, "outer.Alias").kind, "type");
+    assert_eq!(named(&parsed, "outer.Alias").kind, NodeKind::Type);
     assert_eq!(named(&parsed, "outer.Alias").signature, "type Alias = int");
-    assert_eq!(named(&parsed, "outer.Generic").kind, "type");
+    assert_eq!(named(&parsed, "outer.Generic").kind, NodeKind::Type);
     assert_eq!(
         named(&parsed, "outer.Generic").signature,
         "type Generic[T] = list[T]"
@@ -186,7 +187,7 @@ func (s *Store[T]) Run() {
         ("Store[T].Run.s.callback", "function"),
         ("Store[T].Run.s.callback.ReceiverLocal", "type"),
     ] {
-        assert_eq!(named(&parsed, name).kind, kind);
+        assert_eq!(named(&parsed, name).kind.as_str(), kind);
     }
     assert!(
         parsed
@@ -260,7 +261,7 @@ fn python_unbound_callback_retains_its_named_callable_binding() {
     let source = "def outer():\n    invoke(lambda: (callback := lambda: 1))\n";
     let parsed = clean("callbacks.py", source);
     assert_callable(&parsed, "outer.callback");
-    assert_eq!(named(&parsed, "outer.callback").kind, "function");
+    assert_eq!(named(&parsed, "outer.callback").kind, NodeKind::Function);
     assert_callable_coverage(&parsed, source);
 }
 
@@ -277,10 +278,10 @@ fn rust_unbound_callback_retains_named_items_without_runtime_values() {
 "#;
     let parsed = clean("callbacks.rs", source);
     assert_callable(&parsed, "outer.helper");
-    assert_eq!(named(&parsed, "outer.LIMIT").kind, "constant");
-    assert_eq!(named(&parsed, "outer.Local").kind, "struct");
-    assert_eq!(named(&parsed, "outer.Local.field").kind, "field");
-    assert_eq!(named(&parsed, "outer.helper").kind, "function");
+    assert_eq!(named(&parsed, "outer.LIMIT").kind, NodeKind::Constant);
+    assert_eq!(named(&parsed, "outer.Local").kind, NodeKind::Struct);
+    assert_eq!(named(&parsed, "outer.Local.field").kind, NodeKind::Field);
+    assert_eq!(named(&parsed, "outer.helper").kind, NodeKind::Function);
     assert!(!parsed.structure.nodes.iter().any(|n| n.name == "runtime"));
     assert_callable_coverage(&parsed, source);
 }
@@ -294,7 +295,7 @@ fn rust_constant_and_static_initializers_do_not_create_callable_scopes() {
 "#;
     let parsed = clean("initializer.rs", source);
     assert_callable_coverage(&parsed, source);
-    assert_eq!(named(&parsed, "outer.Local").kind, "struct");
+    assert_eq!(named(&parsed, "outer.Local").kind, NodeKind::Struct);
     assert_eq!(
         named(&parsed, "outer.Local").parent_id,
         Some(named(&parsed, "outer").id)
@@ -312,8 +313,11 @@ fn rust_discarded_closures_do_not_declare_a_wildcard_symbol() {
 fn rust_reference_binding_patterns_use_the_declared_identifier() {
     let source = "fn outer() { let ref callback = || { fn nested() {} }; }\n";
     let parsed = clean("bindings.rs", source);
-    assert_eq!(named(&parsed, "outer.callback").kind, "function");
-    assert_eq!(named(&parsed, "outer.callback.nested").kind, "function");
+    assert_eq!(named(&parsed, "outer.callback").kind, NodeKind::Function);
+    assert_eq!(
+        named(&parsed, "outer.callback.nested").kind,
+        NodeKind::Function
+    );
     assert_callable(&parsed, "outer.callback");
     assert_callable_coverage(&parsed, source);
 }
@@ -333,8 +337,8 @@ func outer() {
 }
 "#;
     let parsed = clean("constants.go", source);
-    assert_eq!(named(&parsed, "outer.LIMIT").kind, "constant");
-    assert_eq!(named(&parsed, "outer.SECOND").kind, "constant");
+    assert_eq!(named(&parsed, "outer.LIMIT").kind, NodeKind::Constant);
+    assert_eq!(named(&parsed, "outer.SECOND").kind, NodeKind::Constant);
     assert!(
         parsed
             .structure
@@ -350,10 +354,10 @@ fn go_mutable_package_variables_are_not_constants_based_on_capitalization() {
         "constants.go",
         "package p\nvar VALUE int\nvar FIRST, lower int\nconst LIMIT = 1\n",
     );
-    assert_eq!(named(&parsed, "VALUE").kind, "variable");
-    assert_eq!(named(&parsed, "FIRST").kind, "variable");
+    assert_eq!(named(&parsed, "VALUE").kind, NodeKind::Variable);
+    assert_eq!(named(&parsed, "FIRST").kind, NodeKind::Variable);
     assert!(named(&parsed, "FIRST").names.contains(&"lower".into()));
-    assert_eq!(named(&parsed, "LIMIT").kind, "constant");
+    assert_eq!(named(&parsed, "LIMIT").kind, NodeKind::Constant);
 }
 
 #[test]
@@ -371,9 +375,9 @@ func outer() {
 "#;
     let parsed = clean("callbacks.go", source);
     assert_callable(&parsed, "outer.callback");
-    assert_eq!(named(&parsed, "outer.Local").kind, "struct");
-    assert_eq!(named(&parsed, "outer.Local.Field").kind, "field");
-    assert_eq!(named(&parsed, "outer.callback").kind, "function");
+    assert_eq!(named(&parsed, "outer.Local").kind, NodeKind::Struct);
+    assert_eq!(named(&parsed, "outer.Local.Field").kind, NodeKind::Field);
+    assert_eq!(named(&parsed, "outer.callback").kind, NodeKind::Function);
     assert!(!parsed.structure.nodes.iter().any(|n| n.name == "runtime"));
     assert_callable_coverage(&parsed, source);
 }
@@ -390,10 +394,10 @@ var result = func() int {
 "#;
     let parsed = clean("initializer.go", source);
     assert_callable(&parsed, "callback");
-    assert_eq!(named(&parsed, "result").kind, "variable");
-    assert_eq!(named(&parsed, "Local").kind, "struct");
-    assert_eq!(named(&parsed, "Local.Field").kind, "field");
-    assert_eq!(named(&parsed, "callback").kind, "function");
+    assert_eq!(named(&parsed, "result").kind, NodeKind::Variable);
+    assert_eq!(named(&parsed, "Local").kind, NodeKind::Struct);
+    assert_eq!(named(&parsed, "Local.Field").kind, NodeKind::Field);
+    assert_eq!(named(&parsed, "callback").kind, NodeKind::Function);
     assert_callable_coverage(&parsed, source);
 }
 
@@ -403,8 +407,8 @@ fn go_multibinding_comments_do_not_hide_named_callbacks() {
     let parsed = clean("bindings.go", source);
     assert_callable(&parsed, "outer.first");
     assert_callable(&parsed, "outer.second");
-    assert_eq!(named(&parsed, "outer.first").kind, "function");
-    assert_eq!(named(&parsed, "outer.second").kind, "function");
+    assert_eq!(named(&parsed, "outer.first").kind, NodeKind::Function);
+    assert_eq!(named(&parsed, "outer.second").kind, NodeKind::Function);
     assert_callable_coverage(&parsed, source);
 }
 
@@ -423,10 +427,10 @@ func outer() {
 }
 "#;
     let parsed = clean("bindings.go", source);
-    assert_eq!(named(&parsed, "outer.callback").kind, "function");
-    assert_eq!(named(&parsed, "outer.Local").kind, "struct");
-    assert_eq!(named(&parsed, "outer.Local.Field").kind, "field");
-    assert_eq!(named(&parsed, "outer.nested").kind, "function");
+    assert_eq!(named(&parsed, "outer.callback").kind, NodeKind::Function);
+    assert_eq!(named(&parsed, "outer.Local").kind, NodeKind::Struct);
+    assert_eq!(named(&parsed, "outer.Local.Field").kind, NodeKind::Field);
+    assert_eq!(named(&parsed, "outer.nested").kind, NodeKind::Function);
     assert!(!parsed.structure.nodes.iter().any(|n| n.name == "result"));
     assert_callable(&parsed, "outer.callback");
     assert_callable(&parsed, "outer.nested");

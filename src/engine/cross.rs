@@ -5,6 +5,7 @@ use super::*;
 
 impl Engine {
     pub fn cross_search(&self, target: Option<&Engine>, options: &Value) -> Result<Vec<Value>> {
+        self.reporting(|| {
         // Cross-search needs a more selective floor than natural-language
         // queries: weak edges can otherwise join every connected component.
         // Include the effective default in the cache key as well as filtering.
@@ -17,11 +18,11 @@ impl Engine {
         if !Selection::compile(options)?.includes_group(FormatGroup::Code) {
             return Ok(Vec::new());
         }
-        let mut exclusions = cross_search_exclusions(&self.config)?;
-        exclusions.extend(cross_search_exclusions(&target.config)?);
+        let mut exclusions = self.config.cross_search_exclusions()?;
+        exclusions.extend(target.config.cross_search_exclusions()?);
         ensure!(
-            !self.structural_only
-                && !target.structural_only
+            !self.structural_only()
+                && !target.structural_only()
                 && [self, target]
                     .iter()
                     .all(|engine| engine.items.iter().all(|item| {
@@ -196,6 +197,7 @@ impl Engine {
         searching.finish();
         self.try_write_index(|| self.db.put_search_cache(&cache_key()?, &results))?;
         Ok(results)
+        })
     }
 }
 

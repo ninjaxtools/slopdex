@@ -8,22 +8,24 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn parse(
-    language: &'static str,
+    language: super::LanguageId,
     path: &str,
     source: &str,
     descriptions: &mut super::descriptions::SourceDescriptions,
 ) -> Result<ParsedFile> {
-    let (mut parser, mut tree) = parse_code(language, path, source)?;
-    if language == "bash" {
+    let language_id = language;
+    let language = language.as_str();
+    let (mut parser, mut tree) = parse_code(language_id, path, source)?;
+    if language_id == super::LanguageId::Bash {
         tree = super::shell::recover(&mut parser, tree, source);
     }
     if tree.root_node().has_error()
-        && matches!(language, "typescript" | "tsx")
+        && language_id.is_typescript()
         && let Some(recovered) = recover_typescript(&mut parser, &tree, source)
     {
         tree = recovered;
     }
-    let javascript = matches!(language, "typescript" | "tsx" | "javascript" | "jsx");
+    let javascript = language_id.is_js_family();
     let mut collector = Collector {
         source,
         language,
@@ -142,7 +144,7 @@ fn collect_calls(
 ) {
     let nodes = &mut structure.nodes;
     let mut owners: Vec<usize> = (0..nodes.len())
-        .filter(|&id| super::structure::is_callable_kind(&nodes[id].kind))
+        .filter(|&id| nodes[id].kind.is_callable())
         .collect();
     owners.sort_by_key(|&id| {
         (
@@ -888,8 +890,10 @@ fn extract(
     embedding_input.push_str("\nsource:\n");
     embedding_input.push_str(source);
     Ok(Callable {
-        language: language.to_owned(),
-        kind: candidate.kind.to_owned(),
+        language: super::LanguageId::from_name(language)
+            .expect("callable extraction only runs for registry languages"),
+        kind: super::NodeKind::from_name(candidate.kind)
+            .expect("callable candidates only carry registry node kinds"),
         name: candidate.name.clone(),
         qualified_name: qualified_name.to_owned(),
         description: None,
@@ -1085,7 +1089,7 @@ fn import_expression_end(source: &str, start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{language_for_path, parse};
+    use super::super::{LanguageId, NodeKind, parse};
     use super::*;
 
     fn symbols(parsed: &ParsedFile) -> Vec<(&str, &str)> {
@@ -1221,7 +1225,7 @@ invoke(() => 1);
             );
             assert_eq!(
                 parsed.callables[0].language,
-                language_for_path(path).unwrap()
+                LanguageId::for_path(path).unwrap()
             );
         }
     }
@@ -1400,8 +1404,8 @@ enum Mode { ONE { int value() { return 1; } }; abstract int value(); }
             ]
         );
         assert_eq!(&names[6..], ["Read.value", "Item.Item", "Mode.ONE.value"]);
-        assert_eq!(parsed.callables[0].kind, "constructor");
-        assert_eq!(parsed.callables[7].kind, "constructor");
+        assert_eq!(parsed.callables[0].kind, NodeKind::Constructor);
+        assert_eq!(parsed.callables[7].kind, NodeKind::Constructor);
         assert_eq!(
             parsed.callables[1].signature.as_deref(),
             Some("public int get(int value)")

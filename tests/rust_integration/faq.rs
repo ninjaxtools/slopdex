@@ -1,4 +1,5 @@
 use super::*;
+use slopdex::OpenOptions;
 
 fn entries(repo: &Repo) -> Result<i64> {
     Ok(repo
@@ -510,7 +511,7 @@ fn faq_live_vectors_survive_pruning_without_a_sidecar_and_reset_clears_entries()
     );
     let engine = repo.open(&mock.config())?;
     drop(engine);
-    let db = slopdex::storage::Database::open_with_config(
+    let db = slopdex::Database::open_with_config(
         &repo.index,
         &repo.root,
         &repo.isolated_config(&mock.config()),
@@ -532,7 +533,12 @@ fn faq_readers_defer_writes_without_allowing_stale_semantic_hits() -> Result<()>
     engine.faq("east original question", &all())?;
     repo.write("code.rs", &function("changed", "VECTOR_EAST"))?;
     engine.refresh()?;
-    let reader = Engine::open_map_readonly(&repo.root, &repo.index, repo.isolated_config(&config))?;
+    let reader = Engine::open_with(
+        &repo.root,
+        &repo.index,
+        repo.isolated_config(&config),
+        OpenOptions::structure().read_only(),
+    )?;
     let db = repo.db()?;
     let before: i64 = db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
     let answer = engine.faq("east new question", &all())?;
@@ -694,7 +700,7 @@ fn faq_promotes_legacy_file_keyed_answers_using_the_matching_entries_original_qu
     let options = json!({"minSimilarity":-1,"glob":"code.rs"});
     let answer = engine.faq("east original question", &options)?;
     let request = mock.requests("/responses").pop().unwrap();
-    let profile = slopdex::providers::Providers::new(&config)?.llm().profile();
+    let profile = slopdex::Providers::new(&config)?.llm().profile();
     let legacy_key = slopdex::hash(json!([
         "explanation-v3",profile,slopdex::hash(config["agentCommand"].to_string()),
         request.body["instructions"],description_prompt(&request.body),{"code.rs":slopdex::hash(&source)}

@@ -4,6 +4,7 @@
 //! not entire physical lines. The caller can therefore retain mixed lines and
 //! ordinary blank lines while removing blank lines inside a multiline span.
 
+use super::LanguageId;
 use super::syntax::{children, parse_code, text, unwrap_value};
 use anyhow::Result;
 use std::ops::Range;
@@ -12,7 +13,7 @@ use tree_sitter::Node;
 /// Conventional test paths in the supported source languages. Both separator
 /// spellings work independently of the host platform; this never accesses disk.
 pub(crate) fn is_test_file(path: &str) -> bool {
-    let Some(language) = super::language_for_path(path) else {
+    let Some(language) = LanguageId::for_path(path) else {
         return false;
     };
     let parts: Vec<_> = path.split(['/', '\\']).collect();
@@ -30,32 +31,32 @@ pub(crate) fn is_test_file(path: &str) -> bool {
     };
     let test_directory = in_directory(&["test", "tests", "__tests__"]);
     match language {
-        "javascript" | "jsx" | "typescript" | "tsx" => {
+        LanguageId::JavaScript | LanguageId::Jsx | LanguageId::TypeScript | LanguageId::Tsx => {
             test_directory
                 || matches!(lower.as_str(), "test" | "spec")
                 || [".test", ".spec", "_test", "_spec"]
                     .iter()
                     .any(|suffix| lower.ends_with(suffix))
         }
-        "python" => {
+        LanguageId::Python => {
             test_directory
                 || matches!(lower.as_str(), "test" | "tests")
                 || lower.starts_with("test_")
                 || lower.ends_with("_test")
         }
-        "go" => lower.ends_with("_test"),
-        "rust" => {
+        LanguageId::Go => lower.ends_with("_test"),
+        LanguageId::Rust => {
             in_directory(&["tests"])
                 || lower == "tests"
                 || lower.ends_with("_test")
                 || lower.ends_with("_tests")
         }
-        "java" => {
+        LanguageId::Java => {
             test_directory
                 || in_directory(&["integrationTest", "integrationTests"])
                 || java_test_name(stem)
         }
-        "c" | "bash" => {
+        LanguageId::C | LanguageId::Bash => {
             test_directory
                 || matches!(lower.as_str(), "test" | "tests")
                 || lower.starts_with("test_")
@@ -124,43 +125,31 @@ fn collect_ranges(
         exclusions.tests.push(0..source.len());
         return Ok(exclusions);
     }
-    let Some(language) = super::language_for_path(path) else {
+    let Some(language) = LanguageId::for_path(path) else {
         return Ok(exclusions);
     };
-    if !matches!(
-        language,
-        "javascript"
-            | "jsx"
-            | "typescript"
-            | "tsx"
-            | "python"
-            | "rust"
-            | "go"
-            | "java"
-            | "c"
-            | "bash"
-    ) {
+    if !language.is_code() {
         if !exclude_comments {
             return Ok(exclusions);
         }
         // Reuse the data/document parsers' literal protection, Markdown inline
         // grammar, container markers, and byte-preserving grammar recovery.
         let mut descriptions = super::descriptions::SourceDescriptions::default();
-        if language == "markdown" {
+        if language == LanguageId::Markdown {
             super::markdown::parse(source, &mut descriptions)?;
         } else {
-            super::data::parse(language, path, source, &mut descriptions)?;
+            super::data::parse(language.as_str(), path, source, &mut descriptions)?;
         }
         exclusions.comments = merge(descriptions.comments);
         return Ok(exclusions);
     }
     let (mut parser, mut tree) = parse_code(language, path, source)?;
-    if language == "bash" {
+    if language == LanguageId::Bash {
         tree = super::shell::recover(&mut parser, tree, source);
     }
     let root = tree.root_node();
     let whole_test_file = whole_test_file
-        || (exclude_tests && language == "rust" && rust_inner_test_cfg(root, source));
+        || (exclude_tests && language == LanguageId::Rust && rust_inner_test_cfg(root, source));
     if whole_test_file {
         exclusions.tests.push(0..source.len());
         if !exclude_comments {
@@ -179,7 +168,7 @@ fn collect_ranges(
         }
         if exclude_tests
             && !inside_test
-            && let Some(range) = test_range(node, source, language)
+            && let Some(range) = test_range(node, source, language.as_str())
         {
             exclusions.tests.push(range);
             if !exclude_comments {
@@ -189,7 +178,7 @@ fn collect_ranges(
             // and docstrings independently for comment-only line totals.
             inside_test = true;
         }
-        if exclude_comments && language == "python" {
+        if exclude_comments && language == LanguageId::Python {
             let body = match node.kind() {
                 "module" => Some(node),
                 "function_definition" | "class_definition" => node.child_by_field_name("body"),

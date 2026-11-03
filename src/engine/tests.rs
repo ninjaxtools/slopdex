@@ -38,10 +38,11 @@ fn git_fixture() -> Result<(tempfile::TempDir, Engine)> {
     fs::write(root.join("source.rs"), "pub fn first() {}\n")?;
     git_command(&root, &["add", "."])?;
     git_command(&root, &["commit", "-qm", "initial"])?;
-    let engine = Engine::open_map(
+    let engine = Engine::open_with(
         &root,
         &temp.path().join("index.sqlite"),
         json!({"artifactCachePath":temp.path().join("global.sqlite")}),
+        OpenOptions::structure(),
     )?;
     Ok((temp, engine))
 }
@@ -189,7 +190,7 @@ fn discovery_excludes_lock_files_even_with_explicit_includes_and_candidates() ->
                 source_paths_subset(
                     &root,
                     &temp.path().join("index.sqlite"),
-                    &config,
+                    &Config::from(config.clone()),
                     subset,
                     None,
                     false,
@@ -267,7 +268,7 @@ fn source_paths_subset_normalizes_nested_git_candidates() -> Result<()> {
     let paths = source_paths_subset(
         &root,
         &temp.path().join("index.sqlite"),
-        &json!({"artifactCachePath":temp.path().join("global.sqlite")}),
+        &Config::from(json!({"artifactCachePath":temp.path().join("global.sqlite")})),
         Some(&candidates),
         None,
         false,
@@ -334,10 +335,11 @@ fn in_tree_artifact_writes_do_not_invalidate_git_discovery() -> Result<()> {
     let (_temp, engine) = git_fixture()?;
     let root = engine.root.clone();
     drop(engine);
-    let mut engine = Engine::open_map(
+    let mut engine = Engine::open_with(
         &root,
         &root.join("index.sqlite"),
         json!({"artifactCachePath":root.join("global.sqlite")}),
+        OpenOptions::structure(),
     )?;
     engine.refresh_structure()?;
     assert_eq!(engine.files.len(), 1);
@@ -361,12 +363,12 @@ fn writable_engines_share_reads_and_scope_exclusivity_to_writes() -> Result<()> 
     fs::write(root.join("source.rs"), "pub fn indexed() {}\n")?;
     let index = temp.path().join("index.sqlite");
     let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
-    let mut first = Engine::open_map(&root, &index, config.clone())?;
+    let mut first = Engine::open_with(&root, &index, config.clone(), OpenOptions::structure())?;
     first.refresh_structure()?;
-    let second = Engine::open_map(&root, &index, config)?;
+    let second = Engine::open_with(&root, &index, config, OpenOptions::structure())?;
     assert_eq!(first.status()?, second.status()?);
 
-    let probe = OpenOptions::new()
+    let probe = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(temp.path().join("index.sqlite.lock"))?;
@@ -425,7 +427,7 @@ fn concurrent_cold_engine_opens_do_not_wait_for_initialized_readers() -> Result<
             let (barrier, tx) = (barrier.clone(), tx.clone());
             std::thread::spawn(move || {
                 barrier.wait();
-                let result = Engine::open_map(&root, &index, config);
+                let result = Engine::open_with(&root, &index, config, OpenOptions::structure());
                 tx.send(result).expect("engine opener receiver");
             })
         })
@@ -455,13 +457,13 @@ fn concurrent_cold_engine_opens_do_not_wait_for_initialized_readers() -> Result<
 fn contended_writer_times_out_but_readers_can_share() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("index.lock");
-    let first = OpenOptions::new()
+    let first = fs::OpenOptions::new()
         .create_new(true)
         .read(true)
         .write(true)
         .open(&path)?;
-    let second = OpenOptions::new().read(true).write(true).open(&path)?;
-    let writer = OpenOptions::new().read(true).write(true).open(&path)?;
+    let second = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+    let writer = fs::OpenOptions::new().read(true).write(true).open(&path)?;
     lock_index(&first, true)?;
     lock_index(&second, true)?;
     let error = lock_index_with_timeout(&writer, false, Duration::from_millis(60))
@@ -470,7 +472,7 @@ fn contended_writer_times_out_but_readers_can_share() -> Result<()> {
     drop(first);
     drop(second);
     lock_index(&writer, false)?;
-    let reader = OpenOptions::new().read(true).write(true).open(&path)?;
+    let reader = fs::OpenOptions::new().read(true).write(true).open(&path)?;
     let error = lock_index_with_timeout(&reader, true, Duration::from_millis(60))
         .expect_err("reader must wait for a writer");
     assert!(error.to_string().contains("Index is in use"));
@@ -556,7 +558,7 @@ fn non_git_refresh_reuses_fingerprints_and_respects_size_policy() -> Result<()> 
     fs::write(root.join("second.rs"), "pub fn second() {}\n")?;
     let index = temp.path().join("index.sqlite");
     let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
-    let mut engine = Engine::open_map(&root, &index, config.clone())?;
+    let mut engine = Engine::open_with(&root, &index, config.clone(), OpenOptions::structure())?;
     assert_eq!(engine.refresh_structure()?["filesUpdated"], 2);
     assert!(engine.db.meta("checkpoint")?.is_none());
     let generation = engine.db.generation()?;
@@ -577,7 +579,7 @@ fn non_git_refresh_reuses_fingerprints_and_respects_size_policy() -> Result<()> 
     // Discovery policy changes rescan without re-reading unchanged files.
     let mut excluded = config.clone();
     excluded["exclude"] = json!(["first.rs"]);
-    let mut engine = Engine::open_map(&root, &index, excluded)?;
+    let mut engine = Engine::open_with(&root, &index, excluded, OpenOptions::structure())?;
     let refreshed = engine.refresh_structure()?;
     assert_eq!(
         (&refreshed["filesUpdated"], &refreshed["filesDeleted"]),
@@ -589,14 +591,14 @@ fn non_git_refresh_reuses_fingerprints_and_respects_size_policy() -> Result<()> 
     // The size limit is policy that changes the result for unchanged metadata.
     let mut small = config.clone();
     small["maxFileSize"] = json!(20);
-    let mut engine = Engine::open_map(&root, &index, small)?;
+    let mut engine = Engine::open_with(&root, &index, small, OpenOptions::structure())?;
     engine.refresh_structure()?;
     let errors = engine.errors()?;
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(errors[0]["path"], "second.rs");
     assert_eq!(errors[0]["code"], "read-error");
     drop(engine);
-    let mut engine = Engine::open_map(&root, &index, config)?;
+    let mut engine = Engine::open_with(&root, &index, config, OpenOptions::structure())?;
     engine.refresh_structure()?;
     assert!(engine.errors()?.is_empty());
     assert_eq!(engine.db.paths()?, ["first.rs", "second.rs"]);
@@ -635,7 +637,7 @@ fn ineligible_dirty_paths_do_not_defeat_the_unchanged_fast_path() -> Result<()> 
     assert_eq!(engine.db.paths()?, ["source.rs"]);
     // Indexed paths stay dirty even when configuration would not select them.
     fs::write(root.join("source.rs"), "pub fn edited() {}\n")?;
-    let eligibility = Eligibility::new(&json!({"exclude":["source.rs"]}))?;
+    let eligibility = Eligibility::new(&Config::from(json!({"exclude":["source.rs"]})))?;
     let mut dirty = HashSet::from(["source.rs".to_owned(), "scratch.bin".to_owned()]);
     engine.retain_relevant_dirty(&mut dirty, &eligibility);
     assert_eq!(dirty, HashSet::from(["source.rs".to_owned()]));
@@ -706,7 +708,7 @@ fn discovery_skips_undecodable_names() -> Result<()> {
     let config = json!({"artifactCachePath":temp.path().join("global.sqlite")});
     // This is exactly what an unindexed map walks.
     assert_eq!(source_paths(&root, &index, &config)?, ["kept.rs"]);
-    let mut engine = Engine::open_map(&root, &index, config)?;
+    let mut engine = Engine::open_with(&root, &index, config, OpenOptions::structure())?;
     assert_eq!(engine.refresh_structure()?["filesUpdated"], 1);
     assert_eq!(engine.refresh_structure()?["filesUpdated"], 0);
     assert_eq!(engine.db.paths()?, ["kept.rs"]);
@@ -736,12 +738,14 @@ fn discovery_skips_unreadable_directories() -> Result<()> {
         return Ok(restore()?);
     }
     let walked = source_paths(&root, &index, &config);
-    let indexed = Engine::open_map(&root, &index, config).and_then(|mut engine| {
-        let first = engine.refresh_structure()?;
-        // The remembered directory's policy probes are unreadable as well.
-        let second = engine.refresh_structure()?;
-        Ok((first, second, engine.db.paths()?))
-    });
+    let indexed = Engine::open_with(&root, &index, config, OpenOptions::structure()).and_then(
+        |mut engine| {
+            let first = engine.refresh_structure()?;
+            // The remembered directory's policy probes are unreadable as well.
+            let second = engine.refresh_structure()?;
+            Ok((first, second, engine.db.paths()?))
+        },
+    );
     restore()?;
     assert_eq!(walked?, ["kept.rs"]);
     let (first, second, paths) = indexed?;
@@ -874,7 +878,7 @@ fn reranker_candidate_cap_reports_omitted_results() -> Result<()> {
         engine
             .items
             .iter()
-            .filter(|item| item.kind == "function")
+            .filter(|item| item.kind == UnitKind::Function)
             .count(),
         12
     );
@@ -943,7 +947,7 @@ fn descriptions_cover_healthy_callables_beside_parse_errors() -> Result<()> {
     let healthy = engine
         .items
         .iter()
-        .find(|item| item.kind == "function" && item.data["name"] == "healthy")
+        .find(|item| item.kind == UnitKind::Function && item.data["name"] == "healthy")
         .context("healthy callable is indexed")?;
     assert_eq!(healthy.data["description"], "Generated summary.");
     assert_eq!(
@@ -1015,4 +1019,87 @@ fn cosine_is_neutral_for_zero_or_mismatched_vectors() {
     assert_eq!(cosine(&[1.0], &[1.0, 0.0]), 0.0);
     assert_eq!(cosine(&[], &[]), 0.0);
     assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-9);
+}
+
+#[derive(Default)]
+struct RecordingProgress {
+    events: std::sync::Mutex<Vec<String>>,
+}
+
+impl ProgressReporter for RecordingProgress {
+    fn message(&self, text: &str) {
+        self.events.lock().unwrap().push(format!("message {text}"));
+    }
+
+    fn stage_started(&self, _stage: ui::StageId, label: &str, total: usize) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("start {label} {total}"));
+    }
+
+    fn stage_advanced(&self, _stage: ui::StageId, completed: usize, total: usize) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("advance {completed}/{total}"));
+    }
+
+    fn stage_finished(&self, _stage: ui::StageId, success: bool) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("finish {success}"));
+    }
+}
+
+#[test]
+fn injected_progress_reporter_receives_engine_progress_and_is_scoped() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("repo");
+    fs::create_dir(&root)?;
+    fs::write(root.join("a.rs"), "pub fn first() {}\n")?;
+    fs::write(root.join("b.rs"), "pub fn second() {}\n")?;
+    let opening = Arc::new(RecordingProgress::default());
+    let mut engine = Engine::open_with(
+        &root,
+        &temp.path().join("index.sqlite"),
+        json!({"artifactCachePath": temp.path().join("global.sqlite")}),
+        OpenOptions::structure().with_progress(opening.clone()),
+    )?;
+    assert!(
+        opening
+            .events
+            .lock()
+            .unwrap()
+            .contains(&"message Loading index records".to_owned())
+    );
+
+    let refreshing = Arc::new(RecordingProgress::default());
+    engine.set_progress(refreshing.clone());
+    engine.refresh_structure()?;
+    let events = refreshing.events.lock().unwrap().clone();
+    let start = events
+        .iter()
+        .position(|event| event == "start Indexing files 2")
+        .unwrap_or_else(|| panic!("{events:?}"));
+    let finish = events[start..]
+        .iter()
+        .position(|event| event == "finish true")
+        .unwrap_or_else(|| panic!("{events:?}"));
+    assert!(events[start..start + finish].contains(&"advance 2/2".to_owned()));
+    // The replaced reporter saw nothing from the refresh, and nothing leaks
+    // to this thread once the engine call returns.
+    assert!(
+        !opening
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.contains("Indexing"))
+    );
+    let before = refreshing.events.lock().unwrap().len();
+    ui::progress("outside any engine call");
+    assert_eq!(refreshing.events.lock().unwrap().len(), before);
+    Ok(())
 }

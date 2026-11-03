@@ -4,6 +4,7 @@ use super::{
 };
 #[cfg(test)]
 use crate::cli::{args::Format, io::print_json};
+use crate::parse::NodeKind;
 use crate::{cli::args::Detail, filter, map, parse::StructureNode};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -83,10 +84,9 @@ pub(in crate::cli) fn print_map_row(
         {
             let bodies = markdown_map_bodies(source, structure);
             for node in &nodes {
-                if node.kind == "heading"
+                if node.kind == NodeKind::Heading
                     && selection.is_none_or(|selection| {
-                        selection.kind_matches(&node.kind)
-                            && selection.symbol_matches_at(path, node)
+                        selection.kind_matches(node.kind) && selection.symbol_matches_at(path, node)
                     })
                     && let Some(body) = bodies.get(&node.id)
                 {

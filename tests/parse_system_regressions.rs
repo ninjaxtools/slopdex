@@ -1,7 +1,8 @@
 mod parse_support;
 
 use parse_support::{callables, clean, declarations, named};
-use slopdex::parse::{ParsedFile, parse};
+use slopdex::NodeKind;
+use slopdex::{ParsedFile, parse};
 
 #[test]
 fn java_unbound_lambdas_preserve_named_local_classes() {
@@ -66,7 +67,7 @@ fn java_comments_in_parenthesized_lambda_bindings_are_transparent() {
 fn java_method_named_constructor_is_an_ordinary_method() {
     let parsed = clean("Demo.java", "class Demo { void constructor() {} }");
     assert_eq!(callables(&parsed), [("Demo.constructor", "method")]);
-    assert_eq!(named(&parsed, "Demo.constructor").kind, "method");
+    assert_eq!(named(&parsed, "Demo.constructor").kind, NodeKind::Method);
 }
 
 #[test]
@@ -115,8 +116,8 @@ fn c_named_tag_definitions_in_initializers_are_preserved() {
         "initializers.c",
         "int size = sizeof(struct Healthy { int field; });",
     );
-    assert_eq!(named(&parsed, "Healthy").kind, "struct");
-    assert_eq!(named(&parsed, "Healthy.field").kind, "field");
+    assert_eq!(named(&parsed, "Healthy").kind, NodeKind::Struct);
+    assert_eq!(named(&parsed, "Healthy.field").kind, NodeKind::Field);
     assert_eq!(named(&parsed, "Healthy").signature, "struct Healthy");
 }
 
@@ -126,8 +127,8 @@ fn c_local_initializer_data_does_not_hide_named_tag_definitions() {
         "initializers.c",
         "void outer(void) { int size = sizeof(struct Healthy { int field; }); }",
     );
-    assert_eq!(named(&parsed, "outer.Healthy").kind, "struct");
-    assert_eq!(named(&parsed, "outer.Healthy.field").kind, "field");
+    assert_eq!(named(&parsed, "outer.Healthy").kind, NodeKind::Struct);
+    assert_eq!(named(&parsed, "outer.Healthy.field").kind, NodeKind::Field);
     assert!(
         !parsed
             .structure
@@ -141,13 +142,13 @@ fn c_local_initializer_data_does_not_hide_named_tag_definitions() {
 fn c_prototype_parameters_preserve_actual_tag_definitions() {
     let parsed = clean("api.h", "int use(struct Healthy { int field; } *input);");
     assert!(parsed.callables.is_empty());
-    assert_eq!(named(&parsed, "use").kind, "function");
+    assert_eq!(named(&parsed, "use").kind, NodeKind::Function);
     assert!(
         parsed
             .structure
             .nodes
             .iter()
-            .any(|node| node.name == "Healthy" && node.kind == "struct"),
+            .any(|node| node.name == "Healthy" && node.kind == NodeKind::Struct),
         "{:?}",
         declarations(&parsed)
     );
@@ -156,7 +157,7 @@ fn c_prototype_parameters_preserve_actual_tag_definitions() {
             .structure
             .nodes
             .iter()
-            .any(|node| node.name == "field" && node.kind == "field")
+            .any(|node| node.name == "field" && node.kind == NodeKind::Field)
     );
 }
 
@@ -182,9 +183,9 @@ fn c_return_type_tag_definition_belongs_to_the_enclosing_scope() {
         "types.c",
         "struct Healthy { int field; } make(void) { return (struct Healthy){1}; }",
     );
-    assert_eq!(named(&parsed, "Healthy").kind, "struct");
-    assert_eq!(named(&parsed, "Healthy.field").kind, "field");
-    assert_eq!(named(&parsed, "make").kind, "function");
+    assert_eq!(named(&parsed, "Healthy").kind, NodeKind::Struct);
+    assert_eq!(named(&parsed, "Healthy.field").kind, NodeKind::Field);
+    assert_eq!(named(&parsed, "make").kind, NodeKind::Function);
     assert!(
         !parsed
             .structure
@@ -245,7 +246,7 @@ fn c_local_data_bindings_do_not_hide_nested_named_tag_definitions() {
             .structure
             .nodes
             .iter()
-            .any(|node| node.name == "Healthy" && node.kind == "struct")
+            .any(|node| node.name == "Healthy" && node.kind == NodeKind::Struct)
     );
     assert!(
         !parsed
@@ -262,8 +263,8 @@ fn c_compound_literal_initializers_preserve_named_tags_without_data_members() {
         "literal.c",
         "void outer(void) { void *data = &(struct Healthy { int field; }){ .field = 1 }; }",
     );
-    assert_eq!(named(&parsed, "outer.Healthy").kind, "struct");
-    assert_eq!(named(&parsed, "outer.Healthy.field").kind, "field");
+    assert_eq!(named(&parsed, "outer.Healthy").kind, NodeKind::Struct);
+    assert_eq!(named(&parsed, "outer.Healthy.field").kind, NodeKind::Field);
     assert!(
         !parsed
             .structure
@@ -546,11 +547,11 @@ fn anonymous_initializer_classes_preserve_members_and_suppress_local_data() {
         .iter()
         .find(|node| node.name.starts_with("<anonymous@"))
         .unwrap();
-    assert_eq!(anonymous.kind, "class");
+    assert_eq!(anonymous.kind, NodeKind::Class);
     assert_eq!(anonymous.parent_id, Some(named(&parsed, "Demo.outer").id));
     assert_eq!(
         named(&parsed, &format!("{}.field", anonymous.qualified_name)).kind,
-        "field"
+        NodeKind::Field
     );
     assert_eq!(parsed.callables.len(), 2);
     assert_eq!(
@@ -587,9 +588,9 @@ void outer(void) {
         callables(&parsed),
         [("factory", "function"), ("outer", "function")]
     );
-    assert_eq!(named(&parsed, "callbacks").kind, "variable");
-    assert_eq!(named(&parsed, "Record.callback").kind, "field");
-    assert_eq!(named(&parsed, "outer.prototype").kind, "function");
+    assert_eq!(named(&parsed, "callbacks").kind, NodeKind::Variable);
+    assert_eq!(named(&parsed, "Record.callback").kind, NodeKind::Field);
+    assert_eq!(named(&parsed, "outer.prototype").kind, NodeKind::Function);
     assert_eq!(
         parsed
             .structure

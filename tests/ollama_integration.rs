@@ -2,10 +2,8 @@
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use slopdex::{
-    engine::Engine,
-    providers::{Providers, prepare_embeddings},
-};
+use slopdex::OpenOptions;
+use slopdex::{Engine, Providers, prepare_embeddings};
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -735,7 +733,12 @@ fn missing_index_and_structural_map_never_contact_ollama() -> Result<()> {
     // Structural commands do not require a valid semantic model selection.
     unavailable["dimensions"] = json!(9999);
     fixture.save(&unavailable)?;
-    let mut engine = Engine::open_map(&fixture.root, &fixture.index, unavailable)?;
+    let mut engine = Engine::open_with(
+        &fixture.root,
+        &fixture.index,
+        unavailable,
+        OpenOptions::structure(),
+    )?;
     engine.refresh_structure()?;
     drop(engine);
     let result = fixture.success(&["map"])?;

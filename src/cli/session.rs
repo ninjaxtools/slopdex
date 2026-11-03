@@ -9,8 +9,9 @@ use super::workspace::{
     SourceWorkspace, absolute, config_path, index_path, repository_config_selected, require_index,
 };
 use super::{MapOutput, emit_map};
-use crate::engine::Engine;
+use crate::engine::{Engine, OpenMode, OpenOptions};
 use crate::providers::Providers;
+use crate::ui::TerminalProgress;
 use crate::{lines, map, ui};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -43,12 +44,26 @@ impl CommandMode {
         config: &Value,
         readonly: bool,
     ) -> Result<Engine> {
-        match (self, readonly) {
-            (Self::Symbols, _) => Engine::open_symbol_map(root, index, config.clone(), readonly),
-            (Self::Structure, true) => Engine::open_map_readonly(root, index, config.clone()),
-            (Self::Structure, false) => Engine::open_map(root, index, config.clone()),
-            (Self::Content, true) => Engine::open_readonly(root, index, config.clone()),
-            (Self::Content, false) => Engine::open(root, index, config.clone()),
+        // CLI boundary: parse and validate the effective JSON into the
+        // typed Config once; the engine consumes typed fields and keeps
+        // the canonical JSON only as identity input.
+        let config = crate::Config::from_value(config.clone())?;
+        let mut options = OpenOptions::default().with_progress(TerminalProgress::shared());
+        if readonly {
+            options = options.read_only();
+        }
+        match self {
+            Self::Symbols => Engine::open_symbol_map(root, index, config, options),
+            Self::Structure => Engine::open_with(
+                root,
+                index,
+                config,
+                OpenOptions {
+                    mode: OpenMode::Structure,
+                    ..options
+                },
+            ),
+            Self::Content => Engine::open_with(root, index, config, options),
         }
     }
 
@@ -334,7 +349,11 @@ impl<'a> Session<'a> {
         {
             require_index(&index)?;
             let engine = ui::spin("Opening saved index", || {
-                Engine::open_symbol_map(root, &index, config.clone(), args.query.is_empty())
+                let mut options = OpenOptions::default().with_progress(TerminalProgress::shared());
+                if args.query.is_empty() {
+                    options = options.read_only();
+                }
+                Engine::open_symbol_map(root, &index, config.clone(), options)
             })?;
             let format = cli.global.format.unwrap_or(Format::Summary);
             if let Some(name) = &args.name {

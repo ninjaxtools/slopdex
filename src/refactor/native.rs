@@ -8,6 +8,7 @@ mod go;
 mod java;
 mod rust;
 
+use crate::parse::NodeKind;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
@@ -63,8 +64,8 @@ impl Module {
             .nodes
             .iter()
             .filter(|node| {
-                node.kind != "import"
-                    && node.kind != "impl"
+                node.kind != NodeKind::Import
+                    && node.kind != NodeKind::Impl
                     && (node.qualified_name == name
                         || !name.contains('.') && node.parent_id.is_none() && node.name == name)
             })
@@ -113,7 +114,7 @@ impl Module {
                     .structure
                     .nodes
                     .iter()
-                    .filter(|node| node.kind == "import")
+                    .filter(|node| node.kind == NodeKind::Import)
                     .flat_map(|node| &node.imports)
                     .any(
                         |binding| binding.alias.as_deref().or(binding.name.as_deref())

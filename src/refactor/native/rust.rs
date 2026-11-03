@@ -1,4 +1,5 @@
 use super::*;
+use crate::parse::NodeKind;
 use anyhow::Context as _;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -255,7 +256,7 @@ fn uses(module: &Module) -> Result<Vec<Use>> {
             .structure
             .nodes
             .iter()
-            .find(|symbol| symbol.kind == "import" && symbol.end_byte == node.end_byte())
+            .find(|symbol| symbol.kind == NodeKind::Import && symbol.end_byte == node.end_byte())
             .context("Missing indexed Rust use declaration")?
             .id;
         let scope = std::iter::successors(node.parent(), |node| node.parent())
@@ -286,7 +287,7 @@ fn context(layout: &Layout, path: &str, module: &Module, offset: usize) -> Conte
         .nodes
         .iter()
         .filter(|node| {
-            node.kind == "module"
+            node.kind == NodeKind::Module
                 && node.start_byte <= offset
                 && offset < node.end_byte
                 && module
@@ -410,14 +411,14 @@ impl Workspace {
                     .structure
                     .nodes
                     .iter()
-                    .any(|node| node.kind == "module" && node.name == parts[0]);
+                    .any(|node| node.kind == NodeKind::Module && node.name == parts[0]);
         }
         !self.files.values().any(|module| {
             module
                 .structure
                 .nodes
                 .iter()
-                .any(|node| node.kind == "macro" && node.name == *name)
+                .any(|node| node.kind == NodeKind::Macro && node.name == *name)
         }) && !module
             .structure
             .nodes
@@ -485,7 +486,9 @@ impl Workspace {
                     .structure
                     .nodes
                     .iter()
-                    .find(|symbol| symbol.kind == "module" && symbol.end_byte == node.end_byte())
+                    .find(|symbol| {
+                        symbol.kind == NodeKind::Module && symbol.end_byte == node.end_byte()
+                    })
                     .context("Missing indexed Rust module")?;
                 ensure!(
                     !symbol
@@ -566,7 +569,7 @@ impl Workspace {
             if let Some(parents) = layout.registrations.get(&path) {
                 for (parent, range, _) in parents {
                     if self.files[parent].structure.nodes.iter().any(|node| {
-                        node.kind == "module"
+                        node.kind == NodeKind::Module
                             && node.end_byte == range.end
                             && node
                                 .attributes
@@ -636,7 +639,8 @@ impl Workspace {
                         import.scope.start <= offset
                             && offset <= import.scope.end
                             && lexical.and_then(|site| site.binding_id).is_none_or(|id| {
-                                module.structure.nodes[id].kind != "import" || import.id == id
+                                module.structure.nodes[id].kind != NodeKind::Import
+                                    || import.id == id
                             })
                     });
                     visible.sort_by_key(|import| import.scope.end - import.scope.start);
@@ -668,7 +672,7 @@ impl Workspace {
                     let local = lexical
                         .and_then(|site| site.binding_id)
                         .map(|id| &module.structure.nodes[id])
-                        .filter(|node| node.kind != "import")
+                        .filter(|node| node.kind != NodeKind::Import)
                         .or_else(|| {
                             module.structure.nodes.iter().find(|node| {
                                 node.name == first
@@ -834,7 +838,7 @@ impl Workspace {
                 continue;
             }
             if let Some(id) = site.binding_id
-                && module.structure.nodes[id].kind != "import"
+                && module.structure.nodes[id].kind != NodeKind::Import
             {
                 let symbol = &module.structure.nodes[id];
                 let mut parts = layout.contexts[path].module.clone();
@@ -1096,7 +1100,7 @@ impl Workspace {
                 .structure
                 .nodes
                 .iter()
-                .find(|node| node.kind == "module" && node.qualified_name == name)
+                .find(|node| node.kind == NodeKind::Module && node.qualified_name == name)
                 .context("Missing inline Rust module scope")?;
             module
                 .declaration(symbol.id)?
@@ -1176,12 +1180,9 @@ impl Workspace {
         );
         for path in parents {
             let module = &self.files[&path];
-            if module
-                .structure
-                .nodes
-                .iter()
-                .any(|node| node.parent_id.is_none() && node.kind == "module" && node.name == *name)
-            {
+            if module.structure.nodes.iter().any(|node| {
+                node.parent_id.is_none() && node.kind == NodeKind::Module && node.name == *name
+            }) {
                 continue;
             }
             self.add_imports(
@@ -1455,7 +1456,7 @@ impl Workspace {
         let symbol = self.files[from].symbol(selected)?;
         self.rust_attributes(symbol, true)?;
         ensure!(
-            symbol.kind == "function" && symbol.parent_id.is_none(),
+            symbol.kind == NodeKind::Function && symbol.parent_id.is_none(),
             "Only free, file-level Rust functions currently move between modules"
         );
         let key = (from.to_owned(), symbol.id);
@@ -1598,7 +1599,7 @@ impl Workspace {
                             .iter()
                             .find(|site| site.range == reference.range)
                             .and_then(|site| site.binding_id)
-                            .is_some_and(|id| module.structure.nodes[id].kind == "import");
+                            .is_some_and(|id| module.structure.nodes[id].kind == NodeKind::Import);
                         if !imported {
                             let scope = context(&layout, path, module, reference.range.start);
                             additions
@@ -1636,9 +1637,9 @@ impl Workspace {
                         covered.push(path_range);
                     } else if module.sites.iter().any(|site| {
                         site.range == reference.range
-                            && site
-                                .binding_id
-                                .is_some_and(|id| module.structure.nodes[id].kind != "import")
+                            && site.binding_id.is_some_and(|id| {
+                                module.structure.nodes[id].kind != NodeKind::Import
+                            })
                     }) {
                         self.files[to].name_conflict(&dependency.name)?;
                         additions

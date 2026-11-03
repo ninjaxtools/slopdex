@@ -8,6 +8,7 @@ mod code;
 mod data;
 mod descriptions;
 mod imports;
+mod language;
 pub(crate) mod line_exclusions;
 mod markdown;
 mod references;
@@ -18,6 +19,7 @@ mod syntax;
 pub(crate) use references::{EditSite, edit_sites};
 pub(crate) use syntax::grammar;
 
+pub use language::{LanguageId, NodeKind};
 pub(crate) use structure::is_callable_kind;
 pub use structure::{CallSite, FileStructure, ImportBinding, ReferenceSite, StructureNode};
 
@@ -29,8 +31,8 @@ use crate::formats::FormatGroup;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Callable {
-    pub language: String,
-    pub kind: String,
+    pub language: LanguageId,
+    pub kind: NodeKind,
     pub name: String,
     pub qualified_name: String,
     /// Source comment prose and, for Python, a leading constant docstring.
@@ -79,45 +81,22 @@ pub struct ParsedFile {
     pub structure: FileStructure,
 }
 
+/// The serialized language name for a path. The typed registry entry point
+/// is [`LanguageId::for_path`]; this wrapper serves string-typed boundaries
+/// (storage, cache keys) with the identical name.
 pub fn language_for_path(path: &str) -> Option<&'static str> {
-    let file = path.rsplit(['/', '\\']).next()?;
-    let (stem, extension) = file.rsplit_once('.')?;
-    if stem.is_empty() {
-        return None;
-    }
-    Some(match extension.to_ascii_lowercase().as_str() {
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "tsx",
-        "js" | "mjs" | "cjs" => "javascript",
-        "jsx" => "jsx",
-        "py" | "pyw" => "python",
-        "rs" => "rust",
-        "go" => "go",
-        "java" => "java",
-        "c" | "h" => "c",
-        "md" | "markdown" => "markdown",
-        "json" => "json",
-        "tf" | "tfvars" | "hcl" => "terraform",
-        "yaml" | "yml" => "yaml",
-        "toml" => "toml",
-        "xml" | "svg" | "xsd" | "xsl" | "xslt" => "xml",
-        "html" | "htm" => "html",
-        "css" => "css",
-        "sh" | "bash" | "zsh" => "bash",
-        _ => return None,
-    })
+    LanguageId::for_path(path).map(LanguageId::as_str)
 }
 
 pub fn parse(path: &str, source: &str) -> Result<ParsedFile> {
     let mut descriptions = descriptions::SourceDescriptions::default();
-    let mut parsed = match language_for_path(path) {
-        Some(language) => match FormatGroup::for_language(language) {
-            Some(FormatGroup::Docs) => markdown::parse(source, &mut descriptions),
-            Some(FormatGroup::Config | FormatGroup::Markup) => {
-                data::parse(language, path, source, &mut descriptions)
+    let mut parsed = match LanguageId::for_path(path) {
+        Some(language) => match language.format_group() {
+            FormatGroup::Docs => markdown::parse(source, &mut descriptions),
+            FormatGroup::Config | FormatGroup::Markup => {
+                data::parse(language.as_str(), path, source, &mut descriptions)
             }
-            Some(FormatGroup::Code) => code::parse(language, path, source, &mut descriptions),
-            None => Ok(ParsedFile::default()),
+            FormatGroup::Code => code::parse(language, path, source, &mut descriptions),
         },
         None => Ok(ParsedFile::default()),
     }?;

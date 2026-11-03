@@ -1,6 +1,6 @@
 fn main() {
-    if let Err(error) = slopdex::cli::run() {
-        slopdex::cli::report_error(&error);
+    if let Err(error) = slopdex::run() {
+        slopdex::report_error(&error);
         std::process::exit(1);
     }
 }

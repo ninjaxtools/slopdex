@@ -110,6 +110,13 @@ struct Context {
 }
 
 impl Providers {
+    /// Construct providers from a boundary-parsed [`Config`](crate::Config).
+    /// Provider internals still read the canonical JSON, which is the
+    /// documented identity input for provider profiles.
+    pub fn from_config(config: &crate::Config) -> Result<Self> {
+        Self::new(config.raw())
+    }
+
     pub fn new(config: &Value) -> Result<Self> {
         ensure!(
             config.is_object(),

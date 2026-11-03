@@ -2,86 +2,92 @@
 
 use super::*;
 use super::{discovery::*, prepare::*};
+use crate::storage::UnitKind;
 
 impl Engine {
     pub fn refresh(&mut self) -> Result<Value> {
-        let structure = self.refresh_structure()?;
-        if flag(&self.config, "noReindex") {
-            return Ok(structure);
-        }
-        ensure!(
-            !self.structural_only,
-            "Semantic preparation requires a search engine"
-        );
-        let mut paths = HashSet::new();
-        for item in &self.items {
-            if (item.kind != "symbol-description" && item.embedding.is_empty())
-                || (item.data["description"].is_string() && item.description_embedding.is_none())
-            {
-                paths.insert(item.path.clone());
+        let progress = self.progress.clone();
+        ui::with_reporter(&progress, || {
+            let structure = self.refresh_structure()?;
+            if self.config.no_reindex() {
+                return Ok(structure);
             }
-        }
-        for file in self.files.values() {
-            if file.description.is_some() && file.description_embedding.is_none() {
-                paths.insert(file.path.clone());
-            }
-        }
-        let mut paths: Vec<_> = paths.into_iter().collect();
-        paths.sort();
-        let profile = self.providers.vector().profile().to_string();
-        let prepared = paths.is_empty()
-            && self.db.meta("active_embedding_profile")?.as_deref() == Some(&profile);
-        if self.readonly && !prepared {
-            return Err(NeedsWrite.into());
-        }
-        if prepared {
-            return Ok(
-                json!({"filesUpdated":structure["filesUpdated"],"filesDeleted":structure["filesDeleted"],
-                "filesPrepared":0,"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),
-                "checkpoint":self.db.meta("checkpoint")?,"generation":self.db.generation()?}),
+            ensure!(
+                !self.structural_only(),
+                "Semantic preparation requires a search engine"
             );
-        }
-        let mut inputs = Vec::new();
-        for path in paths {
-            let file = &self.files[&path];
-            let source = self.source(&path)?.to_owned();
-            inputs.push(PrepareInput {
-                path,
-                source,
-                source_mode: file.source_mode.clone(),
-                regenerate_file: false,
-                regenerate_callables: false,
-                generate_descriptions: false,
-            });
-        }
-        let changed = self.prepare_all(inputs)?;
-        let checkpoint = self.db.meta("checkpoint")?;
-        ensure!(
-            git::head(&self.root) == checkpoint,
-            "Git HEAD changed during indexing; rerun"
-        );
-        for (file, _) in &changed {
-            self.verify_source_unchanged(file)?;
-        }
-        self.write_index(|engine| engine.db.apply(&changed, &[], checkpoint.as_deref()))?;
-        self.load()?;
-        self.artifacts.backfill_remote(&self.db);
-        Ok(
-            json!({"filesUpdated":structure["filesUpdated"],"filesDeleted":structure["filesDeleted"],
-            "filesPrepared":changed.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),
+            let mut paths = HashSet::new();
+            for item in &self.items {
+                if (item.kind != UnitKind::SymbolDescription && item.embedding.is_empty())
+                    || (item.data["description"].is_string()
+                        && item.description_embedding.is_none())
+                {
+                    paths.insert(item.path.clone());
+                }
+            }
+            for file in self.files.values() {
+                if file.description.is_some() && file.description_embedding.is_none() {
+                    paths.insert(file.path.clone());
+                }
+            }
+            let mut paths: Vec<_> = paths.into_iter().collect();
+            paths.sort();
+            let profile = self.providers.vector().profile().to_string();
+            let prepared = paths.is_empty()
+                && self.db.meta("active_embedding_profile")?.as_deref() == Some(&profile);
+            if self.readonly() && !prepared {
+                return Err(NeedsWrite.into());
+            }
+            if prepared {
+                return Ok(
+                    json!({"filesUpdated":structure["filesUpdated"],"filesDeleted":structure["filesDeleted"],
+                "filesPrepared":0,"functionCount":self.items.iter().filter(|i|i.kind==UnitKind::Function).count(),
+                "checkpoint":self.db.meta("checkpoint")?,"generation":self.db.generation()?}),
+                );
+            }
+            let mut inputs = Vec::new();
+            for path in paths {
+                let file = &self.files[&path];
+                let source = self.source(&path)?.to_owned();
+                inputs.push(PrepareInput {
+                    path,
+                    source,
+                    source_mode: file.source_mode.clone(),
+                    regenerate_file: false,
+                    regenerate_callables: false,
+                    generate_descriptions: false,
+                });
+            }
+            let changed = self.prepare_all(inputs)?;
+            let checkpoint = self.db.meta("checkpoint")?;
+            ensure!(
+                git::head(&self.root) == checkpoint,
+                "Git HEAD changed during indexing; rerun"
+            );
+            for (file, _) in &changed {
+                self.verify_source_unchanged(file)?;
+            }
+            self.write_index(|engine| engine.db.apply(&changed, &[], checkpoint.as_deref()))?;
+            self.load()?;
+            self.artifacts.backfill_remote(&self.db);
+            Ok(
+                json!({"filesUpdated":structure["filesUpdated"],"filesDeleted":structure["filesDeleted"],
+            "filesPrepared":changed.len(),"functionCount":self.items.iter().filter(|i|i.kind==UnitKind::Function).count(),
             "checkpoint":checkpoint,"generation":self.db.generation()?}),
-        )
+            )
+        })
     }
 
     pub fn refresh_structure(&mut self) -> Result<Value> {
-        self.refresh_structure_with(|| Ok(()))
+        let progress = self.progress.clone();
+        ui::with_reporter(&progress, || self.refresh_structure_with(|| Ok(())))
     }
 
     pub(super) fn refresh_structure_with(
         &mut self,
         after_discovery: impl FnOnce() -> Result<()>,
     ) -> Result<Value> {
-        if flag(&self.config, "noReindex") {
+        if self.config.no_reindex() {
             return Ok(json!({"skipped":true,"generation":self.db.generation()?}));
         }
         ui::progress("Checking repository changes");
@@ -146,7 +152,7 @@ impl Engine {
             })
         {
             return Ok(
-                json!({"filesUpdated":0,"filesDeleted":0,"functionCount":self.items.iter().filter(|item| item.kind=="function").count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
+                json!({"filesUpdated":0,"filesDeleted":0,"functionCount":self.items.iter().filter(|item| item.kind==UnitKind::Function).count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
             );
         }
         let previous_fingerprints = self.saved_fingerprints()?;
@@ -166,7 +172,7 @@ impl Engine {
             || changed_policy
             || (previous_checkpoint != checkpoint
                 && changes.as_ref().is_some_and(|c| c.policy_changed));
-        let max_size = self.config["maxFileSize"].as_u64().unwrap_or(1_048_576);
+        let max_size = self.config.max_file_size();
         let mut candidates = changes
             .as_ref()
             .map(|c| c.changed.clone())
@@ -219,7 +225,7 @@ impl Engine {
             .filter(|p| (full_scan || candidates.contains(*p)) && !paths_set.contains(*p))
             .cloned()
             .collect();
-        if self.readonly
+        if self.readonly()
             && (!removed.is_empty()
                 || self.db.meta("checkpoint")? != checkpoint
                 || self.db.meta("discovery_policy")?.as_deref() != Some(&policy))
@@ -279,7 +285,7 @@ impl Engine {
                         indexing.inc(1);
                         continue;
                     }
-                    if self.readonly {
+                    if self.readonly() {
                         return Err(NeedsWrite.into());
                     }
                     let file = File {
@@ -308,7 +314,7 @@ impl Engine {
                 indexing.inc(1);
                 continue;
             }
-            if self.readonly {
+            if self.readonly() {
                 return Err(NeedsWrite.into());
             }
             let parsed = self.parsed(&path, &source)?;
@@ -385,14 +391,14 @@ impl Engine {
             );
         }
         if changed.is_empty() && removed.is_empty() && previous_checkpoint == checkpoint {
-            if !self.readonly {
+            if !self.readonly() {
                 self.write_index(|engine| {
                     engine.save_refresh_state(&dirty, &fingerprints, &policy, &directories)?;
                     engine.db.apply_structure(&[], &[], checkpoint.as_deref())
                 })?;
             }
             return Ok(
-                json!({"filesUpdated":0,"filesDeleted":0,"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
+                json!({"filesUpdated":0,"filesDeleted":0,"functionCount":self.items.iter().filter(|i|i.kind==UnitKind::Function).count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
             );
         }
         ui::progress("Saving index snapshot");
@@ -421,7 +427,7 @@ impl Engine {
             self.load()?;
         }
         Ok(
-            json!({"filesUpdated":changed.len(),"filesDeleted":removed.len(),"functionCount":self.items.iter().filter(|i|i.kind=="function").count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
+            json!({"filesUpdated":changed.len(),"filesDeleted":removed.len(),"functionCount":self.items.iter().filter(|i|i.kind==UnitKind::Function).count(),"checkpoint":checkpoint,"generation":self.db.generation()?}),
         )
     }
 

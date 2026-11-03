@@ -1,5 +1,6 @@
 use super::super::syntax::relative_path;
 use super::*;
+use crate::parse::NodeKind;
 
 #[derive(Clone)]
 struct Include {
@@ -147,7 +148,7 @@ impl Workspace {
             .nodes
             .iter()
             .filter(|node| {
-                node.parent_id.is_none() && node.kind != "import" && node.name == selected
+                node.parent_id.is_none() && node.kind != NodeKind::Import && node.name == selected
             })
             .collect();
         if candidates.len() == 1 {
@@ -162,7 +163,10 @@ impl Workspace {
             })
             .collect();
         ensure!(
-            definitions.len() == 1 && candidates.iter().all(|node| node.kind == "function"),
+            definitions.len() == 1
+                && candidates
+                    .iter()
+                    .all(|node| node.kind == NodeKind::Function),
             "Ambiguous C declaration: {selected}"
         );
         Ok(definitions[0])
@@ -187,7 +191,7 @@ impl Workspace {
                     && !static_symbol(module, node)
             }) {
                 definitions += usize::from(
-                    node.kind == "function"
+                    node.kind == NodeKind::Function
                         && module
                             .declaration(node.id)
                             .is_ok_and(|node| node.kind() == "function_definition"),
@@ -233,7 +237,7 @@ impl Workspace {
         let mut found = BTreeSet::new();
         for header in self.c_headers(path)? {
             for node in self.files[&header].structure.nodes.iter().filter(|node| {
-                node.parent_id.is_none() && node.kind != "import" && node.name == site.name
+                node.parent_id.is_none() && node.kind != NodeKind::Import && node.name == site.name
             }) {
                 found.insert((header.clone(), node.id));
             }
@@ -337,7 +341,7 @@ impl Workspace {
         self.c_move_context(to)?;
         let symbol = self.c_symbol(from, selected)?;
         ensure!(
-            symbol.kind == "function",
+            symbol.kind == NodeKind::Function,
             "Only C function definitions can move between files"
         );
         let declaration = self.files[from].declaration(symbol.id)?;
@@ -377,7 +381,7 @@ impl Workspace {
                     && !matches!(node.kind.as_str(), "struct" | "union" | "enum")
             }) {
                 ensure!(
-                    existing.kind == "function"
+                    existing.kind == NodeKind::Function
                         && static_symbol(&self.files[path], existing) == private
                         && self.files[path].declaration(existing.id)?.kind()
                             != "function_definition",
@@ -410,7 +414,7 @@ impl Workspace {
             for (path, id) in &origin {
                 ensure!(
                     !static_symbol(&self.files[path], &self.files[path].structure.nodes[*id])
-                        && self.files[path].structure.nodes[*id].kind != "macro",
+                        && self.files[path].structure.nodes[*id].kind != NodeKind::Macro,
                     "Moving {name} would capture private/preprocessor dependency {}",
                     site.name
                 );

@@ -14,15 +14,16 @@ the [command reference](reference.md) for CLI documentation. Use
 | `xtask/Cargo.toml`, `xtask/src/main.rs` | Workspace verification and release checks; tooling member with `publish = false`, `release = false`, and `dist = false`. |
 | `.cargo/config.toml` | `cargo verify` and `cargo release-check` aliases for xtask. |
 | `npm/package.json` | npm release metadata, version synchronization and verification against cargo-dist's generated package. |
-| `src/main.rs`, `src/lib.rs` | Native entry point/error exit handling, public core modules, shared SHA-256 helper. |
+| `src/main.rs`, `src/lib.rs` | Native entry point/error exit handling; the crate's only public surface, a root facade re-exporting `Engine`/`OpenOptions`, `Config`, the parser and its typed vocabularies, `Database`, `Providers`, progress reporting, and the shared SHA-256 helper. All modules are private. |
 | `src/cli.rs` | Clap commands/validation, root-selected JSON configuration, interactive prompts, summary/JSON/JSONL output, connected-component clusters. |
-| `src/ui.rs` | Shared cliclack progress and diagnostic rendering on terminal stderr, plain redirected diagnostics, synchronized provider notices. |
-| `src/engine.rs` | Filesystem/Git refresh, artifact reuse, description lifecycle, independent-index search/filtering/reranking, cross-search, and task explanation context. |
+| `src/ui.rs` | The public `ProgressReporter` trait (default `NoProgress`: silent progress, notices on stderr), thread-scoped routing of progress, info and warnings to the reporter an engine call installs (carried into provider worker threads), the CLI's cliclack terminal reporter on stderr, plain redirected diagnostics, synchronized provider notices. |
+| `src/engine.rs` | `OpenOptions` (`OpenMode` full/structure, `Access` read-write/read-only, injected progress reporter), the loaded snapshot, reconstructible derived caches, filesystem/Git refresh, artifact reuse, description lifecycle, independent-index search/filtering/reranking, cross-search, and task explanation context. |
+| `src/config.rs` | Typed `Config`: core options parsed and validated once at the CLI/Engine boundary; the canonical JSON is kept only as provider-profile and cache-key identity input. |
 | `src/formats.rs` | Central code/docs/config/markup groups, language/extension membership, defaults, and format-selection validation. |
 | `src/filter.rs` | Shared format-group selection, ordered path globs, qualified-name regexes, resolved semantic selection, and map kind selection with ancestor context. |
 | `src/symbols.rs` | Stable normalization of bare names and queries for name-only symbol embeddings. |
 | `src/map.rs` | Compact structure summaries from canonical metadata; display-only truncation. |
-| `src/parse/mod.rs` | Shared parsing result types, file-language detection, and dispatch to code, Markdown, or configuration/markup parsing. |
+| `src/parse/mod.rs`, `src/parse/language.rs` | Shared parsing result types; the language registry (`LanguageId`: names, extensions, format group, grammar) and the closed `NodeKind` vocabulary, both serialized as their historic strings; and dispatch to code, Markdown, or configuration/markup parsing. |
 | `src/parse/code.rs` | Tree-sitter callable extraction and diagnostics, byte-preserving TypeScript recovery, one-sweep call-site ownership (callables sorted by start byte become active during the pre-order walk; per-owner set deduplication). |
 | `src/parse/structure.rs`, `src/parse/imports.rs` | Canonical declarations, signatures, hierarchy, source ranges, and imported bindings/aliases. |
 | `src/parse/syntax.rs` | Shared AST helpers, quote-safe key text, and the `Descent` guard (512 levels or a 768 KiB stack budget, whichever comes first): the recursive code/structure walkers stop descending and record one diagnostic instead of overflowing the stack; simple helpers use explicit stacks. |
@@ -32,7 +33,7 @@ the [command reference](reference.md) for CLI documentation. Use
 | `src/callgraph.rs` | Snapshot callable graph and outgoing symbol-reference resolution: language-aware bare-name scoping, `impl`/static receiver matching, namespace-only `.` receivers through imports, Rust `super::` and Go package import paths. |
 | `src/parse/descriptions.rs` | Shared source-comment attachment, Python function/class docstrings, and file/symbol description extraction. |
 | `src/models.rs`, `src/providers/` | Capability traits, agent CLI text generation, hosted/local embeddings and native reranking, API credential/endpoint policy and bounded HTTP retries. |
-| `src/storage.rs` | Worktree SQLite bindings, attached global artifacts, streamed snapshot digests, transactional live-state reconciliation, schema validation. |
+| `src/storage.rs` | Worktree SQLite bindings behind named methods (the connection is crate-private), typed `UnitKind` search units, attached global artifacts, streamed snapshot digests, transactional live-state reconciliation, schema validation. |
 | `src/cache.rs` | Authoritative global SQLite store and validated, best-effort S3 provider artifacts. |
 | `src/git.rs`, `src/registry.rs` | Git candidate discovery/checkpoints, repository relatedness evidence, and self-retiring per-artifact single-flight locks. |
 | `src/vectors.rs`, `src/vectors/shared.rs` | Checked F32 cosine USearch primitives and immutable shared bases with exact worktree deltas/membership masks. |
@@ -175,7 +176,7 @@ content only, never config or markup. Plain search includes the selected groups'
 content indexes plus group-filtered shared symbols and available descriptions.
 `CommandMode` centralizes
 opening and refresh: pure `search-symbols` and `search --symbols` use
-`Engine::open_symbol_map(root, index, config, readonly)` and `refresh_structure`,
+`Engine::open_symbol_map(root, index, config, options)` and `refresh_structure`,
 as semantic map does; mixed content/symbol searches use normal engine refresh.
 All search commands require an existing index. Read-only `NeedsWrite` retries
 reopen the same mode writable, retaining structural-only refresh for pure symbols.

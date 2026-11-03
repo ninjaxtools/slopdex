@@ -5,6 +5,7 @@
 //! exclusive end (including an end at column 1 of the following line).
 
 use super::Diagnostic;
+use super::language::{LanguageId, NodeKind};
 use super::syntax::{Descent, children, text, unwrap_value};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
@@ -54,11 +55,9 @@ pub struct ImportBinding {
 pub struct StructureNode {
     pub id: usize,
     pub parent_id: Option<usize>,
-    pub language: String,
-    /// Stable semantic kind, e.g. function, method, class, struct, interface,
-    /// enum, variant, field, type, trait, impl, module, constant, variable,
-    /// import, macro, constructor, heading.
-    pub kind: String,
+    pub language: LanguageId,
+    /// Stable semantic kind; see [`NodeKind`] for the closed vocabulary.
+    pub kind: NodeKind,
     pub name: String,
     pub qualified_name: String,
     /// Source-provided prose attached to this declaration or heading.
@@ -188,27 +187,15 @@ fn unquote(value: &str) -> String {
     value.trim_matches(['\'', '"', '`', '<', '>']).to_owned()
 }
 
-/// The node kinds that own a callable body. The one definition every
-/// consumer (structure, filter, map, call graph) shares, so adding a kind
-/// cannot diverge between them.
+/// Whether a serialized kind name (e.g. from JSON `Item.data`) is callable.
+/// Delegates to the typed definition, [`NodeKind::is_callable`]; unknown
+/// names are not callable.
 pub(crate) fn is_callable_kind(kind: &str) -> bool {
-    matches!(kind, "function" | "method" | "constructor" | "generator")
+    NodeKind::from_name(kind).is_some_and(NodeKind::is_callable)
 }
 
 fn container(kind: &str) -> bool {
-    matches!(
-        kind,
-        "class"
-            | "struct"
-            | "union"
-            | "enum"
-            | "interface"
-            | "trait"
-            | "impl"
-            | "module"
-            | "type"
-            | "variant"
-    )
+    NodeKind::from_name(kind).is_some_and(NodeKind::is_container)
 }
 
 fn value(node: Node<'_>) -> Option<Node<'_>> {
@@ -356,8 +343,10 @@ impl Collector<'_> {
         self.nodes.push(StructureNode {
             id,
             parent_id: parent,
-            language: self.language.to_owned(),
-            kind: kind.to_owned(),
+            language: LanguageId::from_name(self.language)
+                .expect("structure extraction only runs for registry languages"),
+            kind: NodeKind::from_name(kind)
+                .expect("classification only yields registry node kinds"),
             name,
             qualified_name,
             description: None,

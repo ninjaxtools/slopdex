@@ -2,7 +2,7 @@
 mod parse_support;
 
 use parse_support::{byte_at, callables, clean, declarations, named};
-use slopdex::parse::ParsedFile;
+use slopdex::ParsedFile;
 use tree_sitter::{Language, Parser};
 
 const SCRIPT_PATHS: [&str; 4] = ["fixture.js", "fixture.jsx", "fixture.ts", "fixture.tsx"];
@@ -511,7 +511,7 @@ fn real_type_declarations_and_callable_signatures_remain_available() {
             ("API.Base.run", "method"),
             ("API.external", "function"),
         ] {
-            assert_eq!(named(&parsed, name).kind, kind, "{path}");
+            assert_eq!(named(&parsed, name).kind.as_str(), kind, "{path}");
         }
         assert_eq!(
             callables(&parsed),

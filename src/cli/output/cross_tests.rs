@@ -7,6 +7,7 @@ use crate::cli::{
     },
 };
 use crate::engine::Engine;
+use crate::engine::OpenOptions;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::fs;
@@ -45,7 +46,12 @@ fn cross_summary_groups_sources_and_matches_from_the_same_file() -> Result<()> {
         "impl Api {\n  fn first(&self) {}\n  fn second(&self) {}\n}\n",
     )?;
     let index = dir.path().join("index.sqlite");
-    let mut engine = Engine::open_map(dir.path(), &index, map_config(dir.path()))?;
+    let mut engine = Engine::open_with(
+        dir.path(),
+        &index,
+        map_config(dir.path()),
+        OpenOptions::structure(),
+    )?;
     engine.refresh_structure()?;
     let first = json!({"path":"api.rs", "qualifiedName":"Api.first", "name":"first", "startLine":2,"endLine":2});
     let second = json!({"path":"api.rs", "qualifiedName":"Api.second", "name":"second", "startLine":3,"endLine":3});

@@ -368,6 +368,7 @@ fn sqlite_temporary_directory() -> PathBuf {
     std::env::temp_dir()
 }
 
+#[cfg(test)]
 /// Explicit, user-invoked maintenance of the global artifact store selected by
 /// `config`. It never runs implicitly.
 ///

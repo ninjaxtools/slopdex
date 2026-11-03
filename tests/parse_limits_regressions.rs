@@ -4,7 +4,8 @@
 mod parse_support;
 
 use parse_support::{callables, clean, named};
-use slopdex::parse::parse;
+use slopdex::NodeKind;
+use slopdex::parse;
 use std::time::{Duration, Instant};
 
 const DEPTH: usize = 10_000;
@@ -19,7 +20,7 @@ fn nested(prefix: &str, open: &str, inner: &str, close: &str, suffix: &str) -> S
 
 /// Runs on a thread with the default test stack to prove the walkers bound
 /// their own recursion instead of relying on a generous main-thread stack.
-fn parse_in_test_thread(path: &'static str, source: String) -> slopdex::parse::ParsedFile {
+fn parse_in_test_thread(path: &'static str, source: String) -> slopdex::ParsedFile {
     std::thread::Builder::new()
         .stack_size(2 * 1024 * 1024)
         .spawn(move || parse(path, &source).unwrap())
@@ -126,7 +127,7 @@ fn deeply_nested_json_and_yaml_keep_every_item() {
                 .nodes
                 .iter()
                 .skip(1)
-                .all(|node| node.kind == "item" && node.name == "[0]"),
+                .all(|node| node.kind == NodeKind::Item && node.name == "[0]"),
             "{path}"
         );
         assert!(!parsed.chunks.is_empty(), "{path}");

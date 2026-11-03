@@ -1,4 +1,4 @@
-use slopdex::parse::{ImportBinding, parse};
+use slopdex::{ImportBinding, parse};
 
 fn imports(path: &str, source: &str) -> Vec<ImportBinding> {
     let parsed = parse(path, source).unwrap();

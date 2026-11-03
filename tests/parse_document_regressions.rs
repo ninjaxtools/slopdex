@@ -1,6 +1,7 @@
 //! Concrete document-parser regressions exercised exclusively through the public API.
 
-use slopdex::parse::{ParsedFile, StructureNode, parse};
+use slopdex::NodeKind;
+use slopdex::{ParsedFile, StructureNode, parse};
 
 fn accepted(path: &str, source: &str) -> ParsedFile {
     let parsed = parse(path, source).unwrap();
@@ -111,7 +112,7 @@ fn json_malformed_array_keeps_healthy_items_under_the_array_field() {
     for host in hosts {
         let item = host.parent_id.map(|id| &parsed.structure.nodes[id]);
         assert!(
-            item.is_some_and(|item| item.kind == "item"
+            item.is_some_and(|item| item.kind == NodeKind::Item
                 && item
                     .parent_id
                     .is_some_and(|id| parsed.structure.nodes[id].name == "servers")),
@@ -666,7 +667,7 @@ fn css_repeated_selectors_keep_distinct_nodes_and_their_own_declarations() {
         .structure
         .nodes
         .iter()
-        .filter(|node| node.kind == "rule")
+        .filter(|node| node.kind == NodeKind::Rule)
         .collect();
     assert_eq!(rules.len(), 2);
     assert_ne!(rules[0].id, rules[1].id);

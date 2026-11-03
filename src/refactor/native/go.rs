@@ -1,4 +1,5 @@
 use super::*;
+use crate::parse::NodeKind;
 
 #[derive(Clone)]
 pub(super) struct Import {
@@ -207,7 +208,9 @@ impl Workspace {
                 .structure
                 .nodes
                 .iter()
-                .find(|symbol| symbol.kind == "import" && symbol.end_byte == node.end_byte())
+                .find(|symbol| {
+                    symbol.kind == NodeKind::Import && symbol.end_byte == node.end_byte()
+                })
                 .context("Missing indexed Go import")?
                 .id;
             imports.push(Import {
@@ -250,7 +253,7 @@ impl Workspace {
     fn go_origin(&self, path: &str, site: &EditSite, layout: &Layout) -> Result<Option<Key>> {
         let module = &self.files[path];
         if let Some(id) = site.binding_id {
-            if module.structure.nodes[id].kind != "import" {
+            if module.structure.nodes[id].kind != NodeKind::Import {
                 return Ok(site.receiver.is_none().then(|| (path.into(), id)));
             }
         } else if site.bound {
@@ -296,7 +299,7 @@ impl Workspace {
             "Go lifecycle functions cannot be renamed as ordinary declarations"
         );
         ensure!(
-            symbol.parent_id.is_none() && symbol.kind != "method",
+            symbol.parent_id.is_none() && symbol.kind != NodeKind::Method,
             "Go member renames require receiver-type resolution; select a package declaration"
         );
         let key = (path.to_owned(), symbol.id);
@@ -420,7 +423,7 @@ impl Workspace {
         );
         let symbol = self.files[from].symbol(selected)?;
         ensure!(
-            symbol.kind == "function" && symbol.parent_id.is_none(),
+            symbol.kind == NodeKind::Function && symbol.parent_id.is_none(),
             "Only free Go functions can move between files"
         );
         let key = (from.to_owned(), symbol.id);
@@ -739,10 +742,10 @@ impl Workspace {
             .structure
             .nodes
             .iter()
-            .filter(|node| node.parent_id.is_none() && node.kind != "import")
+            .filter(|node| node.parent_id.is_none() && node.kind != NodeKind::Import)
             .collect();
         ensure!(
-            declarations.len() == 1 && declarations[0].kind == "function",
+            declarations.len() == 1 && declarations[0].kind == NodeKind::Function,
             "Moving a Go file across packages currently requires one free function; move declarations individually otherwise"
         );
         let name = declarations[0].name.clone();

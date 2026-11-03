@@ -1,6 +1,7 @@
 //! Vector search over committed index records.
 
 use super::*;
+use crate::storage::UnitKind;
 
 struct SearchPlan {
     groups: Vec<FormatGroup>,
@@ -49,14 +50,17 @@ type DescriptionQueries<'a> = (Option<&'a [f32]>, Option<&'a [f32]>);
 
 impl Engine {
     pub(super) fn vector(&self, key: &str) -> Result<Vec<f32>> {
-        if let Some(vector) = self.vectors.borrow().get(key) {
+        if let Some(vector) = self.derived.vectors.borrow().get(key) {
             return Ok(vector.clone());
         }
         let vector = self
             .db
             .embedding(key)?
             .context("Missing indexed embedding")?;
-        self.vectors.borrow_mut().insert(key.into(), vector.clone());
+        self.derived
+            .vectors
+            .borrow_mut()
+            .insert(key.into(), vector.clone());
         Ok(vector)
     }
 
@@ -90,7 +94,7 @@ impl Engine {
     }
 
     fn ensure_index(&self, kind: &str) -> Result<()> {
-        if self.indexes.borrow().contains_key(kind) {
+        if self.derived.indexes.borrow().contains_key(kind) {
             return Ok(());
         }
         let items: Vec<_> = self
@@ -137,10 +141,10 @@ impl Engine {
             &PathBuf::from(path),
             &profile,
             &vectors,
-            self.readonly,
+            self.readonly(),
         )?;
         let state = format!("index_state_{kind}");
-        if !self.readonly
+        if !self.readonly()
             && (prepared.needs_publication()
                 || self.db.meta(&state)?.as_deref() != Some(prepared.fingerprint()))
         {
@@ -150,7 +154,7 @@ impl Engine {
             })?;
         }
         let index = prepared.into_index();
-        self.indexes.borrow_mut().insert(kind.into(), index);
+        self.derived.indexes.borrow_mut().insert(kind.into(), index);
         Ok(())
     }
 
@@ -172,7 +176,7 @@ impl Engine {
     }
 
     pub fn search(&self, query: &str, kind: &str, options: &Value) -> Result<Vec<Value>> {
-        Ok(self.search_limited(query, kind, options)?.rows)
+        self.reporting(|| Ok(self.search_limited(query, kind, options)?.rows))
     }
 
     /// Search the union of queries, retaining each match's best-ranked result.
@@ -182,7 +186,7 @@ impl Engine {
         kind: &str,
         options: &Value,
     ) -> Result<Vec<Value>> {
-        Ok(self.search_queries_limited(queries, kind, options)?.rows)
+        self.reporting(|| Ok(self.search_queries_limited(queries, kind, options)?.rows))
     }
 
     pub(crate) fn search_queries_limited(
@@ -191,83 +195,85 @@ impl Engine {
         kind: &str,
         options: &Value,
     ) -> Result<LimitedResults<Value>> {
-        let queries: BTreeSet<_> = queries.iter().collect();
-        if queries.len() == 1 {
-            return self.search_limited(queries.first().unwrap(), kind, options);
-        }
-        let limit = limits::resolve(&self.config, options)?;
-        let ranking_score = if flag(&self.config, "rerankingEnabled") {
-            "rerankScore"
-        } else {
-            "similarity"
-        };
-        let order = |a: &Value, b: &Value| {
-            score(b, ranking_score)
-                .total_cmp(&score(a, ranking_score))
-                .then_with(|| a.to_string().cmp(&b.to_string()))
-        };
-        // Scores belong to the query, not the match. Include full item data so
-        // names shared by locations or streams stay distinct.
-        let identity = |row: &Value| {
-            json!([
-                row["type"],
-                row["function"],
-                row["symbol"],
-                row["chunk"],
-                row["file"]
-            ])
-            .to_string()
-        };
-        let mut matches: BTreeMap<String, Value> = BTreeMap::new();
-        let mut capped = false;
-        for query in queries {
-            let mut query_options = options.clone();
-            query_options["limit"] = limit.value();
-            let rows = loop {
-                // A query's best count + 1 distinct matches suffice for both the
-                // global top count and omission detection, even if queries overlap.
-                // Keep using search_rows so individual queries reuse their caches.
-                let mut rows = self.search_rows(query, kind, &query_options)?;
-                capped |= take_omission_marker(&mut rows);
-                let Some(count) = limit.count() else {
-                    break rows;
-                };
-                let probe = query_options["limit"].as_u64().unwrap() as usize;
-                let identities: HashSet<_> = rows.iter().map(&identity).collect();
-                if identities.len() > count || rows.len() <= probe {
-                    break rows;
-                }
-                // Duplicate streams can consume the spare candidate. Widen only
-                // in that case, rather than misreporting an exactly full union.
-                let wider = probe.saturating_mul(2);
-                if wider == probe {
-                    break rows;
-                }
-                query_options["limit"] = json!(wider);
-            };
-            for row in rows {
-                matches
-                    .entry(identity(&row))
-                    .and_modify(|existing| {
-                        if order(&row, existing).is_lt() {
-                            *existing = row.clone();
-                        }
-                    })
-                    .or_insert(row);
+        self.reporting(|| {
+            let queries: BTreeSet<_> = queries.iter().collect();
+            if queries.len() == 1 {
+                return self.search_limited(queries.first().unwrap(), kind, options);
             }
-        }
-        let mut rows: Vec<_> = matches.into_values().collect();
-        rows.sort_by(order);
-        let omitted = limit
-            .count()
-            .is_some_and(|count| capped || rows.len() > count);
-        if let Some(count) = limit.count() {
-            rows.truncate(count);
-        }
-        Ok(LimitedResults {
-            rows,
-            omitted,
-            limit: limit.count(),
+            let limit = self.config.resolve_limit(options)?;
+            let ranking_score = if self.config.reranking_enabled() {
+                "rerankScore"
+            } else {
+                "similarity"
+            };
+            let order = |a: &Value, b: &Value| {
+                score(b, ranking_score)
+                    .total_cmp(&score(a, ranking_score))
+                    .then_with(|| a.to_string().cmp(&b.to_string()))
+            };
+            // Scores belong to the query, not the match. Include full item data so
+            // names shared by locations or streams stay distinct.
+            let identity = |row: &Value| {
+                json!([
+                    row["type"],
+                    row["function"],
+                    row["symbol"],
+                    row["chunk"],
+                    row["file"]
+                ])
+                .to_string()
+            };
+            let mut matches: BTreeMap<String, Value> = BTreeMap::new();
+            let mut capped = false;
+            for query in queries {
+                let mut query_options = options.clone();
+                query_options["limit"] = limit.value();
+                let rows = loop {
+                    // A query's best count + 1 distinct matches suffice for both the
+                    // global top count and omission detection, even if queries overlap.
+                    // Keep using search_rows so individual queries reuse their caches.
+                    let mut rows = self.search_rows(query, kind, &query_options)?;
+                    capped |= take_omission_marker(&mut rows);
+                    let Some(count) = limit.count() else {
+                        break rows;
+                    };
+                    let probe = query_options["limit"].as_u64().unwrap() as usize;
+                    let identities: HashSet<_> = rows.iter().map(&identity).collect();
+                    if identities.len() > count || rows.len() <= probe {
+                        break rows;
+                    }
+                    // Duplicate streams can consume the spare candidate. Widen only
+                    // in that case, rather than misreporting an exactly full union.
+                    let wider = probe.saturating_mul(2);
+                    if wider == probe {
+                        break rows;
+                    }
+                    query_options["limit"] = json!(wider);
+                };
+                for row in rows {
+                    matches
+                        .entry(identity(&row))
+                        .and_modify(|existing| {
+                            if order(&row, existing).is_lt() {
+                                *existing = row.clone();
+                            }
+                        })
+                        .or_insert(row);
+                }
+            }
+            let mut rows: Vec<_> = matches.into_values().collect();
+            rows.sort_by(order);
+            let omitted = limit
+                .count()
+                .is_some_and(|count| capped || rows.len() > count);
+            if let Some(count) = limit.count() {
+                rows.truncate(count);
+            }
+            Ok(LimitedResults {
+                rows,
+                omitted,
+                limit: limit.count(),
+            })
         })
     }
 
@@ -277,21 +283,23 @@ impl Engine {
         kind: &str,
         options: &Value,
     ) -> Result<LimitedResults<Value>> {
-        let mut options = options.clone();
-        let limit = limits::resolve(&self.config, &options)?;
-        options["limit"] = limit.value();
-        let mut rows = self.search_rows(query, kind, &options)?;
-        let capped = take_omission_marker(&mut rows);
-        let omitted = limit
-            .count()
-            .is_some_and(|count| capped || rows.len() > count);
-        if let Some(count) = limit.count() {
-            rows.truncate(count);
-        }
-        Ok(LimitedResults {
-            rows,
-            omitted,
-            limit: limit.count(),
+        self.reporting(|| {
+            let mut options = options.clone();
+            let limit = self.config.resolve_limit(&options)?;
+            options["limit"] = limit.value();
+            let mut rows = self.search_rows(query, kind, &options)?;
+            let capped = take_omission_marker(&mut rows);
+            let omitted = limit
+                .count()
+                .is_some_and(|count| capped || rows.len() > count);
+            if let Some(count) = limit.count() {
+                rows.truncate(count);
+            }
+            Ok(LimitedResults {
+                rows,
+                omitted,
+                limit: limit.count(),
+            })
         })
     }
 
@@ -314,7 +322,7 @@ impl Engine {
         // an unselected file missing its embedding must not fail a narrow
         // read-only search that could never surface it.
         ensure!(
-            (!content || !self.structural_only)
+            (!content || !self.structural_only())
                 && self.items.iter().all(|item| {
                     !formats.path_matches(&item.path)
                         || content_group(item).is_none_or(|group| !groups.contains(&group))
@@ -339,7 +347,7 @@ impl Engine {
         if let Some(results) = self.db.search_cache(&key)? {
             return Ok(results);
         }
-        if self.readonly {
+        if self.readonly() {
             return Err(NeedsWrite.into());
         }
         let selection = self.selection(options)?;
@@ -351,14 +359,14 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let rerank = flag(&self.config, "rerankingEnabled");
+        let rerank = self.config.reranking_enabled();
         let limit = options["limit"].as_u64().map(|v| v as usize);
         let candidate_limit = if rerank {
             if let Some(maximum) = self.providers.reranker()?.candidate_limit() {
                 Some(
                     limit
                         .unwrap_or(maximum)
-                        .max(self.config["rerankerCandidates"].as_u64().unwrap_or(10) as usize)
+                        .max(self.config.reranker_candidates() as usize)
                         .min(maximum),
                 )
             } else {
@@ -402,10 +410,9 @@ impl Engine {
                         &i.path,
                         &i.data,
                         self.cached_structure(&i.path)?.as_deref(),
-                        (selection.has_regex()
-                            && matches!(i.kind.as_str(), "function" | "symbol-description"))
-                        .then(|| self.source(&i.path))
-                        .transpose()?,
+                        (selection.has_regex() && i.kind.is_code())
+                            .then(|| self.source(&i.path))
+                            .transpose()?,
                     )
                 {
                     allowed.insert(i.id);
@@ -415,16 +422,16 @@ impl Engine {
                 self.neighbors(index_kind, &vector, &allowed, fetch_limit, options)?
             {
                 let item = self.item(id)?;
-                let mut result = if item.kind == "symbol-description" {
+                let mut result = if item.kind == UnitKind::SymbolDescription {
                     let mut symbol = item.data.clone();
                     symbol.as_object_mut().unwrap().remove("calls");
                     json!({"type":"symbol","symbol":symbol,"similarity":similarity})
-                } else if item.kind == "function" {
+                } else if item.kind == UnitKind::Function {
                     json!({"type":"function","function":item.data,"similarity":similarity})
                 } else {
                     json!({"type":item.kind,"chunk":item.data,"similarity":similarity})
                 };
-                if matches!(item.kind.as_str(), "function" | "symbol-description") {
+                if item.kind.is_code() {
                     self.add_scores(&mut result, item, &vector, None)?;
                 }
                 item_results
@@ -491,21 +498,23 @@ impl Engine {
                 })
                 .collect();
             let reranking = ui::counted("Reranking candidates", documents.len());
+            // Identity input: raw reranker fragments (null when absent).
+            let raw = self.config.raw();
             let mut ranking_identity = json!([
                 "rerank-v1",
-                self.config["rerankerProvider"],
-                self.config["rerankerModel"],
-                self.config["rerankerBaseUrl"],
+                raw["rerankerProvider"],
+                raw["rerankerModel"],
+                raw["rerankerBaseUrl"],
                 query,
                 documents
             ]);
             // Preserve native API cache identities; only command rerankers
             // depend on a subprocess invocation.
-            if self.config["rerankerProvider"] == "command" {
+            if raw["rerankerProvider"] == "command" {
                 ranking_identity
                     .as_array_mut()
                     .unwrap()
-                    .push(self.config["rerankerCommand"].clone());
+                    .push(raw["rerankerCommand"].clone());
             }
             let ranking_key = hash(ranking_identity.to_string());
             self.artifacts
@@ -559,7 +568,9 @@ impl Engine {
     }
 
     fn query_key(&self, query: &str, kind: &str, options: &Value) -> Result<String> {
-        let mut config = self.config.clone();
+        // Identity input: the whole canonical JSON (unknown keys included)
+        // is the search-cache key, minus the two refresh-mode flags.
+        let mut config = self.config.raw().clone();
         if let Some(config) = config.as_object_mut() {
             config.remove("noReindex");
             config.remove("forceReindex");
@@ -594,11 +605,11 @@ impl Engine {
         // A query can use a newly prepared plan without publishing its pointer
         // when other readers are active. Cache its actual plan, not the old one.
         if role == "symbols"
-            && let Some(symbols) = self.symbol_index.borrow().as_ref()
+            && let Some(symbols) = self.derived.symbol_index.borrow().as_ref()
         {
             return Some(symbols.index.fingerprint().to_owned());
         }
-        if let Some(index) = self.indexes.borrow().get(role) {
+        if let Some(index) = self.derived.indexes.borrow().get(role) {
             return Some(index.fingerprint().to_owned());
         }
         // The authoritative snapshot pins its plan independently of disposable
@@ -634,7 +645,7 @@ impl Engine {
         options: &Value,
     ) -> Result<Vec<(u64, f64)>> {
         self.ensure_index(kind)?;
-        let indexes = self.indexes.borrow();
+        let indexes = self.derived.indexes.borrow();
         let index = indexes.get(kind).context("Search index unavailable")?;
         let wanted = limit.unwrap_or(eligible_count).min(eligible_count);
         if wanted == 0 {
@@ -680,7 +691,7 @@ impl Engine {
         if let Some((query, key)) = description.zip(item.description_embedding.as_ref()) {
             let similarity = cosine(query, &self.vector(key)?);
             result["descriptionSimilarity"] = json!(similarity);
-            if item.kind == "function" {
+            if item.kind == UnitKind::Function {
                 result["functionDescriptionSimilarity"] = json!(similarity);
             }
         }

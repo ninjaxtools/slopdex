@@ -5,6 +5,7 @@ mod tree;
 pub(crate) use files::print_files;
 pub(crate) use tree::Tree;
 
+use crate::parse::NodeKind;
 use crate::{
     engine,
     filter::Selection,
@@ -213,7 +214,7 @@ fn count_file(
         let mut headings: Vec<_> = structure
             .nodes
             .iter()
-            .filter(|node| node.kind == "heading")
+            .filter(|node| node.kind == NodeKind::Heading)
             .collect();
         headings.sort_unstable_by_key(|node| node.start_byte);
         let heading_ends: HashMap<_, _> = headings
@@ -233,7 +234,7 @@ fn count_file(
             if !selection.symbol_matches_in(path, node, Some(source)) {
                 continue;
             }
-            if node.kind == "heading" {
+            if node.kind == NodeKind::Heading {
                 // As in expanded map output, a heading owns only its immediate
                 // body; unmatched child/sibling headings still delimit it.
                 let end = heading_ends[&node.id];

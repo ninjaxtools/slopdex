@@ -1,5 +1,6 @@
 //! Relative ES-module resolution and lexical, token-level JS/TS edits.
 
+use crate::parse::NodeKind;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
@@ -163,7 +164,8 @@ impl Module {
                                 .nodes
                                 .iter()
                                 .find(|symbol| {
-                                    symbol.kind == "import" && symbol.end_byte == node.end_byte()
+                                    symbol.kind == NodeKind::Import
+                                        && symbol.end_byte == node.end_byte()
                                 })
                                 .map(|symbol| symbol.id),
                             type_only: has_token(node, "type"),
@@ -174,7 +176,7 @@ impl Module {
                     {
                         for symbol in structure.nodes.iter().filter(|symbol| {
                             symbol.parent_id.is_none()
-                                && symbol.kind != "import"
+                                && symbol.kind != NodeKind::Import
                                 && node.start_byte()
                                     <= symbol.declaration_start_byte.unwrap_or(symbol.start_byte)
                                 && symbol.end_byte <= node.end_byte()
@@ -280,7 +282,7 @@ impl Module {
             .nodes
             .iter()
             .filter(|node| {
-                node.kind != "import"
+                node.kind != NodeKind::Import
                     && node.parent_id.is_none()
                     && (node.name == name || node.qualified_name == name)
             })
@@ -1036,7 +1038,7 @@ impl Workspace {
             if range.start <= dependency.start_byte && dependency.end_byte <= range.end {
                 continue;
             }
-            if dependency.kind == "import" {
+            if dependency.kind == NodeKind::Import {
                 let link = module
                     .links
                     .iter()

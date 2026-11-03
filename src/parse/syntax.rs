@@ -46,28 +46,11 @@ pub(super) fn parse_bounded(parser: &mut Parser, source: impl AsRef<[u8]>) -> Op
     parse_bounded_flag(parser, source.as_ref(), PARSE_TIMEOUT, &mut false)
 }
 
-/// The tree-sitter grammar for every name [`super::language_for_path`] returns.
+/// The tree-sitter grammar for a serialized language name. Delegates to the
+/// total registry mapping [`super::LanguageId::grammar`]; unknown names have
+/// no grammar.
 pub(crate) fn grammar(language: &str) -> Option<Language> {
-    Some(match language {
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        "javascript" | "jsx" => tree_sitter_javascript::LANGUAGE.into(),
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        "c" => tree_sitter_c::LANGUAGE.into(),
-        "bash" => tree_sitter_bash::LANGUAGE.into(),
-        "markdown" => tree_sitter_md_025::LANGUAGE.into(),
-        "json" => tree_sitter_json::LANGUAGE.into(),
-        "terraform" => tree_sitter_hcl::LANGUAGE.into(),
-        "yaml" => tree_sitter_yaml::LANGUAGE.into(),
-        "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
-        "xml" => tree_sitter_xml::LANGUAGE_XML.into(),
-        "html" => tree_sitter_html::LANGUAGE.into(),
-        "css" => tree_sitter_css::LANGUAGE.into(),
-        _ => return None,
-    })
+    super::LanguageId::from_name(language).map(super::LanguageId::grammar)
 }
 
 /// Parse `source` with `grammar`, returning the parser for recovery reparses.
@@ -102,11 +85,16 @@ pub(super) fn parse_with(
     Ok((parser, tree))
 }
 
-/// Parse a code file; unknown names fall back to the JavaScript grammar, as
-/// every JS-family language shares it.
-pub(super) fn parse_code(language: &str, path: &str, source: &str) -> Result<(Parser, Tree)> {
-    let grammar = grammar(language).unwrap_or_else(|| tree_sitter_javascript::LANGUAGE.into());
-    parse_with(&grammar, language, path, source)
+/// Parse a code file for a registry language. There is no string-named
+/// entry point: unknown language names fail at
+/// [`super::LanguageId::from_name`] / [`super::LanguageId::for_path`]
+/// instead of being parsed with another language's grammar.
+pub(super) fn parse_code(
+    language: super::LanguageId,
+    path: &str,
+    source: &str,
+) -> Result<(Parser, Tree)> {
+    parse_with(&language.grammar(), language.as_str(), path, source)
 }
 
 pub(super) fn text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
@@ -313,6 +301,25 @@ pub(super) fn shell_owner(mut node: Node<'_>) -> Option<Node<'_>> {
 mod tests {
     use super::*;
     use tree_sitter::Parser;
+
+    #[test]
+    fn parse_code_rejects_unknown_languages_instead_of_falling_back() {
+        // Unknown names have no registry entry, hence no grammar to fall
+        // back to; supported dispatch only ever yields registry languages.
+        for language in ["unknown", "", "cpp", "JavaScript"] {
+            assert_eq!(super::super::LanguageId::from_name(language), None);
+            assert!(grammar(language).is_none());
+        }
+        assert!(
+            parse_code(
+                super::super::LanguageId::JavaScript,
+                "file.js",
+                "function f() {}"
+            )
+            .is_ok()
+        );
+        assert!(parse_code(super::super::LanguageId::Rust, "file.rs", "fn f() {}").is_ok());
+    }
 
     #[test]
     fn parse_deadline_aborts_and_reports_the_timeout() {

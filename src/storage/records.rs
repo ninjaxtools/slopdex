@@ -298,6 +298,8 @@ impl Database {
                 description,
             ) = r?;
             let id = u64::try_from(id).context("Invalid search unit id")?;
+            let kind = UnitKind::from_name(&kind)
+                .with_context(|| format!("Invalid stored search unit kind {kind:?}"))?;
             let mut data: Value = serde_json::from_str(&data)?;
             ensure!(data.is_object(), "Invalid stored search unit");
             data.as_object_mut()
@@ -315,7 +317,7 @@ impl Database {
             } else if data.get("description").is_some() {
                 data["description"] = Value::Null;
             }
-            let embedding = if kind == "symbol-description" {
+            let embedding = if kind == UnitKind::SymbolDescription {
                 None
             } else if let Some(profile) = profile {
                 match data["embeddingInput"].as_str() {

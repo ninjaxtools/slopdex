@@ -11,7 +11,7 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl IndexLock {
     pub(super) fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
@@ -95,7 +95,7 @@ mod tests {
     use super::*;
 
     fn exclusive_available(path: &Path) -> bool {
-        let file = OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)

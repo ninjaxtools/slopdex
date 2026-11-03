@@ -1,6 +1,7 @@
 //! Source-ordered declaration excerpts shared by map and semantic results.
 //! Ranges refer to the original file; signatures deliberately omit bodies.
 
+use crate::parse::{LanguageId, NodeKind};
 use crate::{
     callgraph::{CallGraph, Key, Refs},
     engine,
@@ -397,7 +398,7 @@ pub(crate) fn prepare(
             file.nodes
                 .iter()
                 .map(|&index| &file.structure.nodes[index])
-                .filter(|node| parse::is_callable_kind(&node.kind))
+                .filter(|node| node.kind.is_callable())
                 .map(|node| Key {
                     path: path.clone(),
                     id: node.id,
@@ -610,18 +611,17 @@ pub fn file_header(path: &str) -> String {
     format!("*** {path}\n")
 }
 
-pub fn render(structure: &FileStructure, path: Option<&str>) -> String {
-    render_nodes(&structure.nodes, path)
-}
-
+#[cfg(test)]
 pub fn render_nodes(nodes: &[StructureNode], path: Option<&str>) -> String {
     render_with_detail(nodes, path, Detail::Compact)
 }
 
+#[cfg(test)]
 pub fn render_with_detail(nodes: &[StructureNode], path: Option<&str>, detail: Detail) -> String {
     render_with_source(nodes, path, detail, None)
 }
 
+#[cfg(test)]
 /// Source is the indexed snapshot. It lets Markdown headings separated only by
 /// blank lines share one hunk without folding across omitted prose.
 pub fn render_with_source(
@@ -633,6 +633,7 @@ pub fn render_with_source(
     render_with_structure(nodes, path, detail, source, None)
 }
 
+#[cfg(test)]
 /// `full_structure` is the unfiltered indexed tree. It prevents visibility/kind
 /// filters from making an incomplete container or sibling run look complete.
 pub fn render_with_structure(
@@ -652,6 +653,7 @@ pub fn render_with_structure(
     )
 }
 
+#[cfg(test)]
 pub fn render_with_descriptions(
     nodes: &[StructureNode],
     path: Option<&str>,
@@ -697,7 +699,12 @@ pub fn render_with_hits(
         .collect();
     let full_heading_next: HashMap<_, _> = full_structure
         .into_iter()
-        .flat_map(|structure| structure.nodes.iter().filter(|node| node.kind == "heading"))
+        .flat_map(|structure| {
+            structure
+                .nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::Heading)
+        })
         .collect::<Vec<_>>()
         .windows(2)
         .map(|pair| (pair[0].id, pair[1].id))
@@ -721,7 +728,7 @@ pub fn render_with_hits(
             let child = node.parent_id == Some(previous.id);
             // Fold headings only across gaps after their declarations, not
             // across the section bodies covered by their displayed ranges.
-            let end = if child || previous.kind == "heading" {
+            let end = if child || previous.kind == NodeKind::Heading {
                 declaration_line(previous)
             } else {
                 display_end(previous)
@@ -739,7 +746,7 @@ pub fn render_with_hits(
                             .and_then(|children| children.first())
                             .is_some_and(|first| first.id == node.id)
                     })
-                } else if previous.kind == "heading" && node.kind == "heading" {
+                } else if previous.kind == NodeKind::Heading && node.kind == NodeKind::Heading {
                     full_structure
                         .is_none_or(|_| full_heading_next.get(&previous.id) == Some(&node.id))
                 } else {
@@ -813,8 +820,11 @@ fn append_group(
         if let Some(references) = hits
             .references
             .and_then(|references| references.get(&node.id))
-            && let Some(references) =
-                render_references(&node.language, references.iter().map(String::as_str), depth)
+            && let Some(references) = render_references(
+                node.language.as_str(),
+                references.iter().map(String::as_str),
+                depth,
+            )
         {
             output.push_str(&references);
         }
@@ -828,9 +838,9 @@ fn append_group(
 /// of a Markdown heading, or the first declaration line after Rust attributes.
 fn declaration_line(node: &StructureNode) -> usize {
     let start = node.declaration_start_line.unwrap_or(node.start_line);
-    if node.kind == "heading" {
+    if node.kind == NodeKind::Heading {
         start + node.signature.lines().count().saturating_sub(1)
-    } else if node.language == "rust" {
+    } else if node.language == LanguageId::Rust {
         start
             + node
                 .attributes
@@ -861,8 +871,8 @@ fn shared_comment_gap(
     source_lines: Option<&[&str]>,
 ) -> bool {
     previous.parent_id == node.parent_id
-        && previous.kind != "heading"
-        && node.kind != "heading"
+        && previous.kind != NodeKind::Heading
+        && node.kind != NodeKind::Heading
         && previous.declaration_start_byte.is_some()
         && previous.start_byte == node.start_byte
         && node
@@ -985,7 +995,7 @@ pub fn heading_context(structure: &FileStructure, chunk: &Value) -> Vec<Structur
         .nodes
         .iter()
         .filter(|node| {
-            node.kind == "heading"
+            node.kind == NodeKind::Heading
                 && node.start_line <= start
                 && (start < node.end_line || start == node.end_line && node.end_column > 1)
         })
@@ -1023,7 +1033,11 @@ fn declaration(
         output.push_str(&indent);
         output.push_str(line);
         if index + 1 == line_count {
-            output.push_str(&inline_note(&node.language, annotation, description));
+            output.push_str(&inline_note(
+                node.language.as_str(),
+                annotation,
+                description,
+            ));
         }
         output.push('\n');
     }
@@ -1043,7 +1057,7 @@ fn signature(node: &StructureNode, detail: Detail) -> String {
     } else {
         &node.signature
     };
-    if node.kind == "heading" {
+    if node.kind == NodeKind::Heading {
         return signature.to_owned();
     }
     let mut signature = signature.replace('\r', "\\r").replace('\n', "\\n");
@@ -1145,7 +1159,7 @@ impl<'a> NodeIndex<'a> {
             .chain(name_candidates)
             .copied()
             .filter(|node| {
-                (any_kind || parse::is_callable_kind(&node.kind))
+                (any_kind || node.kind.is_callable())
                     && (qualified == Some(node.qualified_name.as_str())
                         || name == Some(node.name.as_str())
                             && node.start_line <= end
@@ -1330,7 +1344,9 @@ mod tests {
                 id,
                 name: format!("item{id}"),
                 qualified_name: format!("item{id}"),
-                kind: "function".into(),
+                kind: parse::NodeKind::Function,
+                language: parse::LanguageId::Rust,
+                signature: "pub fn".into(),
                 start_byte: id,
                 ..StructureNode::default()
             })
@@ -1557,7 +1573,7 @@ mod tests {
         let selected: Vec<_> = structure
             .nodes
             .into_iter()
-            .filter(|n| n.kind == "method")
+            .filter(|n| n.kind == NodeKind::Method)
             .collect();
         let filtered = render_nodes(&selected, None);
         assert!(
@@ -1872,7 +1888,7 @@ mod tests {
         let parent = structure
             .nodes
             .iter()
-            .find(|node| node.name == "MarkdownChunk" && node.kind == "struct")
+            .find(|node| node.name == "MarkdownChunk" && node.kind == NodeKind::Struct)
             .unwrap();
         let selected: Vec<_> = structure
             .nodes

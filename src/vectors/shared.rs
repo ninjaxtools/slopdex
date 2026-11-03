@@ -230,6 +230,7 @@ impl<'a> Snapshot<'a> {
 }
 
 impl SharedIndex {
+    #[cfg(test)]
     /// Open a worktree snapshot, sharing a suitable immutable base across worktrees.
     ///
     /// The profile and native index contract isolate the global registry. Dimensions
@@ -516,11 +517,13 @@ impl SharedIndex {
         Ok(results)
     }
 
+    #[cfg(test)]
     /// Number of current occurrences, including repeated embeddings.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

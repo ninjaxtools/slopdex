@@ -56,7 +56,9 @@ pub(super) const EXCLUDED_LOCK_FILES: &[&str] = &[
 ];
 
 pub(crate) fn source_paths(root: &Path, index: &Path, config: &Value) -> Result<Vec<String>> {
-    source_paths_subset(root, index, config, None, None, true)
+    // Boundary for the map/lines callers that still hold JSON: parse once
+    // here; typed fields drive the walk below.
+    source_paths_subset(root, index, &Config::from(config.clone()), None, None, true)
 }
 
 /// File-level selection shared by discovery and Git status filtering.
@@ -67,10 +69,10 @@ pub(super) struct Eligibility {
 }
 
 impl Eligibility {
-    pub(super) fn new(config: &Value) -> Result<Self> {
+    pub(super) fn new(config: &Config) -> Result<Self> {
         Ok(Self {
-            include: globs(&config["include"])?,
-            exclude: globs(&config["exclude"])?,
+            include: config.include_globs()?,
+            exclude: config.exclude_globs()?,
             lock_files: globs(&json!(EXCLUDED_LOCK_FILES))?,
         })
     }
@@ -109,16 +111,13 @@ pub(super) fn skippable_walk_error(error: &ignore::Error) -> bool {
 pub(super) fn source_paths_subset(
     root: &Path,
     index: &Path,
-    config: &Value,
+    config: &Config,
     candidates: Option<&HashSet<String>>,
     mut directories: Option<&mut HashSet<String>>,
     warn: bool,
 ) -> Result<Vec<String>> {
     let eligibility = Eligibility::new(config)?;
-    ensure!(
-        config["maxFileSize"].as_u64().unwrap_or(1_048_576) > 0,
-        "maxFileSize must be positive"
-    );
+    ensure!(config.max_file_size() > 0, "maxFileSize must be positive");
     let mut walker = ignore::WalkBuilder::new(root);
     let filter_root = root.to_owned();
     let candidates = candidates.cloned();
@@ -138,7 +137,7 @@ pub(super) fn source_paths_subset(
                 })
                 .collect()
         });
-    let global_path = crate::cache::store_path(config)?;
+    let global_path = crate::cache::store_path(config.raw())?;
     walker
         .hidden(false)
         .require_git(false)
@@ -291,12 +290,15 @@ pub(super) fn file_fingerprint(path: &Path) -> Result<Value> {
     Ok(json!([metadata.len(), modified, identity]))
 }
 
-pub(super) fn selection_contract(config: &Value) -> String {
+pub(super) fn selection_contract(config: &Config) -> String {
+    // Identity input: raw include/exclude Values (null when absent) keep the
+    // persisted contract byte-identical; maxFileSize was always normalized
+    // to its effective number here, which the typed field preserves.
     json!([
         STRUCTURE_PARSER_VERSION,
-        config["include"],
-        config["exclude"],
-        config["maxFileSize"].as_u64().unwrap_or(1_048_576),
+        config.raw()["include"],
+        config.raw()["exclude"],
+        config.max_file_size(),
         EXCLUDED,
         EXCLUDED_LOCK_FILES
     ])
@@ -305,17 +307,14 @@ pub(super) fn selection_contract(config: &Value) -> String {
 
 pub(super) fn indexing_policy(
     root: &Path,
-    config: &Value,
+    config: &Config,
     identity: Option<&str>,
     directories: &HashSet<String>,
 ) -> Result<String> {
     // Validate even on the unchanged fast path.
-    globs(&config["include"])?;
-    globs(&config["exclude"])?;
-    ensure!(
-        config["maxFileSize"].as_u64().unwrap_or(1_048_576) > 0,
-        "maxFileSize must be positive"
-    );
+    config.include_globs()?;
+    config.exclude_globs()?;
+    ensure!(config.max_file_size() > 0, "maxFileSize must be positive");
     let mut external = BTreeMap::new();
     // Effective ignore inputs can themselves be Git-ignored. Remember walked
     // directories and stat only their policy files, not every source file.
