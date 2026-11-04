@@ -2,7 +2,7 @@
 use super::*;
 use crate::storage::FaqEntry;
 
-pub(super) const SYSTEM: &str = "Explain the existing code and documentation relevant to the user's task using only the supplied search context. Do not propose an implementation. If there is insufficient context, say so in the description. Respond with a single JSON object and no other text, in exactly this shape: {\"description\": \"<free-text explanation>\", \"references\": [{\"path\": \"<path>\", \"symbol\": \"<qualified symbol name>\"}]}. List in references only the files and symbols from the supplied search context that are relevant to the task, using paths and symbol names exactly as shown there. Omit \"symbol\" for a whole-file reference. Do not invent paths, symbols, or line numbers; line numbers are added for you.";
+pub(super) const SYSTEM: &str = "Explain the existing code and documentation relevant to the user's task using the supplied search context and any additional workspace sources you inspect. Do not propose an implementation. If there is insufficient context, say so in the description. Respond with a single JSON object and no other text, in exactly this shape: {\"description\": \"<free-text explanation>\", \"references\": [{\"path\": \"<path>\", \"symbol\": \"<qualified symbol name>\"}]}. List in references the files and symbols relevant to the task, including sources you discover independently of the supplied context. Use workspace-relative paths and exact symbol names. Omit \"symbol\" for a whole-file reference. Do not invent paths, symbols, or line numbers; references are verified and line numbers are added for you.";
 
 pub(crate) fn threshold(config: &Value, options: &Value) -> Result<f64> {
     let value = options
@@ -195,13 +195,16 @@ impl Engine {
         files.iter().all(|(path, expected)| {
             self.files
                 .get(path)
-                .is_some_and(|file| file.hash == *expected)
+                .is_none_or(|file| file.hash == *expected)
                 && checked
                     .entry(path.clone())
                     .or_insert_with(|| {
                         let path = self.root.join(path);
                         let metadata = fs::symlink_metadata(&path).ok()?;
                         if !metadata.is_file() {
+                            return None;
+                        }
+                        if !path.canonicalize().ok()?.starts_with(&self.root) {
                             return None;
                         }
                         let max_size = self.config.max_file_size();
@@ -269,7 +272,8 @@ impl Engine {
             "FAQ question exceeds the prompt size limit"
         );
         // The rendered search text is LLM context only: it is neither returned
-        // nor cached with the answer. Its files/symbols bound what may be cited.
+        // nor cached with the answer. Citations may also name sources the agent
+        // discovers independently; validate those against the workspace below.
         // Reserve room for the truncation marker; whole trailing file sections
         // beyond the remaining budget are omitted during rendering instead.
         let search_budget = FAQ_PROMPT_BYTES - prompt.len() - marker.len();
@@ -346,12 +350,83 @@ impl Engine {
             response
         };
         let (description, cited) = parse_answer(&response);
-        let (references, files) = match_references(&cited, &context_files, &symbols);
+        let (references, files) = self.verify_faq_references(&cited, &symbols)?;
         Ok((
             json!({"query":query,"question":query,"description":description,"references":references,
             "omitted":results.omitted,"limit":results.limit}),
             files,
         ))
+    }
+
+    fn verify_faq_references(
+        &self,
+        cited: &[Cited],
+        rendered: &[crate::cli::RenderedSymbol],
+    ) -> Result<(Vec<Value>, BTreeMap<String, String>)> {
+        let mut normalized = Vec::new();
+        let mut files = BTreeMap::new();
+        let mut symbols = Vec::new();
+        let mut checked = HashSet::new();
+        for citation in cited {
+            let Ok(path) = normalize_path(&self.root, citation.path.trim()) else {
+                continue;
+            };
+            normalized.push(Cited {
+                path: path.clone(),
+                symbol: citation.symbol.clone(),
+            });
+            if !checked.insert(path.clone()) {
+                continue;
+            }
+            let structure = if let Some(file) = self.files.get(&path) {
+                // Preserve saved-snapshot semantics, including --no-reindex.
+                // Freshness is checked separately before publishing/reusing FAQ entries.
+                files.insert(path.clone(), file.hash.clone());
+                self.cached_structure(&path)?
+            } else {
+                // The agent may inspect a file that is not indexed. Read only
+                // regular, bounded workspace sources, never a symlink escape.
+                let absolute = self.root.join(&path);
+                if !fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.is_file())
+                    || !absolute
+                        .canonicalize()
+                        .is_ok_and(|resolved| resolved.starts_with(&self.root))
+                {
+                    continue;
+                }
+                let Ok(source) = read_source(&self.root, &path, self.config.max_file_size()) else {
+                    continue;
+                };
+                files.insert(path.clone(), hash(&source));
+                parse::parse(&path, &source)
+                    .ok()
+                    .map(|parsed| Arc::new(parsed.structure))
+            };
+            if let Some(structure) = structure {
+                symbols.extend(
+                    structure
+                        .nodes
+                        .iter()
+                        .map(|node| crate::cli::RenderedSymbol {
+                            path: path.clone(),
+                            qualified_name: node.qualified_name.clone(),
+                            name: node.name.clone(),
+                            start_line: node.start_line,
+                            end_line: node.end_line,
+                        }),
+                );
+            } else {
+                // Older offline indexes may lack current structure but still
+                // carry declaration metadata in their rendered search units.
+                symbols.extend(
+                    rendered
+                        .iter()
+                        .filter(|symbol| symbol.path == path)
+                        .cloned(),
+                );
+            }
+        }
+        Ok(match_references(&normalized, &files, &symbols))
     }
 }
 
@@ -415,8 +490,8 @@ fn parse_answer(raw: &str) -> (String, Vec<Cited>) {
     (description, references)
 }
 
-/// Keep only citations present in the rendered search context, in cited
-/// order and without duplicates. Symbol citations gain the rendered line
+/// Keep only citations present in the verified files and symbols, in cited
+/// order and without duplicates. Symbol citations gain the verified line
 /// range and canonical qualified name; the returned file hashes (for exactly
 /// the kept references) drive FAQ cache invalidation.
 fn match_references(

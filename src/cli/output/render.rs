@@ -84,7 +84,8 @@ pub(super) fn score_details(row: &Value) -> String {
 }
 
 /// One declaration actually rendered into map/search text, with the line
-/// range shown for it. FAQ validates LLM-cited symbols against these.
+/// range shown for it. Also used as fallback metadata for FAQ citations when
+/// an older index lacks current structure.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RenderedSymbol {
     pub path: String,

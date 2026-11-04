@@ -1101,17 +1101,19 @@ budget are omitted and marked. Complete file source is not appended apart
 from the selected code bodies and Markdown excerpts above.
 The instruction asks for an explanation of existing code/docs, not an
 implementation proposal, as a single JSON object holding a free-text
-`description` and a `references` list of the files and symbols from the
-supplied context that the model considers relevant (a path, plus a symbol name
+`description` and a `references` list of the files and symbols that the model
+considers relevant, including workspace sources it inspects independently
+of the supplied context (a path, plus a symbol name
 for symbol references).
 
 Context uses the indexed snapshot. Provider retries/failover still apply.
-Cited references are validated against the rendered context: a file citation
-must name a rendered file, and a symbol citation must name a rendered
-declaration (including other declarations in a candidate file's full map,
-expanded callers/callees, and reference-comment targets)
-in that file, matched by qualified or unqualified name. Citations that do not
-match are silently dropped, as are any line numbers the model supplies.
+Cited references are validated against workspace files and declarations, not
+restricted to the rendered context or search filters. Indexed files use the
+saved snapshot; unindexed files are read from disk within `maxFileSize`.
+A symbol citation must name a declaration in that file, matched by qualified
+or unqualified name. Missing or unverifiable files/symbols and paths outside
+the workspace are dropped, as are any line numbers the model supplies.
+This verifies reference locations, not whether they support the model's claims.
 Responses that are not the requested JSON object are treated as a plain
 description with no references. Reranker order informs the prompt.
 JSON output contains `query` (the current question), `question` (the original
@@ -1120,7 +1122,7 @@ the cosine similarity of the vector-search match that produced the answer, or
 `1` when the answer was generated rather than matched. Each
 kept reference is `{"path": ...}` for a whole file or
 `{"path": ..., "symbol": <canonical qualified name>, "startLine": ..., "endLine": ...}`
-with the line range taken from the rendered context, in cited order without
+with the line range taken from source declarations, in cited order without
 duplicates.
 Text output labels the generated prose `Explanation (score=...)` and follows it
 with `References`, one location per line (`path`, or `path:start-end:symbol` in
@@ -1155,8 +1157,9 @@ FAQ hits reuse the original references without searching, reranking, or calling
 the LLM again; a new question may still require a query embedding. Entries persist
 across restarts and unrelated snapshot changes. Embedding/LLM profiles and search
 filters/context options isolate answers; changing only the FAQ cutoff does not.
-Every referenced file must still match both the indexed and on-disk content
-hash; changes to context files the answer did not cite do not invalidate it.
+Every referenced file must still match its on-disk content hash and, when
+indexed, its indexed hash; changes to context files the answer did not cite
+do not invalidate it.
 Changes, deletions, and renames of referenced files invalidate cached answers,
 but their entries remain as canonical-question anchors. A matching paraphrase refreshes the same entry using its **original
 question**, not a newly worded prompt. `query` reports the incoming question;
@@ -1165,7 +1168,7 @@ are updated in place, without accumulating duplicates for paraphrases.
 Live files are read for this
 validation even with `--no-reindex`; that flag still uses the saved snapshot on a
 miss, but a stale snapshot cannot publish a reusable FAQ entry. Answers whose
-references match no context file are not added to the FAQ index; an existing
+references match no verifiable workspace file are not added to the FAQ index; an existing
 stale question anchor is retained until it can be refreshed with valid
 referenced-file dependencies. The FAQ table is created on demand in
 existing schema-4 indexes; no rebuild is needed. A live-state reset clears FAQ entries.

@@ -95,6 +95,7 @@ struct Request {
 #[derive(Default)]
 struct MockState {
     requests: Vec<Request>,
+    faq_references: Option<Vec<Value>>,
     fail_embedding_containing: Option<String>,
     errors: Vec<String>,
     concurrent: Option<Arc<ConcurrentRequests>>,
@@ -387,8 +388,11 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
                     "answer grounded in indexed context: {}",
                     slopdex::hash(body["input"].to_string())
                 );
-                let answer =
-                    json!({"description": description, "references": faq_citations(prompt)});
+                let references = state
+                    .faq_references
+                    .clone()
+                    .unwrap_or_else(|| faq_citations(prompt));
+                let answer = json!({"description": description, "references": references});
                 (200, json!({"output_text": answer.to_string()}))
             } else {
                 let prefix = if prompt.starts_with("Describe the purpose") {

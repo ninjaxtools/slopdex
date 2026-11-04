@@ -96,7 +96,7 @@ pub(crate) use super::render::RenderedSymbol;
 
 /// FAQ uses expanded search presentation over full candidate-file maps;
 /// dependencies include traversal and reference targets, and rendered symbols
-/// are what the LLM may later cite. Whole trailing file sections beyond
+/// provide fallback metadata for validating citations. Whole trailing file sections beyond
 /// `byte_budget` are omitted (reported by the final flag).
 pub(crate) fn faq_search_context(
     engine: &Engine,

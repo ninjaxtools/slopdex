@@ -875,3 +875,103 @@ fn faq_context_includes_full_file_maps_and_seed_code() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn faq_verifies_independently_discovered_references_and_tracks_their_freshness() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(
+        "entry.ts",
+        "export function entry() { /* VECTOR_EAST */ return 1; }\n",
+    )?;
+    repo.write("other.ts", "export class Api {\n  run() { return 2; }\n}\n")?;
+    repo.write("unindexed.rs", "fn discovered() {}\n")?;
+    repo.write("notes.txt", "Agent-discovered documentation.\n")?;
+    let outside = tempfile::tempdir()?;
+    let outside_path = outside.path().join("outside.rs");
+    fs::write(&outside_path, "fn outside() {}\n")?;
+    mock.state.lock().unwrap().faq_references = Some(vec![
+        json!({"path":"./other.ts","symbol":"run()","startLine":999}),
+        json!({"path":"other.ts","symbol":"Api.run"}),
+        json!({"path":"other.ts","symbol":"invented"}),
+        json!({"path":"gone.rs"}),
+        json!({"path":"notes.txt"}),
+        json!({"path":"unindexed.rs","symbol":"discovered"}),
+        json!({"path":"notes.txt","symbol":"invented"}),
+        json!({"path":"entry.ts","symbol":"invented"}),
+        json!({"path":"../outside.rs"}),
+        json!({"path":outside_path}),
+        json!({"path":"."}),
+    ]);
+    let mut config = mock.config();
+    config["exclude"] = json!(["unindexed.rs"]);
+    let options = json!({"glob":"entry.ts","minSimilarity":-1,"callers":0,"callees":0,
+        "expandCallers":0,"expandCallees":0,"refs":"none"});
+    let mut engine = repo.open(&config)?;
+    engine.refresh()?;
+    let answer = engine.faq("east", &options)?;
+    let node = engine
+        .presentation_structure("other.ts")?
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|node| node.qualified_name == "Api.run")
+        .unwrap();
+    assert_eq!(
+        answer["references"],
+        json!([
+            {"path":"other.ts","symbol":"Api.run","startLine":node.start_line,"endLine":node.end_line},
+            {"path":"notes.txt"},
+            {"path":"unindexed.rs","symbol":"discovered","startLine":1,"endLine":1}
+        ])
+    );
+    let requests = mock.requests("/responses");
+    let prompt = description_prompt(&requests[0].body);
+    for path in ["other.ts", "notes.txt", "unindexed.rs"] {
+        assert!(
+            !prompt.contains(path),
+            "independent reference was in context: {prompt}"
+        );
+    }
+    let files: String = repo
+        .db()?
+        .query_row("SELECT files FROM faq_entries", [], |row| row.get(0))?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&files)?
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["notes.txt", "other.ts", "unindexed.rs"]
+    );
+    drop(engine);
+    let mut engine = repo.open(&config)?;
+    assert_eq!(engine.faq("east", &options)?, answer);
+    assert_eq!(mock.requests("/responses").len(), 1);
+
+    // Unindexed sources also invalidate cached answers. The prompt is unchanged,
+    // so paid raw responses are reused but their citations are revalidated.
+    repo.write("unindexed.rs", "\nfn discovered() {}\n")?;
+    assert_eq!(
+        engine.index_entries("faq", &json!({}))?[0]["data"]["valid"],
+        false
+    );
+    let shifted = engine.faq("east", &options)?;
+    assert_eq!(shifted["references"][2]["startLine"], 2);
+    assert_eq!(mock.requests("/responses").len(), 1);
+    repo.write("unindexed.rs", "fn renamed() {}\n")?;
+    let renamed = engine.faq("east", &options)?;
+    assert_eq!(renamed["references"].as_array().unwrap().len(), 2);
+    assert_eq!(mock.requests("/responses").len(), 1);
+
+    // An indexed symbol outside the context is checked again after refresh.
+    repo.write("other.ts", "export class Api { renamed() { return 3; } }\n")?;
+    engine.refresh()?;
+    let changed = engine.faq("east", &options)?;
+    assert_eq!(changed["references"], json!([{"path":"notes.txt"}]));
+    assert_eq!(mock.requests("/responses").len(), 1);
+    fs::remove_file(repo.root.join("notes.txt"))?;
+    assert_eq!(engine.faq("east", &options)?["references"], json!([]));
+    assert_eq!(mock.requests("/responses").len(), 1);
+    Ok(())
+}
