@@ -657,6 +657,9 @@ pub(super) struct FaqArgs {
     /// Reuse question/answer cosine matches strictly above this value (config faqThreshold; default: 0.7)
     #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
     pub(super) faq_threshold: Option<f64>,
+    /// Reuse a stale entry's question only above this cosine score (config faqRegenerationThreshold; default: 0.8)
+    #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
+    pub(super) faq_regeneration_threshold: Option<f64>,
 }
 
 #[derive(Debug, Args)]

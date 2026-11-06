@@ -104,6 +104,135 @@ fn faq_cutoff_is_configurable_strict_and_does_not_change_context_identity() -> R
 }
 
 #[test]
+fn faq_regeneration_uses_only_strong_stale_question_anchors() -> Result<()> {
+    let mock = Mock::start()?;
+    // (stored question, incoming question, match cutoff, configured regeneration
+    // cutoff, per-call override, reuse original). Test single and multi-answer paths.
+    for (original, query, match_cutoff, configured, override_cutoff, reuse) in [
+        (
+            "VECTOR_MID original",
+            "VECTOR_NORTH weak",
+            0.5,
+            None,
+            None,
+            false,
+        ),
+        ("east original", "east strong", 0.7, None, None, true),
+        (
+            "east original",
+            "VECTOR_MID weak",
+            0.7,
+            Some(0.9),
+            None,
+            false,
+        ),
+        (
+            "east original",
+            "VECTOR_MID strong",
+            0.7,
+            Some(0.9),
+            Some(0.7),
+            true,
+        ),
+        (
+            "east original",
+            "VECTOR_MID weak",
+            0.7,
+            Some(0.7),
+            Some(0.9),
+            false,
+        ),
+    ] {
+        for limit in [json!(1), json!("off")] {
+            let repo = Repo::new()?;
+            let source = function("selected", "VECTOR_EAST");
+            repo.write("code.rs", &source)?;
+            let mut config = mock.config();
+            config["artifactCachePath"] = json!(repo.home.join("artifacts.sqlite"));
+            if let Some(cutoff) = configured {
+                config["faqRegenerationThreshold"] = json!(cutoff);
+            }
+            let mut engine = repo.open(&config)?;
+            engine.refresh()?;
+            let options =
+                json!({"glob":"code.rs", "minSimilarity":-1, "faqThreshold":match_cutoff});
+            engine.faq(original, &options)?;
+            let mut options = options;
+            options["faqLimit"] = limit;
+            if let Some(cutoff) = override_cutoff {
+                options["faqRegenerationThreshold"] = json!(cutoff);
+            }
+            let single = |result: Value| {
+                if result.is_array() {
+                    result[0].clone()
+                } else {
+                    result
+                }
+            };
+            // The regeneration policy does not affect valid-answer matching or
+            // isolate entries when supplied only on the later request.
+            let calls = mock.requests("/responses").len();
+            assert_eq!(single(engine.faq(query, &options)?)["question"], original);
+            assert_eq!(mock.requests("/responses").len(), calls);
+            repo.write("code.rs", &source.replace("42", "43"))?;
+            engine.refresh()?;
+            let answer = single(engine.faq(query, &options)?);
+            let expected = if reuse { original } else { query };
+            assert_eq!(answer["question"], expected, "{options}");
+            assert_eq!(answer["query"], query);
+            assert_eq!(entries(&repo)?, if reuse { 1 } else { 2 });
+            let requests = mock.requests("/responses");
+            assert_eq!(requests.len(), calls + 1);
+            assert!(
+                description_prompt(&requests.last().unwrap().body)
+                    .starts_with(&format!("Task: {expected}\n"))
+            );
+            let stored: String = repo.db()?.query_row(
+                "SELECT question FROM faq_entries ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(stored, expected);
+            // The published question embedding belongs to the generated question.
+            assert_eq!(
+                single(engine.faq(expected, &options)?)["question"],
+                expected
+            );
+            assert_eq!(mock.requests("/responses").len(), calls + 1);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn faq_regeneration_cutoff_is_strict() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let source = function("selected", "VECTOR_EAST");
+    repo.write("code.rs", &source)?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let mut options = json!({"glob":"code.rs", "minSimilarity":-1});
+    engine.faq("east original", &options)?;
+    let hit = engine.faq("VECTOR_MID incoming", &options)?;
+    // Use the actual vector-search score to avoid assumptions about float rounding.
+    options["faqRegenerationThreshold"] = hit["score"].clone();
+    repo.write("code.rs", &source.replace("42", "43"))?;
+    engine.refresh()?;
+    assert_eq!(
+        engine.faq("VECTOR_MID incoming", &options)?["question"],
+        "VECTOR_MID incoming"
+    );
+    let calls = mock.count();
+    for value in [json!(2), json!(-2), json!("0.8"), json!(null)] {
+        options["faqRegenerationThreshold"] = value;
+        assert!(engine.faq("east original", &options).is_err());
+    }
+    assert_eq!(mock.count(), calls);
+    Ok(())
+}
+
+#[test]
 fn faq_reports_scores_and_limits_ranked_vector_matches() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
@@ -432,15 +561,53 @@ fn faq_cli_replaces_describe_and_threshold_override_reuses_saved_references() ->
         "text output must not include map excerpts: {text}"
     );
     assert!(!repo.cli(&["describe", "east"])?.status.success());
-    for value in ["NaN", "2", "-2", "0.8-0.9"] {
+    for flag in ["--faq-threshold", "--faq-regeneration-threshold"] {
+        for value in ["NaN", "2", "-2", "0.8-0.9"] {
+            assert!(!repo.cli(&["faq", "east", flag, value])?.status.success());
+        }
+    }
+    repo.cli_json(&["config", "set", "faqThreshold", "0.75"])?;
+    Ok(())
+}
+
+#[test]
+fn faq_cli_configures_and_overrides_regeneration_without_changing_matching() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    let source = function("selected", "VECTOR_EAST");
+    repo.write("code.rs", &source)?;
+    repo.cli_json(&["config", "set", "faqRegenerationThreshold", "0.9"])?;
+    for invalid in ["2", "-2", "null", "\"0.8\""] {
         assert!(
             !repo
-                .cli(&["faq", "east", "--faq-threshold", value])?
+                .cli(&["config", "set", "faqRegenerationThreshold", invalid])?
                 .status
                 .success()
         );
     }
-    repo.cli_json(&["config", "set", "faqThreshold", "0.75"])?;
+    repo.cli_json(&["faq", "east original", "--threshold", "-1"])?;
+    repo.write("code.rs", &source.replace("42", "43"))?;
+    let refreshed = repo.cli_json(&[
+        "faq",
+        "VECTOR_MID paraphrase",
+        "--threshold",
+        "-1",
+        "--faq-regeneration-threshold",
+        "0.7",
+    ])?;
+    assert_eq!(refreshed["question"], "east original");
+    // The configured 0.9 regeneration cutoff still allows a valid 0.8 match.
+    let calls = mock.requests("/responses").len();
+    assert_eq!(
+        repo.cli_json(&["faq", "VECTOR_MID paraphrase", "--threshold", "-1"])?["question"],
+        "east original"
+    );
+    assert_eq!(mock.requests("/responses").len(), calls);
+    repo.write("code.rs", &source.replace("42", "44"))?;
+    let regenerated = repo.cli_json(&["faq", "VECTOR_MID paraphrase", "--threshold", "-1"])?;
+    assert_eq!(regenerated["question"], "VECTOR_MID paraphrase");
+    assert_eq!(entries(&repo)?, 2);
     Ok(())
 }
 

@@ -23,6 +23,8 @@ use crate::limits::{self, ResultLimit};
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 /// Default `faqThreshold` (strict-greater comparison lives in `engine::faq`).
 pub const DEFAULT_FAQ_THRESHOLD: f64 = 0.7;
+/// Default cutoff for reusing a stale FAQ entry's question during regeneration.
+pub const DEFAULT_FAQ_REGENERATION_THRESHOLD: f64 = 0.8;
 /// Default `rerankerCandidates` when absent or not an unsigned integer.
 pub const DEFAULT_RERANKER_CANDIDATES: u64 = 10;
 
@@ -47,6 +49,7 @@ pub struct Config {
     embedding_is_ollama: bool,
     default_limit: ResultLimit,
     faq_threshold: Option<f64>,
+    faq_regeneration_threshold: Option<f64>,
     reranking_enabled: bool,
     reranker_candidates: u64,
     no_reindex: bool,
@@ -66,6 +69,10 @@ impl std::fmt::Debug for Config {
             .field("embedding_parallelism", &self.embedding_parallelism)
             .field("embedding_is_ollama", &self.embedding_is_ollama)
             .field("faq_threshold", &self.faq_threshold)
+            .field(
+                "faq_regeneration_threshold",
+                &self.faq_regeneration_threshold,
+            )
             .field("reranking_enabled", &self.reranking_enabled)
             .field("reranker_candidates", &self.reranker_candidates)
             .field("no_reindex", &self.no_reindex)
@@ -119,6 +126,10 @@ impl Config {
                 .get("faqThreshold")
                 .and_then(Value::as_f64)
                 .filter(|value| value.is_finite() && (-1.0..=1.0).contains(value)),
+            faq_regeneration_threshold: raw
+                .get("faqRegenerationThreshold")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && (-1.0..=1.0).contains(value)),
             reranking_enabled: flag(raw, "rerankingEnabled"),
             reranker_candidates: raw
                 .get("rerankerCandidates")
@@ -137,7 +148,7 @@ impl Config {
 
     /// Parse and validate a configuration value at a boundary. Error strings
     /// and order match the previous Engine-open validation exactly: numeric
-    /// limits (including `defaultLimit`) first, then `faqThreshold`.
+    /// limits (including `defaultLimit`) first, then FAQ thresholds.
     pub fn from_value(raw: Value) -> Result<Self> {
         let config = Self::parse_typed(&raw);
         config.validate()?;
@@ -147,12 +158,14 @@ impl Config {
     /// The validation previously open-coded in `Engine::open_internal`.
     pub fn validate(&self) -> Result<()> {
         limits::validate_config(&self.raw)?;
-        // Same check (and message) as engine::faq::threshold on config only.
-        if let Some(value) = self.raw.get("faqThreshold") {
-            value
-                .as_f64()
-                .filter(|number| number.is_finite() && (-1.0..=1.0).contains(number))
-                .context("faqThreshold must be a finite number between -1 and 1")?;
+        // Same checks (and messages) as engine::faq on config only.
+        for key in ["faqThreshold", "faqRegenerationThreshold"] {
+            if let Some(value) = self.raw.get(key) {
+                value
+                    .as_f64()
+                    .filter(|number| number.is_finite() && (-1.0..=1.0).contains(number))
+                    .with_context(|| format!("{key} must be a finite number between -1 and 1"))?;
+            }
         }
         Ok(())
     }
@@ -263,6 +276,25 @@ impl Config {
         Ok(self.faq_threshold.unwrap_or(DEFAULT_FAQ_THRESHOLD))
     }
 
+    /// Regeneration cutoff: only matches strictly above this value reuse a
+    /// stale entry's question. Per-call options override the configured value.
+    pub fn faq_regeneration_threshold(&self, options: &Value) -> Result<f64> {
+        if let Some(value) = options.get("faqRegenerationThreshold") {
+            return value
+                .as_f64()
+                .filter(|number| number.is_finite() && (-1.0..=1.0).contains(number))
+                .context("faqRegenerationThreshold must be a finite number between -1 and 1");
+        }
+        if self.raw.get("faqRegenerationThreshold").is_some()
+            && self.faq_regeneration_threshold.is_none()
+        {
+            bail!("faqRegenerationThreshold must be a finite number between -1 and 1");
+        }
+        Ok(self
+            .faq_regeneration_threshold
+            .unwrap_or(DEFAULT_FAQ_REGENERATION_THRESHOLD))
+    }
+
     pub fn reranking_enabled(&self) -> bool {
         self.reranking_enabled
     }
@@ -324,6 +356,7 @@ mod tests {
         assert_eq!(config.parallelism()?, 10);
         assert_eq!(config.embedding_parallelism()?, 10);
         assert_eq!(config.faq_threshold(&json!({}))?, 0.7);
+        assert_eq!(config.faq_regeneration_threshold(&json!({}))?, 0.8);
         assert_eq!(config.reranker_candidates(), 10);
         assert!(!config.reranking_enabled() && !config.no_reindex() && !config.force_reindex());
         assert!(config.artifact_cache_path().is_none());
@@ -336,7 +369,8 @@ mod tests {
         let config = Config::from_value(json!({
             "maxFileSize": 2048, "include": ["src/**"], "exclude": ["gen/**"],
             "parallelism": 4, "embeddingProvider": "ollama", "defaultLimit": "none",
-            "faqThreshold": 0.25, "rerankingEnabled": true, "rerankerCandidates": 33,
+            "faqThreshold": 0.25, "faqRegenerationThreshold": 0.9,
+            "rerankingEnabled": true, "rerankerCandidates": 33,
             "artifactCachePath": "/tmp/store.sqlite",
         }))?;
         assert_eq!(config.max_file_size(), 2048);
@@ -349,6 +383,11 @@ mod tests {
         assert!(config.embedding_is_ollama());
         assert_eq!(config.faq_threshold(&json!({}))?, 0.25);
         assert_eq!(config.faq_threshold(&json!({"faqThreshold": -0.5}))?, -0.5);
+        assert_eq!(config.faq_regeneration_threshold(&json!({}))?, 0.9);
+        assert_eq!(
+            config.faq_regeneration_threshold(&json!({"faqRegenerationThreshold": 0.75}))?,
+            0.75
+        );
         assert!(config.reranking_enabled());
         assert_eq!(config.reranker_candidates(), 33);
         assert_eq!(
@@ -357,6 +396,30 @@ mod tests {
         );
         assert_eq!(config.resolve_limit(&json!({}))?.count(), None);
         assert_eq!(config.resolve_limit(&json!({"limit": 3}))?.count(), Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn faq_regeneration_threshold_validates_config_and_options() -> Result<()> {
+        let config = Config::default();
+        for value in [json!(2), json!(-2), json!("0.8"), json!(null)] {
+            let raw = json!({"faqRegenerationThreshold": value});
+            assert!(Config::from_value(raw.clone()).is_err());
+            assert!(
+                Config::from(raw.clone())
+                    .faq_regeneration_threshold(&json!({}))
+                    .is_err()
+            );
+            assert!(config.faq_regeneration_threshold(&raw).is_err());
+        }
+        for value in [-1.0, 1.0] {
+            let raw = json!({"faqRegenerationThreshold": value});
+            assert_eq!(
+                Config::from_value(raw.clone())?.faq_regeneration_threshold(&json!({}))?,
+                value
+            );
+            assert_eq!(config.faq_regeneration_threshold(&raw)?, value);
+        }
         Ok(())
     }
 

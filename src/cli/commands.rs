@@ -172,6 +172,9 @@ fn faq(session: &mut Session, args: &FaqArgs, out: &mut impl Write) -> Result<()
     if let Some(threshold) = args.faq_threshold {
         options["faqThreshold"] = json!(threshold);
     }
+    if let Some(threshold) = args.faq_regeneration_threshold {
+        options["faqRegenerationThreshold"] = json!(threshold);
+    }
     // For faq, --limit counts the ranked FAQ questions returned, not the
     // source-search results feeding generation (those keep using the
     // configured defaultLimit).

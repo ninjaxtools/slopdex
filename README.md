@@ -259,6 +259,8 @@ First a semantic search selects the relevant files and symbols for the question.
 
 The result is indexed under the embeddings of the original question as well as the LLM response. Any subsequent questions will be use the index to try and get a match above the configured threshold (0.7 by default, configured with `--faq-threshold`), and reuse the response. Each answer reports the vector-search `score` of its match (a freshly generated answer scores 1), and `--limit N` returns up to N ranked FAQ matches instead of just the best one (`--limit off` returns all of them).
 
+When a matched answer is invalidated, regeneration reuses its original question only if the match score is strictly above `faqRegenerationThreshold` (default `0.8`, overridden with `--faq-regeneration-threshold`). Otherwise it answers the incoming question directly. The existing matching threshold is unchanged.
+
 Changes in the referenced files invalidate the FAQ answer and repeat the LLM request.
 
 ## Inspect and export indexes

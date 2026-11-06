@@ -36,6 +36,7 @@ const ADVANCED_KEYS: &[&str] = &[
     "artifactS3",
     "symbolDimensions",
     "faqThreshold",
+    "faqRegenerationThreshold",
     "jinaTask",
     "providerTimeoutMs",
     "providerMaxRetries",
@@ -397,6 +398,7 @@ fn validate_config(config: &Value) -> Result<()> {
     ensure!(config.is_object(), "config must be a JSON object");
     crate::limits::validate_config(config)?;
     crate::engine::faq::threshold(config, &json!({}))?;
+    crate::Config::from(config.clone()).faq_regeneration_threshold(&json!({}))?;
     cross_search_exclusions(config)?;
     ensure!(
         config.get("descriptionsEnabled").is_none(),

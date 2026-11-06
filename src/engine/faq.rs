@@ -37,6 +37,7 @@ impl Engine {
     pub fn faq(&self, query: &str, options: &Value) -> Result<Value> {
         self.reporting(|| {
             let cutoff = self.config.faq_threshold(options)?;
+            let regeneration_cutoff = self.config.faq_regeneration_threshold(options)?;
             let faq_limit = faq_limit(options)?;
             let single = faq_limit == limits::ResultLimit::Count(1);
             ensure!(!query.trim().is_empty(), "FAQ question must not be empty");
@@ -62,9 +63,10 @@ impl Engine {
                 let context = context
                     .as_object_mut()
                     .context("FAQ options must be an object")?;
-                // The cutoff and the number of answers returned do not change
-                // what an answer is generated from, so neither isolates entries.
+                // Reuse policy and the number of answers returned do not change
+                // the generation context, so they do not isolate entries.
                 context.remove("faqThreshold");
+                context.remove("faqRegenerationThreshold");
                 context.remove("faqLimit");
             }
             context["limit"] = self.config.resolve_limit(options)?.value();
@@ -131,7 +133,7 @@ impl Engine {
                 }
             } else {
                 // Stale entries are never served; with no valid match the best
-                // stale entry below still anchors a regenerated answer.
+                // stale entry below may still anchor a regenerated answer.
                 let mut checked = HashMap::new();
                 let mut results = Vec::new();
                 for (entry, score) in &ranked {
@@ -150,7 +152,11 @@ impl Engine {
                     return Ok(json!(results));
                 }
             }
-            let matched = matched.map(|(entry, _)| entry);
+            // A weaker match may serve a valid cached answer, but must not
+            // replace the incoming question when generating a fresh answer.
+            let matched = matched
+                .filter(|(_, score)| *score > regeneration_cutoff)
+                .map(|(entry, _)| entry);
 
             let question = matched.map_or(query, |entry| entry.question.as_str());
             let question_embedding =

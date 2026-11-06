@@ -1151,7 +1151,7 @@ prints each matched question with its answer). A limit above `1` on a miss
 still generates only one new answer, returned as a one-element array with
 `score` `1`. The FAQ `--limit` does not cap the source search behind a
 generated answer; that search keeps using `defaultLimit`. Changing only the
-FAQ cutoff or limit does not isolate cached entries.
+FAQ matching/regeneration cutoffs or limit does not isolate cached entries.
 
 FAQ hits reuse the original references without searching, reranking, or calling
 the LLM again; a new question may still require a query embedding. Entries persist
@@ -1161,10 +1161,15 @@ Every referenced file must still match its on-disk content hash and, when
 indexed, its indexed hash; changes to context files the answer did not cite
 do not invalidate it.
 Changes, deletions, and renames of referenced files invalidate cached answers,
-but their entries remain as canonical-question anchors. A matching paraphrase refreshes the same entry using its **original
-question**, not a newly worded prompt. `query` reports the incoming question;
-`question` reports the canonical one used for search and the LLM request. Entries
-are updated in place, without accumulating duplicates for paraphrases.
+but their entries remain as potential canonical-question anchors. When no valid
+answer matches, the best stale match reuses its **original question** only if its
+best question-or-answer score is **strictly greater than `0.8`**. Configure this
+separately with `faqRegenerationThreshold` or override it with
+`--faq-regeneration-threshold N` (a finite number in `[-1,1]`). Otherwise, generation
+uses the incoming question directly. Matching still uses `faqThreshold`.
+`query` reports the incoming question; `question` reports the one used for search
+and the LLM request. Strong paraphrases update the original entry in place;
+weaker ones create an entry for the incoming question instead.
 Live files are read for this
 validation even with `--no-reindex`; that flag still uses the saved snapshot on a
 miss, but a stale snapshot cannot publish a reusable FAQ entry. Answers whose
@@ -1798,6 +1803,7 @@ Example `config.json` (user or repository settings):
 | `agentTimeoutMs` | Positive subprocess timeout for text generation, default `300000` (five minutes). No automatic subprocess retries. |
 | `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, the source search behind generated FAQ answers, map direct matches, and cross-search output. `--limit` overrides it (for `faq`, `--limit` instead caps the ranked FAQ questions returned, default `1`). |
 | `faqThreshold` | FAQ cache cosine cutoff in `[-1,1]`, default `0.7`; the best question or answer score must be strictly greater. `--faq-threshold` overrides it. |
+| `faqRegenerationThreshold` | Cosine cutoff in `[-1,1]` for reusing a stale entry's original question during regeneration, default `0.8`; the best question or answer score must be strictly greater. Otherwise use the incoming question. `--faq-regeneration-threshold` overrides it; valid-answer matching still uses `faqThreshold`. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path (ignored in repository-selected settings; use `--index`, `--config`, or the user config), glob arrays, and positive byte limit as described above. |
 | `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index; ignored in repository-selected settings) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle (also ignored there), as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`, Ollama `8` (maximum `64`); larger configured values are capped. The full config wizard defaults to `8` for Ollama and `32` otherwise; embedding-only setup leaves batching defaults to the provider. |
