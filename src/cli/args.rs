@@ -139,7 +139,7 @@ pub(super) enum Command {
     Map(MapArgs),
     /// Count file or matching symbol/section lines as a folder tree or ranked files
     Lines(LinesArgs),
-    /// Rename or move indexed JS/TS, Rust, Go, Java, or C code and update references
+    /// Rename or move indexed Markdown files or JS/TS, Rust, Go, Java, or C code and update references
     Refactor(RefactorArgs),
     /// Refresh and show index metadata, counts, and profiles as JSON
     Status,
@@ -176,7 +176,7 @@ pub(super) enum Command {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  slopdex refactor src/utils.ts src/helpers.ts\n  slopdex refactor src/utils.ts::parse parseConfig\n  slopdex refactor src/utils.rs::parse src/parser.rs::parse_config --dry-run\n  slopdex refactor parser.go::Parse helpers.go\n  slopdex refactor Parser.java::Parser.parse Helpers.java\n  slopdex refactor include/api.h include/parser.h\n\nPaths are relative to cwd. A bare symbol destination renames it in place; a path moves it. Members use indexed qualified names (file::Class.method). Language-specific module/package/linkage rules apply; unresolved or unsafe cases are rejected. No model requests are made."
+    after_help = "Examples:\n  slopdex refactor docs/old.md guides/new.md --dry-run\n  slopdex refactor src/utils.ts src/helpers.ts\n  slopdex refactor src/utils.ts::parse parseConfig\n  slopdex refactor src/utils.rs::parse src/parser.rs::parse_config --dry-run\n  slopdex refactor parser.go::Parse helpers.go\n  slopdex refactor Parser.java::Parser.parse Helpers.java\n  slopdex refactor include/api.h include/parser.h\n\nPaths are relative to cwd. Markdown file moves update links across indexed Markdown files and rebase relative links in the moved file. A bare symbol destination renames it in place; a path moves it. Members use indexed qualified names (file::Class.method). Language-specific module/package/linkage rules apply; unresolved or unsafe cases are rejected. No model requests are made."
 )]
 pub(super) struct RefactorArgs {
     /// Source file or file::symbol

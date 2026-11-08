@@ -2,6 +2,8 @@ use super::*;
 use crate::parse;
 use tempfile::TempDir;
 
+#[path = "markdown_tests.rs"]
+mod markdown;
 #[path = "typed_tests.rs"]
 mod typed;
 

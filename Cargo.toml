@@ -37,6 +37,7 @@ cliclack = "0.5.6"
 dirs = "6"
 fs2 = "0.4"
 globset = "0.4"
+html-escape = "0.2"
 ignore = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -61,7 +62,7 @@ tree-sitter-xml = "0.7.0"
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
 tree-sitter-bash = "0.25.1"
-tree-sitter-md-025 = "0.5.6"
+tree-sitter-md-025 = { version = "0.5.6", features = ["parser"] }
 usearch = "2.26.2"
 zstd = { version = "0.14", default-features = false }
 tempfile = "3"

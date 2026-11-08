@@ -45,7 +45,7 @@ can also follow the command. Quote multiword queries.
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Show selected groups' declarations, keys, sections, elements, and Markdown headings; refresh existing structure or parse directly if no index exists. | Summary |
 | `lines [PATH]...` | Count whole files, or matching symbols/sections with `-e`/`-q`, in a folder tree with aggregate counts; `--output files` gives a ranked file list. | Tree |
-| `refactor <source> <destination>` | Rename/move indexed JS/TS, Rust, Go, Java, or C code with language-specific reference updates. | Changed-file count; diff with `--dry-run` |
+| `refactor <source> <destination>` | Rename/move indexed Markdown files or JS/TS, Rust, Go, Java, or C code with reference updates. | Changed-file count; diff with `--dry-run` |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
@@ -61,6 +61,7 @@ can also follow the command. Quote multiword queries.
 ## Source refactoring
 
 ```sh
+slopdex refactor docs/old.md guides/new.md --dry-run
 slopdex refactor src/utils.ts src/helpers.ts
 slopdex refactor src/utils.ts src/lib/utils.ts
 slopdex refactor src/utils.ts::parse parseConfig
@@ -88,13 +89,14 @@ qualified spelling, e.g. `Parser.java::Parser.parse`.
 
 | Language | Files | Symbol renames and function moves |
 | --- | --- | --- |
+| Markdown | Update inline links, images, and reference definitions across all indexed Markdown files; rebase relative destinations in the moved file. Preserve titles, queries, and fragments. | File moves only; heading renames/moves are not supported. |
 | JS/TS | Update relative ES-module specifiers and rebase imports in moved files. | Rename top-level functions, variables/constants, classes, interfaces, types, and enums. Move free functions/single-binding arrow functions; transfer imports and follow named imports, re-exports, and static namespace references. |
 | Rust | Update standard `mod` registration, `use` paths, and qualified references; preserve explicit aliases and rebase moved-file imports. | Rename declarations and types through lexical bindings and re-exports. Move file-level free functions; transfer accessible dependencies and register destination modules. Newly exposed private functions use `pub(crate)` so existing crate callers remain valid. |
 | Go | Same-package file moves preserve package-level references. Cross-package file moves currently require a single free function. | Rename package declarations across package files and imports. Free-function moves transfer/prune imports and update package selectors. Cross-package callers require exported names; moves creating import cycles fail. `go.mod` supplies generated local package paths. |
 | Java | Update packages and imports. Renaming a public type also renames its constructors and matching `.java` filename; changing that filename similarly renames its public type. | Rename top-level types and unambiguous static members. Move static methods into existing destination classes, updating static imports/callers and required dependencies. Access is promoted to `public` when necessary to keep callers valid. |
 | C | Update literal includes and rebase quoted includes in moved files. Headers and translation units retain their respective roles. | Rename declarations through lexical bindings, explicit headers, and external-linkage prototypes. Move function definitions; retain a prototype for remaining callers and copy required indexed includes. Static linkage is never silently turned into external linkage. |
 
-All adapters use indexed declarations and lexical bindings, not global text
+Code adapters use indexed declarations and lexical bindings, not global text
 replacement. Unrelated names, comments, literal strings, explicit aliases, and
 object keys remain unchanged. Ignored/excluded files and external consumers are
 outside the operation's scope. Cross-language moves, name capture, ambiguous
@@ -103,6 +105,12 @@ source writes. No language compiler or model provider is needed at runtime.
 
 Important conservative limits:
 
+- **Markdown:** source/destination files must use `.md` or `.markdown`
+  (case-insensitive); only standard Markdown links are rewritten. Root-relative
+  URLs resolve from the selected repository root. External URLs, prose, code
+  examples, raw HTML, and wiki links
+  are not rewritten. Ignored/excluded files are not scanned. Relative outgoing
+  links are rebased even when their targets are not indexed (for example images).
 - **JS/TS:** relative ES modules only, including extensionless/index imports and
   `.js` specifiers resolving to TS. Default-export moves, ambient module exports,
   computed/escaping namespaces, and affected dynamic imports/`require` block

@@ -276,6 +276,50 @@ fn cli_refactor_file_move_and_text_diff_leave_sources_untouched_during_preview()
 }
 
 #[test]
+fn cli_refactor_markdown_moves_update_links_offline_and_refresh_structure() -> Result<()> {
+    let repo = Repo::new()?;
+    repo.init_git()?;
+    repo.write("docs/old.md", "# Guide\n\n[Home](../README.md)\n")?;
+    repo.write("README.md", "# Home\n\n[Guide](docs/old.md#guide)\n")?;
+    repo.write(
+        "nested/index.markdown",
+        "[Guide][guide]\n\n[guide]: ../docs/old.md\n",
+    )?;
+    repo.write("ignored.md", "[Guide](docs/old.md)\n")?;
+    repo.write(".gitignore", "ignored.md\n")?;
+    let preview = repo.cli_json(&["refactor", "docs/old.md", "guides/deep/new.md", "--dry-run"])?;
+    assert_eq!(preview["dryRun"], true);
+    assert_eq!(preview["changes"].as_array().unwrap().len(), 4);
+    assert!(repo.root.join("docs/old.md").exists());
+    assert!(!repo.root.join("guides").exists());
+
+    let report = repo.cli_json(&["refactor", "docs/old.md", "guides/deep/new.md"])?;
+    assert_eq!(report["dryRun"], false);
+    assert!(!repo.root.join("docs/old.md").exists());
+    assert_eq!(
+        fs::read_to_string(repo.root.join("guides/deep/new.md"))?,
+        "# Guide\n\n[Home](../../README.md)\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("README.md"))?,
+        "# Home\n\n[Guide](guides/deep/new.md#guide)\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("nested/index.markdown"))?,
+        "[Guide][guide]\n\n[guide]: ../guides/deep/new.md\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("ignored.md"))?,
+        "[Guide](docs/old.md)\n"
+    );
+    let mapped = repo.cli_json(&["map", "--no-reindex", "--private"])?;
+    let mapped = mapped.to_string();
+    assert!(mapped.contains("guides/deep/new.md"), "{mapped}");
+    assert!(!mapped.contains("docs/old.md"), "{mapped}");
+    Ok(())
+}
+
+#[test]
 fn cli_refactor_rejects_saved_snapshots_and_conflicts() -> Result<()> {
     let repo = Repo::new()?;
     let original = "export function parse() {}\nconst collision = 1;\n";

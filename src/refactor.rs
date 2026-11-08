@@ -5,6 +5,7 @@
 //! writes. This is not a crash-atomic multi-file filesystem transaction.
 
 mod javascript;
+mod markdown;
 mod native;
 mod syntax;
 
@@ -241,7 +242,9 @@ fn create_parents(path: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
 pub(crate) fn supported(path: &str) -> bool {
     matches!(
         crate::parse::language_for_path(path),
-        Some("javascript" | "jsx" | "typescript" | "tsx" | "rust" | "go" | "java" | "c")
+        Some(
+            "javascript" | "jsx" | "typescript" | "tsx" | "rust" | "go" | "java" | "c" | "markdown"
+        )
     )
 }
 
@@ -258,7 +261,7 @@ pub(crate) fn plan(
     let source_path = argument_path(&root, &cwd, source_file)?;
     ensure!(
         files.contains_key(&source_path),
-        "Source is not an indexed refactorable code file: {source_path}"
+        "Source is not an indexed refactorable file: {source_path}"
     );
     let (destination_path, new_name) = if let Some(symbol) = symbol {
         if identifier(destination) {
@@ -280,7 +283,7 @@ pub(crate) fn plan(
     };
     ensure!(
         supported(&destination_path),
-        "Destination must be a supported code file"
+        "Destination must be a supported code or Markdown file"
     );
     ensure!(
         same_family(&source_path, &destination_path),
@@ -306,7 +309,21 @@ pub(crate) fn plan(
     };
     let source_inputs = inputs.clone();
     inputs.extend(policies.clone());
-    let after = if !javascript {
+    let after = if crate::parse::language_for_path(&source_path) == Some("markdown") {
+        ensure!(
+            symbol.is_none(),
+            "Markdown refactor supports file moves only"
+        );
+        ensure!(
+            source_path != destination_path,
+            "Source and destination are identical"
+        );
+        ensure!(
+            !root.join(&destination_path).try_exists()?,
+            "Destination already exists: {destination_path}"
+        );
+        markdown::move_file(files, &source_path, &destination_path)?
+    } else if !javascript {
         let mut workspace = native::Workspace::new(&root, files)?;
         workspace.refactor(&source_path, symbol, &destination_path, new_name.as_deref())?;
         inputs.extend(workspace.consulted());
