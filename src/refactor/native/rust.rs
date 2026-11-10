@@ -1,5 +1,6 @@
 use super::*;
 use crate::parse::NodeKind;
+use crate::refactor::{checked_path, lexical, syntax::relative_path};
 use anyhow::Context as _;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,7 +21,159 @@ struct Layout {
     registrations: BTreeMap<String, Vec<Registration>>,
 }
 
-type Registration = (String, Range<usize>, Range<usize>);
+struct Registration {
+    parent: String,
+    range: Range<usize>,
+    // A literal #[path] is relative to this directory, not the logical module.
+    directory: String,
+    literal: Option<Range<usize>>,
+}
+
+struct PathAttribute {
+    value: String,
+    literal: Range<usize>,
+}
+
+fn path_literal(source: &str, literal: Node<'_>) -> Result<String> {
+    if literal.kind() == "raw_string_literal" {
+        return Ok(children(literal)
+            .into_iter()
+            .find(|node| node.kind() == "string_content")
+            .map(|node| text(source, node).to_owned())
+            .unwrap_or_default());
+    }
+    ensure!(
+        literal.kind() == "string_literal",
+        "Rust #[path] requires a string literal"
+    );
+    let value = text(source, literal);
+    let mut chars = value[1..value.len() - 1].chars().peekable();
+    let mut result = String::new();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            result.push(character);
+            continue;
+        }
+        let escaped = chars.next().context("Incomplete Rust #[path] escape")?;
+        result.push(match escaped {
+            '\\' | '"' | '\'' => escaped,
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '0' => '\0',
+            'x' => {
+                let digits: String = chars.by_ref().take(2).collect();
+                let byte = u8::from_str_radix(&digits, 16)?;
+                ensure!(
+                    digits.len() == 2 && byte.is_ascii(),
+                    "Invalid Rust #[path] ASCII escape"
+                );
+                char::from(byte)
+            }
+            'u' => {
+                ensure!(
+                    chars.next() == Some('{'),
+                    "Invalid Rust #[path] Unicode escape"
+                );
+                let mut digits = String::new();
+                loop {
+                    match chars
+                        .next()
+                        .context("Incomplete Rust #[path] Unicode escape")?
+                    {
+                        '}' => break,
+                        '_' => {}
+                        digit => digits.push(digit),
+                    }
+                }
+                char::from_u32(u32::from_str_radix(&digits, 16)?)
+                    .context("Invalid Rust #[path] Unicode scalar")?
+            }
+            '\n' => {
+                while chars
+                    .peek()
+                    .is_some_and(|character| matches!(character, ' ' | '\t' | '\n' | '\r'))
+                {
+                    chars.next();
+                }
+                continue;
+            }
+            _ => bail!("Unsupported escape in Rust #[path] literal"),
+        });
+    }
+    Ok(result)
+}
+
+fn path_attribute(module: &Module, node: Node<'_>) -> Result<Option<PathAttribute>> {
+    let mut result = None;
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        previous = sibling.prev_named_sibling();
+        if sibling.is_extra() {
+            continue;
+        }
+        if sibling.kind() != "attribute_item" {
+            break;
+        }
+        let attribute = sibling.named_child(0).context("Missing Rust attribute")?;
+        let name = attribute
+            .named_child(0)
+            .context("Missing Rust attribute name")?;
+        if text(&module.source, name) == "cfg_attr" {
+            ensure!(
+                !walk(attribute).iter().any(|node| {
+                    node.kind() == "identifier" && text(&module.source, *node) == "path"
+                }),
+                "Conditional Rust #[path] attributes require cfg-context resolution"
+            );
+        }
+        if text(&module.source, name) != "path" {
+            continue;
+        }
+        ensure!(
+            result.is_none(),
+            "Multiple Rust #[path] attributes are ambiguous"
+        );
+        let literal = attribute
+            .child_by_field_name("value")
+            .context("Rust #[path] requires a string literal")?;
+        result = Some(PathAttribute {
+            value: path_literal(&module.source, literal)?,
+            literal: literal.byte_range(),
+        });
+    }
+    Ok(result)
+}
+
+fn path_directory(path: &str, module: &Module, node: Node<'_>, owned: bool) -> Result<String> {
+    let mut inline: Vec<_> = std::iter::successors(node.parent(), |node| node.parent())
+        .filter(|node| node.kind() == "mod_item")
+        .collect();
+    inline.reverse();
+    let file = Path::new(path);
+    let mut directory = file.parent().unwrap_or(Path::new("")).to_owned();
+    let mut unowned = !owned
+        && !file
+            .file_stem()
+            .is_some_and(|stem| matches!(stem.to_str(), Some("mod" | "lib" | "main")));
+    for parent in inline {
+        if let Some(attribute) = path_attribute(module, parent)? {
+            directory.push(attribute.value);
+        } else {
+            if unowned {
+                directory.push(file.file_stem().context("Missing Rust file stem")?);
+            }
+            directory.push(text(
+                &module.source,
+                parent
+                    .child_by_field_name("name")
+                    .context("Missing Rust module name")?,
+            ));
+        }
+        unowned = false;
+    }
+    Ok(lexical(&directory).to_string_lossy().replace('\\', "/"))
+}
 
 #[derive(Clone)]
 struct Item {
@@ -326,6 +479,43 @@ fn inferred(path: &str) -> Context {
 }
 
 impl Workspace {
+    fn rust_path_target(&self, directory: &str, value: &str) -> Result<String> {
+        let target = lexical(&self.root.join(directory).join(value));
+        let target = target
+            .strip_prefix(&self.root)
+            .context("Rust #[path] must remain inside the repository")?;
+        checked_path(&self.root, target)?;
+        Ok(target.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn rust_path_owned(&self) -> Result<BTreeSet<String>> {
+        // A file loaded with #[path] owns its containing directory for child
+        // lookup; ordinary foo.rs instead searches foo/. Nested inline paths
+        // therefore depend on how the containing file was registered.
+        let mut owned = BTreeSet::new();
+        for _ in 0..=self.files.len() {
+            let mut next = BTreeSet::new();
+            for (path, module) in &self.files {
+                for node in walk(module.tree.root_node()).into_iter().filter(|node| {
+                    node.kind() == "mod_item" && node.child_by_field_name("body").is_none()
+                }) {
+                    if let Some(attribute) = path_attribute(module, node)? {
+                        let directory = path_directory(path, module, node, owned.contains(path))?;
+                        let target = self.rust_path_target(&directory, &attribute.value)?;
+                        if self.files.contains_key(&target) {
+                            next.insert(target);
+                        }
+                    }
+                }
+            }
+            if next == owned {
+                return Ok(owned);
+            }
+            owned = next;
+        }
+        bail!("Cyclic Rust #[path] directory ownership cannot be resolved safely")
+    }
+
     fn rust_attributes(&self, symbol: &StructureNode, moving: bool) -> Result<()> {
         for attribute in &symbol.attributes {
             let value = attribute
@@ -475,6 +665,7 @@ impl Workspace {
         {
             value.module.clear();
         }
+        let owned = self.rust_path_owned()?;
         for (path, module) in &self.files {
             for node in walk(module.tree.root_node()).into_iter().filter(|node| {
                 node.kind() == "mod_item" && node.child_by_field_name("body").is_none()
@@ -482,30 +673,27 @@ impl Workspace {
                 let name = node
                     .child_by_field_name("name")
                     .context("Missing Rust module name")?;
-                let symbol = module
-                    .structure
-                    .nodes
-                    .iter()
-                    .find(|symbol| {
-                        symbol.kind == NodeKind::Module && symbol.end_byte == node.end_byte()
-                    })
-                    .context("Missing indexed Rust module")?;
-                ensure!(
-                    !symbol
-                        .attributes
-                        .iter()
-                        .any(|attribute| attribute.contains("path")),
-                    "#[path] Rust module registration cannot be inferred safely: {path}"
-                );
-                let scope = context(&layout, path, module, node.start_byte());
-                let mut parts = scope.module.clone();
-                parts.push(text(&module.source, name).into());
-                let base = [scope.root.as_str(), &parts.join("/")]
-                    .into_iter()
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let found: Vec<_> = [format!("{base}.rs"), format!("{base}/mod.rs")]
+                let attribute = path_attribute(module, node)?;
+                let directory = path_directory(path, module, node, owned.contains(path))?;
+                let mut base = Path::new(&directory).to_owned();
+                let file = Path::new(path);
+                if !owned.contains(path)
+                    && !std::iter::successors(node.parent(), |node| node.parent())
+                        .any(|node| node.kind() == "mod_item")
+                    && !file
+                        .file_stem()
+                        .is_some_and(|stem| matches!(stem.to_str(), Some("mod" | "lib" | "main")))
+                {
+                    base.push(file.file_stem().context("Missing Rust file stem")?);
+                }
+                base.push(text(&module.source, name));
+                let base = base.to_string_lossy().replace('\\', "/");
+                let candidates = if let Some(attribute) = &attribute {
+                    vec![self.rust_path_target(&directory, &attribute.value)?]
+                } else {
+                    vec![format!("{base}.rs"), format!("{base}/mod.rs")]
+                };
+                let found: Vec<_> = candidates
                     .into_iter()
                     .filter(|target| self.files.contains_key(target))
                     .collect();
@@ -515,7 +703,12 @@ impl Workspace {
                         .registrations
                         .entry(target.clone())
                         .or_default()
-                        .push((path.clone(), node.byte_range(), name.byte_range()));
+                        .push(Registration {
+                            parent: path.clone(),
+                            range: node.byte_range(),
+                            directory,
+                            literal: attribute.map(|attribute| attribute.literal),
+                        });
                 }
             }
         }
@@ -551,6 +744,51 @@ impl Workspace {
         Ok(layout)
     }
 
+    fn rust_layout_contexts(&self, layout: &mut Layout) -> Result<()> {
+        // Physical file names need not match the logical names declared by mod.
+        // Propagate parent contexts only after collecting every registration so
+        // the result is independent of file ordering and custom-path depth.
+        for _ in 0..=self.files.len() {
+            let mut contexts = layout.contexts.clone();
+            for (target, registrations) in &layout.registrations {
+                let mut found = BTreeSet::new();
+                for registration in registrations {
+                    let module = &self.files[&registration.parent];
+                    let node = module
+                        .tree
+                        .root_node()
+                        .descendant_for_byte_range(registration.range.start, registration.range.end)
+                        .context("Missing Rust module registration")?;
+                    let mut scope =
+                        context(layout, &registration.parent, module, node.start_byte());
+                    scope.module.push(
+                        text(
+                            &module.source,
+                            node.child_by_field_name("name")
+                                .context("Missing Rust module name")?,
+                        )
+                        .into(),
+                    );
+                    found.insert((scope.root, scope.module));
+                }
+                ensure!(
+                    found.len() == 1,
+                    "Rust file has multiple logical module contexts: {target}"
+                );
+                let (root, module) = found.into_iter().next().unwrap();
+                contexts.insert(target.clone(), Context { root, module });
+            }
+            if contexts.iter().all(|(path, scope)| {
+                let old = &layout.contexts[path];
+                scope.root == old.root && scope.module == old.module
+            }) {
+                return Ok(());
+            }
+            layout.contexts = contexts;
+        }
+        bail!("Cyclic Rust module registrations cannot be resolved safely")
+    }
+
     fn rust_conditional(&self, layout: &Layout, path: &str) -> bool {
         let mut pending = vec![path.to_owned()];
         let mut seen = BTreeSet::new();
@@ -567,7 +805,9 @@ impl Workspace {
                 return true;
             }
             if let Some(parents) = layout.registrations.get(&path) {
-                for (parent, range, _) in parents {
+                for registration in parents {
+                    let parent = &registration.parent;
+                    let range = &registration.range;
                     if self.files[parent].structure.nodes.iter().any(|node| {
                         node.kind == NodeKind::Module
                             && node.end_byte == range.end
@@ -997,7 +1237,8 @@ impl Workspace {
     }
 
     pub(super) fn rust_rename(&mut self, path: &str, selected: &str, new: &str) -> Result<()> {
-        let layout = self.rust_layout()?;
+        let mut layout = self.rust_layout()?;
+        self.rust_layout_contexts(&mut layout)?;
         let symbol = self.files[path].symbol(selected)?;
         self.rust_attributes(symbol, false)?;
         ensure!(
@@ -1156,7 +1397,11 @@ impl Workspace {
                     continue;
                 }
                 if let Some(parents) = layout.registrations.get(&path) {
-                    pending.extend(parents.iter().map(|(path, _, _)| path.clone()));
+                    pending.extend(
+                        parents
+                            .iter()
+                            .map(|registration| registration.parent.clone()),
+                    );
                 } else {
                     roots.insert(path);
                 }
@@ -1180,6 +1425,29 @@ impl Workspace {
         );
         for path in parents {
             let module = &self.files[&path];
+            let file = Path::new(&path);
+            let owned = layout
+                .registrations
+                .get(&path)
+                .is_some_and(|registrations| {
+                    registrations
+                        .iter()
+                        .any(|registration| registration.literal.is_some())
+                });
+            let directory = if owned
+                || file
+                    .file_stem()
+                    .is_some_and(|stem| matches!(stem.to_str(), Some("mod" | "lib" | "main")))
+            {
+                file.parent().unwrap_or(Path::new("")).to_owned()
+            } else {
+                file.with_extension("")
+            };
+            let base = directory.join(name).to_string_lossy().replace('\\', "/");
+            ensure!(
+                to == format!("{base}.rs") || to == format!("{base}/mod.rs"),
+                "Destination Rust module requires explicit #[path] registration before moving to {to}"
+            );
             if module.structure.nodes.iter().any(|node| {
                 node.parent_id.is_none() && node.kind == NodeKind::Module && node.name == *name
             }) {
@@ -1287,8 +1555,65 @@ impl Workspace {
         Ok(())
     }
 
+    fn rust_move_path_file(&mut self, layout: &Layout, from: &str, to: &str) -> Result<()> {
+        let module = &self.files[from];
+        ensure!(
+            !walk(module.tree.root_node()).iter().any(|node| {
+                node.kind() == "mod_item" && node.child_by_field_name("body").is_none()
+            }),
+            "Moving a Rust file with external child modules requires moving the module tree, not one file"
+        );
+        if Path::new(from).parent() != Path::new(to).parent() {
+            for symbol in &module.structure.nodes {
+                self.rust_attributes(symbol, true)?;
+            }
+            self.rust_check_macros(
+                Path::new(from)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap(),
+                Some((from, 0..module.source.len())),
+            )?;
+        }
+        let mut edits = Edits::new();
+        for registration in &layout.registrations[from] {
+            let anchor = Path::new(&registration.directory).join("__path.rs");
+            let relative = relative_path(&anchor.to_string_lossy().replace('\\', "/"), to);
+            let literal = format!("{relative:?}");
+            edits
+                .entry(registration.parent.clone())
+                .or_default()
+                .push(Edit {
+                    range: registration
+                        .literal
+                        .clone()
+                        .unwrap_or(registration.range.start..registration.range.start),
+                    text: if registration.literal.is_some() {
+                        literal
+                    } else {
+                        // Mixed implicit/explicit registrations keep the same
+                        // logical name too; make their physical path explicit.
+                        format!("#[path = {literal}]\n")
+                    },
+                });
+        }
+        self.apply(edits)?;
+        let source = self.files.remove(from).unwrap().source;
+        self.set_source(to, source)
+    }
+
     pub(super) fn rust_move_file(&mut self, from: &str, to: &str) -> Result<()> {
-        let layout = self.rust_layout()?;
+        let mut layout = self.rust_layout()?;
+        if layout.registrations.get(from).is_some_and(|registrations| {
+            registrations
+                .iter()
+                .any(|registration| registration.literal.is_some())
+        }) {
+            // #[path] moves change storage, not module identity. Updating every
+            // registration also works when several test crates share a file.
+            return self.rust_move_path_file(&layout, from, to);
+        }
+        self.rust_layout_contexts(&mut layout)?;
         let old_context = &layout.contexts[from];
         let new_context = inferred(to);
         ensure!(
@@ -1336,7 +1661,9 @@ impl Workspace {
         let mut edits = Edits::new();
         self.rust_rewire_uses(&layout, &old, &new, true, from, &mut edits)?;
         let public = layout.registrations.get(from).is_some_and(|registrations| {
-            registrations.iter().any(|(path, range, _)| {
+            registrations.iter().any(|registration| {
+                let path = &registration.parent;
+                let range = &registration.range;
                 self.files[path]
                     .tree
                     .root_node()
@@ -1406,11 +1733,14 @@ impl Workspace {
         let registrations = layout.registrations.get(from).context(
             "Source Rust module is not registered; implicit/custom module layouts cannot be moved",
         )?;
-        for (path, range, _) in registrations {
-            edits.entry(path.clone()).or_default().push(Edit {
-                range: range.clone(),
-                text: String::new(),
-            });
+        for registration in registrations {
+            edits
+                .entry(registration.parent.clone())
+                .or_default()
+                .push(Edit {
+                    range: registration.range.clone(),
+                    text: String::new(),
+                });
         }
         self.apply(edits)?;
         let source = self.files.remove(from).unwrap().source;
@@ -1452,7 +1782,8 @@ impl Workspace {
         if !self.files.contains_key(to) {
             self.set_source(to, String::new())?;
         }
-        let layout = self.rust_layout()?;
+        let mut layout = self.rust_layout()?;
+        self.rust_layout_contexts(&mut layout)?;
         let symbol = self.files[from].symbol(selected)?;
         self.rust_attributes(symbol, true)?;
         ensure!(

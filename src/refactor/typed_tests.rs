@@ -523,6 +523,227 @@ fn rust_file_moves_do_not_register_modules_in_unrelated_binary_entrypoints() -> 
 }
 
 #[test]
+fn unrelated_rust_path_modules_do_not_block_refactors() -> Result<()> {
+    let f = Fixture::new(&[
+        (
+            "src/lib.rs",
+            "pub mod a;\n#[doc = \"module path\"] mod documented;\n#[path = \"support/helpers.rs\"] mod helpers;\n",
+        ),
+        ("src/a.rs", "pub fn parse() {}\n"),
+        ("src/documented.rs", "pub fn example() {}\n"),
+        ("src/support/helpers.rs", "pub fn example() {}\n"),
+    ])?;
+    f.plan("src/a.rs", "src/b.rs")?.apply()?;
+    f.plan("src/b.rs::parse", "read_config")?.apply()?;
+    assert!(
+        f.read("src/lib.rs")
+            .contains("#[path = \"support/helpers.rs\"] mod helpers;")
+    );
+    assert_eq!(f.read("src/support/helpers.rs"), "pub fn example() {}\n");
+    assert_eq!(f.read("src/b.rs"), "pub fn read_config() {}\n");
+    Ok(())
+}
+
+#[test]
+fn rust_path_file_moves_preserve_names_and_update_all_test_registrations() -> Result<()> {
+    let source = "pub fn parse() -> i32 { 1 }\n";
+    let f = Fixture::new(&[
+        (
+            "tests/driver.rs",
+            "#[path = \"support.rs\"]\nmod suite;\n#[test] fn smoke() { assert_eq!(suite::parse(), 1); }\n",
+        ),
+        (
+            "tests/other.rs",
+            "#[cfg(test)]\n#[path = r#\"./support.rs\"#]\n// Keep this comment.\nmod shared;\n#[test] fn smoke() { assert_eq!(shared::parse(), 1); }\n",
+        ),
+        ("tests/support.rs", source),
+    ])?;
+    let plan = f.plan("tests/support.rs", "tests/nested/lifecycle.rs")?;
+    assert_eq!(f.read("tests/support.rs"), source);
+    assert!(!f.root.join("tests/nested/lifecycle.rs").exists());
+    plan.apply()?;
+    assert!(!f.root.join("tests/support.rs").exists());
+    assert_eq!(f.read("tests/nested/lifecycle.rs"), source);
+    assert_eq!(
+        f.read("tests/driver.rs"),
+        "#[path = \"nested/lifecycle.rs\"]\nmod suite;\n#[test] fn smoke() { assert_eq!(suite::parse(), 1); }\n"
+    );
+    assert_eq!(
+        f.read("tests/other.rs"),
+        "#[cfg(test)]\n#[path = \"nested/lifecycle.rs\"]\n// Keep this comment.\nmod shared;\n#[test] fn smoke() { assert_eq!(shared::parse(), 1); }\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_path_moves_preserve_mixed_explicit_and_implicit_registrations() -> Result<()> {
+    let f = Fixture::new(&[
+        (
+            "src/lib.rs",
+            "pub mod a;\npub fn run() -> i32 { a::parse() }\n",
+        ),
+        (
+            "src/main.rs",
+            "#[path = \"a.rs\"] mod helper;\nfn main() { helper::parse(); }\n",
+        ),
+        ("src/a.rs", "pub fn parse() -> i32 { 1 }\n"),
+    ])?;
+    f.plan("src/a.rs", "src/nested/helpers.rs")?.apply()?;
+    assert_eq!(
+        f.read("src/lib.rs"),
+        "#[path = \"nested/helpers.rs\"]\npub mod a;\npub fn run() -> i32 { a::parse() }\n"
+    );
+    assert_eq!(
+        f.read("src/main.rs"),
+        "#[path = \"nested/helpers.rs\"] mod helper;\nfn main() { helper::parse(); }\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_path_symbol_renames_follow_logical_names_and_child_modules() -> Result<()> {
+    let f = Fixture::new(&[
+        (
+            "src/lib.rs",
+            "#[path = \"storage.rs\"] pub mod api;\npub fn run() -> i32 { api::parse() + api::child::parse() }\n",
+        ),
+        (
+            "src/storage.rs",
+            "pub mod child;\npub fn parse() -> i32 { child::parse() }\n",
+        ),
+        ("src/child.rs", "pub fn parse() -> i32 { 1 }\n"),
+    ])?;
+    f.plan("src/child.rs::parse", "read_config")?.apply()?;
+    assert!(
+        f.read("src/lib.rs")
+            .contains("api::parse() + api::child::read_config()")
+    );
+    assert!(f.read("src/storage.rs").contains("child::read_config()"));
+    f.plan("src/storage.rs::parse", "read_config")?.apply()?;
+    assert!(
+        f.read("src/lib.rs")
+            .contains("api::read_config() + api::child::read_config()")
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_inline_path_moves_rebase_against_the_attribute_directory() -> Result<()> {
+    let f = Fixture::new(&[
+        (
+            "src/lib.rs",
+            "mod outer { #[path = \"../support.rs\"] mod helper; }\n",
+        ),
+        ("src/support.rs", "pub fn example() {}\n"),
+    ])?;
+    f.plan("src/support.rs", "src/new/helpers.rs")?.apply()?;
+    assert_eq!(
+        f.read("src/lib.rs"),
+        "mod outer { #[path = \"../new/helpers.rs\"] mod helper; }\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_inline_path_overrides_use_physical_not_logical_directories() -> Result<()> {
+    let f = Fixture::new(&[
+        (
+            "src/lib.rs",
+            "mod file;\n#[path = \"custom/child.rs\"] mod shared;\n",
+        ),
+        (
+            "src/file.rs",
+            "#[path = \"custom\"] mod inline { mod child; #[path = \"leaf.rs\"] mod helper; }\n",
+        ),
+        ("src/custom/child.rs", "pub fn example() {}\n"),
+        ("src/custom/leaf.rs", "pub fn example() {}\n"),
+    ])?;
+    f.plan("src/custom/child.rs", "src/new/child.rs")?.apply()?;
+    f.plan("src/custom/leaf.rs", "src/new/leaf.rs")?.apply()?;
+    assert_eq!(
+        f.read("src/file.rs"),
+        "#[path = \"custom\"] mod inline { #[path = \"../new/child.rs\"]\nmod child; #[path = \"../new/leaf.rs\"] mod helper; }\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_path_file_moves_decode_rust_string_literals() -> Result<()> {
+    for literal in [
+        r#""support\x2ers""#,
+        r#""support\u{002e}rs""#,
+        r###"r##"support.rs"##"###,
+        "\"supp\\\n \tort.rs\"",
+    ] {
+        let registration = format!("#[path = {literal}] mod helper;\n");
+        let f = Fixture::new(&[
+            ("src/lib.rs", &registration),
+            ("src/support.rs", "pub fn example() {}\n"),
+        ])?;
+        f.plan("src/support.rs", "src/new/helpers.rs")?.apply()?;
+        assert_eq!(
+            f.read("src/lib.rs"),
+            "#[path = \"new/helpers.rs\"] mod helper;\n"
+        );
+        f.plan("src/new/helpers.rs", "src/newer/helpers.rs")?
+            .apply()?;
+        assert_eq!(
+            f.read("src/lib.rs"),
+            "#[path = \"newer/helpers.rs\"] mod helper;\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_path_moves_reject_conditional_paths_and_external_child_modules() -> Result<()> {
+    for files in [
+        vec![
+            (
+                "src/lib.rs",
+                "#[cfg_attr(test, path = \"a.rs\")] mod helper;\n",
+            ),
+            ("src/a.rs", "pub fn example() {}\n"),
+        ],
+        vec![
+            ("src/lib.rs", "#[path = \"a.rs\"] mod helper;\n"),
+            ("src/a.rs", "mod child;\n"),
+            ("src/a/child.rs", "pub fn example() {}\n"),
+        ],
+    ] {
+        let f = Fixture::new(&files)?;
+        assert!(f.plan("src/a.rs", "src/new/helpers.rs").is_err());
+        for (path, source) in files {
+            assert_eq!(f.read(path), source);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_custom_path_destinations_require_a_matching_physical_registration() -> Result<()> {
+    let f = Fixture::new(&[
+        (
+            "src/lib.rs",
+            "pub mod utils;\n#[path = \"storage.rs\"] pub mod api;\n",
+        ),
+        ("src/utils.rs", "pub fn parse() {}\n"),
+        ("src/storage.rs", ""),
+    ])?;
+    let error = f
+        .plan("src/utils.rs::parse", "src/api/parser.rs")
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("explicit #[path] registration"),
+        "{error}"
+    );
+    assert_eq!(f.read("src/utils.rs"), "pub fn parse() {}\n");
+    assert!(!f.root.join("src/api/parser.rs").exists());
+    Ok(())
+}
+
+#[test]
 fn shadowed_expression_macros_are_rejected_instead_of_treated_as_builtins() -> Result<()> {
     let f = Fixture::new(&[(
         "src/lib.rs",

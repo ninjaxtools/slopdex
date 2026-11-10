@@ -128,6 +128,61 @@ fn typed_rust_cli_refactors_compile_with_module_and_import_updates() -> Result<(
 }
 
 #[test]
+fn rust_path_file_moves_update_test_crates_offline_without_changing_module_names() -> Result<()> {
+    let repo = Repo::new()?;
+    let driver = "#[path = \"support.rs\"]\nmod suite;\nfn expected() -> i32 { 1 }\n#[test] fn smoke() { assert_eq!(suite::parse(), 1); }\n";
+    let other = "#[cfg(test)]\n#[path = r#\"support.rs\"#]\nmod shared;\nfn expected() -> i32 { 1 }\n#[test] fn smoke() { assert_eq!(shared::parse(), 1); }\n";
+    let support = "pub fn parse() -> i32 { super::expected() }\n";
+    repo.write("tests/driver.rs", driver)?;
+    repo.write("tests/other.rs", other)?;
+    repo.write("tests/support.rs", support)?;
+    let args = ["refactor", "tests/support.rs", "tests/nested/lifecycle.rs"];
+    let mut preview_args = args.to_vec();
+    preview_args.push("--dry-run");
+    let preview = repo.cli_json(&preview_args)?;
+    assert_eq!(preview["dryRun"], true);
+    assert_eq!(
+        fs::read_to_string(repo.root.join("tests/driver.rs"))?,
+        driver
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("tests/support.rs"))?,
+        support
+    );
+    assert!(!repo.root.join("tests/nested/lifecycle.rs").exists());
+    repo.cli_json(&args)?;
+    assert!(!repo.root.join("tests/support.rs").exists());
+    assert_eq!(
+        fs::read_to_string(repo.root.join("tests/nested/lifecycle.rs"))?,
+        support
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("tests/driver.rs"))?,
+        driver.replace("support.rs", "nested/lifecycle.rs")
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("tests/other.rs"))?,
+        other.replace("r#\"support.rs\"#", "\"nested/lifecycle.rs\"")
+    );
+    if let Some(rustc) = compiler("rustc")? {
+        for entry in ["driver", "other"] {
+            compiled(
+                repo.child(&rustc)
+                    .args(["--edition=2024", "--test"])
+                    .arg(format!("tests/{entry}.rs"))
+                    .arg("-o")
+                    .arg(
+                        repo.home
+                            .join(format!("{entry}{}", std::env::consts::EXE_SUFFIX)),
+                    )
+                    .output()?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn typed_go_cli_refactors_compile_without_unused_imports_or_package_cycles() -> Result<()> {
     let Some(go) = compiler("go")? else {
         return Ok(());
