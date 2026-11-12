@@ -4,6 +4,7 @@ mod args;
 mod commands;
 mod config;
 mod io;
+mod metrics;
 mod output;
 mod session;
 mod workspace;
@@ -98,6 +99,9 @@ pub fn run() -> Result<()> {
 
 fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
     let root = root_path(cli.global.root.as_deref())?;
+    if let Command::Metrics { reset } = cli.command {
+        return metrics::print(&root, reset, cli.global.format, out);
+    }
     let workspaces = match &cli.command {
         Command::Map(args) => map_workspaces(&root, &args.paths)?,
         Command::Lines(args) => map_workspaces(&root, &args.paths)?,
@@ -117,8 +121,23 @@ fn run_cli(cli: &Cli, mut out: &mut impl Write) -> Result<()> {
         json: io::JsonArrayWriter::new(),
     };
     let mut line_files = Vec::new();
+    let mut tracker = metrics::Tracker::new(cli);
     for workspace in workspaces {
-        run_workspace(cli, &workspace, &mut out, &mut map_output, &mut line_files)?;
+        let mut usage = metrics::Usage::default();
+        if matches!(cli.command, Command::Map(_) | Command::Lines(_)) {
+            usage.results(0);
+        }
+        let started = std::time::Instant::now();
+        let result = run_workspace(
+            cli,
+            &workspace,
+            &mut out,
+            &mut map_output,
+            &mut line_files,
+            &mut usage,
+        );
+        tracker.observe(&workspace.root, started.elapsed(), result.is_ok(), usage);
+        result?;
     }
     if let Command::Lines(args) = &cli.command {
         let limit = args.limit.and_then(ResultLimit::count);
@@ -188,8 +207,10 @@ fn run_workspace(
     mut out: &mut impl Write,
     map_output: &mut MapOutput,
     line_files: &mut Vec<(PathBuf, usize)>,
+    usage: &mut metrics::Usage,
 ) -> Result<()> {
-    let Some(mut session) = Session::setup(cli, workspace, &mut out, map_output, line_files)?
+    let Some(mut session) =
+        Session::setup(cli, workspace, &mut out, map_output, line_files, usage)?
     else {
         return Ok(());
     };

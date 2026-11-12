@@ -35,6 +35,12 @@ impl Engine {
     /// object by default, or an array of ranked answers when the FAQ limit
     /// (`faqLimit`/`limit`) is greater than one or off.
     pub fn faq(&self, query: &str, options: &Value) -> Result<Value> {
+        self.faq_with_usage(query, options)
+            .map(|(result, _)| result)
+    }
+
+    /// Keep reuse accounting out of the public answer/cache representation.
+    pub(crate) fn faq_with_usage(&self, query: &str, options: &Value) -> Result<(Value, u64)> {
         self.reporting(|| {
             let cutoff = self.config.faq_threshold(options)?;
             let regeneration_cutoff = self.config.faq_regeneration_threshold(options)?;
@@ -129,7 +135,7 @@ impl Engine {
                     result["query"] = json!(query);
                     result["score"] = json!(score);
                     ui::progress("Reusing FAQ answer");
-                    return Ok(result);
+                    return Ok((result, 1));
                 }
             } else {
                 // Stale entries are never served; with no valid match the best
@@ -149,7 +155,8 @@ impl Engine {
                 }
                 if !results.is_empty() {
                     ui::progress("Reusing FAQ answer");
-                    return Ok(json!(results));
+                    let reused = results.len() as u64;
+                    return Ok((json!(results), reused));
                 }
             }
             // A weaker match may serve a valid cached answer, but must not
@@ -189,7 +196,7 @@ impl Engine {
             // perfect 1. The score is per-query, so it is set only after the
             // scoreless result above may have been stored as a cache entry.
             result["score"] = json!(1.0);
-            Ok(if single { result } else { json!([result]) })
+            Ok((if single { result } else { json!([result]) }, 0))
         })
     }
 

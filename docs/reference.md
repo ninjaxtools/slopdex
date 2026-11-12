@@ -47,6 +47,7 @@ can also follow the command. Quote multiword queries.
 | `lines [PATH]...` | Count whole files, or matching symbols/sections with `-e`/`-q`, in a folder tree with aggregate counts; `--output files` gives a ranked file list. | Tree |
 | `refactor <source> <destination>` | Rename/move indexed Markdown files or JS/TS, Rust, Go, Java, or C code with reference updates. | Changed-file count; diff with `--dry-run` |
 | `status` | Refresh and report counts, generation, checkpoint, profiles, and backends. | JSON object |
+| `metrics [--reset]` | Show local usage aggregates for this project, or explicitly clear them. Never opens or refreshes an index. | Text; JSON with `--output json` |
 | `index errors` | Refresh and report saved read/parse/extraction diagnostics. | Summary |
 | `update` | Create or explicitly refresh the index from the current working tree and Git HEAD, when available; `--target` accepts only `HEAD`. | JSON refresh statistics |
 | `update --setup` | Configure and prepare embeddings only, save the selected settings, then update. Embedding flags make setup noninteractive. | JSON refresh statistics |
@@ -57,6 +58,54 @@ can also follow the command. Quote multiword queries.
 | `config [prefix]` | Configure matching settings interactively without opening an index. | Updated-setting summary |
 | `config embeddings` | Focused embedding setup without opening an index; `--provider`, `--model`, and `--dimensions` are saved rather than temporary. | Updated-setting summary |
 | `config set <key> <value>` | Set a documented configuration key directly; JSON literals support booleans, numbers, arrays and objects. Unknown keys are rejected with the closest documented names. | Updated-setting summary |
+
+## Project usage metrics
+
+```sh
+slopdex metrics
+slopdex metrics --output json
+slopdex metrics --reset
+```
+
+Usage is tracked locally, starting with this version; earlier usage cannot be
+reconstructed. The report includes lifetime per-command call, success/failure,
+and elapsed-time totals; measured result and empty-result counts; FAQ answers
+reused; source lines counted; files changed by refactoring; saved-snapshot calls;
+and refactor dry runs. Recent daily totals are retained for 90 UTC days, while
+lifetime command totals remain until reset. JSON includes first/last-use Unix
+timestamps and daily buckets keyed by their UTC start time in Unix seconds.
+
+Results count returned search/index entries, mapped declarations, counted files,
+and FAQ answers. They are not unique across calls; map/search/index limits apply.
+Commands without measured result counts show `-`. Files changed counts actual
+applied refactors, never dry-run proposals. Timing measures workspace command
+work, including setup/refresh,
+not time saved. These are usage indicators, not claims about answer quality,
+developer productivity, token savings, or provider costs.
+
+Projects are identified by canonical workspace root (the same Git checkout root,
+explicit `--root`, or non-Git cwd used by other commands). Symlink aliases share
+metrics; separate checkouts/worktrees have separate histories. External map/lines
+paths are attributed to the projects inspected, once per project per invocation.
+Cross-search is attributed to its source project. Index overrides/rebuilds do not
+reset usage. Direct library calls, help/config/cache commands, metrics itself,
+and argument-parse failures are not counted. Interrupted processes may not record
+their final invocation.
+
+Only aggregate counters and timestamps are stored, with no queries, source text,
+answers, file names, credentials, or raw error messages. Nothing is uploaded.
+Storage is `<cache>/slopdex/metrics-v1/<canonical-root-hash>/usage.json`, using the
+normal `XDG_CACHE_HOME`/platform cache location, independent of the index and
+shared artifact store. JSON output includes `project` and `metricsPath` for
+inspection. An unused project's `metrics` command creates no files. Reset affects
+only this project's metrics, not its index, artifacts, or other projects.
+
+Set `SLOPDEX_NO_METRICS=1` to disable recording (existing history remains readable).
+Recording is best-effort: a corrupt, unwritable, or busy metrics file produces a
+warning but never fails the underlying command. Writers use a bounded lock and
+atomic replacement to avoid lost updates or partial files. `metrics --reset` can
+repair a corrupt history. Metrics stored in a cache can be removed by cache cleanup;
+they are not a durable audit log.
 
 ## Source refactoring
 

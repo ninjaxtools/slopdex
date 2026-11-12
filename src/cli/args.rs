@@ -143,6 +143,12 @@ pub(super) enum Command {
     Refactor(RefactorArgs),
     /// Refresh and show index metadata, counts, and profiles as JSON
     Status,
+    /// Show project-local usage aggregates without opening or refreshing an index
+    Metrics {
+        /// Clear this project's usage history
+        #[arg(long)]
+        reset: bool,
+    },
     /// Inspect indexed data
     Index {
         #[command(subcommand)]

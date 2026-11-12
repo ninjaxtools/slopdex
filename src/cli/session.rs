@@ -4,6 +4,7 @@
 use super::args::{CacheAction, Cli, Command, Format, HelpTopic, IndexAction, help_command};
 use super::config::{self, effective_config, mark_repository_config, run_config};
 use super::io::print_json;
+use super::metrics::Usage;
 use super::output::{print_index_entries, print_indexes, print_limit_notice};
 use super::workspace::{
     SourceWorkspace, absolute, config_path, index_path, repository_config_selected, require_index,
@@ -91,6 +92,7 @@ pub(super) struct Session<'a> {
     pub(super) map_options: Option<Value>,
     /// The initial refresh report, printed by `update`.
     pub(super) refreshed: Option<Value>,
+    pub(super) usage: &'a mut Usage,
 }
 
 impl<'a> Session<'a> {
@@ -175,6 +177,7 @@ impl<'a> Session<'a> {
         mut out: &mut impl Write,
         map_output: &mut MapOutput,
         line_files: &mut Vec<(PathBuf, usize)>,
+        usage: &'a mut Usage,
     ) -> Result<Option<Session<'a>>> {
         if let Command::Help {
             topic: Some(HelpTopic::Models { provider }),
@@ -284,9 +287,11 @@ impl<'a> Session<'a> {
                 let Some(options) = args.existing_options(&root, &workspace.paths)? else {
                     return Ok(None);
                 };
-                line_files.extend(ui::spin("Counting source lines", || {
+                let files = ui::spin("Counting source lines", || {
                     lines::unindexed(&root, &index, &config, &options)
-                })?);
+                })?;
+                usage.line_files(&files);
+                line_files.extend(files);
                 return Ok(None);
             }
             // Semantic selectors must not silently turn into whole-file counts.
@@ -339,6 +344,12 @@ impl<'a> Session<'a> {
                 &options,
                 cli.global.format != Some(Format::Json),
             )?;
+            usage.results(
+                map_output
+                    .remaining
+                    .map_or(prepared.count, |remaining| remaining.min(prepared.count))
+                    as u64,
+            );
             emit_map(cli, &mut out, prepared, &source, &selection, map_output)?;
             return Ok(None);
         }
@@ -362,6 +373,7 @@ impl<'a> Session<'a> {
                 let results = ui::spin("Reading index entries", || {
                     engine.index_entries_limited(name, &options)
                 })?;
+                usage.results(results.rows.len() as u64);
                 print_index_entries(&mut out, &results.rows, format, cli.global.detail)?;
                 print_limit_notice(&mut out, format, results.omitted, results.limit)?;
             } else {
@@ -404,6 +416,7 @@ impl<'a> Session<'a> {
             engine: Some(engine),
             map_options,
             refreshed: None,
+            usage,
         }))
     }
 }

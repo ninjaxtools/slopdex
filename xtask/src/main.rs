@@ -178,6 +178,7 @@ const EXPECTED_COMMANDS: &[&str] = &[
     "lines",
     "refactor",
     "status",
+    "metrics",
     "index",
     "generate",
     "update",

@@ -55,7 +55,10 @@ pub(super) fn dispatch(
             })?;
             print_json(out, &result)
         }
-        Command::Cache { .. } | Command::Config { .. } | Command::Help { .. } => unreachable!(),
+        Command::Cache { .. }
+        | Command::Config { .. }
+        | Command::Help { .. }
+        | Command::Metrics { .. } => unreachable!(),
     }
 }
 
@@ -68,6 +71,7 @@ fn refactor(session: &mut Session, args: &RefactorArgs, out: &mut impl Write) ->
     )?;
     if !args.dry_run {
         plan.apply()?;
+        session.usage.files_changed += plan.changes.len() as u64;
         // Persist only structure, never embeddings or generated descriptions.
         if let Err(error) = session.engine_mut().refresh_structure() {
             ui::warning(format!(
@@ -110,6 +114,7 @@ fn lines(
     let files = session.run_at(&root, "Counting source lines", |engine| {
         lines::indexed(engine, &root, &options)
     })?;
+    session.usage.line_files(&files);
     line_files.extend(files);
     Ok(())
 }
@@ -120,6 +125,12 @@ fn map(session: &mut Session, out: &mut impl Write, map_output: &mut MapOutput) 
         let (prepared, selection) = session.run("Mapping repository structure", |engine| {
             engine.map_prepared(&options, format != Format::Json)
         })?;
+        session.usage.results(
+            map_output
+                .remaining
+                .map_or(prepared.count, |remaining| remaining.min(prepared.count))
+                as u64,
+        );
         emit_map(
             session.cli,
             out,
@@ -143,6 +154,7 @@ fn search(session: &mut Session, out: &mut impl Write) -> Result<()> {
     let rows = session.run("Searching index", |engine| {
         engine.search_queries_limited(&queries, kind, &options)
     })?;
+    session.usage.results(rows.rows.len() as u64);
     print_search(
         out,
         &rows.rows,
@@ -185,7 +197,10 @@ fn faq(session: &mut Session, args: &FaqArgs, out: &mut impl Write) -> Result<()
         }
     }
     let engine = session.engine();
-    let result = ui::spin("Answering FAQ", || engine.faq(&args.query.query, &options))?;
+    let (result, reused) = ui::spin("Answering FAQ", || {
+        engine.faq_with_usage(&args.query.query, &options)
+    })?;
+    session.usage.faq(&result, reused);
     // A semantic hit returns the original answer and references, never a fresh search.
     if format == Format::Json {
         print_json(out, &result)?;

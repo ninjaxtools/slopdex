@@ -117,6 +117,19 @@ Counts whole file contents excluding empty lines (or include them with `--includ
 
 See the [line-count reference](docs/reference.md#line-counts) for details.
 
+## Project usage metrics
+
+```sh
+slopdex metrics
+slopdex metrics --output json
+slopdex metrics --reset
+```
+
+See per-command usage, success/failure counts, timings, results, FAQ answer reuse,
+and other project-local aggregates. Tracking starts with this version and stores
+no queries or source text; nothing is uploaded. Set `SLOPDEX_NO_METRICS=1` to opt
+out. See the [metrics reference](docs/reference.md#project-usage-metrics).
+
 ## Search
 
 Vector search needs either an API key for OpenAI or Jina, or alternatively a local Ollama model can be configured.

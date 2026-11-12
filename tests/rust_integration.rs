@@ -36,6 +36,9 @@ mod faq;
 #[path = "rust_integration/index.rs"]
 mod index;
 
+#[path = "rust_integration/metrics.rs"]
+mod metrics;
+
 const TEST_KEY: &str = "local-integration-placeholder";
 
 /// Upper bound for one loopback exchange or one fail-fast CLI child. These are
@@ -650,6 +653,7 @@ struct Repo {
     root: PathBuf,
     index: PathBuf,
     home: PathBuf,
+    record_metrics: bool,
 }
 
 impl Repo {
@@ -671,6 +675,7 @@ impl Repo {
             root,
             index,
             home,
+            record_metrics: false,
         })
     }
 
@@ -732,6 +737,12 @@ impl Repo {
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.home)
             .env("XDG_CACHE_HOME", self.home.join("cache"))
+            // Most tests assert index/artifact filesystem effects in isolation.
+            // Metrics tests opt in explicitly and use this same isolated cache.
+            .env(
+                "SLOPDEX_NO_METRICS",
+                if self.record_metrics { "0" } else { "1" },
+            )
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("NO_PROXY", "*");
