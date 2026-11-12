@@ -142,7 +142,44 @@ fn metrics_wait_is_bounded_and_reads_do_not_need_writer_lock() -> Result<()> {
     save(&path, &History::default())?;
     let started = Instant::now();
     assert!(lock(&path).is_err());
-    assert!(started.elapsed() < Duration::from_secs(5));
+    let elapsed = started.elapsed();
+    // In particular, Windows ERROR_LOCK_VIOLATION must wait for the deadline,
+    // not bypass contention handling and return immediately.
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "contention failed early: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(5));
     assert_eq!(load(&path)?.totals().invocations, 0);
+    Ok(())
+}
+
+#[test]
+fn metrics_waiter_acquires_the_lock_after_the_holder_releases_it() -> Result<()> {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("usage.json");
+    let held = lock(&path)?;
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = lock(&path).map(drop);
+        let _ = tx.send(result);
+    });
+    let before_release = rx.recv_timeout(Duration::from_millis(50));
+    let waited = matches!(&before_release, Err(RecvTimeoutError::Timeout));
+    drop(held);
+    let result = if waited {
+        rx.recv_timeout(Duration::from_secs(5))
+    } else {
+        before_release
+    };
+    // Always join before propagating either a channel or locking error.
+    assert!(worker.join().is_ok(), "metrics waiter panicked");
+    assert!(
+        waited,
+        "metrics waiter returned while the holder still owned the lock"
+    );
+    result??;
     Ok(())
 }

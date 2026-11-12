@@ -3,7 +3,6 @@
 
 use super::args::{Cli, Command, Format, GenerateAction, IndexAction};
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -188,17 +187,14 @@ fn lock(path: &Path) -> Result<File> {
         .write(true)
         .open(path.with_extension("lock"))?;
     let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err(error).context("Project metrics are busy or unavailable"),
-        }
-    }
+    // The shared helper recognizes fs2's native contention code too: Windows
+    // ERROR_LOCK_VIOLATION is not necessarily classified as WouldBlock.
+    ensure!(
+        crate::registry::lock_exclusive_until(&file, deadline)
+            .context("Project metrics are busy or unavailable")?,
+        "Project metrics are busy or unavailable"
+    );
+    Ok(file)
 }
 
 fn load(path: &Path) -> Result<History> {
