@@ -8,6 +8,21 @@ fn clap_definition_is_consistent() {
 }
 
 #[test]
+fn faq_freshness_uses_a_hard_cutover_from_the_old_flag() {
+    let cli = parse(&["faq", "question"]);
+    let Command::Faq(args) = cli.command else {
+        panic!("expected faq");
+    };
+    assert_eq!(args.freshness, 0.8);
+    let cli = parse(&["faq", "question", "--freshness", "0.9"]);
+    let Command::Faq(args) = cli.command else {
+        panic!("expected faq");
+    };
+    assert_eq!(args.freshness, 0.9);
+    assert!(Cli::try_parse_from(["slopdex", "faq", "question", "--uptodate", "0.9"]).is_err());
+}
+
+#[test]
 fn refactor_uses_two_targets_and_structure_only_without_stale_snapshots() {
     let cli = parse(&["refactor", "src/a.ts::parse", "lib/b.ts::read", "--dry-run"]);
     assert_eq!(

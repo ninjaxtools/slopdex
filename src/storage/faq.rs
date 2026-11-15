@@ -7,7 +7,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS faq_entries(
  id INTEGER PRIMARY KEY AUTOINCREMENT,contract TEXT NOT NULL,question TEXT NOT NULL,
  result TEXT NOT NULL,files TEXT NOT NULL,question_embedding TEXT NOT NULL,answer_embedding TEXT NOT NULL,
- UNIQUE(contract,question));
+ materials TEXT NOT NULL DEFAULT '[]',UNIQUE(contract,question));
 ";
 
 pub(crate) struct FaqEntry {
@@ -15,8 +15,25 @@ pub(crate) struct FaqEntry {
     pub question: String,
     pub result: Value,
     pub files: BTreeMap<String, String>,
+    pub materials: Vec<FaqMaterial>,
     pub question_embedding: String,
     pub answer_embedding: String,
+}
+
+/// Only the verified, cited bytes, retained for line-level freshness comparisons.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FaqMaterial {
+    pub reference: Value,
+    pub hash: String,
+    pub source: String,
+}
+
+fn has_materials(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('faq_entries') WHERE name='materials')",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 pub(crate) fn exists(conn: &Connection) -> Result<bool> {
@@ -44,7 +61,12 @@ impl Database {
         if !exists(&self.conn)? {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare("SELECT id,question,result,files,question_embedding,answer_embedding,contract FROM faq_entries WHERE (?1 IS NULL OR contract=?1) ORDER BY id")?;
+        let materials = if has_materials(&self.conn)? {
+            "materials"
+        } else {
+            "'[]'"
+        };
+        let mut stmt = self.conn.prepare(&format!("SELECT id,question,result,files,question_embedding,answer_embedding,contract,{materials} FROM faq_entries WHERE (?1 IS NULL OR contract=?1) ORDER BY id"))?;
         let rows = stmt.query_map([contract], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -54,11 +76,20 @@ impl Database {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, question, result, files, question_embedding, answer_embedding, contract) =
-                row?;
+            let (
+                id,
+                question,
+                result,
+                files,
+                question_embedding,
+                answer_embedding,
+                contract,
+                materials,
+            ) = row?;
             Ok((
                 contract,
                 FaqEntry {
@@ -66,6 +97,7 @@ impl Database {
                     question,
                     result: serde_json::from_str(&result).context("Invalid FAQ result")?,
                     files: serde_json::from_str(&files).context("Invalid FAQ file dependencies")?,
+                    materials: serde_json::from_str(&materials).context("Invalid FAQ materials")?,
                     question_embedding,
                     answer_embedding,
                 },
@@ -85,8 +117,12 @@ impl Database {
         // Additive, on-demand migration: ordinary warm opens never acquire a writer.
         if !exists(&tx)? {
             tx.execute_batch(SCHEMA)?;
+        } else if !has_materials(&tx)? {
+            tx.execute_batch(
+                "ALTER TABLE faq_entries ADD COLUMN materials TEXT NOT NULL DEFAULT '[]'",
+            )?;
         }
-        tx.execute("INSERT INTO faq_entries(contract,question,result,files,question_embedding,answer_embedding) VALUES(?,?,?,?,?,?) ON CONFLICT(contract,question) DO UPDATE SET result=excluded.result,files=excluded.files,question_embedding=excluded.question_embedding,answer_embedding=excluded.answer_embedding", params![contract,entry.question,entry.result.to_string(),serde_json::to_string(&entry.files)?,entry.question_embedding,entry.answer_embedding])?;
+        tx.execute("INSERT INTO faq_entries(contract,question,result,files,question_embedding,answer_embedding,materials) VALUES(?,?,?,?,?,?,?) ON CONFLICT(contract,question) DO UPDATE SET result=excluded.result,files=excluded.files,question_embedding=excluded.question_embedding,answer_embedding=excluded.answer_embedding,materials=excluded.materials", params![contract,entry.question,entry.result.to_string(),serde_json::to_string(&entry.files)?,entry.question_embedding,entry.answer_embedding,serde_json::to_string(&entry.materials)?])?;
         tx.commit()?;
         Ok(())
     }

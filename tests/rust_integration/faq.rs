@@ -7,6 +7,281 @@ fn entries(repo: &Repo) -> Result<i64> {
         .query_row("SELECT count(*) FROM faq_entries", [], |row| row.get(0))?)
 }
 
+fn ten_line_function() -> &'static str {
+    "fn selected() -> i32 {\n    // VECTOR_EAST\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n    let e = 5;\n    let f = 6;\n    a + b + c + d + e + f\n}\n"
+}
+
+#[test]
+fn faq_explicit_anonymous_ranges_track_only_the_selected_lines() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("code.rs", &function("selected", "VECTOR_EAST"))?;
+    repo.write(
+        "notes.txt",
+        "outside\nselected one\nselected two\noutside\n",
+    )?;
+    mock.state.lock().unwrap().faq_references = Some(vec![
+        json!({"path":"notes.txt","startLine":2,"endLine":3}),
+        json!({"path":"notes.txt","startLine":0,"endLine":3}),
+        json!({"path":"notes.txt","startLine":3,"endLine":20}),
+    ]);
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let original = engine.faq("east", &all())?;
+    assert_eq!(
+        original["references"],
+        json!([{"path":"notes.txt","startLine":2,"endLine":3}])
+    );
+    let materials: String =
+        repo.db()?
+            .query_row("SELECT materials FROM faq_entries", [], |row| row.get(0))?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&materials)?[0]["hash"],
+        slopdex::hash("selected one\nselected two\n")
+    );
+    repo.write(
+        "notes.txt",
+        "added\nchanged outside\nselected one\nselected two\nchanged outside\n",
+    )?;
+    let moved = engine.faq("east", &all())?;
+    assert_eq!(moved["freshness"], 1.0);
+    assert_eq!(
+        moved["references"],
+        json!([{"path":"notes.txt","startLine":3,"endLine":4}])
+    );
+    assert_eq!(mock.requests("/responses").len(), 1);
+    Ok(())
+}
+
+#[test]
+fn faq_legacy_entries_read_without_migration_and_upgrade_on_publication() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let source = function("selected", "VECTOR_EAST");
+    repo.write("code.rs", &source)?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let original = engine.faq("east", &all())?;
+    drop(engine);
+    let db = repo.db()?;
+    db.execute_batch("ALTER TABLE faq_entries DROP COLUMN materials")?;
+    let mut engine = repo.open(&mock.config())?;
+    let before: i64 = db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+    assert_eq!(engine.faq("east", &all())?, original);
+    assert_eq!(
+        db.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?,
+        before
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM pragma_table_info('faq_entries') WHERE name='materials'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0
+    );
+    repo.write("code.rs", &(source + "\n// outside reference\n"))?;
+    engine.refresh()?;
+    assert_eq!(
+        engine.index_entries("faq", &json!({}))?[0]["data"]["valid"],
+        false
+    );
+    engine.faq("east", &all())?;
+    let materials: String =
+        db.query_row("SELECT materials FROM faq_entries", [], |row| row.get(0))?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&materials)?
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(mock.requests("/responses").len(), 1);
+    Ok(())
+}
+
+#[test]
+fn faq_hashes_only_cited_ranges_and_relocates_unchanged_symbols() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    let source = ten_line_function();
+    repo.write(
+        "code.rs",
+        &(source.to_owned() + &function("uncited", "VECTOR_WEST")),
+    )?;
+    mock.state.lock().unwrap().faq_references =
+        Some(vec![json!({"path":"code.rs","symbol":"selected"})]);
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let options = all();
+    let original = engine.faq("east", &options)?;
+    let materials: String =
+        repo.db()?
+            .query_row("SELECT materials FROM faq_entries", [], |row| row.get(0))?;
+    let materials: Value = serde_json::from_str(&materials)?;
+    assert_eq!(materials[0]["hash"], slopdex::hash(source));
+    assert_eq!(materials[0]["source"], source);
+    assert_eq!(materials.as_array().unwrap().len(), 1);
+
+    repo.write(
+        "code.rs",
+        &("// inserted above\n".to_owned() + source + &function("uncited_changed", "VECTOR_WEST")),
+    )?;
+    // No refresh: freshness must use disk, not stale snapshot coordinates.
+    let moved = engine.faq("east", &options)?;
+    assert_eq!(moved["description"], original["description"]);
+    assert_eq!(moved["freshness"], 1.0);
+    assert_eq!(moved["references"][0]["startLine"], 2);
+    assert_eq!(moved["references"][0]["endLine"], 11);
+    assert!(moved["references"][0].get("outdated").is_none());
+    assert_eq!(mock.requests("/responses").len(), 1);
+    drop(engine);
+    let engine = repo.open(&mock.config())?;
+    assert_eq!(engine.faq("east", &options)?, moved);
+    Ok(())
+}
+
+#[test]
+fn faq_partial_freshness_counts_added_removed_and_replaced_lines() -> Result<()> {
+    let mock = Mock::start()?;
+    let source = ten_line_function();
+    let edits = [
+        (
+            source.replace("a = 1", "a = 9").replace("b = 2", "b = 8"),
+            0.8,
+        ),
+        (source.replace("    let a = 1;\n    let b = 2;\n", ""), 0.8),
+        (
+            source.replace(
+                "    let a = 1;",
+                "    let extra = 0;\n    let another = 0;\n    let a = 1;",
+            ),
+            10.0 / 12.0,
+        ),
+    ];
+    for (edited, expected) in edits {
+        let repo = Repo::new()?;
+        repo.write("code.rs", source)?;
+        let mut config = mock.config();
+        config["artifactCachePath"] = json!(repo.home.join("artifacts.sqlite"));
+        let mut engine = repo.open(&config)?;
+        engine.refresh()?;
+        let original = engine.faq("east", &all())?;
+        let calls = mock.requests("/responses").len();
+        repo.write("code.rs", &edited)?;
+        drop(engine);
+        let mut engine = repo.open(&config)?;
+        let hit = engine.faq("east", &all())?;
+        assert_eq!(hit["description"], original["description"]);
+        assert!(
+            (hit["freshness"].as_f64().unwrap() - expected).abs() < 1e-6,
+            "{hit}"
+        );
+        assert_eq!(hit["references"][0]["outdated"], true);
+        assert!((hit["rankScore"].as_f64().unwrap() - (0.9 + 0.1 * expected)).abs() < 1e-6);
+        assert_eq!(mock.requests("/responses").len(), calls);
+        // Strict freshness is policy, not part of the context/cache identity.
+        engine.refresh()?;
+        let mut strict = all();
+        strict["freshness"] = json!(1);
+        let refreshed = engine.faq("east", &strict)?;
+        assert_eq!(refreshed["freshness"], 1.0);
+        assert!(refreshed["references"][0].get("outdated").is_none());
+        assert_eq!(mock.requests("/responses").len(), calls + 1);
+        assert_eq!(entries(&repo)?, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn faq_freshness_is_line_weighted_and_marks_only_changed_references() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("code.rs", ten_line_function())?;
+    repo.write("notes.txt", "one\ntwo\nthree\nfour\nfive\n")?;
+    mock.state.lock().unwrap().faq_references = Some(vec![
+        json!({"path":"code.rs","symbol":"selected"}),
+        json!({"path":"notes.txt"}),
+    ]);
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    engine.faq("east", &all())?;
+    repo.write("notes.txt", "one\nchanged\nthree\nfour\nfive\n")?;
+    let hit = engine.faq("east", &all())?;
+    assert!((hit["freshness"].as_f64().unwrap() - 14.0 / 15.0).abs() < 1e-6);
+    assert!(hit["references"][0].get("outdated").is_none());
+    assert_eq!(hit["references"][1]["outdated"], true);
+    assert_eq!(mock.requests("/responses").len(), 1);
+    Ok(())
+}
+
+#[test]
+fn faq_freshness_reranks_before_limiting_and_skips_unusable_top_hits() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write("old.rs", ten_line_function())?;
+    repo.write("fresh.rs", ten_line_function())?;
+    let mut engine = repo.open(&mock.config())?;
+    engine.refresh()?;
+    let mut forced = all();
+    forced["faqThreshold"] = json!(1);
+    mock.state.lock().unwrap().faq_references =
+        Some(vec![json!({"path":"old.rs","symbol":"selected"})]);
+    engine.faq("east older answer", &forced)?;
+    mock.state.lock().unwrap().faq_references =
+        Some(vec![json!({"path":"fresh.rs","symbol":"selected"})]);
+    engine.faq("east fresh answer", &forced)?;
+    repo.write("old.rs", &ten_line_function().replace("a = 1", "a = 9"))?;
+    assert_eq!(engine.faq("east", &all())?["question"], "east fresh answer");
+    let mut options = all();
+    options["faqLimit"] = json!("off");
+    let ranked = engine.faq("east", &options)?;
+    assert_eq!(ranked.as_array().unwrap().len(), 2);
+    assert_eq!(ranked[0]["question"], "east fresh answer");
+    assert_eq!(ranked[1]["references"][0]["outdated"], true);
+    fs::remove_file(repo.root.join("old.rs"))?;
+    options["freshness"] = json!(1);
+    assert_eq!(engine.faq("east", &options)?.as_array().unwrap().len(), 1);
+    assert_eq!(engine.faq("east", &all())?["question"], "east fresh answer");
+    options["freshness"] = json!(0);
+    let ranked = engine.faq("east", &options)?;
+    assert_eq!(ranked.as_array().unwrap().len(), 2);
+    assert_eq!(ranked[1]["freshness"], 0.0);
+    assert_eq!(ranked[1]["references"][0]["outdated"], true);
+    assert_eq!(mock.requests("/responses").len(), 2);
+    Ok(())
+}
+
+#[test]
+fn faq_cli_freshness_validates_fractions_and_labels_outdated_references() -> Result<()> {
+    let mock = Mock::start()?;
+    let repo = Repo::new()?;
+    repo.write(".slopdex/config.json", &mock.config().to_string())?;
+    repo.write("code.rs", ten_line_function())?;
+    let args = ["faq", "east", "--threshold", "-1"];
+    repo.cli_json(&args)?;
+    repo.write("code.rs", &ten_line_function().replace("a = 1", "a = 9"))?;
+    let hit = repo.cli_json(&args)?;
+    assert_eq!(hit["freshness"], 0.9);
+    assert!(hit.get("uptodate").is_none());
+    assert_eq!(hit["references"][0]["outdated"], true);
+    let text = repo.cli_format(&args, "text")?;
+    assert!(text.status.success());
+    assert!(String::from_utf8(text.stdout)?.contains(":selected *outdated"));
+    for fraction in ["-0.1", "1.1", "NaN", "inf", "no"] {
+        let mut args = args.to_vec();
+        args.extend(["--freshness", fraction]);
+        assert!(!repo.cli(&args)?.status.success());
+    }
+    let calls = mock.requests("/responses").len();
+    let mut strict = args.to_vec();
+    strict.extend(["--freshness", "1"]);
+    let refreshed = repo.cli_json(&strict)?;
+    assert!(refreshed["references"][0].get("outdated").is_none());
+    assert_eq!(mock.requests("/responses").len(), calls + 1);
+    Ok(())
+}
+
 #[test]
 fn faq_matches_question_or_plain_answer_without_repeating_search_and_survives_restart() -> Result<()>
 {
@@ -402,7 +677,7 @@ fn faq_invalidates_changed_deleted_and_renamed_files_but_not_unrelated_edits() -
         original["description"]
     );
     assert_eq!(mock.requests("/responses").len(), calls);
-    // Even an edit outside the selected callable invalidates its entire file.
+    // Edits outside the cited range do not invalidate or rewrite its snapshot.
     repo.write(
         "code.rs",
         &(function("selected", "VECTOR_EAST") + "\n// edited context\n"),
@@ -420,7 +695,7 @@ fn faq_invalidates_changed_deleted_and_renamed_files_but_not_unrelated_edits() -
         .query_row("SELECT files FROM faq_entries", [], |row| row.get(0))?;
     assert_eq!(
         serde_json::from_str::<Value>(&files)?["code.rs"],
-        slopdex::hash(function("selected", "VECTOR_EAST") + "\n// edited context\n")
+        slopdex::hash(function("selected", "VECTOR_EAST"))
     );
     // Verify disk bytes on a warm Engine even without refreshing its saved snapshot.
     fs::rename(repo.root.join("code.rs"), repo.root.join("renamed.rs"))?;
@@ -471,6 +746,7 @@ fn faq_tracks_cited_expanded_files_but_not_uncited_reference_only_files() -> Res
             "{answer}"
         );
         let calls = mock.requests("/responses").len();
+        let expected = slopdex::hash(fs::read(repo.root.join("defs.ts"))?);
         repo.write("defs.ts", &format!("export const LIMIT = {};\nexport function helper() {{ /* VECTOR_NORTH */ return LIMIT; }}\n", calls + 10))?;
         engine.refresh()?;
         engine.faq("east", &options)?;
@@ -480,12 +756,11 @@ fn faq_tracks_cited_expanded_files_but_not_uncited_reference_only_files() -> Res
             "the changed target did not change the actual prompt"
         );
         let rows = engine.index_entries("faq", &json!({}))?;
-        let expected = slopdex::hash(fs::read(repo.root.join("defs.ts"))?);
         if cited {
             assert!(
                 rows.iter().any(|row| row["data"]["valid"] == true
                     && row["data"]["files"]["defs.ts"] == expected),
-                "the cited file's new hash must be tracked: {rows:?}"
+                "the cited symbol is unchanged; its snapshot must remain valid: {rows:?}"
             );
         } else {
             assert!(
@@ -766,7 +1041,7 @@ fn faq_stale_paraphrases_refresh_one_canonical_question_and_reuse_exact_requests
         assert_eq!(question, "east original question");
         assert_eq!(
             serde_json::from_str::<Value>(&files)?["code.rs"],
-            slopdex::hash(edited)
+            slopdex::hash(&source)
         );
         assert_eq!(mock.requests("/responses").len(), 1);
     }
@@ -874,6 +1149,9 @@ fn faq_promotes_legacy_file_keyed_answers_using_the_matching_entries_original_qu
     ]).to_string());
     let db = repo.db()?;
     db.execute("DELETE FROM global.cache WHERE kind='explanation'", [])?;
+    // A legacy entry has only full-file hashes, so an unrelated edit still
+    // triggers regeneration and exercises promotion of the old request key.
+    db.execute("UPDATE faq_entries SET materials='[]'", [])?;
     db.execute(
         "INSERT INTO global.cache VALUES('explanation',?,?)",
         rusqlite::params![legacy_key, answer["description"].as_str().unwrap()],
@@ -929,7 +1207,10 @@ fn faq_request_cache_keeps_paid_answers_even_when_the_snapshot_cannot_publish_a_
         "request caching must not depend on source freshness or FAQ publication"
     );
     repo.write("code.rs", &source)?;
-    assert_eq!(engine.faq("east", &all())?, answer);
+    let restored = engine.faq("east", &all())?;
+    assert_eq!(restored["description"], answer["description"]);
+    assert_eq!(restored["freshness"], 1.0);
+    assert!(restored["references"][0].get("outdated").is_none());
     assert_eq!(entries(&repo)?, 1);
     assert_eq!(mock.requests("/responses").len(), calls);
     Ok(())
@@ -1116,12 +1397,12 @@ fn faq_verifies_independently_discovered_references_and_tracks_their_freshness()
     assert_eq!(engine.faq("east", &options)?, answer);
     assert_eq!(mock.requests("/responses").len(), 1);
 
-    // Unindexed sources also invalidate cached answers. The prompt is unchanged,
-    // so paid raw responses are reused but their citations are revalidated.
+    // Moving an unchanged unindexed symbol updates its displayed range without
+    // invalidating the answer. Later edits still revalidate cached raw responses.
     repo.write("unindexed.rs", "\nfn discovered() {}\n")?;
     assert_eq!(
         engine.index_entries("faq", &json!({}))?[0]["data"]["valid"],
-        false
+        true
     );
     let shifted = engine.faq("east", &options)?;
     assert_eq!(shifted["references"][2]["startLine"], 2);

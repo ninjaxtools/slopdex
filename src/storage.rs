@@ -20,7 +20,7 @@ mod records;
 mod snapshot;
 mod units;
 
-pub(crate) use faq::FaqEntry;
+pub(crate) use faq::{FaqEntry, FaqMaterial};
 pub(crate) use units::{callable_data, callable_identity, decode, parsed_items};
 
 /// Bump when the structure or search-unit extraction contract changes.

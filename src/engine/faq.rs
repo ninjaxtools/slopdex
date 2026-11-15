@@ -1,6 +1,9 @@
 //! Semantic answer reuse, independent of the code-search snapshot generation.
 use super::*;
-use crate::storage::FaqEntry;
+use crate::storage::{FaqEntry, FaqMaterial};
+mod freshness;
+pub(super) use freshness::DEFAULT_FRESHNESS;
+use freshness::{freshness_threshold, reference_source};
 
 pub(super) const SYSTEM: &str = "Explain the existing code and documentation relevant to the user's task using the supplied search context and any additional workspace sources you inspect. Do not propose an implementation. If there is insufficient context, say so in the description. Respond with a single JSON object and no other text, in exactly this shape: {\"description\": \"<free-text explanation>\", \"references\": [{\"path\": \"<path>\", \"symbol\": \"<qualified symbol name>\"}]}. List in references the files and symbols relevant to the task, including sources you discover independently of the supplied context. Use workspace-relative paths and exact symbol names. Omit \"symbol\" for a whole-file reference. Do not invent paths, symbols, or line numbers; references are verified and line numbers are added for you.";
 
@@ -44,6 +47,7 @@ impl Engine {
         self.reporting(|| {
             let cutoff = self.config.faq_threshold(options)?;
             let regeneration_cutoff = self.config.faq_regeneration_threshold(options)?;
+            let freshness_cutoff = freshness_threshold(options)?;
             let faq_limit = faq_limit(options)?;
             let single = faq_limit == limits::ResultLimit::Count(1);
             ensure!(!query.trim().is_empty(), "FAQ question must not be empty");
@@ -74,6 +78,7 @@ impl Engine {
                 context.remove("faqThreshold");
                 context.remove("faqRegenerationThreshold");
                 context.remove("faqLimit");
+                context.remove("freshness");
             }
             context["limit"] = self.config.resolve_limit(options)?.value();
             // Identity input: raw config fragments (null when absent) keep the
@@ -106,13 +111,9 @@ impl Engine {
             ui::progress("Searching FAQ answers");
             let index = self.faq_index(&entries)?;
             // Both occurrences point at the same entry: the best of either embedding wins.
-            // One answer needs only the best occurrence; several need every
-            // occurrence so duplicates and stale entries cannot crowd out matches.
-            let occurrences = if single {
-                1
-            } else {
-                entries.len().saturating_mul(2)
-            };
+            // Freshness can change the order, and stale hits must never crowd
+            // out a usable candidate, including when requesting just one answer.
+            let occurrences = entries.len().saturating_mul(2);
             let mut ranked: Vec<(&FaqEntry, f64)> = Vec::new();
             for (id, similarity) in index.search_filtered(&query_vector, occurrences, |_| true)? {
                 if similarity <= cutoff {
@@ -127,37 +128,31 @@ impl Engine {
                 }
             }
             let matched = ranked.first().copied();
-            if single {
-                if let Some((entry, score)) = matched
-                    && self.faq_files_current(&entry.files, &mut HashMap::new())
-                {
+            let mut checked = HashMap::new();
+            let mut results = Vec::new();
+            for (entry, score) in &ranked {
+                let freshness = self.faq_freshness(entry, &mut checked);
+                if freshness.fraction >= freshness_cutoff {
                     let mut result = entry.result.clone();
                     result["query"] = json!(query);
                     result["score"] = json!(score);
-                    ui::progress("Reusing FAQ answer");
-                    return Ok((result, 1));
+                    result["freshness"] = json!(freshness.fraction);
+                    result["rankScore"] = json!(0.9 * score + 0.1 * freshness.fraction);
+                    result["references"] = json!(freshness.references);
+                    results.push(result);
                 }
-            } else {
-                // Stale entries are never served; with no valid match the best
-                // stale entry below may still anchor a regenerated answer.
-                let mut checked = HashMap::new();
-                let mut results = Vec::new();
-                for (entry, score) in &ranked {
-                    if results.len() == faq_limit.count().unwrap_or(usize::MAX) {
-                        break;
-                    }
-                    if self.faq_files_current(&entry.files, &mut checked) {
-                        let mut result = entry.result.clone();
-                        result["query"] = json!(query);
-                        result["score"] = json!(score);
-                        results.push(result);
-                    }
-                }
-                if !results.is_empty() {
-                    ui::progress("Reusing FAQ answer");
-                    let reused = results.len() as u64;
-                    return Ok((json!(results), reused));
-                }
+            }
+            results.sort_by(|a, b| score(b, "rankScore").total_cmp(&score(a, "rankScore")));
+            results.truncate(faq_limit.count().unwrap_or(usize::MAX));
+            if !results.is_empty() {
+                ui::progress("Reusing FAQ answer");
+                let reused = results.len() as u64;
+                let result = if single {
+                    results.remove(0)
+                } else {
+                    json!(results)
+                };
+                return Ok((result, reused));
             }
             // A weaker match may serve a valid cached answer, but must not
             // replace the incoming question when generating a fresh answer.
@@ -168,22 +163,27 @@ impl Engine {
             let question = matched.map_or(query, |entry| entry.question.as_str());
             let question_embedding =
                 matched.map_or(question_embedding, |entry| entry.question_embedding.clone());
-            let (mut result, files) =
+            let (mut result, files, materials) =
                 self.answer_faq(question, options, matched.map(|entry| &entry.files))?;
             // A saved snapshot may deliberately differ from disk under --no-reindex.
             // It can still answer, but must never publish a stale semantic cache entry.
-            if !files.is_empty() && self.faq_files_current(&files, &mut HashMap::new()) {
+            let mut freshness =
+                self.material_freshness(&materials, &result, &files, &mut HashMap::new());
+            if !materials.is_empty() && freshness.fraction == 1.0 {
                 let answer = result["description"]
                     .as_str()
                     .context("Missing FAQ answer")?;
                 let answer_embedding = self.embed_one(answer, false)?;
                 // Provider work may have overlapped an editor write; validate again.
-                if self.faq_files_current(&files, &mut HashMap::new()) {
+                freshness =
+                    self.material_freshness(&materials, &result, &files, &mut HashMap::new());
+                if freshness.fraction == 1.0 {
                     let entry = FaqEntry {
                         id: 0,
                         question: question.into(),
                         result: result.clone(),
                         files,
+                        materials,
                         question_embedding,
                         answer_embedding,
                     };
@@ -196,6 +196,9 @@ impl Engine {
             // perfect 1. The score is per-query, so it is set only after the
             // scoreless result above may have been stored as a cache entry.
             result["score"] = json!(1.0);
+            result["freshness"] = json!(freshness.fraction);
+            result["rankScore"] = json!(0.9 + 0.1 * freshness.fraction);
+            result["references"] = json!(freshness.references);
             Ok((if single { result } else { json!([result]) }, 0))
         })
     }
@@ -264,13 +267,19 @@ impl Engine {
 
 const FAQ_PROMPT_BYTES: usize = 128 * 1024;
 
+struct VerifiedReferences {
+    references: Vec<Value>,
+    files: BTreeMap<String, String>,
+    materials: Vec<FaqMaterial>,
+}
+
 impl Engine {
     fn answer_faq(
         &self,
         query: &str,
         options: &Value,
         previous_files: Option<&BTreeMap<String, String>>,
-    ) -> Result<(Value, BTreeMap<String, String>)> {
+    ) -> Result<(Value, BTreeMap<String, String>, Vec<FaqMaterial>)> {
         let expand_callers = options["expandCallers"].as_u64().unwrap_or(2) as usize;
         let expand_callees = options["expandCallees"].as_u64().unwrap_or(2) as usize;
         let callers = (options["callers"].as_u64().unwrap_or(0) as usize).max(expand_callers);
@@ -363,11 +372,16 @@ impl Engine {
             response
         };
         let (description, cited) = parse_answer(&response);
-        let (references, files) = self.verify_faq_references(&cited, &symbols)?;
+        let VerifiedReferences {
+            references,
+            files,
+            materials,
+        } = self.verify_faq_references(&cited, &symbols)?;
         Ok((
             json!({"query":query,"question":query,"description":description,"references":references,
             "omitted":results.omitted,"limit":results.limit}),
             files,
+            materials,
         ))
     }
 
@@ -375,11 +389,12 @@ impl Engine {
         &self,
         cited: &[Cited],
         rendered: &[crate::cli::RenderedSymbol],
-    ) -> Result<(Vec<Value>, BTreeMap<String, String>)> {
+    ) -> Result<VerifiedReferences> {
         let mut normalized = Vec::new();
         let mut files = BTreeMap::new();
         let mut symbols = Vec::new();
         let mut checked = HashSet::new();
+        let mut sources = BTreeMap::new();
         for citation in cited {
             let Ok(path) = normalize_path(&self.root, citation.path.trim()) else {
                 continue;
@@ -387,6 +402,7 @@ impl Engine {
             normalized.push(Cited {
                 path: path.clone(),
                 symbol: citation.symbol.clone(),
+                lines: citation.lines,
             });
             if !checked.insert(path.clone()) {
                 continue;
@@ -395,6 +411,7 @@ impl Engine {
                 // Preserve saved-snapshot semantics, including --no-reindex.
                 // Freshness is checked separately before publishing/reusing FAQ entries.
                 files.insert(path.clone(), file.hash.clone());
+                sources.insert(path.clone(), self.db.source(&file.hash)?);
                 self.cached_structure(&path)?
             } else {
                 // The agent may inspect a file that is not indexed. Read only
@@ -411,6 +428,7 @@ impl Engine {
                     continue;
                 };
                 files.insert(path.clone(), hash(&source));
+                sources.insert(path.clone(), source.clone());
                 parse::parse(&path, &source)
                     .ok()
                     .map(|parsed| Arc::new(parsed.structure))
@@ -439,7 +457,42 @@ impl Engine {
                 );
             }
         }
-        Ok(match_references(&normalized, &files, &symbols))
+        let (references, files) = match_references(&normalized, &files, &symbols);
+        let references: Vec<_> = references
+            .into_iter()
+            .filter(|reference| {
+                sources
+                    .get(reference["path"].as_str().unwrap_or(""))
+                    .and_then(|source| reference_source(source, reference))
+                    .is_some()
+            })
+            .collect();
+        let materials = references
+            .iter()
+            .map(|reference| {
+                let source =
+                    reference_source(&sources[reference["path"].as_str().unwrap()], reference)
+                        .unwrap();
+                FaqMaterial {
+                    reference: reference.clone(),
+                    hash: hash(source),
+                    source: source.to_owned(),
+                }
+            })
+            .collect();
+        let files = files
+            .into_iter()
+            .filter(|(path, _)| {
+                references
+                    .iter()
+                    .any(|reference| reference["path"] == *path)
+            })
+            .collect();
+        Ok(VerifiedReferences {
+            references,
+            files,
+            materials,
+        })
     }
 }
 
@@ -448,6 +501,7 @@ impl Engine {
 struct Cited {
     path: String,
     symbol: Option<String>,
+    lines: Option<(u64, u64)>,
 }
 
 /// Split a raw LLM response into its free-text description and cited
@@ -484,6 +538,7 @@ fn parse_answer(raw: &str) -> (String, Vec<Cited>) {
                         return Some(Cited {
                             path: path.into(),
                             symbol: None,
+                            lines: None,
                         });
                     }
                     let path = entry["path"].as_str()?;
@@ -495,6 +550,7 @@ fn parse_answer(raw: &str) -> (String, Vec<Cited>) {
                     Some(Cited {
                         path: path.into(),
                         symbol: symbol.map(str::to_owned),
+                        lines: entry["startLine"].as_u64().zip(entry["endLine"].as_u64()),
                     })
                 })
                 .collect()
@@ -505,8 +561,8 @@ fn parse_answer(raw: &str) -> (String, Vec<Cited>) {
 
 /// Keep only citations present in the verified files and symbols, in cited
 /// order and without duplicates. Symbol citations gain the verified line
-/// range and canonical qualified name; the returned file hashes (for exactly
-/// the kept references) drive FAQ cache invalidation.
+/// range and canonical qualified name. Only these kept references are snapshotted
+/// for freshness; the file hashes remain for legacy request-cache promotion.
 fn match_references(
     cited: &[Cited],
     context_files: &BTreeMap<String, String>,
@@ -524,7 +580,10 @@ fn match_references(
             continue;
         };
         let reference = match &citation.symbol {
-            None => json!({"path": path}),
+            None => match citation.lines {
+                Some((start, end)) => json!({"path":path,"startLine":start,"endLine":end}),
+                None => json!({"path": path}),
+            },
             Some(symbol) => {
                 let symbol = symbol.strip_suffix("()").unwrap_or(symbol);
                 let Some(found) = symbols
@@ -581,19 +640,23 @@ mod tests {
             [
                 Cited {
                     path: "a.rs".into(),
-                    symbol: Some("run".into())
+                    symbol: Some("run".into()),
+                    lines: None,
                 },
                 Cited {
                     path: "b.md".into(),
-                    symbol: None
+                    symbol: None,
+                    lines: None,
                 },
                 Cited {
                     path: "c.rs".into(),
-                    symbol: None
+                    symbol: None,
+                    lines: None,
                 },
                 Cited {
                     path: "d.rs".into(),
-                    symbol: None
+                    symbol: None,
+                    lines: None,
                 },
             ]
         );
@@ -623,26 +686,32 @@ mod tests {
             Cited {
                 path: "a.rs".into(),
                 symbol: Some("run()".into()),
+                lines: None,
             },
             Cited {
                 path: "a.rs".into(),
                 symbol: Some("missing".into()),
+                lines: None,
             },
             Cited {
                 path: "gone.rs".into(),
                 symbol: None,
+                lines: None,
             },
             Cited {
                 path: "./b.md".into(),
                 symbol: None,
+                lines: None,
             },
             Cited {
                 path: "a.rs".into(),
                 symbol: Some("Api.run".into()),
+                lines: None,
             },
             Cited {
                 path: "b.md".into(),
                 symbol: Some("run".into()),
+                lines: None,
             },
         ];
         let (references, tracked) = match_references(&cited, &files, &symbols);

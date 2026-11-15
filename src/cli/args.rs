@@ -666,6 +666,9 @@ pub(super) struct FaqArgs {
     /// Reuse a stale entry's question only above this cosine score (config faqRegenerationThreshold; default: 0.8)
     #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
     pub(super) faq_regeneration_threshold: Option<f64>,
+    /// Minimum unchanged fraction of cited lines required for reuse (default: 0.8)
+    #[arg(long, default_value = "0.8", allow_hyphen_values = true, value_parser = fraction)]
+    pub(super) freshness: f64,
 }
 
 #[derive(Debug, Args)]
@@ -819,6 +822,14 @@ fn similarity(input: &str) -> std::result::Result<f64, String> {
         .ok()
         .filter(|n| n.is_finite() && (-1.0..=1.0).contains(n))
         .ok_or_else(|| "similarity must be finite and in [-1,1]".into())
+}
+
+fn fraction(input: &str) -> std::result::Result<f64, String> {
+    input
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && (0.0..=1.0).contains(n))
+        .ok_or_else(|| "fraction must be finite and in [0,1]".into())
 }
 
 fn threshold(input: &str) -> std::result::Result<Threshold, String> {

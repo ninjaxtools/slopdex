@@ -218,10 +218,11 @@ impl Engine {
                 let answer = entry.result["description"].as_str().context("Invalid FAQ answer")?;
                 let compatible = entry.question_embedding == Database::embedding_key(&profile, true, &entry.question)
                     && entry.answer_embedding == Database::embedding_key(&profile, false, answer);
-                let valid = self.faq_files_current(&entry.files, &mut checked);
+                let freshness = self.faq_freshness(&entry, &mut checked);
+                let valid = freshness.fraction >= faq::DEFAULT_FRESHNESS;
                 Ok(Record {
                     id:entry.id.to_string(),kind:"faq".into(),path:None,name:entry.question.clone(),text:format!("{}\n{}",entry.question,answer),
-                    data:json!({"question":entry.question,"answer":answer,"result":entry.result,"files":entry.files,"contract":contract,"valid":valid}),
+                    data:json!({"question":entry.question,"answer":answer,"result":entry.result,"files":entry.files,"contract":contract,"valid":valid,"freshness":freshness.fraction}),
                     embeddings:vec![self.inspection_embedding("question",entry.question_embedding,compatible)?,self.inspection_embedding("answer",entry.answer_embedding,compatible)?],
                 })
             }).collect();

@@ -187,6 +187,7 @@ fn faq(session: &mut Session, args: &FaqArgs, out: &mut impl Write) -> Result<()
     if let Some(threshold) = args.faq_regeneration_threshold {
         options["faqRegenerationThreshold"] = json!(threshold);
     }
+    options["freshness"] = json!(args.freshness);
     // For faq, --limit counts the ranked FAQ questions returned, not the
     // source-search results feeding generation (those keep using the
     // configured defaultLimit).
@@ -245,10 +246,15 @@ fn print_faq_answer(out: &mut impl Write, result: &Value, show_question: bool) -
         writeln!(out, "\nReferences")?;
         for reference in &references {
             let path = reference["path"].as_str().unwrap_or("");
+            let note = if reference["outdated"].as_bool().unwrap_or(false) {
+                " *outdated"
+            } else {
+                ""
+            };
             match reference["symbol"].as_str() {
                 Some(symbol) => writeln!(
                     out,
-                    "{}",
+                    "{}{note}",
                     crate::map::symbol_location(
                         path,
                         reference["startLine"].as_u64().unwrap_or(1) as usize,
@@ -256,7 +262,13 @@ fn print_faq_answer(out: &mut impl Write, result: &Value, show_question: bool) -
                         symbol,
                     )
                 )?,
-                None => writeln!(out, "{path}")?,
+                None => match (
+                    reference["startLine"].as_u64(),
+                    reference["endLine"].as_u64(),
+                ) {
+                    (Some(start), Some(end)) => writeln!(out, "{path}:{start}-{end}{note}")?,
+                    _ => writeln!(out, "{path}{note}")?,
+                },
             }
         }
     }
