@@ -166,15 +166,14 @@ fn rust_path_file_moves_update_test_crates_offline_without_changing_module_names
     );
     if let Some(rustc) = compiler("rustc")? {
         for entry in ["driver", "other"] {
+            // Resolve and type-check the test modules without linking a binary:
+            // the isolated child environment may not discover the MSVC linker.
             compiled(
                 repo.child(&rustc)
-                    .args(["--edition=2024", "--test"])
+                    .args(["--edition=2024", "--test", "--emit=metadata"])
                     .arg(format!("tests/{entry}.rs"))
                     .arg("-o")
-                    .arg(
-                        repo.home
-                            .join(format!("{entry}{}", std::env::consts::EXE_SUFFIX)),
-                    )
+                    .arg(repo.home.join(format!("{entry}.rmeta")))
                     .output()?,
             )?;
         }
