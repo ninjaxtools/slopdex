@@ -1,10 +1,9 @@
 //! Local, aggregate-only CLI usage. Deliberately independent of index/artifact
 //! storage: observing usage must neither create an index nor share telemetry.
 
-use super::args::{Cli, Command, Format, GenerateAction, IndexAction};
+use super::args::{Cli, Command, Format, GenerateAction, IndexAction, KbAction};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -20,7 +19,6 @@ const MAX_BYTES: u64 = 4 * 1024 * 1024;
 pub(super) struct Usage {
     results: Option<u64>,
     lines_counted: u64,
-    faq_reused_answers: u64,
     pub(super) files_changed: u64,
 }
 
@@ -32,11 +30,6 @@ impl Usage {
     pub(super) fn line_files(&mut self, files: &[(PathBuf, usize)]) {
         self.results(files.len() as u64);
         self.lines_counted += files.iter().map(|(_, count)| *count as u64).sum::<u64>();
-    }
-
-    pub(super) fn faq(&mut self, result: &Value, reused: u64) {
-        self.results(result.as_array().map_or(1, Vec::len) as u64);
-        self.faq_reused_answers += reused;
     }
 }
 
@@ -51,7 +44,6 @@ struct Counts {
     empty_result_invocations: u64,
     results: u64,
     lines_counted: u64,
-    faq_reused_answers: u64,
     files_changed: u64,
     saved_snapshot_invocations: u64,
     dry_runs: u64,
@@ -74,7 +66,6 @@ impl Counts {
             empty_result_invocations,
             results,
             lines_counted,
-            faq_reused_answers,
             files_changed,
             saved_snapshot_invocations,
             dry_runs
@@ -138,7 +129,12 @@ fn command_name(command: &Command) -> Option<&'static str> {
         Command::SearchDescriptions(_) => "search-descriptions",
         Command::SearchMd(_) => "search-docs",
         Command::SearchSymbols(_) => "search-symbols",
-        Command::Faq(_) => "faq",
+        Command::Kb { action } => match action {
+            KbAction::Init(_) => "kb init",
+            KbAction::Query(_) => "kb query",
+            KbAction::Refresh(_) => "kb refresh",
+            KbAction::List => "kb list",
+        },
         Command::CrossSearch(_) => "cross-search",
         Command::Map(_) => "map",
         Command::Lines(_) => "lines",
@@ -250,7 +246,6 @@ pub(super) fn record(cli: &Cli, root: &Path, duration: Duration, success: bool, 
         empty_result_invocations: u64::from(success && usage.results == Some(0)),
         results: usage.results.unwrap_or(0),
         lines_counted: usage.lines_counted,
-        faq_reused_answers: usage.faq_reused_answers,
         files_changed: usage.files_changed,
         saved_snapshot_invocations: u64::from(cli.global.no_reindex),
         dry_runs: u64::from(matches!(&cli.command, Command::Refactor(args) if args.dry_run)),
@@ -300,7 +295,6 @@ impl<'a> Tracker<'a> {
             entry.2.results(results);
         }
         entry.2.lines_counted += usage.lines_counted;
-        entry.2.faq_reused_answers += usage.faq_reused_answers;
         entry.2.files_changed += usage.files_changed;
     }
 }
@@ -406,8 +400,8 @@ pub(super) fn print(
     )?;
     writeln!(
         out,
-        "FAQ answers reused: {}; source lines counted: {}; files refactored: {}",
-        totals.faq_reused_answers, totals.lines_counted, totals.files_changed
+        "Source lines counted: {}; files changed: {}",
+        totals.lines_counted, totals.files_changed
     )?;
     writeln!(
         out,

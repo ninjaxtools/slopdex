@@ -40,7 +40,7 @@ can also follow the command. Quote multiword queries.
 | `search-descriptions <query>` | Search only available source/generated callable, symbol, and file descriptions. | Ranked declaration/file excerpts |
 | `search-docs <query>` (alias `search-md`) | Search only the heading-aware Markdown content index, never config or markup content. | Ranked heading paths |
 | `search-symbols <query>` | Search only the bare symbol-name/alias and Markdown heading-title index. | Ranked declaration/heading excerpts |
-| `faq <query>` | Reuse a similar valid answer, or search and ask the description model; index both the question and plain-text answer. | Explanation text |
+| `kb init/query/refresh/list` | Maintain and query committed Markdown articles with Git-derived reference freshness. | Articles / freshness overview |
 | `index list [index]` | Discover saved index channels or inspect/export their entries; `-q` ranks stored embeddings and `-e` filters entry text. Never refreshes. | Compact text; expanded text, CSV, or JSON |
 | `cross-search` | Find similar callable neighbors in this index or a second repository. | Clusters; summary with `--cohesion` |
 | `map [PATH]...` | Show selected groups' declarations, keys, sections, elements, and Markdown headings; refresh existing structure or parse directly if no index exists. | Summary |
@@ -69,16 +69,16 @@ slopdex metrics --reset
 
 Usage is tracked locally, starting with this version; earlier usage cannot be
 reconstructed. The report includes lifetime per-command call, success/failure,
-and elapsed-time totals; measured result and empty-result counts; FAQ answers
-reused; source lines counted; files changed by refactoring; saved-snapshot calls;
+and elapsed-time totals; measured result and empty-result counts;
+source lines counted; files changed by refactoring or KB generation; saved-snapshot calls;
 and refactor dry runs. Recent daily totals are retained for 90 UTC days, while
 lifetime command totals remain until reset. JSON includes first/last-use Unix
 timestamps and daily buckets keyed by their UTC start time in Unix seconds.
 
 Results count returned search/index entries, mapped declarations, counted files,
-and FAQ answers. They are not unique across calls; map/search/index limits apply.
+and KB articles. They are not unique across calls; map/search/index limits apply.
 Commands without measured result counts show `-`. Files changed counts actual
-applied refactors, never dry-run proposals. Timing measures workspace command
+applied refactors and generated KB articles, never dry-run proposals. Timing measures workspace command
 work, including setup/refresh,
 not time saved. These are usage indicators, not claims about answer quality,
 developer productivity, token savings, or provider costs.
@@ -511,7 +511,7 @@ cross-file callees. Related callables are shown even when they are outside the
 requested paths, glob, name, kind, visibility, or result limit. Expansion stops at
 cycles and deduplicates symbols. It is also available on `search`, `search-code`,
 `search-descriptions`, `search-symbols`, `search-docs` (alias `search-md`),
-`faq`, and `cross-search`; Markdown-only results have no callable to expand.
+and `cross-search`; Markdown-only results have no callable to expand.
 Cross-index results expand within their respective indexes. Calls are extracted
 from indexed source; only uniquely resolved static targets, including supported
 explicit imports, form edges. Dynamic receivers and unresolved calls do not
@@ -539,7 +539,7 @@ regardless of `--detail` or `--expand-code-threshold`. The corresponding
 `--callers`/`--callees` depth can be higher: levels beyond the expanded depth
 still show declarations. The larger depth wins when both flags are given; a root
 that is also another root's caller or callee can receive forced code. These flags
-work wherever `--callers` and `--callees` work, including FAQ context and
+work wherever `--callers` and `--callees` work, including
 cross-search clusters. Map JSON and related callable JSON nodes include indexed
 `source` and `expandedCode: true` at forced-code depths alongside their existing
 `callDepth` metadata.
@@ -611,7 +611,7 @@ format, or `path:line:qualifiedName` for single-line symbols, for example
 All JSON reference locations remain unchanged: callable names never gain `()`,
 even when the corresponding text annotation marks an invocation.
 `--refs` controls these annotations on map nodes, callable search results,
-cross-search source and match objects, and in FAQ's LLM context,
+and cross-search source and match objects,
 independently of traversal. Graph expansion uses `callDepth` on map nodes and
 `relatedCallables` on callable search results; caller/callee depth fields retain
 their graph meaning. With both depths zero and no explicit `--refs`, outgoing
@@ -678,7 +678,7 @@ slopdex map src --callers 0 --callees 0 --refs all
 
 ## Shared selectors
 
-Map, query searches, `faq`, and cross-search accept:
+Map, query searches, and cross-search accept:
 
 - `--formats <GROUPS>`: comma-separated or repeated `code`, `docs`, `config`,
   or `markup`; `all` selects every group. An explicit selection replaces the
@@ -713,7 +713,7 @@ Map, query searches, `faq`, and cross-search accept:
   match selects its symbol; a matching file description selects declarations in
   that file, still subject to globs and map kind/private filters. A parent-name
   match alone does not select children. Ancestors have no expanded heading body unless
-  they directly match. The positional search/FAQ query ranks the chosen
+  they directly match. The positional search query ranks the chosen
   streams; with `search-symbols` or `search --symbols` alone it ranks names.
 - `--symbol-threshold <NUMBER>`: optional finite scalar in `[-1,1]`, default
   `0.5`; inclusive minimum semantic selector similarity, independent of `--threshold`.
@@ -778,7 +778,7 @@ neighbors remain eligible regardless of source selectors. `-k` is map-only.
 
 Only general `search <query> [<query>...]` accepts multiple positional queries.
 Dedicated `search-code`, `search-descriptions`, `search-docs` (alias `search-md`),
-and `search-symbols`, as well as `faq`, still accept one positional query.
+and `search-symbols`, as well as `kb query`, accept one positional query.
 Quote multiword queries: `search "validate session" "reject expired credentials"`
 runs two searches, while unquoted words become separate queries.
 
@@ -794,14 +794,13 @@ queries return the same result array, not separate per-query arrays.
 Common query/cross-search filters:
 
 - `--threshold <number|min-max>`: default `0.8` for cross-search and `0.3` for
-  query commands (including `faq`); finite endpoints in `[-1,1]`,
+  search commands; finite endpoints in `[-1,1]`,
   inclusive minimum and exclusive maximum. A range requires minimum < maximum.
 - `--limit <positive integer|none|off>`: default `4096`, configurable with
   `defaultLimit` in the selected config file. `--limit none` (or `--limit off`)
   disables the output limit, overriding the config. Caps query results
-  (including Markdown). For `faq` it instead caps the ranked FAQ questions
-  returned (default `1`, unaffected by `defaultLimit`; see
-  [Frequently asked questions](#frequently-asked-questions)). For `map`, it caps direct declaration matches
+  (including Markdown). `kb query` instead defaults to one article, unaffected by
+  `defaultLimit`; see [Knowledge base](#knowledge-base). For `map`, it caps direct declaration matches
   across files and mapped workspaces; ancestor and call-graph context do not count.
   When mapping multiple workspaces, the first workspace supplies the configured
   default unless `--limit` is explicit. For cross-search it caps
@@ -887,7 +886,7 @@ slopdex search-symbols 'read settings' --callers 0 --callees 0 --refs cross-file
 slopdex config set agentCommand '["opencode","run"]'
 slopdex generate descriptions
 slopdex search-descriptions "keep the repository index synchronized"
-slopdex faq "How are RPC endpoints registered?"
+slopdex kb query "How are RPC endpoints registered?"
 slopdex cross-search --cross-file-only --lines 4-20 --threshold 0.85-0.9
 slopdex cross-search --uncommitted --cross-file-only --threshold 0.9
 slopdex cross-search --changed-since origin/main --threshold 0.9
@@ -964,7 +963,7 @@ Similarity is model-dependent, not a probability of duplication.
 
 ### Reranking, clusters, and output
 
-Text is the default for `map`, `search`, `cross-search`, and `faq`.
+Text is the default for `map`, `search`, `cross-search`, and `kb query`/`kb list`.
 `--detail compact` (default) prints declaration signatures and scores only;
 `--detail standard` also shows declaration attributes, file-hit description prose,
 and a 160-character Markdown body preview; `--detail expanded` additionally shows full signatures,
@@ -1084,7 +1083,7 @@ JSON `references` arrays keep flat `path:start-end:qualifiedName` locations. Wit
 `--cohesion` or `--output text`, cross-search can instead print source/match groups
 with per-match scores and optional filesystem distance.
 
-Reranking applies to query commands, including the search inside `faq`, not
+Reranking applies to search commands, not
 cross-search. Embedding thresholds are applied first. Cohere/Jina receive up to
 five times the effective result limit, or all retrieved threshold-passing candidates
 without a limit. Generative command reranking receives up to
@@ -1131,148 +1130,108 @@ to stdout and warnings/errors to stderr. Clap argument errors exit with `2`;
 runtime/configuration/domain failures exit with `1`; success/help/version exit
 with `0`.
 
-### Frequently asked questions
+### Knowledge base
 
-`faq` replaces `describe`. On a cache miss it first uses semantic search to
-select seed files, symbols, and Markdown sections for the question. It then
-sends the configured description provider a merged context for those candidate
-files: each candidate file's full declaration map (all declarations and
-headings, including private ones), scores on the direct hits, available file
-descriptions, and Markdown seed content. Direct seed declarations include
-their indexed source code when their similarity exceeds
-`--expand-code-threshold`; callers and callees include code up to two edges
-away by default, even below that threshold, while other declarations in the
-file maps remain signatures only.
-Use `--expand-callers N` and `--expand-callees N` (or `--expand-callables N`)
-to override either related-code depth; explicit `0` disables that direction's
-related-code expansion. These defaults apply only to
-the LLM context; the rendered context itself is neither returned nor cached
-with the answer.
-`--refs` controls outgoing annotations in that context independently of
-traversal. Its implicit default follows the context's resolved depths,
-including its code-expansion depths.
-The entire prompt is limited to 128 KiB. Candidate files are rendered in
-relevance order; a file whose full map does not fit the remaining budget is
-retried as hits-only excerpts, and whole trailing file sections beyond the
-budget are omitted and marked. Complete file source is not appended apart
-from the selected code bodies and Markdown excerpts above.
-The instruction asks for an explanation of existing code/docs, not an
-implementation proposal, as a single JSON object holding a free-text
-`description` and a `references` list of the files and symbols that the model
-considers relevant, including workspace sources it inspects independently
-of the supplied context (a path, plus a symbol name
-for symbol references).
+`kb` replaces the old `faq` command and its separate SQLite/vector index.
+Articles are ordinary Markdown in `docs/kb/` (`kbPath` config), indexed through
+the normal `docs` channel. Old FAQ entries are not migrated or queried.
 
-Context uses the indexed snapshot. Provider retries/failover still apply.
-Cited references are validated against workspace files and declarations, not
-restricted to the rendered context or search filters. Indexed files use the
-saved snapshot; unindexed files are read from disk within `maxFileSize`.
-A symbol citation must name a declaration in that file, matched by qualified
-or unqualified name. Missing or unverifiable files/symbols and paths outside
-the workspace are dropped, as are any line numbers the model supplies.
-This verifies reference locations, not whether they support the model's claims.
-Responses that are not the requested JSON object are treated as a plain
-description with no references. Reranker order informs the prompt.
-JSON output contains `query` (the current question), `question` (the original
-cached question), `description`, `references`, `omitted`, `limit`, and `score`:
-the cosine similarity of the vector-search match that produced the answer, or
-`1` when the answer was generated rather than matched. Each
-kept reference is `{"path": ...}` for a whole file or
-`{"path": ..., "symbol": <canonical qualified name>, "startLine": ..., "endLine": ...}`
-with the line range taken from source declarations, in cited order without
-duplicates.
-Text output labels the generated prose `Explanation (score=...)` and follows it
-with `References`, one location per line (`path`, or `path:start-end:symbol` in
-the shared symbol-location format). The prose is model-generated; its
-format and wording are not deterministic.
+| Command | Behavior |
+| --- | --- |
+| `kb init [--parallelism N]` | Ask `agentCommand` for a full repository/topic review, then start a fresh agent for each topic; write and commit all articles. |
+| `kb query <query> [--threshold N] [--freshness N] [--limit N]` | Return ranked existing articles; never invoke an agent or commit on a miss. |
+| `kb refresh [--parallelism N] [--freshness N]` | Review articles below the freshness cutoff, update explanations/references as needed, and commit only those articles. |
+| `kb list` | Show every article's title, path and freshness without opening an index or calling providers. |
 
-Each workspace maintains a separate `faq` vector index backed by SQLite entries.
-An entry stores the original question, the answer and its kept references, the
-content hashes of exactly the referenced files, and two vector references: the
-question embedding (query mode) and the plain-text LLM answer embedding
-(document mode). The search context, its scores, and its excerpts are not
-stored in the entry or included in the answer embedding.
+Generation defaults to four concurrent agents (`kbParallelism`, range 1–256).
+The review and each article invocation run in the repository root with fresh
+conversation state. Agents are asked to inspect sources read-only and return
+JSON containing a Markdown `description` and `references`. Slopdex verifies the
+references, renders Markdown, and controls writes/commits itself. A missing,
+ambiguous, uncommitted or out-of-repository reference fails generation before
+publishing any articles. This validates locations, not the truth of agent prose.
 
-Before searching code, FAQ compares the incoming question to both embeddings and
-ranks the entries whose cosine similarity is **strictly greater than
-`0.7`** by that best question-or-answer score. Entries whose dependencies are
-still valid are returned immediately, best first, each with its `score`.
-`--faq-threshold N` overrides config `faqThreshold`; both accept a finite
-number in `[-1,1]`. This is independent of `--threshold`, which filters source
-search results on a miss. A cutoff of `1` disables semantic reuse.
-`--limit N` caps how many ranked FAQ questions are returned (default `1`);
-`--limit off` (or `--limit none`) returns every match above the cutoff. With a
-limit of `1` the output is the single answer object described above; with any
-other limit it is a JSON array of such objects in ranked order (text output
-prints each matched question with its answer). A limit above `1` on a miss
-still generates only one new answer, returned as a one-element array with
-`score` `1`. The FAQ `--limit` does not cap the source search behind a
-generated answer; that search keeps using `defaultLimit`. Changing only the
-FAQ matching/regeneration cutoffs or limit does not isolate cached entries.
+Both writing commands require a Git HEAD and a completely clean repository,
+including staged, unstaged and untracked files. Commit those files first.
+The clean HEAD is rechecked after generation; concurrent source changes abort
+publication. Articles are committed using a private index and compare-and-swap
+HEAD update, without running commit hooks or including unrelated staged paths.
+Your Git author identity must be configured. Nothing is pushed. If committing
+fails, generated articles remain on disk for inspection/manual commit.
+`kb init` refuses an existing nonempty knowledge base; use `kb refresh` instead.
+Init, refresh and list need no semantic index. After generation run `update`
+before querying a new repository; subsequent queries refresh normally.
 
-FAQ hits reuse the original references without searching, reranking, or calling
-the LLM again; a new question may still require a query embedding. Entries persist
-across restarts and unrelated snapshot changes. Embedding/LLM profiles and search
-filters/context options isolate answers; changing only the FAQ cutoff does not.
-Every referenced file must still match its on-disk content hash and, when
-indexed, its indexed hash; changes to context files the answer did not cite
-do not invalidate it.
-Changes, deletions, and renames of referenced files invalidate cached answers,
-but their entries remain as potential canonical-question anchors. When no valid
-answer matches, the best stale match reuses its **original question** only if its
-best question-or-answer score is **strictly greater than `0.8`**. Configure this
-separately with `faqRegenerationThreshold` or override it with
-`--faq-regeneration-threshold N` (a finite number in `[-1,1]`). Otherwise, generation
-uses the incoming question directly. Matching still uses `faqThreshold`.
-`query` reports the incoming question; `question` reports the one used for search
-and the LLM request. Strong paraphrases update the original entry in place;
-weaker ones create an entry for the incoming question instead.
-Live files are read for this
-validation even with `--no-reindex`; that flag still uses the saved snapshot on a
-miss, but a stale snapshot cannot publish a reusable FAQ entry. Answers whose
-references match no verifiable workspace file are not added to the FAQ index; an existing
-stale question anchor is retained until it can be refreshed with valid
-referenced-file dependencies. The FAQ table is created on demand in
-existing schema-4 indexes; no rebuild is needed. A live-state reset clears FAQ entries.
-Like other query caches, FAQ membership and derived-pointer writes are best-effort
-when another reader holds the workspace lock; refreshed answers still return,
-but a stale entry can never directly serve its old answer while its update is deferred.
+Article layout:
 
-FAQ freshness and LLM request reuse are separate cache layers. After rebuilding
-the search context, an exact-request lookup uses the configured LLM profile,
-command/model settings, system instruction, and complete final prompt. File
-hashes, snapshot generations, index paths, and incoming paraphrases are **not**
-part of that key. An edit to a referenced file that leaves the rendered context
-unchanged may therefore invalidate the FAQ entry without requiring another LLM
-call; the raw cached response is simply re-parsed and its references
-re-validated against the rebuilt context. A changed prompt or model
-requires a different response. Successful LLM results are saved even when the
-snapshot is stale or a later FAQ/vector publication fails.
+```md
+# Topic title
 
-The request cache is stored in the shared global artifact database (with optional
-S3 reuse), not in `faq_entries` or the workspace SQLite index. Deleting/resetting
-and rebuilding the workspace index retains completed explanation and description
-requests, provided the same global store and request configuration are used.
-Default `cache prune` preserves these paid results. Known legacy exact-request
-and file-keyed explanation responses are promoted when their matching request
-identities can still be reconstructed; no new LLM call is needed for promotion.
+Detailed Markdown explanation, with subsections as needed.
+
+<!-- Reviewed against Git commit <source revision>. -->
+
+## References
+- [src/api.rs :: register](/src/api.rs#L20-L45)
+- [docs/design.md](/docs/design.md)
+```
+
+Targets are repository-root-relative Markdown links; paths are percent-encoded
+where necessary. File references have no anchor; range references use
+`#Lstart-Lend`. Symbol labels include ` :: qualifiedName`, and their ranges are
+resolved from source rather than invented by the model. Keep the `## References`
+section and link format when editing articles by hand.
+
+The article's latest Git commit supplies its reference baseline (the initial
+addition, then later article edits/reviews). No reference snapshots, file hashes,
+or freshness records are stored separately. A review-provenance comment makes
+an unchanged explanation publishable as a new article revision. Freshness is
+the sum of unchanged cited lines divided by the sum of the larger old/current
+line counts per reference. Insertions, deletions and replacements count as
+changes; unrelated edits outside ranges do not. Symbols and anonymous ranges
+are relocated when possible. Deleted/missing references are outdated, and
+uncommitted articles or those without usable references have freshness zero.
+Working-tree edits affect freshness even with `--no-reindex`.
+An article whose history stops at a shallow-clone boundary has no verifiable
+baseline and is treated as stale; fetch sufficient history or refresh it.
+
+Query requires freshness **at least 0.8** (`kbQueryFreshness`); refresh selects
+articles **below 0.9** (`kbRefreshFreshness`). `--freshness` overrides the relevant
+setting, in `[0,1]`. Thus an article at exactly 0.8 may be queried, and an article
+at exactly 0.9 is not refreshed by default.
+
+Query uses ordinary documentation section embeddings, groups matches by article,
+and uses the best section's cosine score. Matching is **strictly above 0.7**
+(`kbThreshold`, override `--threshold`, range `[-1,1]`). Results are ordered by
+`rankScore = 0.9 * score + 0.1 * freshness`. Freshness is applied before the
+article limit, so stale hits cannot crowd out fresh ones. `--limit` defaults
+to 1; `off`/`none` returns every match. The configured `defaultLimit` does not
+apply to KB articles. Saved-snapshot queries never pair old embeddings with
+edited article text.
+
+`--output json` query/list results are always arrays. Each result includes
+`path`, `title`, `description` (the Markdown article), `commit`, `freshness` and
+`references`; query adds `query`, `score` and `rankScore`. Changed references
+have `outdated: true` and relocated ranges when available. Init/refresh return
+`{"articles":["path.md"],"commit":"<hash>"}`; a no-op refresh has an empty list
+and null commit.
 
 ### Inspecting and exporting indexes
 
 `slopdex index list` shows the logical index catalog: `code`, `docs`, `config`,
-`markup`, `descriptions`, `symbols`, and `faq`. Empty channels are included so all
+`markup`, `descriptions`, and `symbols`. Empty channels are included so all
 selectable names are discoverable. Each has `entryCount`, `vectorCount`,
 `pendingCount` (entries missing a required vector), `exists`, and `state`
 (`empty`, `pending`, or `ready`). `docs` also accepts `md` and `markdown`.
 
 ```sh
 slopdex index list
-slopdex index list faq
+slopdex index list docs
 slopdex index list code -q "session validation" --threshold 0.7
 slopdex index list descriptions -e "authentication" -i
-slopdex index list faq -q "session validation" -e "token"
+slopdex index list docs -q "session validation" -e "token"
 slopdex index list symbols --detail expanded
-slopdex index list faq --output json > faq.json
+slopdex index list docs --output json > docs.json
 slopdex index list code --output csv > code.csv
 ```
 
@@ -1284,7 +1243,7 @@ query may call the embedding provider and cache only its query vector.
 
 Without `-q`, entries remain in stable logical index order: content units by saved
 unit ID; callable/symbol descriptions by unit ID followed by file descriptions in
-path order; symbols by native hashed vocabulary ID; FAQ entries by SQLite entry ID.
+path order; symbols by native hashed vocabulary ID.
 Symbol entries are unique normalized names/aliases with their declaration locations,
 not duplicated declaration occurrences. Both file and callable descriptions are
 included in `descriptions`. Pending entries remain inspectable without generating
@@ -1292,16 +1251,14 @@ their missing vectors.
 
 `-q` / `--query` matches the selected channel's **stored embeddings**, not the map
 symbol selector. Results are scored by exact cosine and ordered by decreasing score,
-with original order breaking ties. Repeated queries use the best score (OR). FAQ
-entries use the best score across both question and answer embeddings. Missing or
+with original order breaking ties. Repeated queries use the best score (OR). Missing or
 profile-incompatible vectors cannot match; they are never generated by inspection.
 `--threshold N` or `MIN-MAX` optionally filters semantic scores (inclusive minimum,
-exclusive maximum), independently of FAQ's answer-reuse cutoff. By default every
+exclusive maximum). By default every
 scored entry is included, even with negative similarity.
 
 `-e` / `--regexp` (alias `--regex`) matches entry paths, names, and text, with repeated
 expressions combined by OR and `-i` / `--ignore-case` for case-insensitive matching.
-For FAQ, text means the original question plus plain answer, not the search context or reference list.
 Regex filters are applied before semantic ranking; combining `-q` and `-e` uses AND.
 
 Default text is compact: one truncated preview per entry, with rank, ID, location,
@@ -1316,11 +1273,9 @@ JSON cells. Catalogs can also be exported as CSV or JSON.
 
 Listings and exports have **no implicit result cap**, regardless of `defaultLimit`.
 Use `--limit N` to cap matches explicitly; omission notices go to stderr for CSV/JSON
-so exported stdout stays machine-readable. FAQ exports include every saved retrieval
-contract/profile and its dependency hashes. Semantic queries use only embeddings
-compatible with the effective configured profile. A FAQ entry's `data.valid` reports
-whether its saved dependencies still match the snapshot and on-disk files; inspection
-does not delete stale entries, and they remain available for diagnosis/export.
+so exported stdout stays machine-readable. Semantic queries use only embeddings
+compatible with the effective configured profile. Knowledge-base sections are
+included in `docs`; use `kb list` for article-level freshness.
 
 ## Index lifecycle and persistence
 
@@ -1427,10 +1382,8 @@ line range, and preceding conversation. Renames, line shifts, surrounding-file
 changes, or earlier answers can change the key; reuse requires an identical
 effective request, not merely matching callable source. Source
 descriptions are extracted locally and never sent to a generator for replacement.
-FAQ explanation keys cover the final system/prompt request and LLM configuration,
-not file dependencies. The semantic FAQ entry separately tracks the freshness of
-its referenced files and preserves the original question when a paraphrase
-triggers regeneration.
+Knowledge-base freshness comes from committed Markdown references and Git history,
+not a separate semantic answer cache.
 Map without `-q` never contacts S3. An uncached
 semantic query with `--no-reindex` may consult S3 before its provider call.
 When S3 is enabled later, the next successful semantic refresh uploads existing
@@ -1651,7 +1604,7 @@ with or without Git, even for an empty index. It uses the saved snapshot and its
 bound global store, regardless of later working-tree changes. It supports offline
 inspection and cross-search of an existing native index; missing derived USearch
 files can still be reconstructed locally. It does not make the database read-only or disable all
-network operations: uncached query/selector vectors, reranking, `faq`, and
+network operations: uncached query/selector vectors, reranking, KB generation, and
 explicit description regeneration may consult artifact caches/S3 or call their
 providers. Cached queries can run offline when the matching artifacts/results
 exist. Catalog commands still fetch
@@ -1854,13 +1807,16 @@ Example `config.json` (user or repository settings):
 | --- | --- |
 | `provider`, `model`, `dimensions` | `openai` / `text-embedding-3-large` / `3072`; `jina` defaults to `jina-embeddings-v4` / `1024`; `ollama` defaults to `qwen3-embedding:0.6b` / `1024`. OpenAI small/ada models default to `1536`. CLI: `--provider`, `--model`, `--dimensions`. |
 | `symbolDimensions` | Optional native dimension for name-only symbol embeddings; default `min(256, dimensions)`. OpenAI ada and Ollama models without a known dimension-reduction contract use full dimensions. Separate from content embeddings. |
-| `agentCommand`, `agentModel` | Nonempty CLI argument array and optional model for descriptions and FAQs. No default command/model. CLI: `--agent-command '<JSON array>'`, `--agent-model`. See [agent commands](#agent-commands). |
+| `agentCommand`, `agentModel` | Nonempty CLI argument array and optional model for descriptions and knowledge-base generation. No default command/model. CLI: `--agent-command '<JSON array>'`, `--agent-model`. See [agent commands](#agent-commands). |
 | `rerankingEnabled`, `rerankerProvider`, `rerankerModel`, `rerankerCommand` | Disabled by default. `cohere` defaults to `rerank-v4.0-pro`, `jina` to `jina-reranker-v3.5`; `command` uses an explicit agent command and optional model. |
 | `rerankerCandidates` | Generative (`command`) candidate setting, integer `1..100`, default `10`; CLI `--reranker-candidates`. See retrieval formula above. |
 | `agentTimeoutMs` | Positive subprocess timeout for text generation, default `300000` (five minutes). No automatic subprocess retries. |
-| `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, the source search behind generated FAQ answers, map direct matches, and cross-search output. `--limit` overrides it (for `faq`, `--limit` instead caps the ranked FAQ questions returned, default `1`). |
-| `faqThreshold` | FAQ cache cosine cutoff in `[-1,1]`, default `0.7`; the best question or answer score must be strictly greater. `--faq-threshold` overrides it. |
-| `faqRegenerationThreshold` | Cosine cutoff in `[-1,1]` for reusing a stale entry's original question during regeneration, default `0.8`; the best question or answer score must be strictly greater. Otherwise use the incoming question. `--faq-regeneration-threshold` overrides it; valid-answer matching still uses `faqThreshold`. |
+| `defaultLimit` | Positive result limit, default `4096`, or `"none"` to disable it. Applies to search, map direct matches, and cross-search output. `--limit` overrides it. KB queries independently default to one article. |
+| `kbPath` | Repository-relative Markdown article directory, default `docs/kb`. Paths outside the repository and symlinked paths are rejected. |
+| `kbParallelism` | Concurrent article agents for init/refresh, default `4`, range `1..256`; override with `--parallelism`. |
+| `kbThreshold` | Article cosine cutoff in `[-1,1]`, default `0.7`, strictly greater; `kb query --threshold` overrides it. |
+| `kbQueryFreshness` | Minimum unchanged reference fraction for query, default `0.8`, inclusive; override with `--freshness`. |
+| `kbRefreshFreshness` | Refresh articles strictly below this unchanged fraction, default `0.9`; override with `--freshness`. |
 | `indexPath`, `include`, `exclude`, `maxFileSize` | Index path (ignored in repository-selected settings; use `--index`, `--config`, or the user config), glob arrays, and positive byte limit as described above. |
 | `artifactCachePath`, `artifactS3` | Authoritative global SQLite store path (persistently bound to each index; ignored in repository-selected settings) and optional best-effort S3 bucket/region/endpoint/prefix/pathStyle (also ignored there), as described above. |
 | `embeddingBatchSize` | Positive batch cap. Defaults/maxima: OpenAI `32`, Jina `64`, Ollama `8` (maximum `64`); larger configured values are capped. The full config wizard defaults to `8` for Ollama and `32` otherwise; embedding-only setup leaves batching defaults to the provider. |

@@ -13,8 +13,6 @@ mod workspace;
 use session::CommandMode;
 use session::Session;
 
-pub(crate) use output::{RenderedSymbol, faq_search_context};
-
 use self::{
     args::{Cli, Command, Format},
     io::{print_json, with_stdout},

@@ -109,6 +109,21 @@ impl Llm for Harness {
         messages: &[Message],
         _session: &str,
     ) -> Result<String> {
+        self.conversation(system, messages, None)
+    }
+
+    fn describe_in(&self, root: &Path, system: &str, prompt: &str) -> Result<String> {
+        self.conversation(system, &[Message::user(prompt.into())], Some(root))
+    }
+}
+
+impl Harness {
+    fn conversation(
+        &self,
+        system: &str,
+        messages: &[Message],
+        root: Option<&Path>,
+    ) -> Result<String> {
         ensure!(
             !self.command.is_empty(),
             "{}Command is required for text generation; configure a non-interactive CLI, for example [\"opencode\",\"run\"]",
@@ -132,7 +147,7 @@ impl Llm for Harness {
             "command",
             self.model.as_deref().unwrap_or("harness default"),
         );
-        run(&args, input, self.timeout)
+        run(&args, input, self.timeout, root)
     }
 }
 
@@ -160,7 +175,7 @@ fn kill_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn run(args: &[String], input: Vec<u8>, timeout: Duration) -> Result<String> {
+fn run(args: &[String], input: Vec<u8>, timeout: Duration, root: Option<&Path>) -> Result<String> {
     // Use files instead of pipes: a child may write before consuming stdin, or
     // leave inherited stdout open in a background process. Neither may deadlock
     // slopdex. Files are private and removed on every exit path.
@@ -171,6 +186,9 @@ fn run(args: &[String], input: Vec<u8>, timeout: Duration) -> Result<String> {
     let mut stdout = tempfile::tempfile()?;
     let stderr = tempfile::tempfile()?;
     let mut command = Command::new(&args[0]);
+    if let Some(root) = root {
+        command.current_dir(root);
+    }
     command
         .args(&args[1..])
         .stdin(Stdio::from(stdin))
@@ -230,6 +248,18 @@ fn run(args: &[String], input: Vec<u8>, timeout: Duration) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knowledge_base_agents_run_at_the_requested_repository_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let harness = harness(json!({"agentCommand":[crate::test_agent::executable(),"cwd"]}));
+        let path = harness.describe_in(temp.path(), "Read only", "Locate the repository")?;
+        assert_eq!(
+            Path::new(&path).canonicalize()?,
+            temp.path().canonicalize()?
+        );
+        Ok(())
+    }
     use crate::test_agent as agent;
 
     fn harness(config: Value) -> Harness {

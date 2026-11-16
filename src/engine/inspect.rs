@@ -9,7 +9,6 @@ const CHANNELS: &[&str] = &[
     "markup",
     "descriptions",
     "symbols",
-    "faq",
 ];
 
 struct Embedding {
@@ -212,21 +211,6 @@ impl Engine {
             return self.inspection_symbols();
         }
         let profile = self.providers.vector().profile();
-        if name == "faq" {
-            let mut checked = HashMap::new();
-            return self.db.all_faq_entries()?.into_iter().map(|(contract, entry)| {
-                let answer = entry.result["description"].as_str().context("Invalid FAQ answer")?;
-                let compatible = entry.question_embedding == Database::embedding_key(&profile, true, &entry.question)
-                    && entry.answer_embedding == Database::embedding_key(&profile, false, answer);
-                let freshness = self.faq_freshness(&entry, &mut checked);
-                let valid = freshness.fraction >= faq::DEFAULT_FRESHNESS;
-                Ok(Record {
-                    id:entry.id.to_string(),kind:"faq".into(),path:None,name:entry.question.clone(),text:format!("{}\n{}",entry.question,answer),
-                    data:json!({"question":entry.question,"answer":answer,"result":entry.result,"files":entry.files,"contract":contract,"valid":valid,"freshness":freshness.fraction}),
-                    embeddings:vec![self.inspection_embedding("question",entry.question_embedding,compatible)?,self.inspection_embedding("answer",entry.answer_embedding,compatible)?],
-                })
-            }).collect();
-        }
         let descriptions = name == "descriptions";
         let mut records = Vec::new();
         for item in self.db.items_for_profile(&profile)? {

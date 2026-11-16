@@ -30,11 +30,11 @@ mod lines;
 #[path = "rust_integration/refactor.rs"]
 mod refactor;
 
-#[path = "rust_integration/faq.rs"]
-mod faq;
-
 #[path = "rust_integration/index.rs"]
 mod index;
+
+#[path = "rust_integration/kb.rs"]
+mod kb;
 
 #[path = "rust_integration/metrics.rs"]
 mod metrics;
@@ -98,7 +98,8 @@ struct Request {
 #[derive(Default)]
 struct MockState {
     requests: Vec<Request>,
-    faq_references: Option<Vec<Value>>,
+    kb_topics: Option<Value>,
+    kb_article: Option<Value>,
     fail_embedding_containing: Option<String>,
     errors: Vec<String>,
     concurrent: Option<Arc<ConcurrentRequests>>,
@@ -257,57 +258,6 @@ fn description_prompt(body: &Value) -> &str {
         .unwrap()
 }
 
-/// Simulate an LLM citing its FAQ context: one reference per rendered file
-/// section, naming its scored direct hit when shown, else its first callable.
-fn faq_citations(prompt: &str) -> Vec<Value> {
-    let mut references = Vec::new();
-    let mut current: Option<(String, Option<String>, Option<String>)> = None;
-    let mut finish = |current: &mut Option<(String, Option<String>, Option<String>)>| {
-        if let Some((path, scored, first)) = current.take()
-            && !references.iter().any(|r: &Value| r["path"] == path)
-        {
-            references.push(match scored.or(first) {
-                Some(symbol) => json!({"path": path, "symbol": symbol}),
-                None => json!({"path": path}),
-            });
-        }
-    };
-    for line in prompt.lines() {
-        if let Some(header) = line.strip_prefix("*** ") {
-            finish(&mut current);
-            current = Some((
-                header.split("  ").next().unwrap().trim().to_owned(),
-                None,
-                None,
-            ));
-            continue;
-        }
-        if let Some((_, scored, first)) = &mut current
-            && (scored.is_none() || first.is_none())
-        {
-            for keyword in ["fn ", "def ", "function "] {
-                if let Some(index) = line.find(keyword) {
-                    let name: String = line[index + keyword.len()..]
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
-                        .collect();
-                    if !name.is_empty() {
-                        if first.is_none() {
-                            *first = Some(name.clone());
-                        }
-                        if scored.is_none() && line.contains("score=") {
-                            *scored = Some(name);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    finish(&mut current);
-    references
-}
-
 fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
     // Windows accepted sockets inherit the listener's nonblocking mode.
     // Request parsing needs blocking I/O, bounded by the timeouts below.
@@ -386,17 +336,17 @@ fn serve(mut stream: TcpStream, state: &Mutex<MockState>) -> Result<()> {
         }
         "/v1/responses" => {
             let prompt = description_prompt(&body);
-            if prompt.starts_with("Task: ") {
-                let description = format!(
-                    "answer grounded in indexed context: {}",
-                    slopdex::hash(body["input"].to_string())
+            if prompt.starts_with("Review the entire repository at ") {
+                let topics = state.kb_topics.clone().unwrap_or_else(
+                    || json!([{"title":"Example topic","description":"Explain the example."}]),
                 );
-                let references = state
-                    .faq_references
-                    .clone()
-                    .unwrap_or_else(|| faq_citations(prompt));
-                let answer = json!({"description": description, "references": references});
-                (200, json!({"output_text": answer.to_string()}))
+                (
+                    200,
+                    json!({"output_text":json!({"topics":topics}).to_string()}),
+                )
+            } else if prompt.starts_with("Topic: ") {
+                let article = state.kb_article.clone().unwrap_or_else(|| json!({"description":"## Behavior\nVECTOR_EAST detailed **Markdown** explanation.","references":[{"path":"source.rs","startLine":1,"endLine":10}]}));
+                (200, json!({"output_text":article.to_string()}))
             } else {
                 let prefix = if prompt.starts_with("Describe the purpose") {
                     "file-summary"
@@ -487,7 +437,8 @@ impl ConcurrentWork {
             Self::Embeddings => request.path.ends_with("/embeddings"),
             Self::Callables => {
                 request.path.ends_with("/responses")
-                    && description_prompt(&request.body).starts_with("Describe what")
+                    && (description_prompt(&request.body).starts_with("Describe what")
+                        || description_prompt(&request.body).starts_with("Topic: "))
             }
         }
     }
@@ -3526,112 +3477,6 @@ fn refresh_keeps_commented_overloads_distinct_from_their_implementation() -> Res
 }
 
 #[test]
-fn describe_uses_indexed_search_context_without_whole_files() -> Result<()> {
-    let mock = Mock::start()?;
-    let repo = Repo::new()?;
-    let original = format!(
-        "const FILE_CONTEXT_SENTINEL: i32 = 9;\n{}",
-        function("alpha", "VECTOR_EAST")
-    );
-    repo.write("a.rs", &original)?;
-    repo.write("unrelated.rs", &function("other", "VECTOR_WEST"))?;
-    let mut engine = repo.open(&mock.config())?;
-    engine.refresh()?;
-    // FAQ context uses its indexed snapshot, not a fresh read of the working tree.
-    repo.write("a.rs", "fn not_indexed_yet() {}\n")?;
-    let answer = engine.faq("east", &json!({"minSimilarity": 0.9, "code":true}))?;
-    assert!(
-        answer["description"]
-            .as_str()
-            .unwrap()
-            .starts_with("answer grounded")
-    );
-    assert_eq!(answer["query"], "east");
-    assert_eq!(answer["references"].as_array().unwrap().len(), 1);
-    assert_eq!(answer["references"][0]["path"], "a.rs");
-    assert_eq!(answer["references"][0]["symbol"], "alpha");
-    assert_eq!(answer["references"][0]["startLine"], 2);
-    assert!(
-        answer.get("searchResults").is_none()
-            && answer.get("functions").is_none()
-            && answer.get("files").is_none(),
-        "search context must not be returned: {answer}"
-    );
-    let requests = mock.requests("/responses");
-    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(prompt.starts_with("Task: east\n\n*** a.rs\n"), "{prompt}");
-    assert!(prompt.contains("@@ 1-"), "{prompt}");
-    assert!(prompt.contains("fn alpha"), "{prompt}");
-    assert!(
-        prompt.contains("const FILE_CONTEXT_SENTINEL"),
-        "the candidate file's declaration map is included: {prompt}"
-    );
-    assert!(
-        !prompt.contains("fn other"),
-        "non-candidate files are not mapped: {prompt}"
-    );
-    assert!(!prompt.contains("Full source code for best matching files"));
-    assert!(!prompt.contains("not_indexed_yet"));
-    assert!(!prompt.starts_with('{'));
-    Ok(())
-}
-
-#[test]
-fn describe_keeps_search_skeletons_without_appending_large_files() -> Result<()> {
-    let mock = Mock::start()?;
-    let repo = Repo::new()?;
-    for (path, name, size) in [
-        ("a.rs", "first", 90 * 1024),
-        ("b.rs", "second", 12 * 1024),
-        ("c.rs", "third", 2 * 1024),
-        ("z.rs", "oversized", 110 * 1024),
-    ] {
-        repo.write(
-            path,
-            &(function(name, "VECTOR_EAST") + &format!("// {}\n", "X".repeat(size))),
-        )?;
-    }
-    let mut engine = repo.open(&mock.config())?;
-    engine.refresh()?;
-    engine.faq("east", &json!({"minSimilarity":0.9}))?;
-    let requests = mock.requests("/responses");
-    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(prompt.len() <= 128 * 1024, "{} bytes", prompt.len());
-    for name in ["first", "second", "third", "oversized"] {
-        assert!(prompt.contains(&format!("fn {name}")), "missing {name}");
-    }
-    assert!(!prompt.contains(&"X".repeat(100)), "{prompt}");
-    assert!(!prompt.contains("Full source code for best matching files"));
-    Ok(())
-}
-
-#[test]
-fn describe_bounds_expanded_markdown_search_on_utf8_boundary() -> Result<()> {
-    let mock = Mock::start()?;
-    let repo = Repo::new()?;
-    let sections = (0..20)
-        .map(|index| format!("## Section {index}\nVECTOR_EAST {}\n", "📖".repeat(1800)))
-        .collect::<String>();
-    repo.write("guide.md", &format!("# Guide\n{sections}"))?;
-    let mut engine = repo.open(&mock.config())?;
-    engine.refresh()?;
-    engine.faq("east", &json!({"minSimilarity":0.9}))?;
-    let requests = mock.requests("/responses");
-    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(prompt.len() <= 128 * 1024);
-    assert!(prompt.contains("*** guide.md\n"));
-    assert!(prompt.contains("## Section 0"));
-    assert!(prompt.contains("[Search results truncated to fit the prompt size limit]"));
-    Ok(())
-}
-
-#[test]
 fn failed_provider_publishes_structure_and_partial_artifacts_survive_restart() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
@@ -4268,7 +4113,6 @@ fn uncached_queries_share_the_index_and_skip_optional_workspace_writes() -> Resu
     let selected =
         engine.map(&json!({"symbolQuery":["indexed"], "symbolThreshold":-1, "private":true}))?;
     assert_eq!(selected[0]["nodes"][0]["name"], "indexed");
-    engine.faq("explain the indexed function", &all())?;
     let output = repo.cli_json(&["--no-reindex", "search-code", "uncached CLI query"])?;
     assert!(!output.as_array().unwrap().is_empty());
     repo.cli_json(&["--no-reindex", "lines"])?;
@@ -6554,105 +6398,6 @@ fn cli_search_refs_control_annotations_without_changing_related_callables() -> R
 }
 
 #[test]
-fn cli_describe_refs_reach_the_llm_prompt_without_changing_traversal() -> Result<()> {
-    let mock = Mock::start()?;
-    let repo = Repo::new()?;
-    repo.write(".slopdex/config.json", &mock.config().to_string())?;
-    write_reference_traversal_fixture(&repo)?;
-    repo.cli_json(&["update"])?;
-    let cases: [(&str, &str, &str, &str); 5] = [
-        ("^middle$", "all", "0", "middle"),
-        ("^helper$", "cross-file", "0", "helper"),
-        ("^middle$", "none", "1", "middle"),
-        ("^middle$", "cross-file", "1", "middle"),
-        ("^middle$", "all", "1", "middle"),
-    ];
-    let mut first_prompt = String::new();
-    for (pattern, mode, depth, cited_symbol) in cases {
-        let before = mock.requests("/responses").len();
-        let result = repo.cli_json(&[
-            "--no-reindex",
-            "faq",
-            "middle",
-            "-e",
-            pattern,
-            "--threshold",
-            "-1",
-            "--callers",
-            "0",
-            "--callees",
-            depth,
-            "--expand-callers",
-            "0",
-            "--expand-callees",
-            "0",
-            "--expand-code-threshold",
-            "1",
-            "--refs",
-            mode,
-        ])?;
-        assert!(
-            result.get("functions").is_none() && result.get("searchResults").is_none(),
-            "faq returns only the answer and its references: {result}"
-        );
-        let references = result["references"].as_array().unwrap();
-        let cited = references
-            .iter()
-            .find(|r| r["path"] == "b.py")
-            .unwrap_or_else(|| panic!("{mode}, {depth}: {result}"));
-        assert_eq!(cited["symbol"], cited_symbol, "{mode}, {depth}");
-        assert!(cited["startLine"].is_number(), "{result}");
-        assert!(
-            !references
-                .iter()
-                .any(|r| r["path"] == "c.py" || r["path"] == "d.py"),
-            "reference-only targets are not cited sections: {result}"
-        );
-        let requests = mock.requests("/responses");
-        // With full file maps and zero code-expansion depths, all/1 renders
-        // exactly the all/0 prompt, so its paid LLM response is reused.
-        assert!(
-            requests.len() == before || requests.len() == before + 1,
-            "{mode}, {depth}: {requests:?}"
-        );
-        let prompt = if requests.len() == before {
-            first_prompt.clone()
-        } else {
-            description_prompt(&requests.last().unwrap().body).to_owned()
-        };
-        if first_prompt.is_empty() {
-            first_prompt = prompt.clone();
-        }
-        let prompt = &prompt;
-        assert_eq!(
-            prompt.contains("  # b.py:helper()\n"),
-            mode == "all",
-            "{mode}, {depth}: {prompt}"
-        );
-        assert_eq!(
-            prompt.contains("  # c.py:leaf()\n"),
-            mode != "none",
-            "{mode}, {depth}: {prompt}"
-        );
-        assert!(
-            prompt.contains("def helper():"),
-            "the full b.py map includes sibling declarations: {prompt}"
-        );
-        assert!(
-            !prompt.contains("@ code:\ndef helper():"),
-            "code-expansion depths are 0 and the expand threshold is 1: {prompt}"
-        );
-        assert!(
-            !prompt.contains("def leaf():"),
-            "reference-only target expanded: {prompt}"
-        );
-        assert!(!prompt.contains("def deepest():"), "{prompt}");
-        assert!(!prompt.contains("callees:"), "{prompt}");
-    }
-    Ok(())
-}
-
-#[test]
 fn cli_cross_search_refs_use_each_index_and_do_not_expand_reference_only_targets() -> Result<()> {
     let mock = Mock::start()?;
     let source = Repo::new()?;
@@ -6800,17 +6545,6 @@ fn cli_cross_search_refs_use_each_index_and_do_not_expand_reference_only_targets
                 "saved cross-search must not call providers"
             );
         }
-    }
-    Ok(())
-}
-
-#[test]
-fn describe_rejects_invalid_refs_before_searching_or_calling_providers() -> Result<()> {
-    let repo = Repo::new()?;
-    let engine = repo.open_map(&json!({}))?;
-    for refs in [json!("invalid"), json!(0), json!(true), Value::Null] {
-        let error = engine.faq("middle", &json!({"refs": refs})).unwrap_err();
-        assert!(error.to_string().contains("refs"), "{error}");
     }
     Ok(())
 }
@@ -7034,91 +6768,6 @@ fn expanded_call_depths_force_code_only_within_their_own_levels() -> Result<()> 
     )?;
     assert!(clusters.contains("a.py:\n  3-4:outer\n"), "{clusters}");
     assert!(!clusters.contains("@ code:"), "{clusters}");
-    repo.cli_json(&[
-        "faq",
-        "middle",
-        "-e",
-        "^middle$",
-        "--threshold",
-        "-1",
-        "--expand-callers",
-        "1",
-        "--callees",
-        "0",
-        "--expand-code-threshold",
-        "1",
-    ])?;
-    let responses = mock.requests("/responses");
-    let prompt = responses.last().unwrap().body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(prompt.contains("@ code:\ndef outer():"), "{prompt}");
-    assert!(!prompt.contains("@ code:\ndef middle():"), "{prompt}");
-    Ok(())
-}
-
-#[test]
-fn describe_prompt_defaults_to_two_expanded_call_levels_with_explicit_overrides() -> Result<()> {
-    let mock = Mock::start()?;
-    let repo = Repo::new()?;
-    repo.write(".slopdex/config.json", &mock.config().to_string())?;
-    repo.write("a.py", "from b import middle\n\ndef outer():\n    return middle()\n\ndef outermost():\n    return outer()\n")?;
-    repo.write(
-        "b.py",
-        "from c import leaf\n\ndef middle():\n    return leaf()\n",
-    )?;
-    repo.write(
-        "c.py",
-        "from d import deepest\n\ndef leaf():\n    return deepest()\n",
-    )?;
-    repo.write("d.py", "def deepest():\n    return 1\n")?;
-    repo.cli_json(&["update"])?;
-    let base = [
-        "faq",
-        "middle",
-        "-e",
-        "^middle$",
-        "--threshold",
-        "-1",
-        "--expand-code-threshold",
-        "1",
-    ];
-    let result = repo.cli_json(&base)?;
-    assert!(
-        result.get("functions").is_none() && result.get("searchResults").is_none(),
-        "context expansion must not leak structured traversal into the result: {result}"
-    );
-    let requests = mock.requests("/responses");
-    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    for name in ["outer", "outermost", "leaf", "deepest"] {
-        assert!(
-            prompt.contains(&format!("@ code:\ndef {name}():")),
-            "{prompt}"
-        );
-    }
-    assert!(!prompt.contains("@ code:\ndef middle():"), "{prompt}");
-
-    let mut disabled = base.to_vec();
-    disabled.extend(["--expand-callers", "0", "--expand-callables", "0"]);
-    repo.cli_json(&disabled)?;
-    let requests = mock.requests("/responses");
-    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(!prompt.contains("@ code:"), "{prompt}");
-
-    let mut one_callee = base.to_vec();
-    one_callee.extend(["--expand-callers", "0", "--expand-callables", "1"]);
-    repo.cli_json(&one_callee)?;
-    let requests = mock.requests("/responses");
-    let prompt = requests.last().unwrap().body["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(prompt.contains("@ code:\ndef leaf():"), "{prompt}");
-    assert!(!prompt.contains("@ code:\ndef deepest():"), "{prompt}");
-    assert!(!prompt.contains("@ code:\ndef outer():"), "{prompt}");
     Ok(())
 }
 
@@ -7307,26 +6956,6 @@ fn callable_search_json_and_text_include_associated_callables() -> Result<()> {
     assert!(
         map_text.contains("\ndef outer():\n  # b.py:middle()\n"),
         "{map_text}"
-    );
-    let describe = repo.cli_json(&[
-        "faq",
-        "middle",
-        "-e",
-        "^middle$",
-        "--threshold",
-        "-1",
-        "--callers",
-        "1",
-    ])?;
-    assert!(
-        describe["references"].as_array().is_some_and(|refs| {
-            refs.iter()
-                .any(|r| r["path"] == "a.py" && r["symbol"] == "outer")
-                && refs
-                    .iter()
-                    .any(|r| r["path"] == "b.py" && r["symbol"] == "middle")
-        }),
-        "the caller reached through the faq context must be citable: {describe}"
     );
     let cross = repo.cli(&[
         "cross-search",
@@ -10412,10 +10041,8 @@ fn rerank_and_task_description_caches_survive_restart_and_unrelated_generation_c
     engine.refresh()?;
     let options = json!({"glob":"selected.rs", "minSimilarity":-1});
     let ranked = engine.search("east", "search-code", &options)?;
-    let answer = engine.faq("east", &options)?;
-    assert_eq!(mock.requests("/responses").len(), 1);
     let calls = mock.count();
-    assert_eq!(engine.faq("east", &options)?, answer);
+    assert_eq!(engine.search("east", "search-code", &options)?, ranked);
     assert_eq!(
         mock.count(),
         calls,
@@ -10430,7 +10057,6 @@ fn rerank_and_task_description_caches_survive_restart_and_unrelated_generation_c
     engine.refresh()?;
     assert!(engine.status()?["generation"].as_u64().unwrap() > generation);
     assert_eq!(engine.search("east", "search-code", &options)?, ranked);
-    assert_eq!(engine.faq("east", &options)?, answer);
     assert_eq!(
         mock.count(),
         calls,
@@ -10441,7 +10067,6 @@ fn rerank_and_task_description_caches_survive_restart_and_unrelated_generation_c
     repo.db()?.execute("DELETE FROM search_cache", [])?;
     let engine = repo.open(&config)?;
     assert_eq!(engine.search("east", "search-code", &options)?, ranked);
-    assert_eq!(engine.faq("east", &options)?, answer);
     assert_eq!(mock.count(), calls);
     Ok(())
 }

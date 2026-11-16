@@ -15,14 +15,6 @@ fn fixture(mock: &Mock) -> Result<Repo> {
     engine.refresh()?;
     engine.generate_descriptions()?;
     engine.search("east", "search-symbols", &all())?;
-    engine.faq(
-        "VECTOR_NORTH original question",
-        &json!({"glob":"east.rs","minSimilarity":-1,"faqThreshold":1}),
-    )?;
-    engine.faq(
-        "VECTOR_WEST other question",
-        &json!({"glob":"west.rs","minSimilarity":-1,"faqThreshold":1}),
-    )?;
     Ok(repo)
 }
 
@@ -46,7 +38,6 @@ fn index_catalog_and_exports_cover_every_channel_without_refresh_or_model_calls(
         "markup",
         "descriptions",
         "symbols",
-        "faq",
     ];
     assert_eq!(
         catalog
@@ -81,11 +72,6 @@ fn index_catalog_and_exports_cover_every_channel_without_refresh_or_model_calls(
             );
         }
     }
-    let faq = repo.cli_json(&["index", "list", "faq"])?;
-    assert_eq!(faq[0]["embeddings"].as_array().unwrap().len(), 2);
-    assert_eq!(faq[0]["data"]["valid"], false);
-    assert_eq!(faq[1]["data"]["valid"], true);
-    assert_eq!(faq[0]["data"]["question"], "VECTOR_NORTH original question");
     let code = repo.cli_json(&["index", "list", "code"])?;
     assert_eq!(
         code.as_array().unwrap().len(),
@@ -178,59 +164,6 @@ fn index_queries_score_actual_vectors_with_regex_filtering_stable_ties_and_limit
 }
 
 #[test]
-fn index_faq_query_uses_either_embedding_and_exports_all_profiles() -> Result<()> {
-    let mock = Mock::start()?;
-    let repo = fixture(&mock)?;
-    let question = repo.cli_json(&[
-        "index",
-        "list",
-        "faq",
-        "-q",
-        "VECTOR_WEST",
-        "--threshold",
-        "0.9",
-    ])?;
-    assert_eq!(question.as_array().unwrap().len(), 1);
-    assert_eq!(
-        question[0]["data"]["question"],
-        "VECTOR_WEST other question"
-    );
-    let answer = repo.cli_json(&["index", "list", "faq", "-q", "east", "--threshold", "0.9"])?;
-    assert_eq!(answer.as_array().unwrap().len(), 2);
-    let intersection = repo.cli_json(&[
-        "index",
-        "list",
-        "faq",
-        "-q",
-        "VECTOR_WEST",
-        "-e",
-        "original question",
-        "--threshold",
-        "0.9",
-    ])?;
-    assert!(intersection.as_array().unwrap().is_empty());
-    let mut config = mock.config();
-    config["embeddingDimensions"] = json!(2);
-    let mut engine = repo.open(&config)?;
-    engine.refresh()?;
-    engine.faq("two-dimensional question", &json!({"minSimilarity":-1}))?;
-    drop(engine);
-    let all = repo.cli_json(&["index", "list", "faq"])?;
-    assert_eq!(all.as_array().unwrap().len(), 3);
-    assert!(
-        all[2]["embeddings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|embedding| embedding["compatible"] == false
-                && embedding["vector"].as_array().unwrap().len() == 2)
-    );
-    let current = repo.cli_json(&["index", "list", "faq", "-q", "east", "--threshold", "0.9"])?;
-    assert_eq!(current.as_array().unwrap().len(), 2);
-    Ok(())
-}
-
-#[test]
 fn index_lists_pending_vectors_without_generating_them() -> Result<()> {
     let mock = Mock::start()?;
     let repo = Repo::new()?;
@@ -245,7 +178,7 @@ fn index_lists_pending_vectors_without_generating_them() -> Result<()> {
     let code = repo.cli_json(&["index", "list", "code"])?;
     assert_eq!(code[0]["embeddings"][0]["present"], false);
     assert!(code[0]["embeddings"][0]["vector"].is_null());
-    for name in ["code", "symbols", "faq"] {
+    for name in ["code", "symbols"] {
         assert!(
             repo.cli_json(&["index", "list", name, "-q", "east"])?
                 .as_array()
@@ -346,7 +279,7 @@ fn index_listing_validates_options_and_missing_indexes_before_creating_anything(
     let repo = Repo::new()?;
     for args in [
         vec!["index", "list"],
-        vec!["index", "list", "faq"],
+        vec!["index", "list", "docs"],
         vec!["index", "list", "code", "-q", "east"],
     ] {
         let output = repo.cli(&args)?;

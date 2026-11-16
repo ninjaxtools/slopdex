@@ -134,20 +134,18 @@ fn metrics_corruption_never_fails_a_command_and_explicit_reset_repairs_it() -> R
 }
 
 #[test]
-fn metrics_counts_faq_reuse_and_successful_search_results() -> Result<()> {
+fn metrics_counts_kb_and_successful_search_results() -> Result<()> {
     let mock = Mock::start()?;
-    let repo = fixture()?;
-    repo.write(".slopdex/config.json", &mock.config().to_string())?;
-    repo.write("code.rs", &function("selected", "VECTOR_EAST"))?;
-    let original = repo.cli_json(&["faq", "east original question", "--threshold", "-1"])?;
-    let reused = repo.cli_json(&["faq", "east original question", "--threshold", "-1"])?;
-    assert_eq!(original["description"], reused["description"]);
+    let mut repo = kb::fixture(&mock)?;
+    repo.record_metrics = true;
+    repo.cli_json(&["kb", "init"])?;
+    repo.cli_json(&["update"])?;
+    repo.cli_json(&["kb", "query", "VECTOR_EAST"])?;
     repo.cli_json(&["search-code", "east", "--threshold", "-1", "--limit", "1"])?;
     let calls = mock.count();
     let report = repo.cli_json(&["metrics"])?;
-    assert_eq!(report["commands"]["faq"]["invocations"], 2);
-    assert_eq!(report["commands"]["faq"]["results"], 2);
-    assert_eq!(report["commands"]["faq"]["faqReusedAnswers"], 1);
+    assert_eq!(report["commands"]["kb init"]["invocations"], 1);
+    assert_eq!(report["commands"]["kb query"]["results"], 1);
     assert_eq!(report["commands"]["search-code"]["results"], 1);
     assert_eq!(mock.count(), calls, "metrics called a provider");
     Ok(())

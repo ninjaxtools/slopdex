@@ -1,4 +1,4 @@
-//! Result presentation shared by CLI commands and FAQ context generation.
+//! Result presentation shared by CLI commands.
 
 mod clusters;
 mod cross;
@@ -14,7 +14,6 @@ pub(in crate::cli) use map::print_map;
 pub(in crate::cli) use map::print_map_row;
 pub(in crate::cli) use render::Presentation;
 pub(in crate::cli) use search::print_search;
-pub(crate) use search::{RenderedSymbol, faq_search_context};
 
 use super::{args::Format, io::print_json};
 use anyhow::Result;

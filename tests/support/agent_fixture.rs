@@ -8,6 +8,7 @@ fn main() {
     match args[0].as_str() {
         "echo" => print!("{input}"),
         "emit" => print!("{}", args[1]),
+        "cwd" => print!("{}", std::env::current_dir().unwrap().display()),
         "fail" => { eprintln!("secret-bearing diagnostics"); print!("secret-bearing output"); std::process::exit(7); }
         "sleep" => std::thread::sleep(Duration::from_millis(args[1].parse().unwrap())),
         "flood" => { let bytes = vec![b'x'; args[1].parse().unwrap()]; std::io::stdout().write_all(&bytes).unwrap(); }

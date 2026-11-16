@@ -2,13 +2,9 @@ use super::{
     number,
     render::{Presentation, RankedHit, print_ranked_files, rank, score_details},
 };
-use crate::{
-    callgraph::Refs,
-    cli::{
-        args::{CallDepths, Detail, Format},
-        io::print_json,
-    },
-    engine::Engine,
+use crate::cli::{
+    args::{Detail, Format},
+    io::print_json,
 };
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -90,65 +86,6 @@ pub(in crate::cli) fn print_search(
         presentation,
         None,
     )
-}
-
-pub(crate) use super::render::RenderedSymbol;
-
-/// FAQ uses expanded search presentation over full candidate-file maps;
-/// dependencies include traversal and reference targets, and rendered symbols
-/// provide fallback metadata for validating citations. Whole trailing file sections beyond
-/// `byte_budget` are omitted (reported by the final flag).
-pub(crate) fn faq_search_context(
-    engine: &Engine,
-    rows: &[Value],
-    depths: (usize, usize, usize, usize),
-    refs: Refs,
-    expand_code_threshold: f64,
-    byte_budget: usize,
-) -> Result<(
-    String,
-    std::collections::BTreeSet<String>,
-    Vec<RenderedSymbol>,
-    bool,
-)> {
-    let (callers, callees, expand_callers, expand_callees) = depths;
-    let mut out = Vec::new();
-    let mut presentation = Presentation::with_calls(
-        engine,
-        CallDepths {
-            callers,
-            callees,
-            refs,
-            expand_callers,
-            expand_callees,
-        },
-        expand_code_threshold,
-    )?;
-    presentation.record_symbols = true;
-    presentation.full_file_maps = true;
-    presentation.byte_budget = Some(byte_budget);
-    print_search(
-        &mut out,
-        rows,
-        Format::Summary,
-        Detail::Expanded,
-        false,
-        &mut presentation,
-    )?;
-    let mut symbols: Vec<_> = presentation
-        .rendered_symbols
-        .into_inner()
-        .into_iter()
-        .collect();
-    symbols.sort_by(|a, b| {
-        (&a.path, a.start_line, &a.qualified_name).cmp(&(&b.path, b.start_line, &b.qualified_name))
-    });
-    Ok((
-        String::from_utf8(out)?,
-        presentation.dependencies.into_inner(),
-        symbols,
-        presentation.sections_omitted,
-    ))
 }
 
 #[cfg(test)]

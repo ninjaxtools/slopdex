@@ -92,6 +92,7 @@ pub(crate) fn validate_numeric_config(config: &Value) -> Result<()> {
         ("embeddingBatchSize", 10_000),
         ("parallelism", 256),
         ("embeddingParallelism", 256),
+        ("kbParallelism", 256),
         ("agentTimeoutMs", 3_600_000),
         ("providerTimeoutMs", 3_600_000),
         ("ollamaPullTimeoutMs", 10_800_000),

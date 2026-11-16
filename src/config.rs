@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::{Value, json};
 
@@ -21,10 +21,6 @@ use crate::limits::{self, ResultLimit};
 /// Default `maxFileSize` when the key is absent or not an unsigned integer,
 /// matching the historical `as_u64().unwrap_or(1_048_576)` reads.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
-/// Default `faqThreshold` (strict-greater comparison lives in `engine::faq`).
-pub const DEFAULT_FAQ_THRESHOLD: f64 = 0.7;
-/// Default cutoff for reusing a stale FAQ entry's question during regeneration.
-pub const DEFAULT_FAQ_REGENERATION_THRESHOLD: f64 = 0.8;
 /// Default `rerankerCandidates` when absent or not an unsigned integer.
 pub const DEFAULT_RERANKER_CANDIDATES: u64 = 10;
 
@@ -48,8 +44,6 @@ pub struct Config {
     embedding_parallelism: Option<u64>,
     embedding_is_ollama: bool,
     default_limit: ResultLimit,
-    faq_threshold: Option<f64>,
-    faq_regeneration_threshold: Option<f64>,
     reranking_enabled: bool,
     reranker_candidates: u64,
     no_reindex: bool,
@@ -68,11 +62,6 @@ impl std::fmt::Debug for Config {
             .field("parallelism", &self.parallelism)
             .field("embedding_parallelism", &self.embedding_parallelism)
             .field("embedding_is_ollama", &self.embedding_is_ollama)
-            .field("faq_threshold", &self.faq_threshold)
-            .field(
-                "faq_regeneration_threshold",
-                &self.faq_regeneration_threshold,
-            )
             .field("reranking_enabled", &self.reranking_enabled)
             .field("reranker_candidates", &self.reranker_candidates)
             .field("no_reindex", &self.no_reindex)
@@ -122,14 +111,6 @@ impl Config {
                 .get("defaultLimit")
                 .and_then(|value| ResultLimit::from_value(value).ok())
                 .unwrap_or(ResultLimit::Count(limits::DEFAULT_LIMIT)),
-            faq_threshold: raw
-                .get("faqThreshold")
-                .and_then(Value::as_f64)
-                .filter(|value| value.is_finite() && (-1.0..=1.0).contains(value)),
-            faq_regeneration_threshold: raw
-                .get("faqRegenerationThreshold")
-                .and_then(Value::as_f64)
-                .filter(|value| value.is_finite() && (-1.0..=1.0).contains(value)),
             reranking_enabled: flag(raw, "rerankingEnabled"),
             reranker_candidates: raw
                 .get("rerankerCandidates")
@@ -147,8 +128,7 @@ impl Config {
     }
 
     /// Parse and validate a configuration value at a boundary. Error strings
-    /// and order match the previous Engine-open validation exactly: numeric
-    /// limits (including `defaultLimit`) first, then FAQ thresholds.
+    /// and order validate numeric limits before knowledge-base options.
     pub fn from_value(raw: Value) -> Result<Self> {
         let config = Self::parse_typed(&raw);
         config.validate()?;
@@ -158,15 +138,7 @@ impl Config {
     /// The validation previously open-coded in `Engine::open_internal`.
     pub fn validate(&self) -> Result<()> {
         limits::validate_config(&self.raw)?;
-        // Same checks (and messages) as engine::faq on config only.
-        for key in ["faqThreshold", "faqRegenerationThreshold"] {
-            if let Some(value) = self.raw.get(key) {
-                value
-                    .as_f64()
-                    .filter(|number| number.is_finite() && (-1.0..=1.0).contains(number))
-                    .with_context(|| format!("{key} must be a finite number between -1 and 1"))?;
-            }
-        }
+        crate::kb::validate(&self.raw)?;
         Ok(())
     }
 
@@ -260,41 +232,6 @@ impl Config {
         }
     }
 
-    /// FAQ cutoff: per-call `faqThreshold` option wins over the configured
-    /// value; both are validated with the historical error message. The
-    /// strict-greater-than comparison lives in the FAQ search itself.
-    pub fn faq_threshold(&self, options: &Value) -> Result<f64> {
-        if let Some(value) = options.get("faqThreshold") {
-            return value
-                .as_f64()
-                .filter(|number| number.is_finite() && (-1.0..=1.0).contains(number))
-                .context("faqThreshold must be a finite number between -1 and 1");
-        }
-        if self.raw.get("faqThreshold").is_some() && self.faq_threshold.is_none() {
-            bail!("faqThreshold must be a finite number between -1 and 1");
-        }
-        Ok(self.faq_threshold.unwrap_or(DEFAULT_FAQ_THRESHOLD))
-    }
-
-    /// Regeneration cutoff: only matches strictly above this value reuse a
-    /// stale entry's question. Per-call options override the configured value.
-    pub fn faq_regeneration_threshold(&self, options: &Value) -> Result<f64> {
-        if let Some(value) = options.get("faqRegenerationThreshold") {
-            return value
-                .as_f64()
-                .filter(|number| number.is_finite() && (-1.0..=1.0).contains(number))
-                .context("faqRegenerationThreshold must be a finite number between -1 and 1");
-        }
-        if self.raw.get("faqRegenerationThreshold").is_some()
-            && self.faq_regeneration_threshold.is_none()
-        {
-            bail!("faqRegenerationThreshold must be a finite number between -1 and 1");
-        }
-        Ok(self
-            .faq_regeneration_threshold
-            .unwrap_or(DEFAULT_FAQ_REGENERATION_THRESHOLD))
-    }
-
     pub fn reranking_enabled(&self) -> bool {
         self.reranking_enabled
     }
@@ -355,8 +292,6 @@ mod tests {
         assert_eq!(config.max_file_size(), 1_048_576);
         assert_eq!(config.parallelism()?, 10);
         assert_eq!(config.embedding_parallelism()?, 10);
-        assert_eq!(config.faq_threshold(&json!({}))?, 0.7);
-        assert_eq!(config.faq_regeneration_threshold(&json!({}))?, 0.8);
         assert_eq!(config.reranker_candidates(), 10);
         assert!(!config.reranking_enabled() && !config.no_reindex() && !config.force_reindex());
         assert!(config.artifact_cache_path().is_none());
@@ -369,7 +304,7 @@ mod tests {
         let config = Config::from_value(json!({
             "maxFileSize": 2048, "include": ["src/**"], "exclude": ["gen/**"],
             "parallelism": 4, "embeddingProvider": "ollama", "defaultLimit": "none",
-            "faqThreshold": 0.25, "faqRegenerationThreshold": 0.9,
+            "kbThreshold": 0.25, "kbRefreshFreshness": 0.9,
             "rerankingEnabled": true, "rerankerCandidates": 33,
             "artifactCachePath": "/tmp/store.sqlite",
         }))?;
@@ -381,13 +316,6 @@ mod tests {
         // embeddingParallelism falls back to parallelism before the Ollama default.
         assert_eq!(config.embedding_parallelism()?, 4);
         assert!(config.embedding_is_ollama());
-        assert_eq!(config.faq_threshold(&json!({}))?, 0.25);
-        assert_eq!(config.faq_threshold(&json!({"faqThreshold": -0.5}))?, -0.5);
-        assert_eq!(config.faq_regeneration_threshold(&json!({}))?, 0.9);
-        assert_eq!(
-            config.faq_regeneration_threshold(&json!({"faqRegenerationThreshold": 0.75}))?,
-            0.75
-        );
         assert!(config.reranking_enabled());
         assert_eq!(config.reranker_candidates(), 33);
         assert_eq!(
@@ -400,25 +328,12 @@ mod tests {
     }
 
     #[test]
-    fn faq_regeneration_threshold_validates_config_and_options() -> Result<()> {
-        let config = Config::default();
+    fn kb_threshold_validates_config_and_options() -> Result<()> {
         for value in [json!(2), json!(-2), json!("0.8"), json!(null)] {
-            let raw = json!({"faqRegenerationThreshold": value});
-            assert!(Config::from_value(raw.clone()).is_err());
-            assert!(
-                Config::from(raw.clone())
-                    .faq_regeneration_threshold(&json!({}))
-                    .is_err()
-            );
-            assert!(config.faq_regeneration_threshold(&raw).is_err());
+            assert!(Config::from_value(json!({"kbThreshold": value})).is_err());
         }
         for value in [-1.0, 1.0] {
-            let raw = json!({"faqRegenerationThreshold": value});
-            assert_eq!(
-                Config::from_value(raw.clone())?.faq_regeneration_threshold(&json!({}))?,
-                value
-            );
-            assert_eq!(config.faq_regeneration_threshold(&raw)?, value);
+            Config::from_value(json!({"kbThreshold": value}))?;
         }
         Ok(())
     }
@@ -443,19 +358,19 @@ mod tests {
                 "defaultLimit must be a positive integer or \"none\"",
             ),
             (
-                json!({"faqThreshold": 2.0}),
-                "faqThreshold must be a finite number between -1 and 1",
+                json!({"kbThreshold": 2.0}),
+                "kbThreshold must be a finite number between -1 and 1",
             ),
             (
-                json!({"faqThreshold": "x"}),
-                "faqThreshold must be a finite number between -1 and 1",
+                json!({"kbThreshold": "x"}),
+                "kbThreshold must be a finite number between -1 and 1",
             ),
         ] {
             let error = Config::from_value(value).unwrap_err();
             assert!(format!("{error:#}").contains(message), "{error:#}");
         }
-        // Numeric validation runs before the FAQ check, as Engine open did.
-        let error = Config::from_value(json!({"parallelism": 0, "faqThreshold": 9.0})).unwrap_err();
+        // Numeric validation runs before the KB check.
+        let error = Config::from_value(json!({"parallelism": 0, "kbThreshold": 9.0})).unwrap_err();
         assert!(format!("{error:#}").contains("parallelism must be an integer between 1 and 256"));
         // HTTP retry null-means-unset contract is untouched.
         assert!(Config::from_value(json!({"providerMaxRetries": null})).is_ok());

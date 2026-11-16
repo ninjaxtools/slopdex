@@ -33,6 +33,9 @@ pub trait Llm: Send + Sync {
     fn describe(&self, system: &str, prompt: &str) -> Result<String> {
         self.describe_conversation(system, &[Message::user(prompt.into())], "")
     }
+    fn describe_in(&self, _root: &std::path::Path, system: &str, prompt: &str) -> Result<String> {
+        self.describe(system, prompt)
+    }
     fn describe_conversation(
         &self,
         system: &str,

@@ -172,7 +172,7 @@ const EXPECTED_COMMANDS: &[&str] = &[
     "search-descriptions",
     "search-docs",
     "search-symbols",
-    "faq",
+    "kb",
     "cross-search",
     "map",
     "lines",

@@ -10,7 +10,6 @@ use crate::{
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Write,
 };
@@ -83,57 +82,6 @@ pub(super) fn score_details(row: &Value) -> String {
     }
 }
 
-/// One declaration actually rendered into map/search text, with the line
-/// range shown for it. Also used as fallback metadata for FAQ citations when
-/// an older index lacks current structure.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RenderedSymbol {
-    pub path: String,
-    pub qualified_name: String,
-    pub name: String,
-    pub start_line: usize,
-    pub end_line: usize,
-}
-
-impl RenderedSymbol {
-    fn node(path: &str, node: &StructureNode) -> Self {
-        Self {
-            path: path.to_owned(),
-            qualified_name: node.qualified_name.clone(),
-            name: node.name.clone(),
-            start_line: node.start_line,
-            end_line: node.end_line,
-        }
-    }
-
-    /// Parse a `path:start-end:qualifiedName` reference location, as produced
-    /// by the call graph; invocation labels carry a trailing `()`.
-    fn location(location: &str) -> Option<Self> {
-        let (path, start, end, name) = location.match_indices(':').find_map(|(index, _)| {
-            let (range, name) = location[index + 1..].split_once(':')?;
-            let (start, end) = range.split_once('-').unwrap_or((range, range));
-            Some((
-                &location[..index],
-                start.parse::<usize>().ok()?,
-                end.parse::<usize>().ok()?,
-                name,
-            ))
-        })?;
-        let qualified_name = name.strip_suffix("()").unwrap_or(name);
-        Some(Self {
-            path: path.to_owned(),
-            name: qualified_name
-                .rsplit(['.', ':'])
-                .next()
-                .unwrap_or(qualified_name)
-                .to_owned(),
-            qualified_name: qualified_name.to_owned(),
-            start_line: start,
-            end_line: end,
-        })
-    }
-}
-
 pub(in crate::cli) struct Presentation<'a> {
     engine: Option<&'a Engine>,
     structures: HashMap<String, Option<FileStructure>>,
@@ -142,14 +90,6 @@ pub(in crate::cli) struct Presentation<'a> {
     graph: Option<CallGraph>,
     expanded: Option<Expansion>,
     force_code: BTreeSet<Key>,
-    pub(super) dependencies: RefCell<BTreeSet<String>>,
-    pub(super) record_symbols: bool,
-    pub(super) rendered_symbols: RefCell<BTreeSet<RenderedSymbol>>,
-    /// FAQ context renders every declaration in candidate files, not only hits.
-    pub(super) full_file_maps: bool,
-    /// FAQ context drops whole trailing file sections beyond this many bytes.
-    pub(super) byte_budget: Option<usize>,
-    pub(super) sections_omitted: bool,
 }
 
 impl<'a> Presentation<'a> {
@@ -162,12 +102,6 @@ impl<'a> Presentation<'a> {
             graph: None,
             expanded: None,
             force_code: BTreeSet::new(),
-            dependencies: RefCell::new(BTreeSet::new()),
-            record_symbols: false,
-            rendered_symbols: RefCell::new(BTreeSet::new()),
-            full_file_maps: false,
-            byte_budget: None,
-            sections_omitted: false,
         }
     }
 
@@ -187,12 +121,6 @@ impl<'a> Presentation<'a> {
 
     pub(super) fn calls_enabled(&self) -> bool {
         self.calls.enabled()
-    }
-
-    fn record_symbol(&self, symbol: RenderedSymbol) {
-        if self.record_symbols {
-            self.rendered_symbols.borrow_mut().insert(symbol);
-        }
     }
 
     pub(super) fn key(&self, function: &Value) -> Option<Key> {
@@ -230,16 +158,7 @@ impl<'a> Presentation<'a> {
             id,
         };
         let graph = self.graph.as_ref()?;
-        self.dependencies
-            .borrow_mut()
-            .extend(graph.reference_paths(&key, self.calls.refs));
         let references = graph.reference_labels(&key, self.calls.refs);
-        for symbol in references
-            .iter()
-            .filter_map(|o| RenderedSymbol::location(o))
-        {
-            self.record_symbol(symbol);
-        }
         map::render_references(path, references.iter().map(String::as_str), depth)
     }
 
@@ -310,17 +229,10 @@ impl<'a> Presentation<'a> {
             graph: None,
             expanded: None,
             force_code: BTreeSet::new(),
-            dependencies: RefCell::new(BTreeSet::new()),
-            record_symbols: false,
-            rendered_symbols: RefCell::new(BTreeSet::new()),
-            full_file_maps: false,
-            byte_budget: None,
-            sections_omitted: false,
         }
     }
 
     fn structure(&mut self, path: &str) -> Result<Option<&FileStructure>> {
-        self.dependencies.borrow_mut().insert(path.into());
         if !self.structures.contains_key(path) {
             self.structures.insert(
                 path.to_owned(),
@@ -646,108 +558,17 @@ pub(super) fn print_ranked_files(
             .total_cmp(&maximum(&a.1))
             .then_with(|| a.0.cmp(&b.0))
     });
-    let budget = source.byte_budget;
-    let mut written = 0usize;
-    let mut written_sections = 0usize;
-    let mut omitted = false;
-    for ((is_target, path), hits) in files {
-        if budget.is_none() {
-            if written_sections > 0 {
-                writeln!(out)?;
-            }
-            if is_target && target.is_some() {
-                print_ranked_file(out, &path, &hits, detail, target.as_deref_mut().unwrap())?;
-            } else {
-                print_ranked_file(out, &path, &hits, detail, source)?;
-            }
-            written_sections += 1;
-            continue;
-        }
-        let separator = usize::from(written_sections > 0);
-        let allowance = budget
-            .unwrap()
-            .saturating_sub(written)
-            .saturating_sub(separator);
-        let (section, section_omitted) = if is_target && target.is_some() {
-            budgeted_section(
-                target.as_deref_mut().unwrap(),
-                &path,
-                &hits,
-                detail,
-                allowance,
-                written_sections == 0,
-            )?
-        } else {
-            budgeted_section(
-                source,
-                &path,
-                &hits,
-                detail,
-                allowance,
-                written_sections == 0,
-            )?
-        };
-        omitted |= section_omitted;
-        let Some(section) = section.filter(|section| !section.is_empty()) else {
-            continue;
-        };
-        if written_sections > 0 {
+    for (index, ((is_target, path), hits)) in files.into_iter().enumerate() {
+        if index > 0 {
             writeln!(out)?;
-            written += 1;
         }
-        out.write_all(&section)?;
-        written += section.len();
-        written_sections += 1;
+        if is_target && target.is_some() {
+            print_ranked_file(out, &path, &hits, detail, target.as_deref_mut().unwrap())?;
+        } else {
+            print_ranked_file(out, &path, &hits, detail, source)?;
+        }
     }
-    source.sections_omitted = omitted;
     Ok(())
-}
-
-/// Render one file section within `allowance` bytes, retrying hits-only when
-/// the full map does not fit and rolling back tracked state for skipped files.
-fn budgeted_section(
-    active: &mut Presentation<'_>,
-    path: &str,
-    hits: &[RankedHit<'_>],
-    detail: Detail,
-    allowance: usize,
-    first: bool,
-) -> Result<(Option<Vec<u8>>, bool)> {
-    let dependencies = active.dependencies.borrow().clone();
-    let symbols = active.rendered_symbols.borrow().clone();
-    let mut section = Vec::new();
-    print_ranked_file(&mut section, path, hits, detail, active)?;
-    if section.is_empty() {
-        return Ok((Some(section), false));
-    }
-    let mut omitted = false;
-    if section.len() > allowance && active.full_file_maps {
-        omitted = true;
-        *active.dependencies.borrow_mut() = dependencies.clone();
-        *active.rendered_symbols.borrow_mut() = symbols.clone();
-        let full = active.full_file_maps;
-        active.full_file_maps = false;
-        section.clear();
-        let rendered = print_ranked_file(&mut section, path, hits, detail, active);
-        active.full_file_maps = full;
-        rendered?;
-    }
-    if section.len() > allowance {
-        omitted = true;
-        if !first {
-            *active.dependencies.borrow_mut() = dependencies;
-            *active.rendered_symbols.borrow_mut() = symbols;
-            return Ok((None, omitted));
-        }
-        let mut end = allowance.min(section.len());
-        if let Ok(text) = std::str::from_utf8(&section) {
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-        }
-        section.truncate(end);
-    }
-    Ok((Some(section), omitted))
 }
 
 fn print_ranked_file(
@@ -759,11 +580,6 @@ fn print_ranked_file(
 ) -> Result<()> {
     let structure = presentation.structure(path)?.cloned();
     let mut selected = HashMap::<usize, StructureNode>::new();
-    if presentation.full_file_maps
-        && let Some(structure) = &structure
-    {
-        selected.extend(structure.nodes.iter().map(|node| (node.id, node.clone())));
-    }
     let mut annotations: HashMap<usize, String> = HashMap::new();
     let mut references = HashMap::new();
     let mut extras = HashMap::new();
@@ -873,9 +689,6 @@ fn print_ranked_file(
     }
     let mut nodes: Vec<_> = selected.into_values().collect();
     nodes.sort_by_key(StructureNode::source_order_key);
-    for node in &nodes {
-        presentation.record_symbol(RenderedSymbol::node(path, node));
-    }
     if let Some(graph) = &presentation.graph {
         for node in &nodes {
             let key = Key {
@@ -883,15 +696,6 @@ fn print_ranked_file(
                 id: node.id,
             };
             let outgoing = graph.reference_labels(&key, presentation.calls.refs);
-            presentation
-                .dependencies
-                .borrow_mut()
-                .extend(graph.reference_paths(&key, presentation.calls.refs));
-            // Reference targets are named in the rendered comments even when
-            // their own declarations are not rendered as hunks.
-            for symbol in outgoing.iter().filter_map(|o| RenderedSymbol::location(o)) {
-                presentation.record_symbol(symbol);
-            }
             if !outgoing.is_empty() {
                 references.insert(node.id, outgoing);
             }
@@ -963,35 +767,6 @@ fn print_ranked_file(
     for (fallback_index, hit) in unmatched.iter().enumerate() {
         // Hits without indexed structure are rendered from their search unit
         // metadata (or, for Markdown, their heading path) instead of a node.
-        let start = hit.item["startLine"].as_u64().unwrap_or(1) as usize;
-        let qualified = hit.item["qualifiedName"]
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| {
-                let headings: Vec<_> = array(&hit.item["headingPath"])
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect();
-                (!headings.is_empty()).then(|| headings.join("."))
-            });
-        if let Some(qualified_name) = qualified {
-            let name = text(hit.item, "name");
-            presentation.record_symbol(RenderedSymbol {
-                path: path.to_owned(),
-                name: if name.is_empty() {
-                    qualified_name
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(&qualified_name)
-                        .to_owned()
-                } else {
-                    name.to_owned()
-                },
-                qualified_name,
-                start_line: start,
-                end_line: hit.item["endLine"].as_u64().unwrap_or(start as u64) as usize,
-            });
-        }
         if !nodes.is_empty() || file_hit.is_some() || fallback_index > 0 {
             writeln!(out)?;
         }

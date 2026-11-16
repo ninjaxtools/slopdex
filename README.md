@@ -21,7 +21,7 @@ The main supported functions are
    <br/>find clusters of similar code
 - `slopdex search "QUERY1" ["QUERY2"...]`
    <br/>find code/docs similar to the query
-- `slopdex faq "QUESTION"`
+- `slopdex kb query "QUESTION"`
    <br/>explain code relevant to a task
 
 `map` shows a map/skeleton of the code, excluding implementation details like function bodies. This can be helpful to get a concise map of the code to allow an LLM to explore the codebase incrementally.
@@ -32,7 +32,7 @@ The main supported functions are
 
 `cross-search` also does a vector search but compares all functions with each other (scope can be limited with additional options) and helps with finding duplicated code, or code that is not necessarily duplicated but spread out across the codebase (with `--cohesion`).
 
-`faq` caches LLM responses in a vector index.
+`kb` maintains committed Markdown knowledge-base articles, matched through the normal documentation index.
 
 ## Installation
 
@@ -88,7 +88,7 @@ See the [outgoing references](docs/reference.md#callable-context-and-outgoing-re
 > Add this to your `AGENTS.md` to let the agent use the map command to explore the codebase:
 >
 > ```text
-> - Start any task by asking a relevant high level question with `slopdex faq "<frequently asked question>"`
+> - Start any task by asking a relevant high level question with `slopdex kb query "<knowledge base question>"`
 > - To discover relevant file run `slopdex map -g "<glob>" -i -e "<term|term>" -q "<short symbol concept>" -q "<additional concept>" --private --callers 2 --callees 2 <paths...>` and immediately read plausible implementation ranges from the source files directly.
 > - Avoid mapping repeatedly, frontload the map in one call.
 > - Slopdex is not a replacement for other search tools, but an addition that provides semantic symbol search and mapping functionality.
@@ -125,7 +125,7 @@ slopdex metrics --output json
 slopdex metrics --reset
 ```
 
-See per-command usage, success/failure counts, timings, results, FAQ answer reuse,
+See per-command usage, success/failure counts, timings, results,
 and other project-local aggregates. Tracking starts with this version and stores
 no queries or source text; nothing is uploaded. Set `SLOPDEX_NO_METRICS=1` to opt
 out. See the [metrics reference](docs/reference.md#project-usage-metrics).
@@ -260,33 +260,56 @@ When code is similar but not actually duplicated, then `--cohesion` can help fin
 $ slopdex cross-search --cross-file-only --cohesion --threshold 0.8
 ```
 
-## Frequently asked questions
+## Knowledge base
 
-The `faq` command sends the given question together with relevant code and file maps to the configured LLM and caches the response in a vector index.
-
-```console
-$ slopdex faq "How are RPC endpoints registered?"
+```sh
+slopdex kb init                        # review topics, generate and commit articles
+slopdex update                         # index the articles as ordinary Markdown
+slopdex kb query "How are RPC endpoints registered?"
+slopdex kb list                        # article overview and freshness
+slopdex kb refresh                     # review and commit stale articles
 ```
 
-First a semantic search selects the relevant files and symbols for the question. For each candidate file, the LLM is then given its full declaration map in expanded detail, with source code for the directly relevant symbols and for callers/callees up to two edges away. The LLM generates an explanation along with a list of relevant file and file/symbol references, including sources the agent discovers independently. Only the explanation and verified references (with source-derived line numbers) are emitted and cached. References need not appear in the supplied context: files and symbols are checked against the workspace, and unverifiable references are dropped. The context itself is discarded.
+Articles live in `docs/kb/` by default (`config set kbPath notes/knowledge` changes it).
+`kb init` asks your configured `agentCommand` to review the entire repository for
+topics, then starts a fresh agent per topic, with **4 concurrent agents** by default
+(`kbParallelism` or `--parallelism`). Articles contain detailed Markdown explanations
+and verified file, symbol, or line-range references.
 
-The result is indexed under the embeddings of the original question as well as the LLM response. Subsequent questions try to find a match above the configured cosine threshold (0.7 by default, configured with `--faq-threshold`) and reuse the response. Each answer reports its vector-search `score` (a freshly generated answer scores 1), its `freshness` fraction, and a `rankScore` weighted 90% vector score and 10% freshness. `--limit N` returns up to N matches ranked by this weighted score instead of just the best one (`--limit off` returns all of them).
+Generation and refresh require a clean, committed Git repository. Commit staged,
+unstaged and untracked files first. Slopdex checks again after the agents finish
+and automatically commits **only the generated articles**, never source changes.
+Agent failures leave articles unpublished; commit failures leave generated files
+available for inspection and manual commit. No pushing is performed.
 
-When a matched answer is invalidated, regeneration reuses its original question only if the match score is strictly above `faqRegenerationThreshold` (default `0.8`, overridden with `--faq-regeneration-threshold`). Otherwise it answers the incoming question directly. The existing matching threshold is unchanged.
+`kb query` matches ordinary Markdown embeddings, groups section hits into articles,
+and returns the best article by default (`--limit N` or `--limit off`). Matching is
+strictly above `kbThreshold` (default `0.7`, override `--threshold`). Ranking combines
+90% similarity with 10% freshness. A miss returns no match, never generates prose.
 
-Only the response's verified references determine freshness. References with line ranges hash and retain just those lines; references without ranges track the entire file. Unrelated edits elsewhere in a file do not invalidate a ranged reference, and unchanged symbols can move without becoming outdated. Freshness is the number of unchanged referenced lines divided by the larger of the old and current referenced line counts, aggregated across references. Added, removed, and replaced lines reduce this fraction.
+Freshness comes entirely from Git: each article's latest commit (creation or
+refresh) supplies the reference baseline. Unrelated edits outside cited ranges
+do not count; insertions, deletions and replacements inside references reduce the
+line-weighted unchanged fraction. Current working-tree edits count too.
+Queries require freshness **at least 0.8** (`kbQueryFreshness`); refresh reviews
+articles **below 0.9** (`kbRefreshFreshness`). Both commands accept `--freshness`.
+Uncommitted articles or articles without usable references have freshness zero.
+Articles include a review-provenance comment so a review can renew the Git
+baseline even when its explanation remains correct.
 
-`--freshness 0.8` (the default) allows reuse when at least 80% of the referenced material is unchanged. Use `--freshness 1` for exact freshness, or any fraction from 0 to 1. Changed references are marked `*outdated` in text and `"outdated": true` in JSON; current line ranges are shown when resolvable. Entries below the cutoff are regenerated. An identical LLM request can still reuse its separately cached raw response. Older entries without line snapshots require exact whole-file matches until regenerated.
+`kb` replaces `faq`; the old command, FAQ cache and separate FAQ index are no
+longer used. Rebuild the knowledge base with `kb init` rather than migrating
+cached FAQ answers.
 
 ## Inspect and export indexes
 
 ```sh
 slopdex index list                              # index names, counts, and readiness
-slopdex index list faq                          # compact entries in stored order
+slopdex index list docs                         # ordinary Markdown sections, including KB
 slopdex index list code -q "validate a session" # rank by stored embedding similarity
-slopdex index list faq -e "authentication" -i   # filter question/answer text
-slopdex index list faq --detail expanded        # full text and metadata
-slopdex index list faq --output json > faq.json # full entries and vectors
+slopdex index list docs -e "authentication" -i  # filter documentation text
+slopdex index list docs --detail expanded       # full text and metadata
+slopdex index list docs --output json > docs.json # full entries and vectors
 slopdex index list code --output csv > code.csv
 ```
 

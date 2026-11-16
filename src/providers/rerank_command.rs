@@ -1,4 +1,4 @@
-//! Generative reranking uses the same CLI contract as descriptions and FAQs.
+//! Generative reranking uses the same CLI contract as descriptions and KB agents.
 
 use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};

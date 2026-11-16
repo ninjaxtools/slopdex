@@ -1,4 +1,4 @@
-//! slopdex: a local code index with structural, semantic, and FAQ search.
+//! slopdex: a local code index with structural, semantic, and knowledge-base search.
 //!
 //! The crate exposes a deliberately small facade. Implementation modules are
 //! private; everything a library or test caller needs is re-exported here.
@@ -11,6 +11,7 @@ mod engine;
 mod filter;
 mod formats;
 mod git;
+mod kb;
 mod limits;
 mod lines;
 mod map;

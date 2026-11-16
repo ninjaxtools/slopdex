@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
     version,
     disable_help_subcommand = true,
     about = "Semantic code, documentation, and configuration search",
-    after_help = "Examples:\n  slopdex update\n  slopdex generate descriptions\n  slopdex search \"validate an authenticated session\"\n  slopdex search-symbols \"validate session\"\n  slopdex search \"validate session\" --code --symbols\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex faq \"How are RPC endpoints registered?\"\n  slopdex config\n\nSearch and cross-search require an existing index; run update first. Plain search includes all indexes; selectors restrict it to explicit indexes. Descriptions are generated only by generate descriptions. Pure symbol searches refresh only structure. --no-reindex reuses saved snapshots; queries and explicit generation may call providers. Map without -q parses directly when no index exists."
+    after_help = "Examples:\n  slopdex update\n  slopdex generate descriptions\n  slopdex search \"validate an authenticated session\"\n  slopdex search-symbols \"validate session\"\n  slopdex search \"validate session\" --code --symbols\n  slopdex cross-search --cross-file-only --lines 4 --threshold 0.85-0.9\n  slopdex kb init\n  slopdex kb query \"How are RPC endpoints registered?\"\n  slopdex kb refresh\n  slopdex config\n\nSearch, kb query and cross-search require an existing index; run update first. Plain search includes all indexes; selectors restrict it to explicit indexes. Descriptions are generated only by generate descriptions. KB generation requires a clean Git commit and commits only articles. Pure symbol searches refresh only structure. --no-reindex reuses saved snapshots; queries and explicit generation may call providers. Map without -q parses directly when no index exists."
 )]
 pub(super) struct Cli {
     #[command(flatten)]
@@ -131,8 +131,11 @@ pub(super) enum Command {
     SearchMd(QueryArgs),
     /// Search only the symbol-name/alias and heading-title index
     SearchSymbols(QueryArgs),
-    /// Answer codebase questions; reuse answers with similar questions or answer text
-    Faq(FaqArgs),
+    /// Generate, query and maintain Git-backed Markdown knowledge-base articles
+    Kb {
+        #[command(subcommand)]
+        action: KbAction,
+    },
     /// Compare functions; clusters are connected components of observed matches
     CrossSearch(CrossArgs),
     /// Show code declarations and Markdown headings; -q matches symbols, descriptions, and heading titles
@@ -206,11 +209,11 @@ pub(super) enum IndexAction {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  slopdex index list\n  slopdex index list faq\n  slopdex index list code -q 'validate a session'\n  slopdex index list descriptions -e 'authentication' -i\n  slopdex index list faq --detail expanded\n  slopdex index list faq --output csv\n  slopdex index list symbols --output json\n\nWithout -q, entries retain stable index order. Repeated -q queries use the best cosine score; -e filters entry text before ranking. CSV/JSON always export complete entries and vector values. Listings use the saved snapshot, never refresh or generate missing index entries, and have no default result limit."
+    after_help = "Examples:\n  slopdex index list\n  slopdex index list docs\n  slopdex index list code -q 'validate a session'\n  slopdex index list descriptions -e 'authentication' -i\n  slopdex index list docs --detail expanded\n  slopdex index list docs --output csv\n  slopdex index list symbols --output json\n\nWithout -q, entries retain stable index order. Repeated -q queries use the best cosine score; -e filters entry text before ranking. CSV/JSON always export complete entries and vector values. Listings use the saved snapshot, never refresh or generate missing index entries, and have no default result limit."
 )]
 pub(super) struct IndexListArgs {
     /// Index name; omit to list channels and entry/vector counts
-    #[arg(value_name = "INDEX", value_parser = ["code", "docs", "md", "markdown", "config", "markup", "descriptions", "symbols", "faq"])]
+    #[arg(value_name = "INDEX", value_parser = ["code", "docs", "md", "markdown", "config", "markup", "descriptions", "symbols"])]
     pub(super) name: Option<String>,
     /// Match the selected index's stored embeddings; repeat for OR with best-score ranking
     #[arg(short = 'q', long, requires = "name", allow_hyphen_values = true, value_parser = nonempty)]
@@ -481,15 +484,6 @@ impl CallArgs {
             expand_callees,
         }
     }
-
-    pub(super) fn resolve_faq_context(self) -> CallDepths {
-        Self {
-            expand_callers: Some(self.expand_callers.unwrap_or(2)),
-            expand_callees: Some(self.expand_callees.unwrap_or(2)),
-            ..self
-        }
-        .resolve(Detail::Expanded)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -651,24 +645,48 @@ impl Command {
     }
 }
 
+#[derive(Debug, Subcommand)]
+pub(super) enum KbAction {
+    /// Review all repository topics, generate articles in parallel, and commit them
+    Init(KbGenerateArgs),
+    /// Match existing articles; never generates answers on a miss
+    Query(KbQueryArgs),
+    /// Review stale articles and commit updates (default freshness cutoff: 0.9)
+    Refresh(KbRefreshArgs),
+    /// List all articles and their Git-derived freshness without opening an index
+    List,
+}
+
 #[derive(Debug, Args)]
-#[command(mut_arg("limit", |arg| {
-    arg.help(
-        "Positive number of ranked FAQ questions to return, or 'off'/'none' for all matches (default: 1)",
-    )
-}))]
-pub(super) struct FaqArgs {
+pub(super) struct KbGenerateArgs {
+    /// Concurrent article agents (config kbParallelism; default: 4)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
+    pub(super) parallelism: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct KbRefreshArgs {
     #[command(flatten)]
-    pub(super) query: QueryArgs,
-    /// Reuse question/answer cosine matches strictly above this value (config faqThreshold; default: 0.7)
+    pub(super) generation: KbGenerateArgs,
+    /// Refresh articles below this unchanged fraction (config kbRefreshFreshness; default: 0.9)
+    #[arg(long, allow_hyphen_values = true, value_parser = fraction)]
+    pub(super) freshness: Option<f64>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct KbQueryArgs {
+    /// Question or topic to match
+    #[arg(value_parser = nonempty)]
+    pub(super) query: String,
+    /// Match cosine scores strictly above this value (config kbThreshold; default: 0.7)
     #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
-    pub(super) faq_threshold: Option<f64>,
-    /// Reuse a stale entry's question only above this cosine score (config faqRegenerationThreshold; default: 0.8)
-    #[arg(long, allow_hyphen_values = true, value_parser = similarity)]
-    pub(super) faq_regeneration_threshold: Option<f64>,
-    /// Minimum unchanged fraction of cited lines required for reuse (default: 0.8)
-    #[arg(long, default_value = "0.8", allow_hyphen_values = true, value_parser = fraction)]
-    pub(super) freshness: f64,
+    pub(super) threshold: Option<f64>,
+    /// Minimum unchanged fraction (config kbQueryFreshness; default: 0.8)
+    #[arg(long, allow_hyphen_values = true, value_parser = fraction)]
+    pub(super) freshness: Option<f64>,
+    /// Maximum articles, or 'none'/'off' for all matches (default: 1)
+    #[arg(long)]
+    pub(super) limit: Option<ResultLimit>,
 }
 
 #[derive(Debug, Args)]

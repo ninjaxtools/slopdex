@@ -37,8 +37,8 @@ mod presentation;
 mod refresh;
 mod search;
 
-pub(crate) mod faq;
 mod inspect;
+mod kb;
 mod locking;
 use locking::IndexLock;
 

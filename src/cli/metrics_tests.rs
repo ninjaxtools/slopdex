@@ -47,16 +47,9 @@ fn lifetime_totals_survive_daily_retention_and_clock_changes() {
 #[test]
 fn usage_counts_answers_and_file_lines_without_retaining_content() {
     let mut usage = Usage::default();
-    usage.faq(
-        &serde_json::json!([
-            {"description": "private answer"},
-            {"description": "another private answer"}
-        ]),
-        1,
-    );
+    usage.results(2);
     usage.line_files(&[(PathBuf::from("private.rs"), 12)]);
     assert_eq!(usage.results, Some(3));
-    assert_eq!(usage.faq_reused_answers, 1);
     assert_eq!(usage.lines_counted, 12);
 }
 

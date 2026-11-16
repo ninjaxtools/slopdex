@@ -1,7 +1,7 @@
 //! Per-command handlers over an opened, refreshed [`Session`].
 
 use super::args::{
-    Command, CrossArgs, FaqArgs, Format, GenerateAction, IndexAction, LinesArgs, RefactorArgs,
+    Command, CrossArgs, Format, GenerateAction, IndexAction, KbAction, LinesArgs, RefactorArgs,
 };
 use super::config::{effective_config, mark_repository_config};
 use super::io::print_json;
@@ -14,7 +14,7 @@ use super::{MapOutput, emit_map, warn_errors};
 use crate::engine::Engine;
 use crate::{limits, lines, ui};
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -33,7 +33,46 @@ pub(super) fn dispatch(
         | Command::SearchDescriptions(_)
         | Command::SearchMd(_)
         | Command::SearchSymbols(_) => search(session, out),
-        Command::Faq(args) => faq(session, args, out),
+        Command::Kb {
+            action: KbAction::Query(args),
+        } => {
+            let mut options = json!({});
+            if let Some(value) = args.threshold {
+                options["kbThreshold"] = json!(value);
+            }
+            if let Some(value) = args.freshness {
+                options["freshness"] = json!(value);
+            }
+            if let Some(value) = args.limit {
+                options["limit"] = value.value();
+            }
+            let rows = session.run("Searching knowledge base", |engine| {
+                engine.kb_query(&args.query, &options)
+            })?;
+            session.usage.results(rows.len() as u64);
+            if session.format() == Format::Json {
+                print_json(out, &rows)
+            } else {
+                if rows.is_empty() {
+                    writeln!(
+                        out,
+                        "No fresh knowledge-base match. Run `slopdex kb init` or `slopdex kb refresh`."
+                    )?;
+                }
+                for row in rows {
+                    writeln!(
+                        out,
+                        "{} (score={:.2}, freshness={:.2})\n\n{}",
+                        row["path"].as_str().unwrap_or(""),
+                        row["score"].as_f64().unwrap_or(0.0),
+                        row["freshness"].as_f64().unwrap_or(0.0),
+                        row["description"].as_str().unwrap_or("")
+                    )?;
+                }
+                Ok(())
+            }
+        }
+        Command::Kb { .. } => unreachable!(),
         Command::CrossSearch(args) => cross_search(session, args, out),
         Command::Status => print_json(out, &session.engine().status()?),
         Command::Index {
@@ -168,111 +207,6 @@ fn search(session: &mut Session, out: &mut impl Write) -> Result<()> {
         )?,
     )?;
     print_limit_notice(out, format, rows.omitted, rows.limit)
-}
-
-fn faq(session: &mut Session, args: &FaqArgs, out: &mut impl Write) -> Result<()> {
-    let cli = session.cli;
-    let format = session.format();
-    let mut options = args.query.filters.options();
-    let context = args.query.calls.resolve_faq_context();
-    options["callers"] = json!(context.callers);
-    options["callees"] = json!(context.callees);
-    options["expandCallers"] = json!(context.expand_callers);
-    options["expandCallees"] = json!(context.expand_callees);
-    options["refs"] = json!(context.refs);
-    options["expandCodeThreshold"] = json!(cli.global.expand_code_threshold);
-    if let Some(threshold) = args.faq_threshold {
-        options["faqThreshold"] = json!(threshold);
-    }
-    if let Some(threshold) = args.faq_regeneration_threshold {
-        options["faqRegenerationThreshold"] = json!(threshold);
-    }
-    options["freshness"] = json!(args.freshness);
-    // For faq, --limit counts the ranked FAQ questions returned, not the
-    // source-search results feeding generation (those keep using the
-    // configured defaultLimit).
-    if let Some(limit) = args.query.filters.limit {
-        options["faqLimit"] = limit.value();
-        if let Some(options) = options.as_object_mut() {
-            options.remove("limit");
-        }
-    }
-    let engine = session.engine();
-    let (result, reused) = ui::spin("Answering FAQ", || {
-        engine.faq_with_usage(&args.query.query, &options)
-    })?;
-    session.usage.faq(&result, reused);
-    // A semantic hit returns the original answer and references, never a fresh search.
-    if format == Format::Json {
-        print_json(out, &result)?;
-    } else if let Some(results) = result.as_array() {
-        for (index, result) in results.iter().enumerate() {
-            if index > 0 {
-                writeln!(out)?;
-            }
-            print_faq_answer(out, result, true)?;
-        }
-    } else {
-        print_faq_answer(out, &result, false)?;
-    }
-    // The omitted/limit notice describes the source search behind a single
-    // generated answer; an array of ranked FAQ matches has no such search.
-    let (omitted, limit) = if result.is_array() {
-        (false, None)
-    } else {
-        (
-            result["omitted"].as_bool().unwrap_or(false),
-            result["limit"].as_u64().map(|n| n as usize),
-        )
-    };
-    print_limit_notice(out, format, omitted, limit)
-}
-
-fn print_faq_answer(out: &mut impl Write, result: &Value, show_question: bool) -> Result<()> {
-    if show_question {
-        writeln!(
-            out,
-            "Question: {}",
-            result["question"].as_str().unwrap_or("")
-        )?;
-    }
-    let description = result["description"].as_str().unwrap_or("");
-    match result["score"].as_f64() {
-        Some(score) => writeln!(out, "Explanation (score={score:.2})\n{description}")?,
-        None => writeln!(out, "Explanation\n{description}")?,
-    }
-    let references = result["references"].as_array().cloned().unwrap_or_default();
-    if !references.is_empty() {
-        writeln!(out, "\nReferences")?;
-        for reference in &references {
-            let path = reference["path"].as_str().unwrap_or("");
-            let note = if reference["outdated"].as_bool().unwrap_or(false) {
-                " *outdated"
-            } else {
-                ""
-            };
-            match reference["symbol"].as_str() {
-                Some(symbol) => writeln!(
-                    out,
-                    "{}{note}",
-                    crate::map::symbol_location(
-                        path,
-                        reference["startLine"].as_u64().unwrap_or(1) as usize,
-                        reference["endLine"].as_u64().unwrap_or(1) as usize,
-                        symbol,
-                    )
-                )?,
-                None => match (
-                    reference["startLine"].as_u64(),
-                    reference["endLine"].as_u64(),
-                ) {
-                    (Some(start), Some(end)) => writeln!(out, "{path}:{start}-{end}{note}")?,
-                    _ => writeln!(out, "{path}{note}")?,
-                },
-            }
-        }
-    }
-    Ok(())
 }
 
 fn cross_search(session: &mut Session, args: &CrossArgs, out: &mut impl Write) -> Result<()> {

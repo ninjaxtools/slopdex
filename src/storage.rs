@@ -14,13 +14,11 @@ use crate::{
     registry,
 };
 
-mod faq;
 mod publish;
 mod records;
 mod snapshot;
 mod units;
 
-pub(crate) use faq::{FaqEntry, FaqMaterial};
 pub(crate) use units::{callable_data, callable_identity, decode, parsed_items};
 
 /// Bump when the structure or search-unit extraction contract changes.
@@ -487,9 +485,7 @@ fn initialization_lock(path: &Path, config: &Value) -> Result<crate::registry::A
 }
 
 fn reset_live(conn: &Connection) -> Result<()> {
-    if faq::exists(conn)? {
-        conn.execute("DELETE FROM faq_entries", [])?;
-    }
+    conn.execute("DROP TABLE IF EXISTS faq_entries", [])?;
     conn.execute_batch("DELETE FROM search_units; DELETE FROM files; DELETE FROM search_cache; DELETE FROM metadata WHERE key NOT IN ('identity','global_path');")?;
     conn.execute(
         "INSERT INTO metadata VALUES('incarnation',lower(hex(randomblob(16))))",

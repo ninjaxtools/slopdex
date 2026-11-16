@@ -1,7 +1,9 @@
 //! One workspace's engine lifecycle: setup, opening, refresh, and the single
 //! read-only→writable escalation path shared by read commands.
 
-use super::args::{CacheAction, Cli, Command, Format, HelpTopic, IndexAction, help_command};
+use super::args::{
+    CacheAction, Cli, Command, Format, HelpTopic, IndexAction, KbAction, help_command,
+};
 use super::config::{self, effective_config, mark_repository_config, run_config};
 use super::io::print_json;
 use super::metrics::Usage;
@@ -242,6 +244,57 @@ impl<'a> Session<'a> {
             // later workspace defaults cannot reset the shared declaration budget.
             map_output.initialize(&config, &args.options_for(cli.global.detail))?;
         }
+        if let Command::Kb { action } = &cli.command
+            && !matches!(action, KbAction::Query(_))
+        {
+            crate::Config::from_value(config.clone())?;
+            let result = match action {
+                KbAction::List => {
+                    let rows =
+                        ui::spin("Reading knowledge base", || crate::kb::list(root, &config))?;
+                    usage.results(rows.len() as u64);
+                    if cli.global.format == Some(Format::Json) {
+                        print_json(&mut out, &rows)?;
+                    } else {
+                        for row in rows {
+                            writeln!(
+                                out,
+                                "{:.2}  {}  {}",
+                                row["freshness"].as_f64().unwrap_or(0.0),
+                                row["path"].as_str().unwrap_or(""),
+                                row["title"].as_str().unwrap_or("")
+                            )?;
+                        }
+                    }
+                    return Ok(None);
+                }
+                KbAction::Init(args) => {
+                    let mut options = json!({});
+                    if let Some(n) = args.parallelism {
+                        options["parallelism"] = json!(n);
+                    }
+                    ui::spin("Initializing knowledge base", || {
+                        crate::kb::generate(root, &config, &options, false)
+                    })?
+                }
+                KbAction::Refresh(args) => {
+                    let mut options = json!({});
+                    if let Some(n) = args.generation.parallelism {
+                        options["parallelism"] = json!(n);
+                    }
+                    if let Some(n) = args.freshness {
+                        options["freshness"] = json!(n);
+                    }
+                    ui::spin("Refreshing knowledge base", || {
+                        crate::kb::generate(root, &config, &options, true)
+                    })?
+                }
+                KbAction::Query(_) => unreachable!(),
+            };
+            usage.files_changed += result["articles"].as_array().map_or(0, Vec::len) as u64;
+            print_json(&mut out, &result)?;
+            return Ok(None);
+        }
         if let Some(directory) = &workspace.directory {
             for key in ["indexPath", "artifactCachePath"] {
                 if let Some(path) = config[key]
@@ -312,6 +365,9 @@ impl<'a> Session<'a> {
                 | Command::SearchDescriptions(_)
                 | Command::SearchMd(_)
                 | Command::SearchSymbols(_)
+                | Command::Kb {
+                    action: KbAction::Query(_)
+                }
                 | Command::CrossSearch(_)
         ) {
             require_index(&index)?;
@@ -394,6 +450,9 @@ impl<'a> Session<'a> {
                 | Command::SearchDescriptions(_)
                 | Command::SearchMd(_)
                 | Command::SearchSymbols(_)
+                | Command::Kb {
+                    action: KbAction::Query(_)
+                }
         );
         let reader =
             read_only_command && index.exists() && config["forceReindex"].as_bool() != Some(true);

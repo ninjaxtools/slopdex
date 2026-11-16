@@ -18,7 +18,7 @@ provider caches accelerate work but do not define the live repository snapshot.
                   +-------------------------------+
                   | Engine (engine.rs)            |
                   | refresh, map, search, compare, |
-                  | faq; index locking            |
+                  | kb query; index locking       |
                   +---+-----------+-----------+---+
                        |           |           |
                        v           |           | semantic preparation / queries
@@ -88,7 +88,11 @@ provider caches accelerate work but do not define the live repository snapshot.
    and ranks indexed callables by code similarity; available callable/file
    description similarities are supplementary scores and do not affect ranking
    or thresholds.
-   `faq` reuses answers through a separate question/answer vector index, checking referenced-file hashes before reuse; on a miss it sends search context to an LLM and keeps only the explanations' cited files/symbols that appear in that context. `map.rs`
+   `kb` maintains committed Markdown articles in `docs/kb/`. Init reviews all topics
+   and starts article agents with bounded parallelism; refresh reviews stale articles.
+   Queries group normal documentation hits by article and derive reference freshness
+   from each article's latest Git commit and current source, without a separate index.
+   `map.rs`
    renders declaration excerpts, and `callgraph.rs` expands conservatively
    resolved caller/callee context from saved structure.
    Callable graph depths control declaration/code expansion; independent `--refs`

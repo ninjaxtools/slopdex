@@ -241,19 +241,6 @@ fn mark_workspace(store: &Connection, index: &Connection) -> Result<()> {
         "embedding",
         "SELECT embedding_key FROM unit_embeddings UNION SELECT embedding_key FROM descriptions WHERE embedding_key IS NOT NULL",
     )?;
-    let has_faq: bool = index.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='faq_entries')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_faq {
-        mark_query(
-            store,
-            index,
-            "embedding",
-            "SELECT question_embedding FROM faq_entries UNION SELECT answer_embedding FROM faq_entries",
-        )?;
-    }
     Ok(())
 }
 
@@ -261,7 +248,7 @@ fn pointer_suffixes() -> Vec<String> {
     FormatGroup::ALL
         .into_iter()
         .map(FormatGroup::as_str)
-        .chain(["markdown", "descriptions", "symbols", "faq"])
+        .chain(["markdown", "descriptions", "symbols"])
         .map(|role| format!(".{role}.shared.json"))
         .collect()
 }
@@ -318,10 +305,12 @@ fn remove_file(path: &Path) -> Result<u64> {
 
 fn remove_index(index: &Path, protected: &BTreeSet<PathBuf>) -> Result<u64> {
     let mut removed = 0;
-    for suffix in pointer_suffixes()
-        .into_iter()
-        .chain(["-wal".into(), "-shm".into(), "".into()])
-    {
+    for suffix in pointer_suffixes().into_iter().chain([
+        ".faq.shared.json".into(),
+        "-wal".into(),
+        "-shm".into(),
+        "".into(),
+    ]) {
         let path = appended(index, &suffix);
         if path != index && protected.contains(&path) {
             continue;
